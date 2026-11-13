@@ -1,11 +1,7 @@
 name: Import selected engineering reference source
 
-# One-time public research import of OpenHands; restored to manual-only afterward.
-# Download and source verification only; never run upstream applications.
+# Manual source imports only; source is never built or executed.
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/import-selected-reference.yml']
   workflow_dispatch:
     inputs:
       project:
@@ -32,7 +28,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: reference-import-${{ github.event.inputs.project || 'openhands' }}
+  group: reference-import-${{ github.event.inputs.project || 'bolt-diy' }}
   cancel-in-progress: false
 
 jobs:
@@ -42,7 +38,7 @@ jobs:
     steps:
       - name: Resolve audited allowlist
         env:
-          PROJECT: ${{ github.event.inputs.project || 'openhands' }}
+          PROJECT: ${{ github.event.inputs.project || 'bolt-diy' }}
         run: |
           set -euo pipefail
           case "$PROJECT" in
