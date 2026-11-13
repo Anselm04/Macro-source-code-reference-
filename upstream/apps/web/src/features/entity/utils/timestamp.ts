@@ -1,0 +1,123 @@
+import type { DateValue } from '@core/util/date';
+import {
+  differenceInDays,
+  differenceInHours,
+  differenceInMilliseconds,
+  differenceInMinutes,
+  differenceInMonths,
+  differenceInWeeks,
+  differenceInYears,
+  format,
+  isSameYear,
+  isToday,
+  isYesterday,
+  toDate,
+} from 'date-fns';
+
+/**
+ * Formats a timestamp into a human-readable string.
+ * - Today: Shows time (e.g., "2:30 PM")
+ * - Same year: Shows month and day (e.g., "Jan 27")
+ * - Older: Shows full date (e.g., "1/27/24")
+ */
+export function formatTimestamp(date: DateValue): string {
+  const value = toDate(date);
+  if (Number.isNaN(value.getTime())) return 'Invalid Date';
+  if (isToday(value)) {
+    return format(value, 'h:mm a');
+  }
+
+  if (isSameYear(value, new Date())) {
+    return format(value, 'MMM d');
+  }
+
+  return format(value, 'M/d/yy');
+}
+
+/**
+ * Formats a timestamp into a relative human-readable string.
+ * - Under 60 minutes: "X minutes ago"
+ * - Under 24 hours: "X hours ago"
+ * - Yesterday: "3:45pm yesterday"
+ * - Older: Shows date (e.g., "Jan 27" or "1/27/24")
+ */
+export function formatRelativeTimestamp(
+  date: DateValue,
+  options?: { condensed?: boolean }
+): string {
+  const now = new Date();
+  const condensed = options?.condensed ?? false;
+
+  const minutesAgo = differenceInMinutes(now, date);
+
+  if (minutesAgo < 1) {
+    return 'just now';
+  }
+
+  if (minutesAgo < 60) {
+    const unit = condensed ? 'min' : minutesAgo === 1 ? 'minute' : 'minutes';
+    return `${minutesAgo} ${unit} ago`;
+  }
+
+  const hoursAgo = differenceInHours(now, date);
+
+  if (hoursAgo < 24) {
+    const unit = condensed ? 'hr' : hoursAgo === 1 ? 'hour' : 'hours';
+    return `${hoursAgo} ${unit} ago`;
+  }
+
+  if (isYesterday(date)) {
+    return condensed ? 'yest' : `${format(date, 'h:mma')} yesterday`;
+  }
+
+  if (isSameYear(date, now)) {
+    return format(date, 'MMM d');
+  }
+
+  return format(date, 'M/d/yy');
+}
+
+/**
+ * The shortest relative age for dense rows: `now`, `5m`, `17h`, `8d`, `3w`,
+ * `1mo`, `2y`. An unparseable value is returned as is.
+ */
+export function formatCompactRelativeTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+
+  const now = new Date();
+  const ageMs = Math.max(0, differenceInMilliseconds(now, date));
+  const seconds = Math.floor(ageMs / 1000);
+  if (seconds < 60) return 'now';
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+
+  const days = differenceInDays(now, date);
+  if (days < 7) return `${Math.max(1, days)}d`;
+
+  const weeks = differenceInWeeks(now, date);
+  if (weeks < 5) return `${Math.max(1, weeks)}w`;
+
+  const months = differenceInMonths(now, date);
+  if (months < 12) return `${Math.max(1, months)}mo`;
+
+  return `${Math.max(1, differenceInYears(now, date))}y`;
+}
+
+/**
+ * Formats a date + time in a single concise line, e.g. "Apr 15, 2:30 PM" or
+ * "1/27/24, 2:30 PM". Used when a row needs both pieces (e.g. routine
+ * next-run times).
+ */
+export function formatDateAndTime(date: DateValue): string {
+  const d = typeof date === 'string' ? new Date(date) : date;
+  const dateLabel = isSameYear(d, new Date())
+    ? format(d, 'MMM d')
+    : format(d, 'M/d/yy');
+  const timeLabel = format(d, 'h:mm a');
+  return `${dateLabel}, ${timeLabel}`;
+}

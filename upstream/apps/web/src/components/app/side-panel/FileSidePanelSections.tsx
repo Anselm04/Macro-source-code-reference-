@@ -1,0 +1,216 @@
+import {
+  EntityPropertiesSection,
+  EntityTagsSection,
+} from '@app/features/property/side-panel/properties';
+import { useBlockId } from '@core/block';
+import { openDocument } from '@core/component/LexicalMarkdown/component/core/BlockLink';
+import { useCanEdit } from '@core/signal/permissions';
+import { useBlockDocumentName } from '@core/util/currentBlockDocumentName';
+import { type DateValue, formatDate } from '@core/util/date';
+import { useSplitNavigationHandler } from '@core/util/useSplitNavigationHandler';
+import { OwnerLabel } from '@entity/owner/owner-display';
+import { useDocumentMetadataQuery } from '@queries/storage/document-metadata';
+import { createCallback } from '@solid-primitives/rootless';
+import { createMemo, Show } from 'solid-js';
+import { EntityMetadata, EntityMetadataRow } from './EntityMetadata';
+import { SidePanel, type SidePanelSectionLayout } from './SidePanel';
+
+export function FileSidePanelSections() {
+  return (
+    <>
+      <FileDetailsSection order={10} />
+      <FileTagsSection order={20} />
+      <FilePropertiesSection order={30} />
+    </>
+  );
+}
+
+export type DocumentFileSidePanelSectionsProps = {
+  documentId: string;
+  documentName: string;
+  canEdit: boolean;
+};
+
+export function DocumentFileSidePanelSections(
+  props: DocumentFileSidePanelSectionsProps
+) {
+  return (
+    <>
+      <DocumentFileDetailsSection documentId={props.documentId} order={10} />
+      <EntityTagsSection
+        entityId={props.documentId}
+        entityType="DOCUMENT"
+        canEdit={props.canEdit}
+        order={20}
+      />
+      <DocumentFilePropertiesSection
+        documentId={props.documentId}
+        documentName={props.documentName}
+        canEdit={props.canEdit}
+        order={30}
+      />
+    </>
+  );
+}
+
+export function FileDetailsSection(_props: { order?: number }) {
+  return (
+    <SidePanel.Footer>
+      <BlockDetailsSectionContent />
+    </SidePanel.Footer>
+  );
+}
+
+export function DocumentFileDetailsSection(props: {
+  documentId: string;
+  order?: number;
+}) {
+  return (
+    <SidePanel.Footer>
+      <DetailsSectionContent documentId={props.documentId} />
+    </SidePanel.Footer>
+  );
+}
+
+export function FilePropertiesSection(props: { order?: number }) {
+  return (
+    <SidePanel.Section
+      id="properties"
+      title="Properties"
+      defaultOpen
+      order={props.order}
+      render={(renderSection) => (
+        <PropertiesSectionContent renderSection={renderSection} />
+      )}
+    />
+  );
+}
+
+export function DocumentFilePropertiesSection(props: {
+  documentId: string;
+  documentName: string;
+  canEdit: boolean;
+  order?: number;
+}) {
+  return (
+    <SidePanel.Section
+      id="properties"
+      title="Properties"
+      defaultOpen
+      order={props.order}
+      render={(renderSection) => (
+        <EntityPropertiesSection
+          entityId={props.documentId}
+          entityType="DOCUMENT"
+          canEdit={props.canEdit}
+          documentName={props.documentName}
+          showTags={false}
+          renderSection={renderSection}
+        />
+      )}
+    />
+  );
+}
+
+export function FileTagsSection(props: { order?: number }) {
+  const blockId = useBlockId();
+  const canEdit = useCanEdit();
+
+  return (
+    <EntityTagsSection
+      entityId={blockId}
+      entityType="DOCUMENT"
+      canEdit={canEdit()}
+      order={props.order}
+    />
+  );
+}
+
+function PropertiesSectionContent(props: {
+  renderSection: SidePanelSectionLayout;
+}) {
+  const blockId = useBlockId();
+  const canEdit = useCanEdit();
+  const documentName = useBlockDocumentName();
+
+  return (
+    <EntityPropertiesSection
+      entityId={blockId}
+      entityType="DOCUMENT"
+      canEdit={canEdit()}
+      documentName={documentName()}
+      showTags={false}
+      renderSection={props.renderSection}
+    />
+  );
+}
+
+function BlockDetailsSectionContent() {
+  const blockId = useBlockId();
+  return <DetailsSectionContent documentId={blockId} />;
+}
+
+function DetailsSectionContent(props: { documentId: string }) {
+  const query = useDocumentMetadataQuery(() => props.documentId);
+  const metadata = createMemo(() => query.data);
+
+  return (
+    <EntityMetadata
+      ownerId={metadata()?.owner}
+      createdAt={metadata()?.createdAt}
+      updatedAt={metadata()?.updatedAt}
+    >
+      <Show
+        when={(() => {
+          const id = metadata()?.projectId;
+          const name = metadata()?.projectName;
+          return id && name ? { id, name } : undefined;
+        })()}
+      >
+        {(folder) => (
+          <EntityMetadataRow label="Folder">
+            <FolderLink projectId={folder().id} projectName={folder().name} />
+          </EntityMetadataRow>
+        )}
+      </Show>
+    </EntityMetadata>
+  );
+}
+
+export function FolderLink(props: { projectId: string; projectName: string }) {
+  const open = createCallback(() => {
+    openDocument('project', props.projectId, undefined, true);
+  });
+  const navHandlers = useSplitNavigationHandler<HTMLSpanElement>(open);
+
+  return (
+    <span
+      {...navHandlers}
+      class={
+        SidePanel.pillClass + ' pointer-events-auto text-ink hover:bg-hover'
+      }
+    >
+      <span class="truncate underline decoration-current/20 decoration-[max(1px,0.1em)] underline-offset-2">
+        {props.projectName}
+      </span>
+    </span>
+  );
+}
+
+export function OwnerValue(props: { ownerId: string }) {
+  return (
+    <SidePanel.Pill>
+      <OwnerLabel ownerId={props.ownerId} suppressClick />
+    </SidePanel.Pill>
+  );
+}
+
+export function DateValueDisplay(props: { value: DateValue }) {
+  return (
+    <SidePanel.Pill>
+      <span class="truncate">
+        {formatDate(props.value, { showTime: true })}
+      </span>
+    </SidePanel.Pill>
+  );
+}

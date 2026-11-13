@@ -1,0 +1,161 @@
+---
+title: "Chat"
+icon: "comment"
+description: "Channels and direct messages are where you, your team, and your customers communicate."
+---
+
+Open **Chat** in the sidebar, or press <kbd>g</kbd> \+ <kbd>c</kbd>, to see your channels and direct messages.
+
+Watch a 1:30 walkthrough of Macro Chat.
+
+<video src="https://macro.com/video/tutorials/chat.mp4" poster="https://macro.com/video/tutorials/chat-poster.jpg" controls playsInline preload="metadata" className="w-full aspect-video rounded-xl" />
+
+Anyone can be added to a channel by entering their email, even if they're not on your team. People without a Macro account receive an email telling them about their channel notifications.
+
+<CardGroup cols={2}>
+  <Card title="Channels & Groups" icon="users">
+    Organize team conversations by topic, project, or team
+  </Card>
+
+  <Card title="Threaded Replies" icon="comments">
+    Keep discussions organized with threaded conversations
+  </Card>
+
+  <Card title="Bidirectional Links" icon="link">
+    @mention docs, tasks, and emails to create traceable references
+  </Card>
+
+  <Card title="Rich Messages" icon="pen-fancy">
+    Format messages with the same editor used everywhere in Macro
+  </Card>
+</CardGroup>
+
+> To create a channel use shortcut <kbd>c</kbd> \+ <kbd>g</kbd>
+
+New channels function similarly to Slack channels. You can have an empty channel with just yourself, or add team members for a collaborative channel.
+
+## Channel types
+
+Macro has two visibility levels for channels:
+
+### Team channels
+
+Team channels are visible to everyone on your [team](/account/teams). Any team member can discover and join them. When you create a team channel, you can enable **Automatically add teammates** to add all current and future team members to the channel.
+
+<Tip>
+  Use team channels for company-wide announcements, department discussions, or any conversation the whole team should be able to find.
+</Tip>
+
+### Private channels
+
+Private channels are only visible to the people you add. They don't appear in search or discovery for non-members. Use private channels for sensitive discussions or conversations with people outside your team.
+
+## Message history
+
+When someone joins a channel, they see the full message history from the beginning — not just messages sent after they joined. This applies to both team and private channels.
+
+## Agents in channels
+
+You can also mention @Macro to call an agent into the channel. @Macro can summarize previous discussions, answer workspace questions, and more.
+
+Mention an agent you created the same way, with its **@tag**. Open **Settings → Agents** and click **Add agent**. A **Private** agent can be mentioned inside of a team channel only by the owner. A **Team** agent can be mentioned by anyone on the team.
+
+In **Settings → Agents**, **Connect Cursor** lets you mention **@Cursor** on your Cursor subscription. **Bring your own agent** pairs Claude Code, Codex, or another local agent through Macrod. See [Bring your own agent](/AI/bring-your-own).
+
+@mention a coding agent in the channel and it opens a session in the thread. When that session opens a pull request, the message links to it.
+
+## Message Features
+
+### Rich Text Editing
+
+Compose messages using Macro's unified rich text editor:
+
+- **Formatting**: Bold, italic, code blocks, lists
+- **@mentions**: Reference users, documents, tasks, files, and more
+- **Snippets**: Type <kbd>;</kbd> to insert a saved [snippet](/product/snippets)
+- **Attachments**: Add files, images, and media
+- **Markdown**: Full markdown support for quick formatting
+
+### Message actions
+
+Hover over any message on desktop to reveal its action menu. Alongside reactions and replies, you can:
+
+- **Task** — create a task from the message
+- **Chat with Agent** — start an agent chat with the message
+- **Copy Link** — copy a link straight to that message so you can paste it into a doc, task, or another channel
+- **Copy Text** — copy the message's text to your clipboard
+- **Edit** — change a message you sent
+- **Delete** — remove a message you sent, or a message from a bot
+
+On mobile, long-press a message to open the same menu. **Task** is **Create task**, and **Chat with Agent** is **Ask Macro**.
+
+### Thread Replies
+
+Keep conversations organized by replying in threads:
+
+1. Click on any message to view or start a thread
+2. Thread replies appear indented under the parent message
+3. Thread indicators show when new replies are added
+
+<Tip>
+  Threads help keep channels clean by organizing side conversations and reducing notification noise.
+</Tip>
+
+## @Linking System
+
+Mention an entity in a channel and it is shared with the channel participants. The mention also leaves a link you can trace back: the entity shows where it was referenced.
+
+Messages support bidirectional @links to everything in your workspace:
+
+<Steps>
+  <Step title="Type @">
+    Start typing `@` to open the mentions menu
+  </Step>
+  <Step title="Select an item">
+    Choose from documents, tasks, emails, files, users, companies, calls or other channels. Mentioning one shares its permissions with the channel participants.
+  </Step>
+  <Step title="Create the link">
+    The mention creates a bidirectional reference you can trace back later
+  </Step>
+</Steps>
+
+### What You Can @Mention
+
+- **Users**: Notify team members (`@username`)
+- **Documents**: Reference notes, wikis, and collaborative docs
+- **Tasks**: Link to specific tasks or projects
+- **Files**: Reference PDFs, images, videos, and other files
+- **Emails**: Link to email threads
+- **Channels**: Reference other channels or conversations
+- **Dates**: Create date references (`@tomorrow`, `@next week`)
+- **Groups**: Mention groups like `@here` or `@team`
+
+## Attachments
+
+Share files and media in messages:
+
+- **Drag and drop**: Drop files directly into the message composer
+- **File picker**: Browse and select from your storage
+- **Inline previews**: Images and supported files show inline previews
+
+<Info>
+  Attachments shared in channels are automatically imported to Macro's file storage, making them searchable and accessible from anywhere.
+</Info>
+
+## Participant Management
+
+Manage channel membership:
+
+- Add or remove participants
+- View all channel members
+- See participant status and presence
+
+## Best Practices
+
+<Tip>
+  - Use channels to organize conversations by topic or project
+  - @mention documents and tasks to create traceable references
+  - Use threads for side conversations to keep the main channel clean
+  - React with emoji instead of sending "thanks" messages
+  - Edit messages to fix mistakes rather than sending corrections
+</Tip>

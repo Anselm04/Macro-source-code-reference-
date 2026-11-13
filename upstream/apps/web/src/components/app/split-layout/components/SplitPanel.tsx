@@ -1,0 +1,447 @@
+import { isListViewID, LIST_VIEW_ID } from '@app/constants/list-views';
+import { AccessRequestVisitProvider } from '@app/features/access-requests/context/visit';
+import { createSoupState } from '@app/features/next-soup/create-soup-state';
+import { SoupContextProvider } from '@app/features/next-soup/soup-context';
+import { SoupViewContextProvider } from '@app/features/next-soup/soup-view/soup-view-context';
+import { t } from '@app/lib/i18n';
+import {
+  type PaneId,
+  SplitRouter,
+  useOptionalSplitRouter,
+} from '@app/lib/split-router';
+import { globalSplitManager } from '@app/signal/splitLayout';
+import { MobileTopEdgeFade } from '@components/app/mobile/MobileEdgeFade';
+import { MobilePageActionRow } from '@components/app/mobile/MobilePageActionRow';
+import { SplitPanelControllerProvider } from '@components/app/split-panel';
+import { splitContainerAttribute } from '@core/dom-selectors';
+import { EVENT_MODIFIER_KEYS } from '@core/hotkey/constants';
+import { useHotkeyDOMScope } from '@core/hotkey/hotkeys';
+import { TOKENS } from '@core/hotkey/tokens';
+import { isTouchDevice } from '@core/mobile/isTouchDevice';
+import { getSafeAreaInset } from '@core/mobile/safeAreaInsets';
+import CloseIcon from '@icon/system/regular/x.svg';
+import { createElementSize } from '@solid-primitives/resize-observer';
+import { Button, cn, Panel } from '@ui';
+import { createEffect, createSignal, Show, Suspense } from 'solid-js';
+import { createMutable } from 'solid-js/store';
+import { Dynamic } from 'solid-js/web';
+import { createPriorityCollapseController } from '../../../priority-collapse/PriorityCollapseOverflowSensor';
+import { splitBackInterceptor } from '../back-interceptor';
+import {
+  type SplitBottomPanelRegistration,
+  type SplitFileMenuActionGroups,
+  SplitPanelContext,
+  type SplitPanelContextType,
+} from '../context';
+import { useSplitLayout } from '../layout';
+import type { SplitHandle, SplitState } from '../layoutManager';
+import { shouldShowSplitCloseButton, splitViewId } from '../layoutUtils';
+import { registerSplitHotkeys } from '../registerSplitHotkeys';
+import { createOwnedSlots } from '../utils/createOwnedSlots';
+import { createSplitAutofocus } from '../utils/createSplitAutofocus';
+import { SplitDrawerGroup } from './SplitDrawerContext';
+import { SplitHeader } from './SplitHeader';
+import { SplitToolbar } from './SplitToolbar';
+
+type SplitPanelProps = {
+  setPanelRef: (ref: HTMLDivElement) => void;
+  handle: SplitHandle;
+  split: SplitState;
+  active: boolean;
+  index: number;
+};
+
+export function SplitPanel(props: SplitPanelProps) {
+  const [attachHotKeys, splitHotkeyScope] = useHotkeyDOMScope(
+    `split=${props.split.id}`
+  );
+  const [panelRef, setPanelRef] = createSignal<HTMLDivElement | null>(null);
+  const [contentOffsetTop, setContentOffsetTop] = createSignal(0);
+  const navigationCollapsed = createSignal(true);
+  const [titleFileMenuRef, setTitleFileMenuRef] =
+    createSignal<HTMLDivElement>();
+  const [titleFileMenuTrigger, setTitleFileMenuTrigger] =
+    createSignal<() => void>();
+  const [titleFileMenuActions, setTitleFileMenuActions] =
+    createSignal<SplitFileMenuActionGroups>();
+  const [bottomPanel, setBottomPanel] =
+    createSignal<SplitBottomPanelRegistration>();
+  const panelSize = createElementSize(panelRef);
+  // Weak, so the last element pressed doesn't keep a view this split has
+  // left alive.
+  let pointerTarget: WeakRef<Element> | undefined;
+
+  const layoutRefs = createMutable<SplitPanelContextType['layoutRefs']>({});
+  const mobileHeaderOwner = createSignal<symbol>();
+  const headerMdControls = createSignal(0);
+  const headerCollapseController = createPriorityCollapseController();
+  const toolbarCollapseController = createPriorityCollapseController();
+  const ownedSlots = createOwnedSlots(() => splitViewId(props.handle));
+
+  const splitLayoutHelpers = useSplitLayout();
+  const isNotUnifiedList = () => {
+    const content = props.handle.content();
+    return content.type !== 'component' || !isListViewID(content.id);
+  };
+
+  registerSplitHotkeys({
+    // Leaving a piece of content should return you to the list you reached it
+    // from, so walk this split's history back to the most recent list view.
+    // Only a split that never passed through one falls back to the inbox.
+    goToList: () => {
+      const wentBack = props.handle.goBackTo(
+        (content) => content.type === 'component' && isListViewID(content.id)
+      );
+      if (wentBack) return;
+      props.handle.replace({
+        next: { type: 'component', id: LIST_VIEW_ID.home },
+        referredFrom: 'hotkey',
+      });
+    },
+    isNotUnifiedList,
+    getSplitCount: () => splitLayoutHelpers.getSplitCount(),
+    toggleSpotlight: () => props.handle.toggleSpotlight(),
+    canGoForward: () => props.handle.canGoForward(),
+    insertSplit: splitLayoutHelpers.insertSplit,
+    splitName: () => props.handle.displayName(),
+    canGoBack: () => props.handle.canGoBack(),
+    goForward: () => props.handle.goForward(),
+    closeSplit: () => props.handle.close(),
+    goBack: () => props.handle.goBack(),
+    splitHotkeyScope,
+  });
+
+  const nextSoup = createSoupState({
+    initialPredicates: { and: ['explicit-noise'] },
+  });
+
+  createSplitAutofocus({
+    element: panelRef,
+    enabled: () => props.active && !isTouchDevice(),
+  });
+
+  const [toolbarRef, setToolbarRef] = createSignal<HTMLDivElement | null>(null);
+  const [headerRef, setHeaderRef] = createSignal<HTMLDivElement | null>(null);
+  const toolbarSize = createElementSize(toolbarRef);
+  const headerSize = createElementSize(headerRef);
+
+  const [hasToolbarContent, setHasToolbarContent] = createSignal(false);
+
+  createEffect(() => {
+    const safeTop = isTouchDevice() ? getSafeAreaInset('top') : 0;
+    const offset =
+      safeTop +
+      (hasSplitHeader()
+        ? (headerSize.height ?? 0) + (toolbarSize.height ?? 0)
+        : 0);
+    setContentOffsetTop(offset);
+  });
+
+  function multipleSplits() {
+    const splits = globalSplitManager()?.splits?.();
+    return Boolean(splits && splits.length > 1);
+  }
+
+  const splitFocusStyling = () =>
+    !isTouchDevice() &&
+    props.active &&
+    multipleSplits() &&
+    !props.handle.isSpotLight();
+
+  const splitUnfocusedStyling = () =>
+    !isTouchDevice() && !props.active && multipleSplits();
+
+  const usesComposableLayout = () =>
+    props.split.mount.kind === 'component' &&
+    props.split.mount.meta.splitPanelLayout === 'composable';
+
+  const canCloseSplit = () => {
+    const manager = globalSplitManager();
+    return manager ? shouldShowSplitCloseButton(manager) : false;
+  };
+
+  const router = useOptionalSplitRouter();
+  const hasExternalChat = () =>
+    router
+      ?.entry(props.handle.id as string as PaneId)
+      ?.location.route.matches.some((match) => match.id === 'external-chat');
+
+  const externalAccountPage = () =>
+    props.handle.content().type === 'component' &&
+    props.handle.content().id === 'external' &&
+    !hasExternalChat();
+
+  const hasSplitHeader = () => {
+    const content = props.handle.content();
+    return (
+      !usesComposableLayout() &&
+      !(
+        isTouchDevice() &&
+        content.type === 'component' &&
+        (content.id === LIST_VIEW_ID.search ||
+          content.id === LIST_VIEW_ID.channels ||
+          externalAccountPage())
+      )
+    );
+  };
+
+  const MountedContent = () => (
+    <SplitPanelControllerProvider
+      controller={{
+        canGoBack: props.handle.canGoBack,
+        goBack: () => {
+          if (splitBackInterceptor()?.()) return;
+          props.handle.goBack();
+        },
+        canGoForward: props.handle.canGoForward,
+        goForward: props.handle.goForward,
+        canClose: canCloseSplit,
+        close: props.handle.close,
+        get closeButtonPlacement() {
+          return isTouchDevice() ? 'header' : 'frame';
+        },
+      }}
+    >
+      <Suspense>
+        <Show
+          when={
+            props.split.mount.kind === 'component' &&
+            props.split.mount.meta.ownsCollectionState
+          }
+          fallback={
+            <SoupViewContextProvider soup={nextSoup}>
+              <SplitRouter.Outlet
+                pane={props.handle.id as string as PaneId}
+                fallback={<Dynamic component={props.split.mount.element} />}
+              />
+            </SoupViewContextProvider>
+          }
+        >
+          <SplitRouter.Outlet
+            pane={props.handle.id as string as PaneId}
+            fallback={<Dynamic component={props.split.mount.element} />}
+          />
+        </Show>
+      </Suspense>
+    </SplitPanelControllerProvider>
+  );
+
+  return (
+    <AccessRequestVisitProvider
+      visit={`${props.handle.content().type}:${props.handle.content().id}`}
+    >
+      <SoupContextProvider soup={nextSoup}>
+        <SplitPanelContext.Provider
+          value={{
+            isPanelActive: () => props.active,
+            handle: props.handle,
+            setContentOffsetTop,
+            contentOffsetTop,
+            navigationCollapsed,
+            splitHotkeyScope,
+            bottomPanel,
+            registerBottomPanel: (panel) => {
+              setBottomPanel(panel);
+              return () => {
+                setBottomPanel((current) =>
+                  current?.id === panel.id ? undefined : current
+                );
+              };
+            },
+            headerCollapser: headerCollapseController.collapser,
+            toolbarCollapser: toolbarCollapseController.collapser,
+            layoutRefs,
+            mobileHeaderOwner,
+            headerMdControls,
+            titleFileMenuRef,
+            setTitleFileMenuRef,
+            titleFileMenuTrigger,
+            setTitleFileMenuTrigger,
+            titleFileMenuActions,
+            setTitleFileMenuActions,
+            replaceOwnedSlot: ownedSlots.replace,
+            panelSize,
+            panelRef,
+            pointerTarget: () => {
+              const target = pointerTarget?.deref();
+              return target?.isConnected ? target : undefined;
+            },
+          }}
+        >
+          <SplitDrawerGroup panelSize={panelSize}>
+            <Show when={props.handle.isSpotLight()}>
+              <div
+                class="fixed inset-0 w-screen h-screen z-modal-overlay scrim-glass"
+                onClick={() => props.handle.toggleSpotlight(false)}
+              />
+            </Show>
+
+            <div
+              classList={{
+                'fixed inset-16 z-modal-overlay isolate rounded-xl bg-surface shadow-xl':
+                  props.handle.isSpotLight(),
+                'opacity-100': props.active || props.handle.isSpotLight(),
+                // touch:isolate contains the floating SplitHeader within the panel's own stacking context, so the root-level mobile/tablet
+                // search overlay paints over it.
+                'relative size-full touch:isolate': !props.handle.isSpotLight(),
+              }}
+              style={{
+                '--split-header-height': `${hasSplitHeader() ? (headerSize.height ?? 0) : 0}px`,
+                // The hard spacer for top-anchored content on full-frame
+                // mobile/tablet: status bar + floating header strip.
+                '--mobile-content-inset-top':
+                  'calc(var(--safe-top, 0px) + var(--split-header-height, 0px))',
+              }}
+              ref={(ref) => {
+                setPanelRef(ref);
+                props.setPanelRef(ref);
+                attachHotKeys(ref);
+              }}
+              on:pointerdown={{
+                capture: true,
+                handleEvent: (e) => {
+                  pointerTarget =
+                    e.target instanceof Element
+                      ? new WeakRef(e.target)
+                      : undefined;
+                },
+              }}
+              // A split opened from the keyboard has no pressed element to keep
+              // in view. Modifiers are held through Shift- and Cmd-clicks.
+              on:keydown={{
+                capture: true,
+                handleEvent: (e) => {
+                  if (!EVENT_MODIFIER_KEYS.has(e.key.toLowerCase())) {
+                    pointerTarget = undefined;
+                  }
+                },
+              }}
+              data-split-id={props.split.id}
+              {...splitContainerAttribute}
+              data-modal={props.handle.isSpotLight()}
+              tabindex={-1}
+            >
+              <Panel
+                class={cn(
+                  'touch:rounded-none touch:after:hidden touch:border-0! bg-panel transition-none',
+                  props.handle.isSpotLight() ? 'rounded-xl' : 'rounded-lg',
+                  splitUnfocusedStyling() && 'split-panel-inactive',
+                  {
+                    'shadow-sm shadow-drop-shadow/50': splitUnfocusedStyling(),
+                    'shadow-2xl shadow-drop-shadow': splitFocusStyling(),
+                  }
+                )}
+                depth={isTouchDevice() ? 0 : 1}
+                hideBorder={isTouchDevice()}
+              >
+                <Show when={hasSplitHeader()}>
+                  <Panel.Header
+                    class={cn(
+                      'relative block min-h-12 p-0 overflow-visible border-b-0!',
+                      'z-split-panel-chrome',
+                      // On mobile/tablet the header collapses to a zero-height grid row;
+                      // SplitHeader overlays the body as floating islands.
+                      'touch:min-h-0 touch:border-b-0'
+                    )}
+                  >
+                    <SplitHeader
+                      ref={setHeaderRef}
+                      collapseController={headerCollapseController}
+                    />
+                  </Panel.Header>
+
+                  <Panel.Toolbar
+                    class={cn(
+                      'items-start overflow-visible',
+                      !hasToolbarContent() && 'hidden',
+                      isTouchDevice() && 'hidden',
+                      'border-b-0'
+                    )}
+                  >
+                    <SplitToolbar
+                      ref={setToolbarRef}
+                      collapseController={toolbarCollapseController}
+                      onContentChange={setHasToolbarContent}
+                    />
+                  </Panel.Toolbar>
+                </Show>
+                {/* Changing chrome must preserve the mounted view and its split-owned resources. */}
+                <Panel.Body>
+                  <div class="@container/split size-full min-h-0 overflow-hidden relative flex flex-col">
+                    <div
+                      class={cn(
+                        'min-h-0 min-w-0 overflow-hidden relative',
+                        !usesComposableLayout() && bottomPanel()
+                          ? 'h-1/2'
+                          : 'h-full'
+                      )}
+                    >
+                      <MountedContent />
+                    </div>
+                    <Show when={!usesComposableLayout() && bottomPanel()}>
+                      {(panel) => (
+                        <div class="h-1/2 min-h-0 min-w-0 border-t border-edge-frame bg-surface flex flex-col">
+                          <div class="flex h-10 shrink-0 items-center gap-2 border-b border-edge-frame px-2">
+                            <h3 class="min-w-0 flex-1 truncate text-sm font-medium text-ink-muted">
+                              {panel().title}
+                            </h3>
+                            <Button
+                              aria-label="Close"
+                              tooltip="Close"
+                              variant="ghost"
+                              size="icon-sm"
+                              onClick={() => panel().onClose?.()}
+                            >
+                              <CloseIcon class="size-3.5 touch:size-6 shrink-0 pointer-events-none" />
+                            </Button>
+                          </div>
+                          <div class="min-h-0 flex-1 overflow-hidden">
+                            {panel().content()}
+                          </div>
+                        </div>
+                      )}
+                    </Show>
+                  </div>
+                  <Show
+                    when={!usesComposableLayout() && !externalAccountPage()}
+                  >
+                    <MobileTopEdgeFade />
+                  </Show>
+                </Panel.Body>
+              </Panel>
+              <Show when={!isTouchDevice() && canCloseSplit()}>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={t('splitMenu.closeSplit')}
+                  tooltip={{
+                    content: t('splitMenu.closeSplit'),
+                    hotkey: TOKENS.split.close,
+                  }}
+                  class={cn(
+                    'absolute top-0 left-0 z-split-panel-chrome origin-top-left scale-[1.15] size-4 p-0 rounded-none border-0 border-r border-b border-edge-frame bg-panel text-ink-muted/70 hover:bg-hover hover:text-ink',
+                    props.handle.isSpotLight()
+                      ? 'rounded-tl-xl rounded-br-xl'
+                      : 'rounded-tl-md rounded-br-md'
+                  )}
+                  data-split-frame-close=""
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    props.handle.close();
+                  }}
+                >
+                  <CloseIcon class="size-2.5" />
+                </Button>
+              </Show>
+              <Show when={isTouchDevice()}>
+                <Suspense>
+                  <MobilePageActionRow />
+                </Suspense>
+              </Show>
+            </div>
+          </SplitDrawerGroup>
+        </SplitPanelContext.Provider>
+      </SoupContextProvider>
+    </AccessRequestVisitProvider>
+  );
+}

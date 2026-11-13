@@ -1,0 +1,1125 @@
+import { previewKeys } from '@queries/preview/keys';
+import type { CalendarOccurrenceItem } from '@service-storage/generated/schemas/calendarOccurrenceItem';
+import {
+  QueryClient,
+  QueryClientProvider,
+  QueryObserver,
+} from '@tanstack/solid-query';
+import { err, ok } from 'neverthrow';
+import type { JSX } from 'solid-js';
+import { render } from 'solid-js/web';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  type CalendarSyncController,
+  setActiveCalendarSyncController,
+} from '../graphql/sync-controller';
+import { invalidateInvitationScheduling } from '../invitations';
+import { calendarKeys } from '../keys';
+import {
+  isGuestInviteRefused,
+  useDeleteCalendarEventMutation,
+  useInviteCalendarEventGuestsMutation,
+  useRsvpCalendarEventMutation,
+  useUpdateCalendarEventMutation,
+} from '../mutations';
+import type { CalendarOccurrencesData } from '../occurrences';
+
+const rsvpCalendarEventMock = vi.hoisted(() => vi.fn());
+const deleteCalendarEventMock = vi.hoisted(() => vi.fn());
+const updateCalendarEventMock = vi.hoisted(() => vi.fn());
+const inviteCalendarEventGuestsMock = vi.hoisted(() => vi.fn());
+
+vi.mock('@service-email/client', () => ({
+  emailClient: {
+    rsvpCalendarEvent: rsvpCalendarEventMock,
+    deleteCalendarEvent: deleteCalendarEventMock,
+    updateCalendarEvent: updateCalendarEventMock,
+    inviteCalendarEventGuests: inviteCalendarEventGuestsMock,
+  },
+}));
+
+let testQueryClient: QueryClient;
+
+vi.mock('../../client', () => ({
+  get queryClient() {
+    return testQueryClient;
+  },
+}));
+
+const viewportA = {
+  start: '2026-08-01T04:00:00.000Z',
+  end: '2026-09-01T04:00:00.000Z',
+  startDate: '2026-08-01',
+  endDate: '2026-09-01',
+};
+const viewportB = {
+  start: '2026-08-03T04:00:00.000Z',
+  end: '2026-08-10T04:00:00.000Z',
+  startDate: '2026-08-03',
+  endDate: '2026-08-10',
+};
+
+const standaloneItem = (): CalendarOccurrenceItem =>
+  ({
+    event: {
+      id: 'event-1',
+      title: 'Standalone',
+      recurrenceLines: [],
+      time: {
+        kind: 'timed',
+        startsAt: '2026-08-06T14:00:00Z',
+        endsAt: '2026-08-06T15:00:00Z',
+      },
+      attendees: [
+        {
+          email: 'self@example.com',
+          isSelf: true,
+          responseStatus: 'needs_action',
+        },
+        {
+          email: 'other@example.com',
+          isSelf: false,
+          responseStatus: 'declined',
+        },
+      ],
+    },
+    occurrence: {
+      eventId: 'event-1',
+      occurrenceKey: '2026-08-06T14:00:00Z',
+      time: {
+        kind: 'timed',
+        startsAt: '2026-08-06T14:00:00Z',
+        endsAt: '2026-08-06T15:00:00Z',
+      },
+    },
+  }) as unknown as CalendarOccurrenceItem;
+
+const recurringItem = (): CalendarOccurrenceItem =>
+  ({
+    event: {
+      id: 'event-2',
+      title: 'Recurring',
+      recurrenceLines: ['RRULE:FREQ=DAILY'],
+      time: {
+        kind: 'timed',
+        startsAt: '2026-08-04T09:00:00Z',
+        endsAt: '2026-08-04T09:30:00Z',
+      },
+      attendees: [],
+    },
+    occurrence: {
+      eventId: 'event-2',
+      occurrenceKey: '2026-08-05T09:00:00Z',
+      recurrenceId: '2026-08-05T09:00:00Z',
+      time: {
+        kind: 'timed',
+        startsAt: '2026-08-05T09:00:00Z',
+        endsAt: '2026-08-05T09:30:00Z',
+      },
+    },
+  }) as unknown as CalendarOccurrenceItem;
+
+const copy = (calendarId: string, title: string) => ({
+  calendarId,
+  title,
+  eventType: 'default',
+  visibility: 'default',
+  transparency: 'opaque',
+  isReadOnly: false,
+  reminders: { useDefault: true, overrides: [] },
+});
+
+const sharedItem = (): CalendarOccurrenceItem =>
+  ({
+    event: {
+      id: 'event-3',
+      title: 'OOO',
+      recurrenceLines: [],
+      calendarId: 'primary',
+      sources: [copy('primary', 'OOO'), copy('shared', '[me] OOO')],
+      time: {
+        kind: 'timed',
+        startsAt: '2026-08-07T13:00:00Z',
+        endsAt: '2026-08-07T17:00:00Z',
+      },
+      attendees: [],
+    },
+    occurrence: {
+      eventId: 'event-3',
+      occurrenceKey: '2026-08-07T13:00:00Z',
+      time: {
+        kind: 'timed',
+        startsAt: '2026-08-07T13:00:00Z',
+        endsAt: '2026-08-07T17:00:00Z',
+      },
+    },
+  }) as unknown as CalendarOccurrenceItem;
+
+const seedViewports = () => {
+  const data = (): CalendarOccurrencesData => ({
+    items: [standaloneItem(), recurringItem()],
+    syncStatus: 'ready',
+  });
+  testQueryClient.setQueryData(
+    calendarKeys.occurrences('user', viewportA).queryKey,
+    data()
+  );
+  testQueryClient.setQueryData(
+    calendarKeys.occurrences('user', viewportB).queryKey,
+    data()
+  );
+};
+
+const viewportData = (range: typeof viewportA) =>
+  testQueryClient.getQueryData<CalendarOccurrencesData>(
+    calendarKeys.occurrences('user', range).queryKey
+  );
+
+let dispose: (() => void) | undefined;
+
+function renderHook<T>(factory: () => T): T {
+  let hook!: T;
+  dispose = render(
+    () => (
+      <QueryClientProvider client={testQueryClient}>
+        {(() => {
+          hook = factory();
+          return null as unknown as JSX.Element;
+        })()}
+      </QueryClientProvider>
+    ),
+    document.body
+  );
+  return hook;
+}
+
+const failure = () =>
+  err([{ code: 'HTTP_ERROR' as const, message: 'provider says no' }]);
+
+function deferredResult() {
+  let resolve!: (value: unknown) => void;
+  const promise = new Promise<unknown>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * Keeps viewport A on screen, so a settled write refetches it, and holds that
+ * refetch open until the test answers it.
+ */
+function watchViewportA() {
+  let answer!: (data: CalendarOccurrencesData) => void;
+  const refetch = vi.fn(
+    () =>
+      new Promise<CalendarOccurrencesData>((resolve) => {
+        answer = resolve;
+      })
+  );
+  const unsubscribe = new QueryObserver(testQueryClient, {
+    queryKey: calendarKeys.occurrences('user', viewportA).queryKey,
+    queryFn: refetch,
+    staleTime: Number.POSITIVE_INFINITY,
+  }).subscribe(() => {});
+  return {
+    refetch,
+    answer: (data: CalendarOccurrencesData) => answer(data),
+    unsubscribe,
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  testQueryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  seedViewports();
+});
+
+afterEach(() => {
+  dispose?.();
+  dispose = undefined;
+  setActiveCalendarSyncController(undefined);
+  testQueryClient.clear();
+});
+
+it('answers and deletes an imported point without rewriting its time', async () => {
+  const point = standaloneItem();
+  const instant = {
+    kind: 'timed' as const,
+    startsAt: '2026-08-06T14:00:00Z',
+    endsAt: '2026-08-06T14:00:00Z',
+    timeZone: null,
+  };
+  point.event.time = instant;
+  point.occurrence.time = instant;
+  for (const range of [viewportA, viewportB]) {
+    testQueryClient.setQueryData(
+      calendarKeys.occurrences('user', range).queryKey,
+      {
+        items: [point],
+        syncStatus: 'ready',
+      }
+    );
+  }
+  rsvpCalendarEventMock.mockResolvedValue(ok({ id: 'event-1' }));
+  deleteCalendarEventMock.mockResolvedValue(ok({}));
+  const actions = renderHook(() => ({
+    rsvp: useRsvpCalendarEventMutation(),
+    remove: useDeleteCalendarEventMutation(),
+  }));
+
+  await actions.rsvp.mutateAsync({ eventId: 'event-1', response: 'accepted' });
+  expect(rsvpCalendarEventMock).toHaveBeenCalledWith('event-1', {
+    response: 'accepted',
+  });
+  for (const range of [viewportA, viewportB]) {
+    expect(viewportData(range)?.items[0]?.occurrence.time).toEqual(instant);
+  }
+  await actions.remove.mutateAsync({ eventId: 'event-1' });
+  expect(deleteCalendarEventMock).toHaveBeenCalledWith('event-1', {
+    calendarId: undefined,
+    scope: undefined,
+    recurrenceId: undefined,
+  });
+  for (const range of [viewportA, viewportB]) {
+    expect(viewportData(range)?.items).toEqual([]);
+  }
+});
+
+describe('useRsvpCalendarEventMutation', () => {
+  it('optimistically updates the self attendee across every cached viewport', async () => {
+    rsvpCalendarEventMock.mockResolvedValue(ok({ id: 'event-1' }));
+    const rsvp = renderHook(() => useRsvpCalendarEventMutation());
+
+    await rsvp.mutateAsync({ eventId: 'event-1', response: 'accepted' });
+
+    for (const range of [viewportA, viewportB]) {
+      const items = viewportData(range)?.items ?? [];
+      const event = items.find((item) => item.event.id === 'event-1')?.event;
+      expect(
+        event?.attendees.find((attendee) => attendee.isSelf)?.responseStatus
+      ).toBe('accepted');
+      expect(
+        event?.attendees.find((attendee) => !attendee.isSelf)?.responseStatus
+      ).toBe('declined');
+    }
+    expect(rsvpCalendarEventMock).toHaveBeenCalledWith('event-1', {
+      response: 'accepted',
+    });
+  });
+
+  // Three occurrences of one series, so a scoped answer has something to
+  // leave alone.
+  const seriesOccurrence = (key: string): CalendarOccurrenceItem =>
+    ({
+      event: {
+        id: 'event-3',
+        title: 'Standup',
+        recurrenceLines: ['RRULE:FREQ=DAILY'],
+        time: { kind: 'timed', startsAt: key, endsAt: key },
+        attendees: [
+          {
+            email: 'self@example.com',
+            isSelf: true,
+            responseStatus: 'accepted',
+          },
+        ],
+      },
+      occurrence: {
+        eventId: 'event-3',
+        occurrenceKey: key,
+        recurrenceId: key,
+        time: { kind: 'timed', startsAt: key, endsAt: key },
+      },
+    }) as unknown as CalendarOccurrenceItem;
+  const seriesKeys = [
+    '2026-08-04T09:00:00Z',
+    '2026-08-05T09:00:00Z',
+    '2026-08-06T09:00:00Z',
+  ];
+  const seedSeries = () =>
+    testQueryClient.setQueryData(
+      calendarKeys.occurrences('user', viewportA).queryKey,
+      { items: seriesKeys.map(seriesOccurrence), syncStatus: 'ready' }
+    );
+  const responseAt = (key: string) =>
+    viewportData(viewportA)
+      ?.items.find((item) => item.occurrence.occurrenceKey === key)
+      ?.event.attendees.find((attendee) => attendee.isSelf)?.responseStatus;
+
+  it('scopes the optimistic answer to the occurrences it covers', async () => {
+    const keys = seriesKeys;
+    seedSeries();
+    rsvpCalendarEventMock.mockResolvedValue(ok({ id: 'event-3' }));
+    const rsvp = renderHook(() => useRsvpCalendarEventMutation());
+
+    await rsvp.mutateAsync({
+      eventId: 'event-3',
+      response: 'declined',
+      scope: 'this_event',
+      recurrenceId: keys[1],
+      occurrenceKey: keys[1],
+    });
+
+    expect(responseAt(keys[0])).toBe('accepted');
+    expect(responseAt(keys[1])).toBe('declined');
+    expect(responseAt(keys[2])).toBe('accepted');
+    expect(rsvpCalendarEventMock).toHaveBeenCalledWith('event-3', {
+      response: 'declined',
+      scope: 'this_event',
+      recurrenceId: keys[1],
+    });
+
+    await rsvp.mutateAsync({
+      eventId: 'event-3',
+      response: 'tentative',
+      scope: 'all',
+    });
+
+    expect(responseAt(keys[0])).toBe('tentative');
+    expect(responseAt(keys[1])).toBe('tentative');
+    expect(responseAt(keys[2])).toBe('tentative');
+
+    // An omitted scope with a recurrenceId is occurrence-scoped on the
+    // server, so the optimistic patch must not widen it to the series.
+    await rsvp.mutateAsync({
+      eventId: 'event-3',
+      response: 'declined',
+      recurrenceId: keys[2],
+      occurrenceKey: keys[2],
+    });
+
+    expect(responseAt(keys[0])).toBe('tentative');
+    expect(responseAt(keys[1])).toBe('tentative');
+    expect(responseAt(keys[2])).toBe('declined');
+  });
+
+  it('rolls back every viewport when the request fails', async () => {
+    rsvpCalendarEventMock.mockResolvedValue(failure());
+    const rsvp = renderHook(() => useRsvpCalendarEventMutation());
+
+    await expect(
+      rsvp.mutateAsync({ eventId: 'event-1', response: 'declined' })
+    ).rejects.toThrow();
+
+    for (const range of [viewportA, viewportB]) {
+      const items = viewportData(range)?.items ?? [];
+      const event = items.find((item) => item.event.id === 'event-1')?.event;
+      expect(
+        event?.attendees.find((attendee) => attendee.isSelf)?.responseStatus
+      ).toBe('needs_action');
+    }
+  });
+
+  const selfStatus = () =>
+    viewportData(viewportA)
+      ?.items.find((item) => item.event.id === 'event-1')
+      ?.event.attendees.find((attendee) => attendee.isSelf)?.responseStatus;
+
+  it('keeps the newer optimistic response when an older overlapping request fails', async () => {
+    const first = deferredResult();
+    const second = deferredResult();
+    rsvpCalendarEventMock
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const rsvp = renderHook(() => useRsvpCalendarEventMutation());
+
+    const firstMutation = rsvp
+      .mutateAsync({ eventId: 'event-1', response: 'accepted' })
+      .catch(() => {});
+    await vi.waitFor(() => expect(selfStatus()).toBe('accepted'));
+
+    const secondMutation = rsvp.mutateAsync({
+      eventId: 'event-1',
+      response: 'tentative',
+    });
+    await vi.waitFor(() => expect(selfStatus()).toBe('tentative'));
+
+    first.resolve(failure());
+    await firstMutation;
+    expect(selfStatus()).toBe('tentative');
+
+    second.resolve(ok({ id: 'event-1' }));
+    await secondMutation;
+    expect(selfStatus()).toBe('tentative');
+  });
+
+  it('keeps a newer identical response when the older request fails', async () => {
+    const first = deferredResult();
+    const second = deferredResult();
+    rsvpCalendarEventMock
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const rsvp = renderHook(() => useRsvpCalendarEventMutation());
+
+    const firstMutation = rsvp
+      .mutateAsync({ eventId: 'event-1', response: 'accepted' })
+      .catch(() => {});
+    await vi.waitFor(() => expect(selfStatus()).toBe('accepted'));
+
+    // The second answer picks the same response, so equal cache values
+    // cannot reveal which mutation wrote last — wait for its request to
+    // confirm its optimistic write went through.
+    const secondMutation = rsvp.mutateAsync({
+      eventId: 'event-1',
+      response: 'accepted',
+    });
+    await vi.waitFor(() =>
+      expect(rsvpCalendarEventMock).toHaveBeenCalledTimes(2)
+    );
+
+    second.resolve(ok({ id: 'event-1' }));
+    await secondMutation;
+    expect(selfStatus()).toBe('accepted');
+
+    first.resolve(failure());
+    await firstMutation;
+    expect(selfStatus()).toBe('accepted');
+  });
+
+  it('rolls a failed series answer back around a newer occurrence answer', async () => {
+    seedSeries();
+    const first = deferredResult();
+    const second = deferredResult();
+    rsvpCalendarEventMock
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const rsvp = renderHook(() => useRsvpCalendarEventMutation());
+
+    const firstMutation = rsvp
+      .mutateAsync({ eventId: 'event-3', response: 'tentative', scope: 'all' })
+      .catch(() => {});
+    await vi.waitFor(() => expect(responseAt(seriesKeys[0])).toBe('tentative'));
+
+    const secondMutation = rsvp.mutateAsync({
+      eventId: 'event-3',
+      response: 'declined',
+      scope: 'this_event',
+      recurrenceId: seriesKeys[1],
+      occurrenceKey: seriesKeys[1],
+    });
+    await vi.waitFor(() => expect(responseAt(seriesKeys[1])).toBe('declined'));
+
+    first.resolve(failure());
+    await firstMutation;
+    expect(responseAt(seriesKeys[0])).toBe('accepted');
+    expect(responseAt(seriesKeys[1])).toBe('declined');
+    expect(responseAt(seriesKeys[2])).toBe('accepted');
+
+    second.resolve(ok({ id: 'event-3' }));
+    await secondMutation;
+    expect(responseAt(seriesKeys[1])).toBe('declined');
+  });
+
+  it('only refetches once the last overlapping request settles', async () => {
+    const first = deferredResult();
+    const second = deferredResult();
+    rsvpCalendarEventMock
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const invalidateSpy = vi.spyOn(testQueryClient, 'invalidateQueries');
+    const rsvp = renderHook(() => useRsvpCalendarEventMutation());
+
+    const firstMutation = rsvp.mutateAsync({
+      eventId: 'event-1',
+      response: 'accepted',
+    });
+    await vi.waitFor(() => expect(selfStatus()).toBe('accepted'));
+    const secondMutation = rsvp.mutateAsync({
+      eventId: 'event-1',
+      response: 'declined',
+    });
+    await vi.waitFor(() => expect(selfStatus()).toBe('declined'));
+
+    first.resolve(ok({ id: 'event-1' }));
+    await firstMutation;
+    expect(invalidateSpy).not.toHaveBeenCalled();
+
+    second.resolve(ok({ id: 'event-1' }));
+    await secondMutation;
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: calendarKeys.occurrences._def,
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: previewKeys.item('event-1').queryKey,
+    });
+  });
+});
+
+describe('useDeleteCalendarEventMutation', () => {
+  it('optimistically removes the event and keeps the removal on success', async () => {
+    deleteCalendarEventMock.mockResolvedValue(ok({}));
+    const remove = renderHook(() => useDeleteCalendarEventMutation());
+
+    await remove.mutateAsync({ eventId: 'event-1' });
+
+    for (const range of [viewportA, viewportB]) {
+      const items = viewportData(range)?.items ?? [];
+      expect(items.map((item) => item.event.id)).toEqual(['event-2']);
+    }
+  });
+
+  it('scopes optimistic removal to one occurrence or a suffix', async () => {
+    deleteCalendarEventMock.mockResolvedValue(ok({}));
+    const remove = renderHook(() => useDeleteCalendarEventMutation());
+
+    await remove.mutateAsync({
+      eventId: 'event-2',
+      scope: 'this_event',
+      recurrenceId: '2026-08-05T09:00:00Z',
+      occurrenceKey: '2026-08-05T09:00:00Z',
+    });
+    expect(deleteCalendarEventMock).toHaveBeenCalledWith('event-2', {
+      scope: 'this_event',
+      recurrenceId: '2026-08-05T09:00:00Z',
+    });
+    let items = viewportData(viewportA)?.items ?? [];
+    expect(items.map((item) => item.occurrence.occurrenceKey)).toEqual([
+      '2026-08-06T14:00:00Z',
+    ]);
+
+    seedViewports();
+    await remove.mutateAsync({
+      eventId: 'event-2',
+      scope: 'this_and_following',
+      recurrenceId: '2026-08-05T09:00:00Z',
+      occurrenceKey: '2026-08-05T09:00:00Z',
+    });
+    items = viewportData(viewportA)?.items ?? [];
+    expect(items.map((item) => item.event.id)).toEqual(['event-1']);
+  });
+
+  it('finishes once the provider deletes the event, before the viewport refetch returns', async () => {
+    deleteCalendarEventMock.mockResolvedValue(ok({}));
+    const viewport = watchViewportA();
+    const remove = renderHook(() => useDeleteCalendarEventMutation());
+
+    const deleted = remove.mutateAsync({ eventId: 'event-1' });
+    await vi.waitFor(() => expect(viewport.refetch).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(remove.isSuccess).toBe(true));
+    await deleted;
+    expect(viewportData(viewportA)?.items.map((item) => item.event.id)).toEqual(
+      ['event-2']
+    );
+
+    viewport.answer({ items: [recurringItem()], syncStatus: 'ready' });
+    await vi.waitFor(() => expect(testQueryClient.isFetching()).toBe(0));
+    expect(viewportData(viewportA)?.items.map((item) => item.event.id)).toEqual(
+      ['event-2']
+    );
+    viewport.unsubscribe();
+  });
+
+  it('restores removed items when the request fails', async () => {
+    deleteCalendarEventMock.mockResolvedValue(failure());
+    const remove = renderHook(() => useDeleteCalendarEventMutation());
+
+    await expect(remove.mutateAsync({ eventId: 'event-1' })).rejects.toThrow();
+
+    for (const range of [viewportA, viewportB]) {
+      const items = viewportData(range)?.items ?? [];
+      expect(items).toHaveLength(2);
+    }
+  });
+
+  it('drops only the addressed copy of a multi-calendar event', async () => {
+    deleteCalendarEventMock.mockResolvedValue(ok({}));
+    testQueryClient.setQueryData(
+      calendarKeys.occurrences('user', viewportA).queryKey,
+      { items: [sharedItem()], syncStatus: 'ready' }
+    );
+    const remove = renderHook(() => useDeleteCalendarEventMutation());
+
+    await remove.mutateAsync({ eventId: 'event-3', calendarId: 'primary' });
+    expect(deleteCalendarEventMock).toHaveBeenCalledWith('event-3', {
+      calendarId: 'primary',
+      scope: undefined,
+      recurrenceId: undefined,
+    });
+    let items = viewportData(viewportA)?.items ?? [];
+    expect(items).toHaveLength(1);
+    expect(items[0].event.sources?.map((source) => source.calendarId)).toEqual([
+      'shared',
+    ]);
+    expect(items[0].event.calendarId).toBe('shared');
+    expect(items[0].event.title).toBe('[me] OOO');
+
+    await remove.mutateAsync({ eventId: 'event-3', calendarId: 'shared' });
+    items = viewportData(viewportA)?.items ?? [];
+    expect(items).toHaveLength(0);
+  });
+
+  it('drops the canonical copy when no calendar is named', async () => {
+    deleteCalendarEventMock.mockResolvedValue(ok({}));
+    testQueryClient.setQueryData(
+      calendarKeys.occurrences('user', viewportA).queryKey,
+      { items: [sharedItem()], syncStatus: 'ready' }
+    );
+    const remove = renderHook(() => useDeleteCalendarEventMutation());
+
+    await remove.mutateAsync({ eventId: 'event-3' });
+    const items = viewportData(viewportA)?.items ?? [];
+    expect(items).toHaveLength(1);
+    expect(items[0].event.sources?.map((source) => source.calendarId)).toEqual([
+      'shared',
+    ]);
+    expect(items[0].event.calendarId).toBe('shared');
+  });
+});
+
+describe('useUpdateCalendarEventMutation', () => {
+  it('patches fields and only rewrites standalone occurrence times', async () => {
+    updateCalendarEventMock.mockResolvedValue(ok({ id: 'event-1' }));
+    const update = renderHook(() => useUpdateCalendarEventMutation());
+    const time = {
+      kind: 'timed',
+      startsAt: '2026-08-06T16:00:00Z',
+      endsAt: '2026-08-06T17:00:00Z',
+    } as const;
+
+    await update.mutateAsync({
+      eventId: 'event-1',
+      patch: { title: 'Renamed', time },
+    });
+    await update.mutateAsync({
+      eventId: 'event-2',
+      patch: { time },
+    });
+
+    const items = viewportData(viewportA)?.items ?? [];
+    const standalone = items.find((item) => item.event.id === 'event-1');
+    expect(standalone?.event.title).toBe('Renamed');
+    expect(standalone?.occurrence.time).toEqual(time);
+
+    const recurring = items.find((item) => item.event.id === 'event-2');
+    expect(recurring?.event.time).toEqual(time);
+    expect(recurring?.occurrence.time.kind === 'timed').toBe(true);
+    expect(recurring?.occurrence.time).toMatchObject({
+      startsAt: '2026-08-05T09:00:00Z',
+    });
+  });
+
+  it('finishes a save once the provider accepts it, then shows the refetched event', async () => {
+    updateCalendarEventMock.mockResolvedValue(ok({ id: 'event-1' }));
+    const viewport = watchViewportA();
+    const update = renderHook(() => useUpdateCalendarEventMutation());
+    const titleOfEvent1 = () =>
+      viewportData(viewportA)?.items.find((item) => item.event.id === 'event-1')
+        ?.event.title;
+
+    const saved = update.mutateAsync({
+      eventId: 'event-1',
+      patch: { title: 'Renamed' },
+    });
+    await vi.waitFor(() => expect(viewport.refetch).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(update.isSuccess).toBe(true));
+    await saved;
+    expect(titleOfEvent1()).toBe('Renamed');
+
+    const refetched = standaloneItem();
+    refetched.event.title = 'Renamed by the provider';
+    viewport.answer({ items: [refetched], syncStatus: 'ready' });
+    await vi.waitFor(() =>
+      expect(titleOfEvent1()).toBe('Renamed by the provider')
+    );
+    viewport.unsubscribe();
+  });
+
+  it("keeps a newer edit on screen when an earlier save's refresh lands during it", async () => {
+    const deltas: Array<() => void> = [];
+    setActiveCalendarSyncController({
+      answering: () => true,
+      runDelta: () =>
+        new Promise<void>((resolve) => {
+          deltas.push(resolve);
+        }),
+    } as unknown as CalendarSyncController);
+    let serverTitle = 'First';
+    const read = vi.fn(async (): Promise<CalendarOccurrencesData> => {
+      const item = standaloneItem();
+      item.event.title = serverTitle;
+      return { items: [item, recurringItem()], syncStatus: 'ready' };
+    });
+    const unsubscribe = new QueryObserver(testQueryClient, {
+      queryKey: calendarKeys.occurrences('user', viewportA).queryKey,
+      queryFn: read,
+      staleTime: Number.POSITIVE_INFINITY,
+    }).subscribe(() => {});
+    const second = deferredResult();
+    updateCalendarEventMock
+      .mockResolvedValueOnce(ok({ id: 'event-1' }))
+      .mockReturnValueOnce(second.promise);
+    const update = renderHook(() => useUpdateCalendarEventMutation());
+    const titleOfEvent1 = () =>
+      viewportData(viewportA)?.items.find((item) => item.event.id === 'event-1')
+        ?.event.title;
+
+    await update.mutateAsync({ eventId: 'event-1', patch: { title: 'First' } });
+    const saving = update.mutateAsync({
+      eventId: 'event-1',
+      patch: { title: 'Second' },
+    });
+    await vi.waitFor(() => expect(titleOfEvent1()).toBe('Second'));
+
+    deltas[0]();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(testQueryClient.isFetching()).toBe(0));
+    expect(titleOfEvent1()).toBe('Second');
+
+    serverTitle = 'Second';
+    second.resolve(ok({ id: 'event-1' }));
+    await saving;
+    await vi.waitFor(() => expect(deltas).toHaveLength(2));
+    deltas[1]();
+    await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(testQueryClient.isFetching()).toBe(0));
+    expect(titleOfEvent1()).toBe('Second');
+    unsubscribe();
+  });
+
+  it('scopes an optimistic edit to the targeted occurrence, or widens to the series', async () => {
+    const keys = [
+      '2026-08-04T09:00:00Z',
+      '2026-08-05T09:00:00Z',
+      '2026-08-06T09:00:00Z',
+    ];
+    const occurrence = (key: string): CalendarOccurrenceItem =>
+      ({
+        event: {
+          id: 'event-4',
+          title: 'Standup',
+          description: 'series notes',
+          recurrenceLines: ['RRULE:FREQ=DAILY'],
+          time: { kind: 'timed', startsAt: key, endsAt: key },
+          attendees: [],
+        },
+        occurrence: {
+          eventId: 'event-4',
+          occurrenceKey: key,
+          recurrenceId: key,
+          time: { kind: 'timed', startsAt: key, endsAt: key },
+        },
+      }) as unknown as CalendarOccurrenceItem;
+    testQueryClient.setQueryData(
+      calendarKeys.occurrences('user', viewportA).queryKey,
+      { items: keys.map(occurrence), syncStatus: 'ready' }
+    );
+    updateCalendarEventMock.mockResolvedValue(ok({ id: 'event-4' }));
+    const update = renderHook(() => useUpdateCalendarEventMutation());
+    const descriptionAt = (key: string) =>
+      viewportData(viewportA)?.items.find(
+        (item) => item.occurrence.occurrenceKey === key
+      )?.event.description;
+
+    await update.mutateAsync({
+      eventId: 'event-4',
+      scope: 'this_event',
+      recurrenceId: keys[1],
+      occurrenceKey: keys[1],
+      patch: { description: 'this day only' },
+    });
+
+    expect(descriptionAt(keys[0])).toBe('series notes');
+    expect(descriptionAt(keys[1])).toBe('this day only');
+    expect(descriptionAt(keys[2])).toBe('series notes');
+    expect(updateCalendarEventMock).toHaveBeenCalledWith('event-4', {
+      description: 'this day only',
+      calendarId: undefined,
+      scope: 'this_event',
+      recurrenceId: keys[1],
+    });
+
+    await update.mutateAsync({
+      eventId: 'event-4',
+      scope: 'all',
+      patch: { description: 'shared notes' },
+    });
+
+    expect(descriptionAt(keys[0])).toBe('shared notes');
+    expect(descriptionAt(keys[1])).toBe('shared notes');
+    expect(descriptionAt(keys[2])).toBe('shared notes');
+  });
+});
+
+describe('useInviteCalendarEventGuestsMutation', () => {
+  const attendeesOf = (eventId: string, range = viewportA) =>
+    viewportData(range)?.items.find((item) => item.event.id === eventId)?.event
+      .attendees;
+
+  it('shows the new guests as unanswered on every viewport while the request is in flight', async () => {
+    const pending = deferredResult();
+    inviteCalendarEventGuestsMock.mockReturnValue(pending.promise);
+    const invite = renderHook(() => useInviteCalendarEventGuestsMutation());
+
+    const sent = invite.mutateAsync({
+      eventId: 'event-1',
+      guests: [
+        { email: 'dana@example.com', optional: true },
+        { email: 'Other@example.com' },
+      ],
+    });
+    await vi.waitFor(() =>
+      expect(inviteCalendarEventGuestsMock).toHaveBeenCalled()
+    );
+
+    for (const range of [viewportA, viewportB]) {
+      expect(attendeesOf('event-1', range)).toEqual([
+        {
+          email: 'self@example.com',
+          isSelf: true,
+          responseStatus: 'needs_action',
+        },
+        {
+          email: 'other@example.com',
+          isSelf: false,
+          responseStatus: 'declined',
+        },
+        {
+          email: 'dana@example.com',
+          responseStatus: 'needs_action',
+          isOrganizer: false,
+          isOptional: true,
+          isSelf: false,
+        },
+      ]);
+    }
+    expect(inviteCalendarEventGuestsMock).toHaveBeenCalledWith('event-1', {
+      calendarId: undefined,
+      guests: [
+        { email: 'dana@example.com', optional: true },
+        { email: 'Other@example.com' },
+      ],
+      scope: undefined,
+      recurrenceId: undefined,
+    });
+    pending.resolve(ok({ id: 'event-1' }));
+    expect(await sent).toBe('sent');
+  });
+
+  it('adds guests to the targeted occurrence alone', async () => {
+    const keys = ['2026-08-04T09:00:00Z', '2026-08-05T09:00:00Z'];
+    const occurrence = (key: string): CalendarOccurrenceItem =>
+      ({
+        event: {
+          id: 'event-4',
+          recurrenceLines: ['RRULE:FREQ=DAILY'],
+          time: { kind: 'timed', startsAt: key, endsAt: key },
+          attendees: [],
+        },
+        occurrence: {
+          eventId: 'event-4',
+          occurrenceKey: key,
+          recurrenceId: key,
+          time: { kind: 'timed', startsAt: key, endsAt: key },
+        },
+      }) as unknown as CalendarOccurrenceItem;
+    testQueryClient.setQueryData(
+      calendarKeys.occurrences('user', viewportA).queryKey,
+      { items: keys.map(occurrence), syncStatus: 'ready' }
+    );
+    inviteCalendarEventGuestsMock.mockResolvedValue(ok({ id: 'event-4' }));
+    const invite = renderHook(() => useInviteCalendarEventGuestsMutation());
+    const emailsAt = (key: string) =>
+      viewportData(viewportA)
+        ?.items.find((item) => item.occurrence.occurrenceKey === key)
+        ?.event.attendees.map((attendee) => attendee.email);
+
+    await invite.mutateAsync({
+      eventId: 'event-4',
+      guests: [{ email: 'dana@example.com' }],
+      scope: 'this_event',
+      recurrenceId: keys[1],
+      occurrenceKey: keys[1],
+    });
+
+    expect(emailsAt(keys[0])).toEqual([]);
+    expect(emailsAt(keys[1])).toEqual(['dana@example.com']);
+  });
+
+  it('removes the optimistic guests when the organizer does not allow inviting', async () => {
+    inviteCalendarEventGuestsMock.mockResolvedValue(
+      err([
+        {
+          code: 'guests_cannot_invite' as const,
+          message: 'Only the organizer can invite guests.',
+        },
+      ])
+    );
+    const invite = renderHook(() => useInviteCalendarEventGuestsMutation());
+
+    let error: unknown;
+    try {
+      await invite.mutateAsync({
+        eventId: 'event-1',
+        guests: [{ email: 'dana@example.com' }],
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(isGuestInviteRefused(error)).toBe(true);
+    expect(attendeesOf('event-1')?.map((attendee) => attendee.email)).toEqual([
+      'self@example.com',
+      'other@example.com',
+    ]);
+  });
+
+  it('does not read other failures as a refusal', async () => {
+    inviteCalendarEventGuestsMock.mockResolvedValue(failure());
+    const invite = renderHook(() => useInviteCalendarEventGuestsMutation());
+
+    let error: unknown;
+    try {
+      await invite.mutateAsync({
+        eventId: 'event-1',
+        guests: [{ email: 'dana@example.com' }],
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(isGuestInviteRefused(error)).toBe(false);
+  });
+});
+
+it('updates and rolls back invitation projections with no calendar viewport loaded', async () => {
+  testQueryClient.removeQueries({ queryKey: calendarKeys.occurrences._def });
+  const item = standaloneItem();
+  const key = calendarKeys.invitations('thread').queryKey;
+  const initial = {
+    invite: {
+      kind: 'resolved' as const,
+      ...item,
+      responding_email: 'self@example.com',
+      can_respond: true,
+      is_stale: false,
+    },
+  };
+  testQueryClient.setQueryData(key, initial);
+  const response = () =>
+    testQueryClient
+      .getQueryData<typeof initial>(key)
+      ?.invite.event.attendees.find((a) => a.isSelf)?.responseStatus;
+  const first = deferredResult();
+  const second = deferredResult();
+  rsvpCalendarEventMock
+    .mockReturnValueOnce(first.promise)
+    .mockReturnValueOnce(second.promise);
+  const rsvp = renderHook(() => useRsvpCalendarEventMutation());
+  const earlier = rsvp
+    .mutateAsync({ eventId: 'event-1', response: 'accepted' })
+    .catch(() => {});
+  await vi.waitFor(() => expect(response()).toBe('accepted'));
+  const later = rsvp.mutateAsync({ eventId: 'event-1', response: 'tentative' });
+  await vi.waitFor(() => expect(response()).toBe('tentative'));
+  first.resolve(failure());
+  await earlier;
+  expect(response()).toBe('tentative');
+  second.resolve(ok(item.event));
+  await later;
+  expect(response()).toBe('tentative');
+  rsvpCalendarEventMock.mockResolvedValueOnce(failure());
+  await expect(
+    rsvp.mutateAsync({ eventId: 'event-1', response: 'declined' })
+  ).rejects.toThrow();
+  expect(response()).toBe('tentative');
+});
+
+it('binds provider writes and optimistic rollback to one address across both hosts', async () => {
+  const item = standaloneItem();
+  item.event.attendees[1].isSelf = true;
+  const viewportKey = calendarKeys.occurrences('user', viewportA).queryKey;
+  testQueryClient.setQueryData(viewportKey, {
+    items: [item],
+    syncStatus: 'ready',
+  });
+  const inviteKey = calendarKeys.invitations('thread').queryKey;
+  const initial = {
+    invite: {
+      kind: 'resolved' as const,
+      ...item,
+      responding_email: 'other@example.com',
+      can_respond: true,
+      is_stale: false,
+    },
+  };
+  testQueryClient.setQueryData(inviteKey, initial);
+  const first = deferredResult();
+  const second = deferredResult();
+  rsvpCalendarEventMock
+    .mockReturnValueOnce(first.promise)
+    .mockReturnValueOnce(second.promise);
+  const mutation = renderHook(() => useRsvpCalendarEventMutation());
+  const response = (email: string) =>
+    testQueryClient
+      .getQueryData<typeof initial>(inviteKey)
+      ?.invite.event.attendees.find((attendee) => attendee.email === email)
+      ?.responseStatus;
+  const firstCall = mutation
+    .mutateAsync({
+      eventId: 'event-1',
+      respondingEmail: 'other@example.com',
+      response: 'accepted',
+    })
+    .catch(() => {});
+  await vi.waitFor(() =>
+    expect(response('other@example.com')).toBe('accepted')
+  );
+  expect(response('self@example.com')).toBe('needs_action');
+  expect(
+    viewportData(viewportA)?.items[0].event.attendees[1].responseStatus
+  ).toBe('accepted');
+  expect(rsvpCalendarEventMock).toHaveBeenCalledWith(
+    'event-1',
+    expect.objectContaining({ respondingEmail: 'other@example.com' })
+  );
+  const secondCall = mutation.mutateAsync({
+    eventId: 'event-1',
+    respondingEmail: 'self@example.com',
+    response: 'tentative',
+  });
+  await vi.waitFor(() =>
+    expect(response('self@example.com')).toBe('tentative')
+  );
+  first.resolve(failure());
+  await firstCall;
+  expect(response('other@example.com')).toBe('declined');
+  expect(response('self@example.com')).toBe('tentative');
+  second.resolve(ok(item.event));
+  await secondCall;
+});
+
+it('revalidates only the thread whose saved invitations changed', () => {
+  const changed = calendarKeys.invitations('thread').queryKey;
+  const other = calendarKeys.invitations('other').queryKey;
+  testQueryClient.setQueryData(changed, {});
+  testQueryClient.setQueryData(other, {});
+  invalidateInvitationScheduling('thread');
+  expect(testQueryClient.getQueryState(changed)?.isInvalidated).toBe(true);
+  expect(testQueryClient.getQueryState(other)?.isInvalidated).toBe(false);
+});
+
+it('leaves unrelated invitation lookups, including failed ones, untouched by a response', async () => {
+  const failed = calendarKeys.invitations('failed').queryKey;
+  const other = standaloneItem();
+  testQueryClient.setQueryData(failed, {
+    invite: {
+      kind: 'resolved' as const,
+      ...other,
+      event: { ...other.event, id: 'other-event' },
+      responding_email: 'self@example.com',
+      can_respond: true,
+      can_join: true,
+      is_stale: false,
+    },
+  });
+  testQueryClient
+    .getQueryCache()
+    .find({ queryKey: failed })
+    ?.setState({ status: 'error', error: new Error('refresh failed') });
+  rsvpCalendarEventMock.mockResolvedValueOnce(ok(standaloneItem().event));
+  const rsvp = renderHook(() => useRsvpCalendarEventMutation());
+  await rsvp.mutateAsync({ eventId: 'event-1', response: 'accepted' });
+  expect(testQueryClient.getQueryState(failed)?.status).toBe('error');
+});

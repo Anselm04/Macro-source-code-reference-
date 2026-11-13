@@ -1,0 +1,112 @@
+import type { AiUsageSnapshot } from '../../../src/lib/service-clients/service-auth/ai-billing-types';
+import type { Link } from '../../../src/lib/service-clients/service-email/generated/schemas/link';
+import { accounts, EMAIL, identity, USER_ID } from './mail';
+
+const link: Link = {
+  id: accounts[0].id,
+  macro_id: USER_ID,
+  email_address: EMAIL,
+  fusionauth_user_id: 'fixture-user',
+  is_primary: true,
+  provider: 'GMAIL',
+  is_sync_active: true,
+  sync_status: 'UP_TO_DATE',
+  needs_reauth: false,
+  needs_calendar_permission: false,
+  calendar_disabled: false,
+  has_calendar_data: false,
+  photo_url: null,
+  settings: { signature: null },
+  created_at: '2025-01-01T00:00:00Z',
+  updated_at: '2025-01-01T00:00:00Z',
+};
+// A free account with nothing used, so billing surfaces stay quiet.
+const aiBilling: AiUsageSnapshot = {
+  tier: 'free',
+  unlimited: false,
+  payer: USER_ID,
+  can_manage_billing: false,
+  seats: 1,
+  period_start: '2025-01-01T00:00:00Z',
+  period_end: '2025-02-01T00:00:00Z',
+  included_cents: 0,
+  used_cents: 0,
+  credits_consumed_cents: 0,
+  credit_balance_cents: 0,
+  overage_enabled: false,
+  overage_limit_cents: 0,
+  overage_charged_cents: 0,
+  overage_suspended: false,
+  uncovered_cents: 0,
+  remaining_cents: 0,
+};
+const name = { id: USER_ID, first_name: 'Offline', last_name: 'Fixture' };
+
+/** Empty, unrelated app-chrome resources. Unlisted requests remain errors. */
+export const bootstrapResponses = new Map<
+  string,
+  { body: unknown; status?: number }
+>([
+  ['GET /auth/user/legacy_user_permissions', { body: identity }],
+  ['GET /auth/user/me', { body: { user_id: USER_ID, permissions: [] } }],
+  ['GET /auth/user/language', { body: { language: null } }],
+  ['GET /auth/system-status', { body: { status: 'operational' } }],
+  ['GET /auth/ai-billing/summary', { body: aiBilling }],
+  ['GET /auth/user/name', { body: name }],
+  ['POST /auth/user/get_names_with_email', { body: { names: [name] } }],
+  ['POST /auth/user/profile_pictures', { body: { pictures: [] } }],
+  ['GET /auth/team', { body: {}, status: 404 }],
+  ['GET /auth/team/user/invites', { body: { invites: [] } }],
+  ['GET /auth/cursor-api-key', { body: { registered: false } }],
+  [
+    'GET /auth/link/github/status',
+    { body: { reauthentication_required: false } },
+  ],
+  ['GET /email/email/links', { body: { links: [link] } }],
+  ['POST /email/email/links/health-check', { body: {} }],
+  ['GET /calendar/calendars', { body: { calendars: [] } }],
+  ['GET /contacts/contacts', { body: { contacts: [] } }],
+  ['GET /dss/comms/channels', { body: { items: [], next_cursor: null } }],
+  ['GET /dss/channels/activity', { body: [] }],
+  ['GET /dss/bots', { body: [] }],
+  ['GET /dss/agents', { body: [] }],
+  ['GET /dss/harnesses', { body: [] }],
+  ['GET /dss/harnesses/directory', { body: [] }],
+  ['GET /dss/forms/accessible', { body: [] }],
+  ['GET /dss/databases', { body: [] }],
+  ['POST /dss/databases/starter', { body: {}, status: 403 }],
+  ['GET /dss/documents/system_skills', { body: { skills: [] } }],
+  ['GET /dss/properties/definitions', { body: [] }],
+  ['GET /dss/properties/tags', { body: [] }],
+  ['GET /dss/call/active', { body: { calls: [] } }],
+  ['GET /dss/call/meetings/active', { body: { meetings: [] } }],
+  ['GET /dss/instructions', { body: {}, status: 404 }],
+  ['GET /dss/crm/settings', { body: {}, status: 403 }],
+  ['GET /dss/crm/contacts', { body: { contacts: [] } }],
+  [
+    'POST /agent-harness/agent-models/load',
+    { body: { models: [], status: 'unsupported' } },
+  ],
+  [
+    'POST /agent-harness/agent-capabilities/discover',
+    { body: { configOptions: [] } },
+  ],
+  ['POST /agent-harness/agent-sessions/warm', { body: {} }],
+  ['GET /cognition/mcp/servers', { body: [] }],
+  ['GET /cognition/pipedream/mcp/connections', { body: [] }],
+  ['GET /cognition/onboarding/prompts', { body: { dismissed: [] } }],
+  ['GET /scheduled-action/scheduled-actions', { body: [] }],
+  ['GET /scheduled-action/scheduled-actions/catalog', { body: [] }],
+  [
+    'GET /scheduled-action/scheduled-actions/suggestions',
+    { body: { status: 'none', suggestions: [] } },
+  ],
+  [
+    'GET /notification/user_notifications/preferences',
+    { body: { disabled_types: [] } },
+  ],
+  ['POST /cognition/ai-projections', { body: {}, status: 403 }],
+  ['GET /notification/unsubscribe', { body: [] }],
+  ['POST /dss/items/soup', { body: { items: [], next_cursor: null } }],
+  ['POST /dss/items/soup/ast', { body: { items: [], next_cursor: null } }],
+]);

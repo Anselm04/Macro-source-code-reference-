@@ -1,0 +1,318 @@
+import { developmentProxyUrl } from './developmentProxy';
+
+const serverHostLocal: Servers = {
+  'auth-service': 'http://localhost:8080',
+  'auth-logout': 'http://localhost:3000', // TODO: make work with local fusionauth later
+  'pdf-service': 'http://localhost:4567',
+  'document-storage-service': 'http://localhost:8086',
+  'websocket-service': 'ws://localhost:6969',
+  'cognition-service': 'http://localhost:8101/cognition',
+  'connection-gateway': 'ws://localhost:8082',
+  'notification-service': 'http://localhost:8089',
+  'static-file': 'http://localhost:8100',
+  'unfurl-service': 'http://localhost:8095',
+  contacts: 'http://localhost:8083',
+  'email-service': 'http://localhost:8087',
+  // calendar_service owns calendar locally on 8088. No gateway locally, so the
+  // client hits the service port directly; it drops the /calendar segment, so
+  // that prefix is carried here.
+  'calendar-service': 'http://localhost:8088/calendar',
+  'image-proxy-service': 'http://localhost:8097',
+  'scheduled-action': 'http://localhost:8101/scheduled-action',
+  'agent-harness': 'http://localhost:8101',
+  preview: 'http://localhost:8101/preview',
+  'agent-git': 'http://localhost:8101/agent-git',
+} as const;
+
+const devServerSuffix = import.meta.env.MODE === 'development' ? '-dev' : '';
+
+const gatewayHost =
+  import.meta.env.MODE === 'development'
+    ? 'https://dev-gateway.macro.com'
+    : 'https://gateway.macro.com';
+
+const authLogoutUrl =
+  import.meta.env.MODE === 'development'
+    ? 'https://fusionauth-dev.macro.com/oauth2/logout?client_id=eb75fe7a-0ef1-4186-96d9-cc62cfb1d10c&tenantId=5e13f524-8d32-0454-81f8-061936256aa4'
+    : 'https://auth.macro.com/oauth2/logout?client_id=75409999-7dc4-4241-b73b-a51818c3a71c&tenantId=a3e53c3d-8d6a-3e92-d64c-fa3bf30a60be';
+
+const directServerHostRemote = {
+  'auth-service': `${gatewayHost}/auth`,
+  'auth-logout': authLogoutUrl,
+  'pdf-service': `https://pdf-service${devServerSuffix}.macro.com`,
+  'document-storage-service': `${gatewayHost}/dss`,
+  'websocket-service': `wss://services${devServerSuffix}.macro.com`,
+  'cognition-service': `${gatewayHost}/cognition`,
+  'connection-gateway': `${gatewayHost.replace(/^http/, 'ws')}/connection-gateway`,
+  'notification-service': `${gatewayHost}/notification`,
+  'static-file': `https://static-file-service${devServerSuffix}.macro.com`,
+  'unfurl-service': `${gatewayHost}/unfurl`,
+  contacts: `${gatewayHost}/contacts`,
+  'email-service': `${gatewayHost}/email`,
+  'calendar-service': `${gatewayHost}/calendar`,
+  'image-proxy-service': `${gatewayHost}/image-proxy`,
+  'scheduled-action': `${gatewayHost}/scheduled-action`,
+  'agent-harness': `${gatewayHost}/agent-harness`,
+  preview: `${gatewayHost}/preview`,
+  'agent-git': `${gatewayHost}/agent-git`,
+} as const;
+
+type Servers = Record<keyof typeof directServerHostRemote, string>;
+
+const serverHostRemote = Object.fromEntries(
+  Object.entries(directServerHostRemote).map(([name, url]) => [
+    name,
+    developmentProxyUrl(url),
+  ])
+) as Servers;
+
+// Single-origin local backend: when the xtask orchestrator's reverse proxy is
+// in use it sets VITE_LOCAL_BACKEND_ORIGIN to the proxy origin, and the whole
+// app talks to it via path prefixes instead of many direct host ports. Unset =>
+// direct-port behavior (unchanged). Declared BEFORE SERVER_HOSTS so it is
+// initialized before SERVER_HOSTS evaluates selectLocalServers() at module load
+// (these are consts in a temporal dead zone; the functions below are hoisted).
+//
+// The special value 'same-origin' resolves to the origin the bundle is served
+// from, at runtime. The headless stack (`cargo x stack up`) builds with it so
+// the static bundle Caddy serves works unchanged on any host that reaches the
+// proxy — localhost, a tunnel URL, a preview domain. (globalThis.location
+// exists in both windows and workers.)
+const rawLocalBackendOrigin: string | undefined = import.meta.env
+  .VITE_LOCAL_BACKEND_ORIGIN;
+const proxyOrigin: string | undefined =
+  rawLocalBackendOrigin === 'same-origin'
+    ? globalThis.location?.origin
+    : resolveProxyOrigin(rawLocalBackendOrigin);
+const wsProxyOrigin = proxyOrigin?.replace(/^http/, 'ws');
+
+// Follow the page's hostname (keeping the proxy's port) so the app works from
+// any `*.localhost` alias. Hostnames get separate cookie jars, so opening tabs
+// like alice.localhost:8090 / carol.localhost:8090 gives each seeded persona an
+// isolated login session against the one backend. Separate stacks don't need
+// this: their proxies keep each stack's cookies apart on any hostname.
+function resolveProxyOrigin(configured: string | undefined) {
+  if (!configured || typeof window === 'undefined') return configured;
+  try {
+    const url = new URL(configured);
+    url.hostname = window.location.hostname;
+    return url.origin;
+  } catch {
+    return configured;
+  }
+}
+
+export const SERVER_HOSTS: Servers =
+  import.meta.env.MODE === 'development'
+    ? selectLocalServers()
+    : serverHostRemote;
+
+/**
+ * The app talks to a self-contained local stack (`run_local`, `just stack`)
+ * through its single-origin proxy, which keeps each instance's cookies apart.
+ * `run_dev` uses the same proxy origin but not those cookie rules.
+ */
+export function usesLocalStackProxy(): boolean {
+  return (
+    import.meta.env.VITE_LOCAL_STACK === 'true' &&
+    SERVER_HOSTS['auth-service'] === proxyServers()?.['auth-service']
+  );
+}
+
+function proxyServers(): Servers | undefined {
+  if (!proxyOrigin || !wsProxyOrigin) return undefined;
+  return {
+    'auth-service': `${proxyOrigin}/auth`,
+    'auth-logout': serverHostLocal['auth-logout'],
+    'pdf-service': serverHostLocal['pdf-service'], // no local container
+    'document-storage-service': `${proxyOrigin}/dss`,
+    'websocket-service': `${wsProxyOrigin}/websocket`,
+    'cognition-service': `${proxyOrigin}/cognition`,
+    'connection-gateway': `${wsProxyOrigin}/connection-gateway`,
+    'notification-service': `${proxyOrigin}/notification`,
+    'static-file': `${proxyOrigin}/static-file`,
+    'unfurl-service': `${proxyOrigin}/unfurl`,
+    'agent-harness': `${proxyOrigin}/agent-harness`,
+    preview: `${proxyOrigin}/preview`,
+    contacts: `${proxyOrigin}/contacts`,
+    'email-service': `${proxyOrigin}/email`,
+    // calendar_service is in the local inventory, so the proxy has a /calendar
+    // route to it (Caddy strips the prefix); the client drops /calendar and
+    // re-appends it via this host.
+    'calendar-service': `${proxyOrigin}/calendar`,
+    'image-proxy-service': `${proxyOrigin}/image-proxy`,
+    'scheduled-action': `${proxyOrigin}/scheduled-action`,
+    'agent-git': `${proxyOrigin}/agent-git`,
+  };
+}
+
+function selectLocalServers(): Servers {
+  const selectedLocalServers: string = import.meta.env.VITE_LOCAL_SERVERS;
+  if (!selectedLocalServers || selectedLocalServers.length === 0) {
+    return serverHostRemote;
+  }
+
+  // Keyword to make running everything locally easier
+  if (selectedLocalServers === 'ALL') {
+    return proxyServers() ?? serverHostLocal;
+  }
+
+  function assertValidName(name: string): name is keyof Servers {
+    if (!(name in serverHostRemote))
+      throw new Error(`unknown server name ${name}`);
+    return true;
+  }
+  const servers = selectedLocalServers.split(',').reduce(
+    (acc: Servers, entry: string) => {
+      // Support "service-name:port" to override the default local port
+      const [name, portOverride] = entry.split(':') as [
+        string,
+        string | undefined,
+      ];
+      if (!assertValidName(name)) return acc;
+      if (portOverride) {
+        const url = new URL(serverHostLocal[name]);
+        url.port = portOverride;
+        acc[name] = url.toString().replace(/\/$/, '');
+      } else {
+        acc[name] = serverHostLocal[name];
+      }
+      console.log(`Using local server ${name}: ${acc[name]}`);
+      return acc;
+    },
+    { ...serverHostRemote }
+  );
+  return servers;
+}
+
+const syncServiceSuffix =
+  import.meta.env.MODE === 'development' ? '-dev3' : '-prod2';
+
+const syncServiceHostLocal = {
+  worker: 'http://localhost:8787',
+  ws: 'ws://localhost:8787',
+} as const;
+
+const syncServiceHostRemote = {
+  worker: developmentProxyUrl(
+    `https://sync-service${syncServiceSuffix}.macroverse.workers.dev`
+  ),
+  ws: developmentProxyUrl(
+    `wss://sync-service${syncServiceSuffix}.macroverse.workers.dev`
+  ),
+} as const;
+
+function selectSyncServiceHost():
+  | typeof syncServiceHostRemote
+  | typeof syncServiceHostLocal
+  | { worker: string; ws: string } {
+  const overrideHost: string | undefined = import.meta.env
+    .VITE_SYNC_SERVICE_HOST;
+  if (overrideHost) {
+    return {
+      worker: `https://${overrideHost}`,
+      ws: `wss://${overrideHost}`,
+    };
+  }
+  if (import.meta.env.MODE !== 'development') {
+    return syncServiceHostRemote;
+  }
+  const selectedLocalServers: string = import.meta.env.VITE_LOCAL_SERVERS;
+  if (
+    selectedLocalServers === 'ALL' ||
+    selectedLocalServers?.includes('sync-service')
+  ) {
+    // Route sync through the single-origin proxy when it is in use.
+    if (proxyOrigin && wsProxyOrigin) {
+      return { worker: `${proxyOrigin}/sync`, ws: `${wsProxyOrigin}/sync` };
+    }
+    return syncServiceHostLocal;
+  }
+  return syncServiceHostRemote;
+}
+
+export const SYNC_SERVICE_HOSTS = selectSyncServiceHost();
+
+// Desktop HTTP services share the native session cookie jar. Navigation-only
+// destinations and WebSocket endpoints do not define HTTP transport prefixes.
+const nativeSessionServices = {
+  'auth-service': SERVER_HOSTS['auth-service'],
+  'auth-logout': undefined,
+  'pdf-service': SERVER_HOSTS['pdf-service'],
+  'document-storage-service': SERVER_HOSTS['document-storage-service'],
+  'websocket-service': undefined,
+  'cognition-service': SERVER_HOSTS['cognition-service'],
+  'connection-gateway': undefined,
+  'notification-service': SERVER_HOSTS['notification-service'],
+  'static-file': SERVER_HOSTS['static-file'],
+  'unfurl-service': SERVER_HOSTS['unfurl-service'],
+  contacts: SERVER_HOSTS['contacts'],
+  'email-service': SERVER_HOSTS['email-service'],
+  'calendar-service': SERVER_HOSTS['calendar-service'],
+  'image-proxy-service': SERVER_HOSTS['image-proxy-service'],
+  'scheduled-action': SERVER_HOSTS['scheduled-action'],
+  'agent-harness': SERVER_HOSTS['agent-harness'],
+  preview: SERVER_HOSTS['preview'],
+  // Git remotes for agent workspaces; the app sends no requests to it.
+  'agent-git': undefined,
+} satisfies Record<keyof Servers, string | undefined>;
+
+/**
+ * The DSS host to use for sync-service permission tokens.
+ * When the sync service is remote, permission tokens must come from the remote DSS
+ * because they need to be signed with the matching JWT secret.
+ */
+export const SYNC_PERMISSION_TOKEN_DSS_HOST =
+  SYNC_SERVICE_HOSTS === syncServiceHostRemote
+    ? serverHostRemote['document-storage-service']
+    : SERVER_HOSTS['document-storage-service'];
+
+export const NATIVE_SESSION_SERVICE_URLS = [
+  ...Object.values(nativeSessionServices).filter((url) => url !== undefined),
+  SYNC_SERVICE_HOSTS.worker,
+  SYNC_PERMISSION_TOKEN_DSS_HOST,
+];
+
+/** Hosts the email service may have embedded in sent mail. Development
+ * proxies rewrite `SERVER_HOSTS`, while the backend embeds its direct URL. */
+export const EMAIL_SERVICE_EMBEDDED_HOSTS: readonly string[] = [
+  ...new Set([
+    SERVER_HOSTS['email-service'],
+    directServerHostRemote['email-service'],
+    serverHostLocal['email-service'],
+  ]),
+];
+
+/** Creates endpoint URL for accessing a static file by its ID */
+export function staticFileIdEndpoint(id: string): string {
+  return `${SERVER_HOSTS['static-file']}/file/${id}`;
+}
+
+/** A static-file reference consumed by a backend, outside the browser proxy. */
+export function staticFileReferenceEndpoint(id: string): string {
+  const host = SERVER_HOSTS['static-file'];
+  const remote = directServerHostRemote['static-file'];
+  const referenceHost = host === developmentProxyUrl(remote) ? remote : host;
+  return `${referenceHost}/file/${id}`;
+}
+
+type StaticFileSize = 'small' | 'medium';
+
+const staticFileSizes: Record<StaticFileSize, number> = {
+  small: 320,
+  medium: 1080,
+};
+
+export function staticFileSizedEndpoint(
+  id: string,
+  size: StaticFileSize
+): string {
+  return `${staticFileIdEndpoint(id)}?size=${staticFileSizes[size]}`;
+}
+
+export function staticFileSizedUrl(url: string, size: StaticFileSize): string {
+  // Embedded and local previews are not image-service URLs. A query string
+  // changes their contents instead of requesting a resized image.
+  if (url.startsWith('data:') || url.startsWith('blob:')) return url;
+  return `${url}?size=${staticFileSizes[size]}`;
+}

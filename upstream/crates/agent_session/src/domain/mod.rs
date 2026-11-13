@@ -1,0 +1,66 @@
+pub mod action_history;
+pub mod activity;
+#[cfg(feature = "admission")]
+pub mod activity_summary;
+pub mod agent_conversation;
+/// Current authorization for agent session streams.
+pub mod audience;
+pub mod auto_archive;
+pub mod coding_agents;
+pub mod coding_preferences;
+pub mod connection;
+/// Authorization of user and runtime session controls.
+pub mod control;
+pub mod error;
+pub mod events;
+pub mod lifecycle;
+/// Lifecycle events as their owner's activity.
+pub mod lifecycle_activity;
+pub mod model;
+#[cfg(feature = "admission")]
+pub mod name_generation;
+pub mod ports;
+pub mod pull_request;
+pub mod pull_request_links;
+pub mod read;
+pub mod retitle;
+mod sandbox_size;
+pub mod search;
+pub mod service;
+pub mod session;
+/// The task a session works on, and linking its pull request to it.
+pub mod session_task;
+/// Session link, channel, and team sharing.
+pub mod sharing;
+pub mod updates;
+
+pub mod credentials;
+
+pub mod repository_branch;
+
+/// Owner-authorized session execution for routines.
+pub mod routines;
+
+/// Durable activity projection and bounded history backfill.
+pub mod turn_state;
+
+/// Repository-matched working branches reported by a session's runtime.
+pub mod working_branch;
+
+/// Recovery of sessions abandoned by crashed replicas.
+pub mod recovery;
+
+/// Warm session promotion and expiry.
+pub mod warm;
+
+/// Visibility policy for standalone session lists.
+pub mod list_visibility;
+
+/// User-scoped AI session actions.
+pub mod tool_actions;
+
+/// Durable system notifications.
+pub mod notifications;
+
+/// Sessions registered as an account's work.
+pub mod work_registration;

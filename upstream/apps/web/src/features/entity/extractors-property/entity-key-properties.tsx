@@ -1,0 +1,288 @@
+import { useMaybeBlockId } from '@core/block';
+import { ScopedPortal } from '@core/component/ScopedPortal';
+import UsersIcon from '@icon/system/regular/users.svg';
+import { Property } from '@property';
+import { Modals } from '@property/component/modal';
+import { SYSTEM_PROPERTY_IDS } from '@property/constants';
+import {
+  PropertiesProvider,
+  type PropertySaveHandler,
+  usePropertiesContext,
+} from '@property/context/PropertiesContext';
+import { PropertyEmptyIcon } from '@property/extractors/PropertyEmpty';
+import type { PropertyApiValues, Property as PropertyT } from '@property/types';
+import { getEntityValues, hasValue } from '@property/utils';
+import { useBulkSaveEntityPropertiesMutation } from '@queries/properties/entity';
+import { EntityType } from '@service-properties/generated/schemas/entityType';
+import { Key } from '@solid-primitives/keyed';
+import { cn, Layer } from '@ui';
+import {
+  type Accessor,
+  createMemo,
+  Match,
+  Show,
+  Suspense,
+  Switch,
+} from 'solid-js';
+import { match } from 'ts-pattern';
+import {
+  type EntityData,
+  type EntityWithProperties,
+  isTaskEntity,
+} from '../types/entity';
+import {
+  getSortedKeyProperties,
+  soupPropertyToProperty,
+  withTaskProject,
+} from './property-helpers';
+
+function getEntityType(entity: EntityData): EntityType {
+  return match(entity)
+    .when(isTaskEntity, () => EntityType.TASK)
+    .with({ type: 'channel' }, () => EntityType.CHANNEL)
+    .with({ type: 'chat' }, () => EntityType.CHAT)
+    .with({ type: 'initiative' }, () => EntityType.INITIATIVE)
+    .with({ type: 'project' }, () => EntityType.PROJECT)
+    .with({ type: 'email' }, () => EntityType.THREAD)
+    .with({ type: 'document' }, () => EntityType.DOCUMENT)
+    .with({ type: 'channel_message' }, () => EntityType.CHANNEL)
+    .with({ type: 'channel_thread' }, () => EntityType.CHANNEL)
+    .with({ type: 'call' }, () => EntityType.CHANNEL)
+    .with({ type: 'crm_company' }, () => EntityType.COMPANY)
+    .with({ type: 'crm_contact' }, () => {
+      // No CONTACT in the properties-service EntityType yet.
+      throw new Error('crm contacts do not support properties');
+    })
+    .with({ type: 'agent_session' }, () => {
+      throw new Error(
+        'agent sessions are not property-service mutation targets'
+      );
+    })
+    .with({ type: 'routine' }, () => {
+      throw new Error('routine entities do not support properties');
+    })
+    .with({ type: 'foreign' }, () => {
+      throw new Error('foreign entities do not support properties');
+    })
+    .with({ type: 'calendar_event' }, () => {
+      throw new Error('calendar events do not support properties');
+    })
+    .with({ type: 'database' }, () => {
+      throw new Error('databases do not support properties');
+    })
+    .with({ type: 'form' }, () => {
+      throw new Error('forms do not support properties');
+    })
+    .with({ type: 'harness' }, () => {
+      throw new Error('runtimes do not support properties');
+    })
+    .exhaustive();
+}
+
+interface EntityKeyPropertiesProps {
+  /** Entity with properties attached */
+  entity: EntityWithProperties<EntityData>;
+  /** Max visible user avatars in the assignees stack before collapsing to +N. */
+  maxUserStackUsers?: number;
+  /** Whether to show the edit affordance caret. */
+  showCaret?: boolean;
+  /** Append a task's Project, set or not (Projects enabled). */
+  includeProject?: boolean;
+  /** The task's leading icon already owns status editing. */
+  hideStatus?: boolean;
+  /** The task's leading priority icon already owns priority editing. */
+  hidePriority?: boolean;
+}
+
+/**
+ * Displays key properties (Status, Priority, Assignees) for an entity as a
+ * row of condensed icon-only pills. Each pill owns its own Kobalte-backed
+ * popover editor via <Property.PopoverEditor /> rendered inline below the
+ * trigger — no modal stack involved.
+ */
+export function EntityKeyProperties(props: EntityKeyPropertiesProps) {
+  const entityType = createMemo(() => getEntityType(props.entity));
+
+  const keyProperties = createMemo((): PropertyT[] => {
+    const soupProperties = props.entity.properties ?? [];
+    const properties = soupProperties.flatMap((soupProperty) => {
+      try {
+        return [soupPropertyToProperty(soupProperty)];
+      } catch (error) {
+        console.warn('Skipping property with unsupported type', error);
+        return [];
+      }
+    });
+    const key = getSortedKeyProperties(properties).filter(
+      (property) =>
+        (!props.hideStatus ||
+          property.propertyDefinitionId !== SYSTEM_PROPERTY_IDS.STATUS) &&
+        (!props.hidePriority ||
+          property.propertyDefinitionId !== SYSTEM_PROPERTY_IDS.PRIORITY)
+    );
+    return props.includeProject && entityType() === EntityType.TASK
+      ? withTaskProject(key, properties)
+      : key;
+  });
+
+  const saveMutation = useBulkSaveEntityPropertiesMutation();
+
+  const saveOne = (property: PropertyT, apiValues: PropertyApiValues) =>
+    saveMutation.mutateAsync({
+      properties: [
+        {
+          entityId: props.entity.id,
+          entityType: entityType(),
+          property,
+          apiValues,
+        },
+      ],
+    });
+
+  const saveHandler: PropertySaveHandler = {
+    saveProperty: (property, value) => saveOne(property, value),
+    saveDate: (property, date) =>
+      saveOne(property, { valueType: 'DATE', value: date }),
+  };
+
+  return (
+    <PropertiesProvider
+      entityType={entityType()}
+      canEdit={true}
+      properties={keyProperties}
+      onRefresh={() => {}}
+      onPropertyAdded={() => {}}
+      onPropertyDeleted={() => {}}
+      saveHandler={saveHandler}
+    >
+      <KeyPropertiesRow
+        properties={keyProperties}
+        maxUserStackUsers={props.maxUserStackUsers}
+        showCaret={props.showCaret}
+      />
+      <ScopedPortal scope="split">
+        <Suspense>
+          <Modals />
+        </Suspense>
+      </ScopedPortal>
+    </PropertiesProvider>
+  );
+}
+
+function KeyPropertiesRow(props: {
+  properties: Accessor<PropertyT[]>;
+  maxUserStackUsers?: number;
+  showCaret?: boolean;
+}) {
+  const ctx = usePropertiesContext();
+  const blockId = useMaybeBlockId();
+
+  return (
+    <div class="flex items-center gap-1 justify-start text-xs">
+      <Key each={props.properties()} by="propertyDefinitionId">
+        {(property) => (
+          <Property.Root
+            property={property()}
+            canEdit={ctx.canEdit}
+            onSave={ctx.saveHandler.saveProperty}
+          >
+            {(shown) => {
+              const isEmpty = () => !hasValue(shown());
+
+              const isUserEntity = () =>
+                shown().valueType === 'ENTITY' &&
+                shown().specificEntityType === 'USER';
+
+              const userCount = () =>
+                isUserEntity() ? getEntityValues(shown()).length : 0;
+              const compactUserStack = () =>
+                isUserEntity() && props.maxUserStackUsers === 1;
+              const maxUsers = () =>
+                compactUserStack() && userCount() === 2
+                  ? 2
+                  : (props.maxUserStackUsers ?? 2);
+
+              return (
+                <>
+                  <Property.Tooltip property={shown()}>
+                    <Layer depth={2}>
+                      <Property.Pill
+                        class={cn(
+                          'flex h-auto items-center gap-1 min-w-0 border-0 font-normal touch:min-h-0 touch:min-w-0',
+                          'px-1.5 py-1 leading-tight text-left rounded-full',
+                          '@max-2xl/u-list:gap-0 @max-2xl/u-list:px-1 @max-2xl/u-list:justify-center',
+                          compactUserStack() &&
+                            '@max-2xl/u-list:w-11 @max-2xl/u-list:shrink-0 @max-2xl/u-list:justify-start'
+                        )}
+                      >
+                        <div class="h-4" />
+                        <Switch
+                          fallback={
+                            <Property.Icon
+                              property={shown()}
+                              class="shrink-0 @max-2xl/u-list:size-4 mobile:size-5"
+                            />
+                          }
+                        >
+                          <Match when={isEmpty()}>
+                            <PropertyEmptyIcon
+                              muted
+                              propertyDefinitionId={
+                                shown().propertyDefinitionId
+                              }
+                              class={
+                                shown().propertyDefinitionId ===
+                                SYSTEM_PROPERTY_IDS.PRIORITY
+                                  ? '@max-2xl/u-list:size-4 mobile:size-5'
+                                  : 'size-3.5 @max-2xl/u-list:size-4 mobile:size-5'
+                              }
+                            />
+                          </Match>
+                          <Match when={userCount() > 1}>
+                            <div class="flex items-center gap-1">
+                              <Show when={props.maxUserStackUsers === 0}>
+                                <UsersIcon class="size-4 shrink-0 mobile:size-5" />
+                              </Show>
+                              <Property.UserStack
+                                property={shown()}
+                                maxUsers={maxUsers()}
+                                avatarClass="@max-2xl/u-list:size-5"
+                              />
+                            </div>
+                          </Match>
+                          <Match when={isUserEntity()}>
+                            <Property.Icon
+                              property={shown()}
+                              class="@max-2xl/u-list:size-5"
+                            />
+                          </Match>
+                        </Switch>
+                        <Property.Text
+                          property={shown()}
+                          class="@max-2xl/u-list:hidden"
+                          fallback={
+                            <Property.Empty
+                              label="None"
+                              hideIcon
+                              class="@max-2xl/u-list:hidden"
+                            />
+                          }
+                        />
+                        <Show when={props.showCaret ?? true}>
+                          <Property.Caret class="@max-2xl/u-list:hidden" />
+                        </Show>
+                      </Property.Pill>
+                    </Layer>
+                  </Property.Tooltip>
+                  <Property.PopoverEditor
+                    entitySelfFilter={{ entityType: ctx.entityType, blockId }}
+                  />
+                </>
+              );
+            }}
+          </Property.Root>
+        )}
+      </Key>
+    </div>
+  );
+}

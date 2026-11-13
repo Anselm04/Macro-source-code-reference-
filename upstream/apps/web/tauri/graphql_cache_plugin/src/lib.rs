@@ -1,0 +1,202 @@
+//! Tauri-native host for the normalized GraphQL cache.
+//!
+//! The webview counterpart of the browser worker glue in
+//! `apps/web/src/lib/graphql-cache/`: the engine (`cache-core` over
+//! `cache-turso`) lives in the Tauri host process behind an async mutex
+//! (`Storage` futures are `MaybeSend`, so `Send` on native) — one shared
+//! instance across all webviews/windows, never webview storage.
+//! Webviews talk to it through the commands in [`commands`] (registered
+//! app-level in `src-tauri`, like the bundle updater plugin) and receive
+//! operation, cache-change, and queued-mutation settlement notifications via
+//! broadcast events. These mirror browser worker pushes; each webview's
+//! `CacheHost` filters operation ids by its own client prefix.
+//!
+//! Design doc: `apps/web/docs/graphql-normalized-cache-plan.md`.
+
+#![deny(missing_docs)]
+
+use serde::Serialize;
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Runtime};
+
+pub mod commands;
+mod engine;
+
+pub use engine::{
+    AffectedOperationsResultWire, CalendarRangeResultWire, ClaimedMutationWire,
+    CommitOptimisticWriteResultWire, DeferOptimisticWriteResultWire, EngineHandle,
+    EnqueueOptimisticMutationResultWire, EntityFilterRequest, EntityFilterResult,
+    InitialMutationClaimWire, PredicateBaselineEntry, PredicateFilterResult, ReadResultWire,
+    RecordSelectionResultWire, RollbackOptimisticWriteResultWire, WriteResultWire,
+};
+
+/// Broadcast event carrying [`OpsAffectedEvent`]: operations whose
+/// underlying records changed. Emitted to every webview; hosts filter by
+/// their own client-id prefix (the origin operation is already excluded by
+/// the engine).
+pub const OPS_AFFECTED_EVENT: &str = "graphql-cache://ops-affected";
+
+/// Broadcast event emitted whenever the effective cache view changes.
+pub const CACHE_CHANGED_EVENT: &str = "graphql-cache://cache-changed";
+
+/// Broadcast event carrying the final outcome of a queued mutation.
+pub const MUTATION_SETTLED_EVENT: &str = "graphql-cache://mutation-settled";
+
+/// Payload of [`OPS_AFFECTED_EVENT`] — mirrors the worker `CachePush`
+/// message in `apps/web/src/lib/graphql-cache/protocol.ts`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpsAffectedEvent {
+    /// Composed record changes, including optimistic rollback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_changes: Option<Vec<cache_core::field_changes::RecordFieldChange>>,
+    /// Registered operation ids (`"{clientId}:{urqlKey}"`) to re-execute.
+    pub op_ids: Vec<String>,
+}
+
+/// Payload of [`CACHE_CHANGED_EVENT`].
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheChangedEvent {
+    /// Exact displayed windows unaffected by every change in this notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unchanged_views: Option<Vec<String>>,
+    /// Known query-write changes; missing metadata requests a conservative refresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_changed_buckets: Option<std::collections::BTreeSet<String>>,
+    /// Effective-view revision installed by the logical mutation.
+    pub revision: String,
+    /// Present when the write cleared durable records and hydration must restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MutationSettledEvent {
+    transaction_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mutation_uuid: Option<String>,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replacement_transaction_id: Option<String>,
+}
+
+#[cfg(test)]
+mod test;
+
+struct InitializedCache {
+    scope: String,
+    handle: EngineHandle,
+}
+
+/// Managed state holding the lazily-initialized engine handle. Register
+/// with `.manage(CacheState::default())` in the app builder.
+#[derive(Default)]
+pub struct CacheState(Mutex<Option<InitializedCache>>);
+
+impl CacheState {
+    /// Takes the initialized cache and explicitly closes its Turso connection.
+    pub fn shutdown(&self) -> Result<(), String> {
+        let cache = self
+            .0
+            .lock()
+            .map_err(|_| "graphql cache state poisoned".to_string())?
+            .take();
+        cache.map_or(Ok(()), |cache| cache.handle.shutdown())
+    }
+}
+
+fn emit_ops_affected<R: Runtime>(
+    app: &AppHandle<R>,
+    op_ids: &[String],
+    field_changes: Option<&Vec<cache_core::field_changes::RecordFieldChange>>,
+) {
+    if op_ids.is_empty() {
+        return;
+    }
+    emit_cache_event(
+        app,
+        OPS_AFFECTED_EVENT,
+        OpsAffectedEvent {
+            field_changes: field_changes.cloned(),
+            op_ids: op_ids.to_vec(),
+        },
+    );
+}
+
+fn emit_cache_changed<R: Runtime>(app: &AppHandle<R>, revision: &str, reset: bool) {
+    emit_cache_changed_with_hints(app, revision, reset, None, None);
+}
+
+fn emit_cache_changed_with_hints<R: Runtime>(
+    app: &AppHandle<R>,
+    revision: &str,
+    reset: bool,
+    search_changed_buckets: Option<&std::collections::BTreeSet<String>>,
+    unchanged_views: Option<&Vec<String>>,
+) {
+    emit_cache_event(
+        app,
+        CACHE_CHANGED_EVENT,
+        CacheChangedEvent {
+            unchanged_views: if reset {
+                None
+            } else {
+                unchanged_views.cloned()
+            },
+            search_changed_buckets: if reset {
+                None
+            } else {
+                search_changed_buckets.cloned()
+            },
+            revision: revision.to_owned(),
+            reset: reset.then_some(true),
+        },
+    );
+}
+
+fn emit_mutation_settled<R: Runtime>(
+    app: &AppHandle<R>,
+    transaction_id: String,
+    mutation_uuid: Option<String>,
+    status: &'static str,
+    error: Option<String>,
+    error_code: Option<String>,
+    replacement_transaction_id: Option<String>,
+) {
+    emit_cache_event(
+        app,
+        MUTATION_SETTLED_EVENT,
+        MutationSettledEvent {
+            transaction_id,
+            mutation_uuid,
+            status,
+            error,
+            error_code,
+            replacement_transaction_id,
+        },
+    );
+}
+
+/// Serialize notifications once, recording their wire size without copying the
+/// payload back through a second JSON encoder for diagnostics.
+#[tracing::instrument(
+    name = "graphql_cache.ipc.notification",
+    skip_all,
+    fields(event.name = event, graphql_cache.ipc.payload_bytes = tracing::field::Empty)
+)]
+fn emit_cache_event<R: Runtime, S: Serialize>(app: &AppHandle<R>, event: &str, payload: S) {
+    let emit = || -> tauri::Result<()> {
+        let json = serde_json::to_string(&payload)?;
+        tracing::Span::current().record("graphql_cache.ipc.payload_bytes", json.len());
+        app.emit_str(event, json)
+    };
+    emit()
+        .inspect_err(|e| tracing::error!(error=?e, "failed to emit graphql cache event"))
+        .ok();
+}

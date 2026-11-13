@@ -1,0 +1,92 @@
+import type { ListView } from '@app/constants/list-views';
+import { GroupDropdown } from '@app/features/next-soup/soup-view/filters-bar/group-dropdown';
+import {
+  type GroupOptionId,
+  TAG_VIEW_GROUP_OPTIONS,
+  TASK_GROUP_OPTIONS,
+} from '@app/features/next-soup/soup-view/group-options';
+import { useSoupView } from '@app/features/next-soup/soup-view/soup-view-context';
+import { useFeatureFlag } from '@app/lib/analytics/posthog';
+import { useSplitPanelOrThrow } from '@components/app/split-layout/layoutUtils';
+import { enableSoupGroupBy } from '@core/constant/featureFlags';
+import type { ButtonVariant } from '@ui';
+import { createMemo, createSignal, Show } from 'solid-js';
+
+export const SoupViewContextGroup = (props: {
+  grouped?: boolean;
+  hideLabel?: boolean;
+  variant?: ButtonVariant;
+}) => {
+  const panel = useSplitPanelOrThrow();
+  const { soup, extensions } = useSoupView();
+  const groupByEnabled = useFeatureFlag(enableSoupGroupBy);
+
+  const [groupOpen, setGroupOpen] = createSignal(false);
+
+  const component = createMemo(() => {
+    const content = panel.handle.content();
+    if (content.type !== 'component') return;
+    return content.id;
+  });
+
+  const isComponentListView = (listView: ListView) => {
+    return component() === listView;
+  };
+
+  const value = createMemo(
+    (): GroupOptionId =>
+      (soup.grouping.activeGroupId() as GroupOptionId) ?? 'none'
+  );
+
+  const onChange = (groupOption: GroupOptionId) => {
+    if (groupOption === 'none') {
+      soup.grouping.setActiveGroupId(undefined);
+    } else {
+      soup.grouping.setActiveGroupId(groupOption);
+      soup.grouping.expandAll();
+    }
+  };
+
+  return (
+    <Show when={groupByEnabled().enabled}>
+      <Show when={isComponentListView('tasks')}>
+        <GroupDropdown
+          grouped={props.grouped}
+          value={value}
+          onChange={onChange}
+          options={TASK_GROUP_OPTIONS}
+          open={groupOpen()}
+          onOpenChange={setGroupOpen}
+          hideLabel={props.hideLabel}
+          variant={props.variant}
+        />
+      </Show>
+      {/* The board is inherently grouped by stage columns, so grouping only
+          applies to the list mode. */}
+      <Show when={extensions?.groupOptions?.visible()}>
+        <GroupDropdown
+          grouped={props.grouped}
+          value={value}
+          onChange={onChange}
+          options={extensions?.groupOptions?.options ?? []}
+          open={groupOpen()}
+          onOpenChange={setGroupOpen}
+          hideLabel={props.hideLabel}
+          variant={props.variant}
+        />
+      </Show>
+      <Show when={component() === 'tag'}>
+        <GroupDropdown
+          grouped={props.grouped}
+          value={value}
+          onChange={onChange}
+          options={TAG_VIEW_GROUP_OPTIONS}
+          open={groupOpen()}
+          onOpenChange={setGroupOpen}
+          hideLabel={props.hideLabel}
+          variant={props.variant}
+        />
+      </Show>
+    </Show>
+  );
+};

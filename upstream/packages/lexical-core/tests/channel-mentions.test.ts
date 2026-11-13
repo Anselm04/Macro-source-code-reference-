@@ -1,0 +1,166 @@
+import { describe, expect, it } from 'vitest';
+import { extractChannelMentionsFromMarkdown } from '../utils/markdown-mentions';
+
+function documentMention(id: string, blockName: string): string {
+  return `<m-document-mention>{"documentId":"${id}","blockName":"${blockName}","documentName":"Doc","blockParams":{}}</m-document-mention>`;
+}
+
+describe('extractChannelMentionsFromMarkdown', () => {
+  it('keeps an expanded database referenced and deduplicates its compact mention', () => {
+    const card =
+      '<m-document-card>{"documentId":"db-1","documentName":"Tasks","blockName":"database"}</m-document-card>';
+    expect(
+      extractChannelMentionsFromMarkdown(
+        `${card}\n\n${documentMention('db-1', 'database')}`
+      )
+    ).toEqual([{ entityType: 'database', entityId: 'db-1' }]);
+  });
+  it('returns no mentions for plain text', () => {
+    expect(extractChannelMentionsFromMarkdown('just some text')).toEqual([]);
+  });
+
+  it('extracts a document mention', () => {
+    const markdown = `see ${documentMention('doc-1', 'md')}`;
+    expect(extractChannelMentionsFromMarkdown(markdown)).toEqual([
+      { entityType: 'document', entityId: 'doc-1' },
+    ]);
+  });
+
+  it('maps block names to entity types', () => {
+    const cases: [string, string][] = [
+      ['md', 'document'],
+      ['pdf', 'document'],
+      ['channel', 'channel'],
+      ['project', 'project'],
+      ['chat', 'chat'],
+      ['email', 'thread'],
+      ['call', 'call'],
+      ['calendar', 'calendar_event'],
+      ['automation', 'automation'],
+      ['routine', 'automation'],
+      ['company', 'crm_company'],
+      ['contact', 'crm_contact'],
+    ];
+    for (const [blockName, entityType] of cases) {
+      expect(
+        extractChannelMentionsFromMarkdown(documentMention('id-1', blockName)),
+        `block name ${blockName}`
+      ).toEqual([{ entityType, entityId: 'id-1' }]);
+    }
+  });
+
+  it('never sends a project mention as a channel reference', () => {
+    // A reference would share the project with the channel; nor is the
+    // initiative id a document.
+    expect(
+      extractChannelMentionsFromMarkdown(
+        `${documentMention('project-1', 'initiative')} ${documentMention('doc-1', 'md')}`
+      )
+    ).toEqual([{ entityType: 'document', entityId: 'doc-1' }]);
+  });
+
+  it('never sends a pipeline mention as a channel reference', () => {
+    expect(
+      extractChannelMentionsFromMarkdown(
+        `${documentMention('pipeline-1', 'pipeline')} ${documentMention('doc-1', 'md')}`
+      )
+    ).toEqual([{ entityType: 'document', entityId: 'doc-1' }]);
+  });
+
+  it('extracts user mentions and re-tags bot principals', () => {
+    const markdown =
+      '<m-user-mention>{"userId":"macro|a@b.com","email":"a@b.com"}</m-user-mention> and ' +
+      '<m-user-mention>{"userId":"bot|00000000-0000-0000-0000-00000000a1a1","email":"Macro"}</m-user-mention>';
+    expect(extractChannelMentionsFromMarkdown(markdown)).toEqual([
+      { entityType: 'user', entityId: 'macro|a@b.com' },
+      {
+        entityType: 'bot',
+        entityId: 'bot|00000000-0000-0000-0000-00000000a1a1',
+      },
+    ]);
+  });
+
+  it('deduplicates repeated mentions', () => {
+    const markdown = `${documentMention('doc-1', 'md')} twice ${documentMention('doc-1', 'md')}`;
+    expect(extractChannelMentionsFromMarkdown(markdown)).toHaveLength(1);
+  });
+
+  it('deduplicates routines across current and saved block names', () => {
+    expect(
+      extractChannelMentionsFromMarkdown(
+        `${documentMention('routine-1', 'routine')} ${documentMention('routine-1', 'automation')}`
+      )
+    ).toEqual([{ entityType: 'automation', entityId: 'routine-1' }]);
+  });
+
+  it('extracts mentions from content containing bare angle brackets', () => {
+    const markdown = `1 < 2 and ${documentMention('doc-1', 'md')}`;
+    expect(extractChannelMentionsFromMarkdown(markdown)).toEqual([
+      { entityType: 'document', entityId: 'doc-1' },
+    ]);
+  });
+
+  it('extracts mentions across multiple lines and formatting', () => {
+    const markdown = `# heading\n\n- a list item with ${documentMention('doc-9', 'email')}\n\nand a user <m-user-mention>{"userId":"macro|a@b.com","email":"a@b.com"}</m-user-mention>`;
+    expect(extractChannelMentionsFromMarkdown(markdown)).toEqual([
+      { entityType: 'thread', entityId: 'doc-9' },
+      { entityType: 'user', entityId: 'macro|a@b.com' },
+    ]);
+  });
+});
+
+it('preserves authored groups for server-side recipient expansion', () => {
+  expect(
+    extractChannelMentionsFromMarkdown(
+      '<m-group-mention>{"groupAlias":"here"}</m-group-mention>'
+    )
+  ).toEqual([{ entityType: 'group', entityId: 'here' }]);
+});
+
+it('references the forms an agent reply presents in its activity cards', () => {
+  // An agent that presents a form it made posts it only as a card in the
+  // reply's steps; without a reference, channel delivery never shares the
+  // form and channel members are denied it.
+  const activity = {
+    agentSessionId: 'session-1',
+    turn: 0,
+    segment: 0,
+    sealed: true,
+    rows: [
+      { id: 'create', label: 'Create Form', status: 'completed' },
+      {
+        id: 'view-1',
+        label: 'Present view',
+        status: 'completed',
+        card: {
+          kind: 'view',
+          view: {
+            widgets: [
+              { type: 'cards', items: [{ type: 'form', id: 'form-1' }] },
+              {
+                type: 'container',
+                children: [
+                  {
+                    type: 'cards',
+                    items: [
+                      { type: 'form', id: 'form-2' },
+                      { type: 'document', id: 'doc-1' },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    ],
+  };
+  expect(
+    extractChannelMentionsFromMarkdown(
+      `<m-agent-activity>${JSON.stringify(activity)}</m-agent-activity>\n\nI built the form.`
+    )
+  ).toEqual([
+    { entityType: 'form', entityId: 'form-1' },
+    { entityType: 'form', entityId: 'form-2' },
+  ]);
+});

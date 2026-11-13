@@ -1,0 +1,412 @@
+import {
+  addDays,
+  addYears,
+  format,
+  getYear,
+  isValid,
+  parse,
+  setYear,
+} from 'date-fns';
+import { type Accessor, createMemo } from 'solid-js';
+import {
+  formatDuration,
+  parseDateFromDuration,
+  parseDurationString,
+} from './dateParser';
+import { type ParsedTime, parseTime } from './parseTime';
+import { searchPresets } from './presets';
+
+// Max number of presets to include
+const PRESET_COUNT = 5;
+
+const DEFAULT_MAX_ITEMS = 10;
+
+export interface DateOption {
+  id: string;
+  displayText: string;
+  secondaryText?: string;
+  date: Date;
+  type: 'duration' | 'preset' | 'natural' | 'absolute';
+  score?: number;
+}
+
+const possibleDateFormats = [
+  'MMM d', // "Jan 15"
+  'MMMM d', // "January 15"
+  'MMM d yyyy', // "Jan 15 2024"
+  'MMMM d yyyy', // "January 15 2024"
+  'M/d', // "1/15"
+  'M/d/yyyy', // "1/15/2024"
+  'MM/dd', // "01/15"
+  'MM/dd/yyyy', // "01/15/2024"
+  'd MMM', // "15 Jan"
+  'd MMMM', // "15 January"
+  'd MMM yyyy', // "15 Jan 2024"
+  'd MMMM yyyy', // "15 January 2024"
+  'yyyy-MM-dd', // "2024-01-15"
+  'dd-MM-yyyy', // "15-01-2024"
+];
+
+/**
+ * Format a parsed time for display, e.g. "9 AM", "3:30 PM"
+ */
+function formatParsedTime(time: ParsedTime): string {
+  const h = time.hours % 12 || 12;
+  const meridiem = time.hours >= 12 ? 'PM' : 'AM';
+  if (time.minutes === 0) {
+    return `${h} ${meridiem}`;
+  }
+  return `${h}:${time.minutes.toString().padStart(2, '0')} ${meridiem}`;
+}
+
+/**
+ * Apply a parsed time to a date, returning a new Date with the time set.
+ */
+function applyTime(date: Date, time: ParsedTime): Date {
+  const result = new Date(date);
+  result.setHours(time.hours, time.minutes, 0, 0);
+  return result;
+}
+
+/**
+ * Parse natural date strings like "feb 17", "march 3", "jan 1 2025", etc.
+ */
+function parseNaturalDate(
+  input: string,
+  baseDate: Date = new Date()
+): Date | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  for (const formatStr of possibleDateFormats) {
+    try {
+      const parsed = parse(trimmed, formatStr, baseDate);
+      if (isValid(parsed)) {
+        const hasYear = /\d{4}/.test(trimmed);
+        if (!hasYear) {
+          const currentYear = getYear(baseDate);
+          let adjustedDate = setYear(parsed, currentYear);
+
+          const sixMonthsAgo = new Date(baseDate);
+          sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+          const adjustedDateOnly = new Date(adjustedDate);
+          adjustedDateOnly.setHours(0, 0, 0, 0);
+          const sixMonthsAgoDateOnly = new Date(sixMonthsAgo);
+          sixMonthsAgoDateOnly.setHours(0, 0, 0, 0);
+
+          if (adjustedDateOnly < sixMonthsAgoDateOnly) {
+            adjustedDate = addYears(adjustedDate, 1);
+          }
+
+          return adjustedDate;
+        }
+
+        return parsed;
+      }
+    } catch {}
+  }
+
+  const lowerInput = trimmed.toLowerCase();
+  const now = new Date(baseDate);
+
+  const daysOfWeek = [
+    'sunday',
+    'monday',
+    'tuesday',
+    'wednesday',
+    'thursday',
+    'friday',
+    'saturday',
+  ];
+
+  // Map of common abbreviations and misspellings to day index
+  const dayAbbreviations: Record<string, number> = {
+    sun: 0,
+    sunday: 0,
+    mon: 1,
+    monday: 1,
+    mndy: 1,
+    tue: 2,
+    tues: 2,
+    tuesday: 2,
+    tu: 2,
+    wed: 3,
+    weds: 3,
+    wednes: 3,
+    wednesday: 3,
+    thu: 4,
+    thur: 4,
+    thurs: 4,
+    thursday: 4,
+    fri: 5,
+    friday: 5,
+    sat: 6,
+    saturday: 6,
+  };
+
+  // Check against the abbreviation map first
+  let dayIndex = dayAbbreviations[lowerInput];
+
+  // Fallback to prefix matching if no exact match
+  if (dayIndex === undefined) {
+    dayIndex = daysOfWeek.findIndex(
+      (day) => day.startsWith(lowerInput) && lowerInput.length >= 2
+    );
+  }
+
+  if (dayIndex !== undefined && dayIndex !== -1) {
+    const currentDay = now.getDay();
+    let daysToAdd = dayIndex - currentDay;
+
+    if (daysToAdd <= 0) {
+      daysToAdd += 7;
+    }
+
+    const result = new Date(now);
+    result.setDate(result.getDate() + daysToAdd);
+    return result;
+  }
+
+  return null;
+}
+
+/**
+ * Score how well an option matches the query
+ */
+function scoreMatch(
+  option: DateOption,
+  query: string,
+  keywords?: string[]
+): number {
+  const lowerQuery = query.toLowerCase();
+  const lowerDisplay = option.displayText.toLowerCase();
+
+  if (lowerDisplay === lowerQuery) return 100;
+  if (lowerDisplay.startsWith(lowerQuery)) return 90;
+  if (lowerDisplay.includes(lowerQuery)) return 70;
+
+  // Keyword matches: exact, prefix while typing, or leading token ("tmrw 8")
+  if (keywords) {
+    const queryTokens = lowerQuery.split(/\s+/).filter(Boolean);
+    const queryMatchesKeyword = keywords.some((kw) => {
+      const lowerKw = kw.toLowerCase();
+      return (
+        lowerKw === lowerQuery ||
+        lowerKw.startsWith(lowerQuery) ||
+        lowerQuery.startsWith(`${lowerKw} `) ||
+        queryTokens.includes(lowerKw)
+      );
+    });
+    if (queryMatchesKeyword) return 85;
+  }
+
+  if (option.secondaryText) {
+    const lowerSecondary = option.secondaryText.toLowerCase();
+    if (lowerSecondary.includes(lowerQuery)) return 50;
+  }
+
+  return 0;
+}
+
+/**
+ * Format a date for display with relative context
+ */
+function formatDateWithContext(
+  date: Date,
+  baseDate: Date = new Date(),
+  showTime = true
+): string {
+  const now = new Date(baseDate);
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const dateOnly = new Date(
+    date.getFullYear(),
+    date.getMonth(),
+    date.getDate()
+  );
+
+  const diffDays = Math.floor(
+    (dateOnly.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)
+  );
+
+  if (diffDays === 0) {
+    return showTime ? `Today, ${format(date, 'h:mm a')}` : 'Today';
+  } else if (diffDays === 1) {
+    return showTime ? `Tomorrow, ${format(date, 'h:mm a')}` : 'Tomorrow';
+  } else if (diffDays === -1) {
+    return showTime ? `Yesterday, ${format(date, 'h:mm a')}` : 'Yesterday';
+  } else if (diffDays > 0 && diffDays <= 7) {
+    return showTime
+      ? format(date, "EEEE, MMM d 'at' h:mm a")
+      : format(date, 'EEEE, MMM d');
+  } else {
+    const sameYear = date.getFullYear() === now.getFullYear();
+    if (showTime) {
+      return sameYear
+        ? format(date, "MMM d 'at' h:mm a")
+        : format(date, "MMM d, yyyy 'at' h:mm a");
+    }
+    return sameYear ? format(date, 'MMM d') : format(date, 'MMM d, yyyy');
+  }
+}
+
+export function useDateSearch(params: {
+  query: Accessor<string>;
+  baseDate?: Date;
+  defaultTime?: ParsedTime;
+  showTimeInResults?: boolean;
+  maxItems?: number;
+}) {
+  const baseDate = params.baseDate || new Date();
+
+  const dateOptions = createMemo(() => {
+    const query = params.query().trim();
+    const options: DateOption[] = [];
+
+    if (!query) {
+      const presets = searchPresets('');
+      return presets
+        .map((preset): DateOption => {
+          let date = preset.getDate(baseDate);
+          if (params.defaultTime) {
+            date = applyTime(date, params.defaultTime);
+          }
+          return {
+            id: preset.id,
+            displayText: preset.label,
+            secondaryText: formatDateWithContext(
+              date,
+              baseDate,
+              params.showTimeInResults ?? true
+            ),
+            date,
+            type: 'preset',
+            score: 0,
+          };
+        })
+        .filter((option) => option.date > new Date())
+        .slice(0, PRESET_COUNT);
+    }
+
+    // Extract time component if present (e.g., "9am", "tomorrow 3:30pm")
+    const parsedTime = parseTime(query);
+    const dateQuery = parsedTime ? parsedTime.rest : query;
+
+    // 1. Try parsing as duration DSL (3d, 1w, etc.)
+    // Only parse the date portion; if time was extracted and nothing remains, skip duration parsing
+    const durationInput = parsedTime ? dateQuery : query;
+    const parsedDuration = durationInput
+      ? parseDurationString(durationInput)
+      : null;
+    if (parsedDuration) {
+      let durationDate = parseDateFromDuration(durationInput, new Date());
+      if (durationDate) {
+        if (parsedTime) {
+          durationDate = applyTime(durationDate, parsedTime.time);
+        }
+        options.push({
+          id: `duration-${query}`,
+          displayText: `${query} (${formatDuration(parsedDuration)} from now)`,
+          secondaryText: formatDateWithContext(
+            durationDate,
+            baseDate,
+            params.showTimeInResults ?? true
+          ),
+          date: durationDate,
+          type: 'duration',
+          score: 100,
+        });
+      }
+    }
+
+    // 2. Standalone time with no date part (e.g., "9am", "3:30pm") → today, or tomorrow if past
+    if (parsedTime && !dateQuery) {
+      const now = new Date();
+      let todayWithTime = applyTime(now, parsedTime.time);
+      if (todayWithTime <= now) {
+        todayWithTime = addDays(todayWithTime, 1);
+      }
+      options.push({
+        id: `time-${query}`,
+        displayText: query,
+        secondaryText: formatDateWithContext(
+          todayWithTime,
+          baseDate,
+          params.showTimeInResults ?? true
+        ),
+        date: todayWithTime,
+        type: 'natural',
+        score: 98,
+      });
+    }
+
+    // 3. Try parsing as natural date (feb 17, march 3, thursday, etc.)
+    const naturalQuery = dateQuery || query;
+    let naturalDate = parseNaturalDate(naturalQuery, baseDate);
+    if (naturalDate) {
+      const naturalTime = parsedTime?.time ?? params.defaultTime;
+      if (naturalTime) {
+        naturalDate = applyTime(naturalDate, naturalTime);
+      }
+      const displayText = parsedTime
+        ? `${naturalQuery} at ${formatParsedTime(parsedTime.time)}`
+        : query;
+      options.push({
+        id: `natural-${query}`,
+        displayText,
+        secondaryText: formatDateWithContext(
+          naturalDate,
+          baseDate,
+          params.showTimeInResults ?? true
+        ),
+        date: naturalDate,
+        type: 'natural',
+        score: 95,
+      });
+    }
+
+    // Search presets using both the full query and the date-only part (time stripped)
+    const presetQuery = parsedTime && dateQuery ? dateQuery : query;
+    const matchingPresets = searchPresets(presetQuery);
+    const effectiveTime = parsedTime?.time ?? params.defaultTime;
+    matchingPresets.forEach((preset) => {
+      let date = preset.getDate(baseDate);
+      if (effectiveTime) {
+        date = applyTime(date, effectiveTime);
+      }
+      const option: DateOption = {
+        id: `preset-${preset.id}`,
+        displayText: parsedTime
+          ? `${preset.label} at ${formatParsedTime(parsedTime.time)}`
+          : preset.label,
+        secondaryText: formatDateWithContext(
+          date,
+          baseDate,
+          params.showTimeInResults ?? true
+        ),
+        date,
+        type: 'preset',
+        score: 0,
+      };
+
+      option.score = scoreMatch(option, presetQuery, preset.keywords);
+
+      if (option.score > 0) {
+        options.push(option);
+      }
+    });
+
+    options.sort((a, b) => {
+      const scoreDiff = (b.score || 0) - (a.score || 0);
+      if (scoreDiff !== 0) return scoreDiff;
+      return a.date.getTime() - b.date.getTime();
+    });
+
+    return options.slice(0, params.maxItems ?? DEFAULT_MAX_ITEMS);
+  });
+
+  return dateOptions;
+}
+
+// Export helper functions for testing
+export { formatDateWithContext, parseNaturalDate, parseTime };

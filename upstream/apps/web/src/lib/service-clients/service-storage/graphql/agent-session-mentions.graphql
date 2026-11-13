@@ -1,0 +1,21 @@
+query AgentSessionMentions($input: SoupInput!) {
+  user {
+    id
+    soup(input: $input) {
+      items {
+        __typename
+        id
+        ... on GraphqlSoupAgentSession {
+          name
+          ownerId
+          botId
+          harness
+          bot { id name avatarUrl }
+          status
+          createdAt
+          updatedAt
+        }
+      }
+    }
+  }
+}

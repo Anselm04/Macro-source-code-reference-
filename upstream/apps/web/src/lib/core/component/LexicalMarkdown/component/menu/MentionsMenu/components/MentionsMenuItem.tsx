@@ -1,0 +1,197 @@
+import { supportsEntityAppearance } from '@app/features/entity-appearance/core/appearance';
+import { AgentOfflineBadge } from '@core/component/AgentOfflineBadge';
+import { EntityIcon } from '@core/component/EntityIcon';
+import { TaskStatusIcon } from '@core/component/TaskStatusIcon';
+import { UserIcon } from '@core/component/UserIcon';
+import { type ChannelEntity, isTaskEntity } from '@entity/types/entity';
+import { getTaskStatusOptionId } from '@entity/utils/task-properties';
+import CalendarBlankIcon from '@icon/system/regular/calendar-blank.svg';
+import ClockIcon from '@icon/system/regular/clock.svg';
+import EmailIcon from '@icon/system/regular/envelope.svg';
+import UsersIcon from '@icon/system/regular/users.svg';
+import { cn } from '@ui';
+import { createEffect, type JSX, Show } from 'solid-js';
+import { match } from 'ts-pattern';
+import type { MentionItem } from '../../../../utils/mentionsUtils';
+import { isBotMentionItem } from '../utils/botMention';
+import {
+  getBlockNameFromEntity,
+  getMentionItemName,
+} from '../utils/entityUtils';
+
+export function MentionsMenuItem(props: {
+  item: MentionItem;
+  index: number;
+  selected: boolean;
+  itemAction: (item: MentionItem) => void;
+  setIndex: (index: number) => void;
+  setOpen: (open: boolean) => void;
+  /** When true, disables the internal scrollIntoView behavior (used when list is virtualized) */
+  disableScrollIntoView?: boolean;
+  /** The agent's runtime is not connected, so mentioning it would go nowhere. */
+  offline?: boolean;
+  actions?: JSX.Element;
+}) {
+  let itemRef: HTMLDivElement | undefined;
+
+  createEffect(() => {
+    if (props.selected && itemRef && !props.disableScrollIntoView) {
+      itemRef.scrollIntoView({ block: 'nearest' });
+    }
+  });
+
+  const name = () => getMentionItemName(props.item);
+
+  const labelParts = () =>
+    match(props.item)
+      .with({ kind: 'user' }, ({ data: { name, email } }) => ({
+        name: name || email,
+        detail: name && name !== email ? email : undefined,
+      }))
+      .with({ kind: 'entity', data: { type: 'crm_contact' } }, ({ data }) => ({
+        name: data.name || data.email,
+        detail: data.name && data.name !== data.email ? data.email : undefined,
+      }))
+      .with({ kind: 'agentSession' }, ({ data }) => ({
+        name: data.name || 'Agent session',
+        detail: data.bot?.name ? `@${data.bot.name}` : undefined,
+      }))
+      .with({ kind: 'bookingLink' }, ({ data }) => ({
+        name: data.title,
+        detail: `${data.durationMinutes} min · ${data.owner}`,
+      }))
+      .with({ kind: 'calendarEvent' }, ({ data }) => ({
+        name: data.title,
+        detail: data.when,
+      }))
+      .otherwise(() => ({ name: name(), detail: undefined }));
+
+  const icon = () => {
+    switch (props.item.kind) {
+      case 'user':
+        return (
+          <UserIcon
+            id={props.item.id}
+            name={props.item.data.name}
+            size="sm"
+            isDeleted={false}
+            photoUrl={props.item.data.photoUrl}
+          />
+        );
+
+      case 'agentSession':
+        return <EntityIcon targetType="agent" size="xs" />;
+      case 'group':
+        return <UsersIcon class="size-4 text-ink-muted" />;
+
+      case 'date':
+        return <ClockIcon class="size-4 text-ink-muted" />;
+
+      case 'bookingLink':
+        return <CalendarBlankIcon class="size-4 text-accent" />;
+      case 'externalChat':
+        return (
+          <EntityIcon
+            targetType="external_chat"
+            provider={props.item.data.provider}
+            size="xs"
+          />
+        );
+
+      case 'calendarEvent':
+        return <EntityIcon targetType="calendar" size="xs" />;
+      case 'routine':
+        return <EntityIcon targetType="routine" size="xs" />;
+
+      case 'entity':
+        if (props.item.bucket === 'email') {
+          return <EmailIcon class="size-4 text-ink-muted" />;
+        }
+        if (props.item.bucket === 'channel' || props.item.bucket === 'dm') {
+          const entity = props.item.data as ChannelEntity;
+          return (
+            <EntityIcon
+              size="xs"
+              targetType={entity.channelType || 'channel'}
+            />
+          );
+        }
+        if (isTaskEntity(props.item.data)) {
+          return (
+            <TaskStatusIcon
+              statusId={getTaskStatusOptionId(props.item.data)}
+              completed={props.item.data.subType.is_completed}
+              size="xs"
+            />
+          );
+        }
+        return (
+          <EntityIcon
+            targetType={getBlockNameFromEntity(props.item)}
+            appearance={
+              supportsEntityAppearance(props.item.data)
+                ? props.item.data.appearance
+                : undefined
+            }
+            size="xs"
+          />
+        );
+    }
+  };
+
+  return (
+    <div
+      ref={itemRef}
+      on:mouseup={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+      on:pointerdown={(e) => {
+        e.preventDefault();
+      }}
+      on:mousedown={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+      on:click={(e) => {
+        e.stopPropagation();
+        // An offline agent stays visible so its absence is explained, but
+        // picking it would insert a mention nothing will answer.
+        if (props.offline) return;
+        props.itemAction(props.item);
+        props.setOpen(false);
+      }}
+      on:mousemove={() => props.setIndex(props.index)}
+      aria-disabled={props.offline ? 'true' : undefined}
+      class={cn('group flex items-center p-1.5 mx-1.5 rounded-md', {
+        'bg-ink/5': props.selected,
+      })}
+    >
+      <div class="mr-2 flex items-center">{icon()}</div>
+      <div class="flex min-w-0 grow items-center gap-2">
+        <span
+          class={cn(
+            'ph-no-capture min-w-0 max-w-full overflow-hidden text-nowrap text-xs sm:text-sm font-medium',
+            props.offline ? 'text-ink-muted' : 'text-ink'
+          )}
+          title={props.offline ? `${name()} — offline` : name()}
+          style={{ 'text-overflow': 'ellipsis' }}
+        >
+          {labelParts().name}
+          <Show when={labelParts().detail}>
+            {(detail) => <span class="ml-[0.5em] opacity-50">{detail()}</span>}
+          </Show>
+        </span>
+        <Show when={isBotMentionItem(props.item)}>
+          <span class="inline-flex shrink-0 items-center rounded-sm bg-hover px-1.5 py-0.5 text-[10px] font-medium leading-none text-ink-muted">
+            Agent
+          </span>
+        </Show>
+        <Show when={props.offline}>
+          <AgentOfflineBadge />
+        </Show>
+      </div>
+      {props.actions}
+    </div>
+  );
+}

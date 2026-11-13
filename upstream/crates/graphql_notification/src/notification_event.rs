@@ -1,0 +1,1683 @@
+//! Typed GraphQL output models for realtime notification event metadata.
+
+mod external_chat;
+use external_chat::GraphqlExternalChatMessageMetadata;
+
+/// Schema-only stub for released clients; remove after 2026-11-30.
+mod whatsapp_group_stub;
+use whatsapp_group_stub::GraphqlWhatsappGroupMessageMetadata;
+
+/// Project discussion notification metadata.
+mod initiative_discussion;
+pub use initiative_discussion::GraphqlInitiativeDiscussionMetadata;
+
+/// CRM company and contact discussion notification metadata.
+mod crm_discussion;
+pub use crm_discussion::GraphqlCrmDiscussionMetadata;
+
+/// Request to join a channel-shared calendar event notification metadata.
+mod calendar_join_request;
+pub use calendar_join_request::GraphqlCalendarEventJoinRequestMetadata;
+/// Request-to-join-a-channel notification metadata.
+mod channel_access_request;
+pub use channel_access_request::GraphqlChannelAccessRequestedMetadata;
+
+use async_graphql::{Enum, ID, Object, Union};
+use model_notifications::{
+    AgentProvider, AgentSessionMentionedMetadata, AgentSessionNotificationRef,
+    AgentSessionSettledMetadata, AgentSessionWaitingForInputMetadata, AgentSignInExpiryMetadata,
+    AgentSignInExpiryStage, AiResponseMetadata, CalendarEventReminderMetadata, CallStartedMetadata,
+    ChannelInviteMetadata, ChannelMentionMetadata, ChannelMessageReactionMetadata,
+    ChannelMessageSendMetadata, ChannelReplyMetadata, ChannelType, CommentedOnDocumentMetadata,
+    ComputerSetupMetadata, ComputerSetupOutcome, DocumentMentionMetadata, GithubPrCheckRun,
+    GithubPrCheckRunState, GithubPrComment, GithubPrCommentKind, GithubPrEventAction,
+    GithubPrEventStatus, GithubPrMention, GithubPrMentionLocation, GithubPrNotificationCommon,
+    GithubPrReview, GithubPrReviewState, GithubPrStatusChanged, GithubReviewRequested,
+    InboxReauthRequiredMetadata, InviteToTeamMetadata, MentionedInDocumentCommentMetadata,
+    NewEmailMetadata, NotifEvent, NotificationDocumentSubType, ReminderMetadata,
+    RepliedToDocumentCommentThreadMetadata, RoutineRunFinishedMetadata, RoutineRunOutcome,
+    RuntimeAccessRemovedMetadata, StoppedAgent, TaskAssignedMetadata,
+};
+
+/// GraphQL channel type used by notification metadata.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlNotificationChannelType {
+    /// Public channel.
+    Public,
+    /// Private channel.
+    Private,
+    /// Direct-message channel.
+    DirectMessage,
+    /// Team channel.
+    Team,
+}
+
+impl From<ChannelType> for GraphqlNotificationChannelType {
+    fn from(value: ChannelType) -> Self {
+        match value {
+            ChannelType::Public => Self::Public,
+            ChannelType::Private => Self::Private,
+            ChannelType::DirectMessage => Self::DirectMessage,
+            ChannelType::Team => Self::Team,
+        }
+    }
+}
+
+/// GraphQL document subtype used by notification metadata.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlNotificationDocumentSubType {
+    /// Task document.
+    Task,
+    /// Snippet document.
+    Snippet,
+    /// Skill document.
+    Skill,
+    /// The description document of an initiative.
+    InitiativeDescription,
+}
+
+impl From<NotificationDocumentSubType> for GraphqlNotificationDocumentSubType {
+    fn from(value: NotificationDocumentSubType) -> Self {
+        match value {
+            NotificationDocumentSubType::Task => Self::Task,
+            NotificationDocumentSubType::Snippet => Self::Snippet,
+            NotificationDocumentSubType::Skill => Self::Skill,
+            NotificationDocumentSubType::InitiativeDescription => Self::InitiativeDescription,
+        }
+    }
+}
+
+/// GraphQL GitHub pull-request lifecycle status.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlGithubPrEventStatus {
+    /// Open pull request.
+    Open,
+    /// Closed pull request.
+    Closed,
+    /// Merged pull request.
+    Merged,
+}
+
+impl From<GithubPrEventStatus> for GraphqlGithubPrEventStatus {
+    fn from(value: GithubPrEventStatus) -> Self {
+        match value {
+            GithubPrEventStatus::Open => Self::Open,
+            GithubPrEventStatus::Closed => Self::Closed,
+            GithubPrEventStatus::Merged => Self::Merged,
+        }
+    }
+}
+
+/// GraphQL GitHub pull-request action.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlGithubPrEventAction {
+    /// Pull request opened.
+    Opened,
+    /// Pull request reopened.
+    Reopened,
+    /// Pull request closed.
+    Closed,
+}
+
+impl From<GithubPrEventAction> for GraphqlGithubPrEventAction {
+    fn from(value: GithubPrEventAction) -> Self {
+        match value {
+            GithubPrEventAction::Opened => Self::Opened,
+            GithubPrEventAction::Reopened => Self::Reopened,
+            GithubPrEventAction::Closed => Self::Closed,
+        }
+    }
+}
+
+/// GraphQL GitHub check-run state.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlGithubPrCheckRunState {
+    /// Check completed successfully.
+    Completed,
+    /// Check completed with a failure-like result.
+    Failed,
+}
+
+impl From<GithubPrCheckRunState> for GraphqlGithubPrCheckRunState {
+    fn from(value: GithubPrCheckRunState) -> Self {
+        match value {
+            GithubPrCheckRunState::Completed => Self::Completed,
+            GithubPrCheckRunState::Failed => Self::Failed,
+        }
+    }
+}
+
+/// GraphQL GitHub pull-request comment kind.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlGithubPrCommentKind {
+    /// Top-level issue comment.
+    Issue,
+    /// Inline review comment.
+    ReviewComment,
+}
+
+impl From<GithubPrCommentKind> for GraphqlGithubPrCommentKind {
+    fn from(value: GithubPrCommentKind) -> Self {
+        match value {
+            GithubPrCommentKind::Issue => Self::Issue,
+            GithubPrCommentKind::ReviewComment => Self::ReviewComment,
+        }
+    }
+}
+
+/// GraphQL location of a GitHub pull-request mention.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlGithubPrMentionLocation {
+    /// Pull-request body.
+    PrBody,
+    /// Top-level comment.
+    Comment,
+    /// Review summary.
+    Review,
+    /// Inline review comment.
+    ReviewComment,
+}
+
+impl From<GithubPrMentionLocation> for GraphqlGithubPrMentionLocation {
+    fn from(value: GithubPrMentionLocation) -> Self {
+        match value {
+            GithubPrMentionLocation::PrBody => Self::PrBody,
+            GithubPrMentionLocation::Comment => Self::Comment,
+            GithubPrMentionLocation::Review => Self::Review,
+            GithubPrMentionLocation::ReviewComment => Self::ReviewComment,
+        }
+    }
+}
+
+/// GraphQL state of a GitHub pull-request review.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlGithubPrReviewState {
+    /// Review approved the pull request.
+    Approved,
+    /// Review requested changes.
+    ChangesRequested,
+    /// Review left comments without an approval decision.
+    Commented,
+}
+
+impl From<GithubPrReviewState> for GraphqlGithubPrReviewState {
+    fn from(value: GithubPrReviewState) -> Self {
+        match value {
+            GithubPrReviewState::Approved => Self::Approved,
+            GithubPrReviewState::ChangesRequested => Self::ChangesRequested,
+            GithubPrReviewState::Commented => Self::Commented,
+        }
+    }
+}
+
+/// GraphQL wrapper for fields shared by channel notification metadata.
+pub struct GraphqlChannelNotificationCommon(model_notifications::CommonChannelMetadata);
+
+/// Fields shared by channel notification metadata.
+#[Object]
+impl GraphqlChannelNotificationCommon {
+    /// Channel type.
+    async fn channel_type(&self) -> GraphqlNotificationChannelType {
+        self.0.channel_type.into()
+    }
+
+    /// Channel display name.
+    async fn channel_name(&self) -> &str {
+        &self.0.channel_name
+    }
+}
+
+/// GraphQL wrapper for fields shared by GitHub pull-request notification metadata.
+pub struct GraphqlGithubPrNotificationCommon(GithubPrNotificationCommon);
+
+/// Fields shared by GitHub pull-request notification metadata.
+#[Object]
+impl GraphqlGithubPrNotificationCommon {
+    /// Internal foreign-entity identifier.
+    async fn foreign_entity_id(&self) -> ID {
+        ID(self.0.foreign_entity_id.to_string())
+    }
+
+    /// External GitHub key.
+    async fn github_key(&self) -> &str {
+        &self.0.github_key
+    }
+
+    /// Repository owner or organization.
+    async fn owner(&self) -> &str {
+        &self.0.owner
+    }
+
+    /// Repository name.
+    async fn repo(&self) -> &str {
+        &self.0.repo
+    }
+
+    /// Pull-request number.
+    async fn number(&self) -> String {
+        self.0.number.to_string()
+    }
+
+    /// Public pull-request URL.
+    async fn url(&self) -> &str {
+        &self.0.url
+    }
+
+    /// Compact pull-request display label.
+    async fn display_name(&self) -> &str {
+        &self.0.display_name
+    }
+
+    /// Pull-request title.
+    async fn title(&self) -> &str {
+        &self.0.title
+    }
+
+    /// Sender GitHub login.
+    async fn sender_github_login(&self) -> Option<&str> {
+        self.0.sender_github_login.as_deref()
+    }
+
+    /// Sender GitHub user identifier.
+    async fn sender_github_user_id(&self) -> Option<&str> {
+        self.0.sender_github_user_id.as_deref()
+    }
+
+    /// Sender GitHub avatar URL.
+    async fn sender_github_avatar_url(&self) -> Option<&str> {
+        self.0.sender_github_avatar_url.as_deref()
+    }
+}
+
+/// GraphQL wrapper for channel mention metadata.
+pub struct GraphqlChannelMentionMetadata(ChannelMentionMetadata);
+
+/// Metadata for a channel mention notification.
+#[Object]
+impl GraphqlChannelMentionMetadata {
+    /// Mentioning message identifier.
+    async fn message_id(&self) -> &str {
+        &self.0.message_id
+    }
+
+    /// Mentioning message content.
+    async fn message_content(&self) -> &str {
+        &self.0.message_content
+    }
+
+    /// Whether the message has attachments.
+    async fn has_attachments(&self) -> bool {
+        self.0.has_attachments
+    }
+
+    /// Thread identifier, when the mention is in a thread.
+    async fn thread_id(&self) -> Option<&str> {
+        self.0.thread_id.as_deref()
+    }
+
+    /// Display name for a non-user sender.
+    async fn sender_display_name(&self) -> Option<&str> {
+        self.0.sender_display_name.as_deref()
+    }
+
+    /// Channel metadata.
+    #[graphql(flatten)]
+    async fn channel(&self) -> GraphqlChannelNotificationCommon {
+        GraphqlChannelNotificationCommon(self.0.common.clone())
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<&str> {
+        self.0.sender_profile_picture_url.as_deref()
+    }
+}
+
+/// GraphQL wrapper for document mention metadata.
+pub struct GraphqlDocumentMentionMetadata(DocumentMentionMetadata);
+
+/// Metadata for a document mention notification.
+#[Object]
+impl GraphqlDocumentMentionMetadata {
+    /// Mentioned document name.
+    async fn document_name(&self) -> &str {
+        &self.0.document_name
+    }
+
+    /// Document owner identifier.
+    async fn owner(&self) -> String {
+        self.0.owner.to_string()
+    }
+
+    /// Document file type.
+    async fn file_type(&self) -> Option<&str> {
+        self.0.file_type.as_deref()
+    }
+
+    /// Document subtype.
+    async fn sub_type(&self) -> Option<GraphqlNotificationDocumentSubType> {
+        self.0.sub_type.clone().map(Into::into)
+    }
+
+    /// Channel mention that referenced the document.
+    #[graphql(flatten)]
+    async fn channel(&self) -> GraphqlChannelMentionMetadata {
+        GraphqlChannelMentionMetadata(self.0.channel.clone())
+    }
+}
+
+/// GraphQL wrapper for a mention in document comment metadata.
+pub struct GraphqlMentionedInDocumentCommentMetadata(MentionedInDocumentCommentMetadata);
+
+/// Metadata for a mention in a document comment.
+#[Object]
+impl GraphqlMentionedInDocumentCommentMetadata {
+    /// Document name.
+    async fn document_name(&self) -> &str {
+        &self.0.document_name
+    }
+
+    /// Document owner identifier.
+    async fn owner(&self) -> String {
+        self.0.owner.to_string()
+    }
+
+    /// Document file type.
+    async fn file_type(&self) -> Option<&str> {
+        self.0.file_type.as_deref()
+    }
+
+    /// Document subtype.
+    async fn sub_type(&self) -> Option<GraphqlNotificationDocumentSubType> {
+        self.0.sub_type.clone().map(Into::into)
+    }
+
+    /// Mention identifier.
+    async fn mention_id(&self) -> &str {
+        &self.0.mention_id
+    }
+
+    /// Comment identifier: a legacy numeric comment id, or the message id in
+    /// the shared message store.
+    async fn comment_id(&self) -> String {
+        self.0.comment_id.to_string()
+    }
+
+    /// Comment thread identifier: a legacy numeric thread id, or the root
+    /// message id in the shared message store.
+    async fn thread_id(&self) -> String {
+        self.0.thread_id.to_string()
+    }
+
+    /// Comment text.
+    async fn text(&self) -> &str {
+        &self.0.text
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<&str> {
+        self.0.sender_profile_picture_url.as_deref()
+    }
+    /// Display name for a non-user sender.
+    async fn sender_display_name(&self) -> Option<&str> {
+        self.0.sender_display_name.as_deref()
+    }
+}
+
+/// GraphQL wrapper for document comment thread reply metadata.
+pub struct GraphqlRepliedToDocumentCommentThreadMetadata(RepliedToDocumentCommentThreadMetadata);
+
+/// Metadata for a reply to a document comment thread.
+#[Object]
+impl GraphqlRepliedToDocumentCommentThreadMetadata {
+    /// Document name.
+    async fn document_name(&self) -> &str {
+        &self.0.document_name
+    }
+
+    /// Document owner identifier.
+    async fn owner(&self) -> String {
+        self.0.owner.to_string()
+    }
+
+    /// Document file type.
+    async fn file_type(&self) -> Option<&str> {
+        self.0.file_type.as_deref()
+    }
+
+    /// Document subtype.
+    async fn sub_type(&self) -> Option<GraphqlNotificationDocumentSubType> {
+        self.0.sub_type.clone().map(Into::into)
+    }
+
+    /// Comment identifier: a legacy numeric comment id, or the message id in
+    /// the shared message store.
+    async fn comment_id(&self) -> String {
+        self.0.comment_id.to_string()
+    }
+
+    /// Comment thread identifier: a legacy numeric thread id, or the root
+    /// message id in the shared message store.
+    async fn thread_id(&self) -> String {
+        self.0.thread_id.to_string()
+    }
+
+    /// Reply text.
+    async fn text(&self) -> &str {
+        &self.0.text
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<&str> {
+        self.0.sender_profile_picture_url.as_deref()
+    }
+    /// Display name for a non-user sender.
+    async fn sender_display_name(&self) -> Option<&str> {
+        self.0.sender_display_name.as_deref()
+    }
+}
+
+/// GraphQL wrapper for document comment metadata.
+pub struct GraphqlCommentedOnDocumentMetadata(CommentedOnDocumentMetadata);
+
+/// Metadata for a comment on a document.
+#[Object]
+impl GraphqlCommentedOnDocumentMetadata {
+    /// Document name.
+    async fn document_name(&self) -> &str {
+        &self.0.document_name
+    }
+
+    /// Document owner identifier.
+    async fn owner(&self) -> String {
+        self.0.owner.to_string()
+    }
+
+    /// Document file type.
+    async fn file_type(&self) -> Option<&str> {
+        self.0.file_type.as_deref()
+    }
+
+    /// Document subtype.
+    async fn sub_type(&self) -> Option<GraphqlNotificationDocumentSubType> {
+        self.0.sub_type.clone().map(Into::into)
+    }
+
+    /// Comment identifier: a legacy numeric comment id, or the message id in
+    /// the shared message store.
+    async fn comment_id(&self) -> String {
+        self.0.comment_id.to_string()
+    }
+
+    /// Comment thread identifier: a legacy numeric thread id, or the root
+    /// message id in the shared message store.
+    async fn thread_id(&self) -> String {
+        self.0.thread_id.to_string()
+    }
+
+    /// Comment text.
+    async fn text(&self) -> &str {
+        &self.0.text
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<&str> {
+        self.0.sender_profile_picture_url.as_deref()
+    }
+    /// Display name for a non-user sender.
+    async fn sender_display_name(&self) -> Option<&str> {
+        self.0.sender_display_name.as_deref()
+    }
+}
+
+/// GraphQL wrapper for channel invitation metadata.
+pub struct GraphqlChannelInviteMetadata(ChannelInviteMetadata);
+
+/// Metadata for a channel invitation.
+#[Object]
+impl GraphqlChannelInviteMetadata {
+    /// Inviting user identifier.
+    async fn invited_by(&self) -> String {
+        self.0.invited_by.to_string()
+    }
+
+    /// Channel name.
+    async fn channel_name(&self) -> &str {
+        &self.0.channel_name
+    }
+
+    /// Message content associated with the invitation.
+    async fn message_content(&self) -> Option<&str> {
+        self.0.message_content.as_deref()
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<&str> {
+        self.0.sender_profile_picture_url.as_deref()
+    }
+}
+
+/// GraphQL wrapper for sent channel message metadata.
+pub struct GraphqlChannelMessageSendMetadata(ChannelMessageSendMetadata);
+
+/// Metadata for a newly sent channel message.
+#[Object]
+impl GraphqlChannelMessageSendMetadata {
+    /// Sending user identifier.
+    async fn sender(&self) -> Option<String> {
+        self.0.sender.as_ref().map(ToString::to_string)
+    }
+
+    /// Display name for a non-user sender.
+    async fn sender_display_name(&self) -> Option<&str> {
+        self.0.sender_display_name.as_deref()
+    }
+
+    /// Message content.
+    async fn message_content(&self) -> &str {
+        &self.0.message_content
+    }
+
+    /// Message identifier.
+    async fn message_id(&self) -> &str {
+        &self.0.message_id
+    }
+
+    /// Whether the message has attachments.
+    async fn has_attachments(&self) -> bool {
+        self.0.has_attachments
+    }
+
+    /// Channel metadata.
+    #[graphql(flatten)]
+    async fn channel(&self) -> GraphqlChannelNotificationCommon {
+        GraphqlChannelNotificationCommon(self.0.common.clone())
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<&str> {
+        self.0.sender_profile_picture_url.as_deref()
+    }
+}
+
+/// GraphQL wrapper for channel message reaction metadata.
+pub struct GraphqlChannelMessageReactionMetadata(ChannelMessageReactionMetadata);
+
+/// Metadata for a reaction to a channel message.
+#[Object]
+impl GraphqlChannelMessageReactionMetadata {
+    /// Reacted-to message identifier.
+    async fn message_id(&self) -> &str {
+        &self.0.message_id
+    }
+
+    /// Root thread identifier when the message is a reply.
+    async fn thread_id(&self) -> Option<&str> {
+        self.0.thread_id.as_deref()
+    }
+
+    /// Reacted-to message content.
+    async fn message_content(&self) -> &str {
+        &self.0.message_content
+    }
+
+    /// Emoji added by the reactor.
+    async fn emoji(&self) -> &str {
+        &self.0.emoji
+    }
+
+    /// Channel metadata.
+    #[graphql(flatten)]
+    async fn channel(&self) -> GraphqlChannelNotificationCommon {
+        GraphqlChannelNotificationCommon(self.0.common.clone())
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<&str> {
+        self.0.sender_profile_picture_url.as_deref()
+    }
+}
+
+/// GraphQL wrapper for channel reply metadata.
+pub struct GraphqlChannelReplyMetadata(ChannelReplyMetadata);
+
+/// Metadata for a reply to a channel thread.
+#[Object]
+impl GraphqlChannelReplyMetadata {
+    /// Thread identifier.
+    async fn thread_id(&self) -> &str {
+        &self.0.thread_id
+    }
+
+    /// Reply message identifier.
+    async fn message_id(&self) -> &str {
+        &self.0.message_id
+    }
+
+    /// Replying user identifier.
+    async fn user_id(&self) -> Option<String> {
+        self.0.user_id.as_ref().map(ToString::to_string)
+    }
+
+    /// Display name for a non-user sender.
+    async fn sender_display_name(&self) -> Option<&str> {
+        self.0.sender_display_name.as_deref()
+    }
+
+    /// Reply content.
+    async fn message_content(&self) -> &str {
+        &self.0.message_content
+    }
+
+    /// Whether the reply has attachments.
+    async fn has_attachments(&self) -> bool {
+        self.0.has_attachments
+    }
+
+    /// Root-message sender identifier.
+    async fn thread_parent_sender_id(&self) -> Option<String> {
+        self.0
+            .thread_parent_sender_id
+            .as_ref()
+            .map(ToString::to_string)
+    }
+
+    /// Channel metadata.
+    #[graphql(flatten)]
+    async fn channel(&self) -> GraphqlChannelNotificationCommon {
+        GraphqlChannelNotificationCommon(self.0.common.clone())
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<&str> {
+        self.0.sender_profile_picture_url.as_deref()
+    }
+}
+
+/// GraphQL wrapper for started call metadata.
+pub struct GraphqlCallStartedMetadata(CallStartedMetadata);
+
+/// Metadata for a started call.
+#[Object]
+impl GraphqlCallStartedMetadata {
+    /// Channel name.
+    async fn channel_name(&self) -> Option<&str> {
+        self.0.channel_name.as_deref()
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<&str> {
+        self.0.sender_profile_picture_url.as_deref()
+    }
+}
+
+/// GraphQL wrapper for newly received email metadata.
+pub struct GraphqlNewEmailMetadata(NewEmailMetadata);
+
+/// Metadata for a newly received email.
+#[Object]
+impl GraphqlNewEmailMetadata {
+    /// Sender email address.
+    async fn sender(&self) -> Option<&str> {
+        self.0.sender.as_deref()
+    }
+
+    /// Recipient email address.
+    async fn to_email(&self) -> &str {
+        &self.0.to_email
+    }
+
+    /// Email thread identifier.
+    async fn thread_id(&self) -> &str {
+        &self.0.thread_id
+    }
+
+    /// Email subject.
+    async fn subject(&self) -> &str {
+        &self.0.subject
+    }
+
+    /// Email snippet.
+    async fn snippet(&self) -> &str {
+        &self.0.snippet
+    }
+}
+
+/// GraphQL wrapper for inbox reauthentication metadata.
+pub struct GraphqlInboxReauthRequiredMetadata(InboxReauthRequiredMetadata);
+
+/// Metadata for an inbox that requires reauthentication.
+#[Object]
+impl GraphqlInboxReauthRequiredMetadata {
+    /// Inbox email address.
+    async fn email_address(&self) -> &str {
+        &self.0.email_address
+    }
+}
+
+/// GraphQL wrapper for routine run metadata.
+pub struct GraphqlRoutineRunFinishedMetadata(RoutineRunFinishedMetadata);
+
+/// Metadata for a finished routine run.
+#[Object]
+impl GraphqlRoutineRunFinishedMetadata {
+    /// Routine id.
+    async fn routine_id(&self) -> ID {
+        ID(self.0.routine_id.to_string())
+    }
+
+    /// Routine name when it ran.
+    async fn routine_name(&self) -> &str {
+        &self.0.routine_name
+    }
+
+    /// Whether the run succeeded.
+    async fn succeeded(&self) -> bool {
+        self.0.outcome == RoutineRunOutcome::Succeeded
+    }
+}
+
+/// The coding agent a Macro computer signs in to an account for.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlAgentProvider {
+    /// An Anthropic Claude account, for Claude Code.
+    Claude,
+}
+
+impl From<AgentProvider> for GraphqlAgentProvider {
+    fn from(value: AgentProvider) -> Self {
+        match value {
+            AgentProvider::Claude => Self::Claude,
+        }
+    }
+}
+
+/// How close a Macro computer's agent sign-in is to no longer working.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlAgentSignInExpiryStage {
+    /// It expires within three days.
+    ExpiresSoon,
+    /// It expires within a day.
+    ExpiresToday,
+    /// It expired, or the agent rejected it.
+    Expired,
+}
+
+impl From<AgentSignInExpiryStage> for GraphqlAgentSignInExpiryStage {
+    fn from(value: AgentSignInExpiryStage) -> Self {
+        match value {
+            AgentSignInExpiryStage::ExpiresSoon => Self::ExpiresSoon,
+            AgentSignInExpiryStage::ExpiresToday => Self::ExpiresToday,
+            AgentSignInExpiryStage::Expired => Self::Expired,
+        }
+    }
+}
+
+/// GraphQL wrapper for agent sign-in expiry metadata.
+pub struct GraphqlAgentSignInExpiryMetadata(AgentSignInExpiryMetadata);
+
+/// Metadata for a Macro computer's agent sign-in running out.
+#[Object]
+impl GraphqlAgentSignInExpiryMetadata {
+    /// The agent whose sign-in is running out.
+    async fn agent(&self) -> GraphqlAgentProvider {
+        self.0.agent.into()
+    }
+
+    /// The computer's harness id.
+    async fn harness_id(&self) -> ID {
+        ID(self.0.harness_id.to_string())
+    }
+
+    /// The computer's name when the notice was sent.
+    async fn computer_name(&self) -> &str {
+        &self.0.computer_name
+    }
+
+    /// How close the sign-in is to no longer working.
+    async fn stage(&self) -> GraphqlAgentSignInExpiryStage {
+        self.0.stage.into()
+    }
+
+    /// When the sign-in expires or expired; absent when the agent rejected it.
+    async fn expires_at(&self) -> Option<String> {
+        self.0.expires_at.map(|timestamp| timestamp.to_rfc3339())
+    }
+}
+
+/// How a Macro computer's first setup ended.
+#[derive(Clone, Copy, Debug, Eq, Enum, PartialEq)]
+pub enum GraphqlComputerSetupOutcome {
+    /// The computer is ready.
+    Ready,
+    /// Setup gave up before the computer was ready.
+    Failed,
+}
+
+/// GraphQL wrapper for computer setup metadata.
+pub struct GraphqlComputerSetupMetadata(ComputerSetupMetadata);
+
+/// Metadata for a Macro computer finishing, or failing, first-time setup.
+#[Object]
+impl GraphqlComputerSetupMetadata {
+    /// The computer that was set up.
+    async fn computer_id(&self) -> ID {
+        ID(self.0.computer_id.to_string())
+    }
+
+    /// The computer's harness, once macrod has connected.
+    async fn harness_id(&self) -> Option<ID> {
+        self.0.harness_id.map(|id| ID(id.to_string()))
+    }
+
+    /// The computer's name when the notice was sent.
+    async fn computer_name(&self) -> &str {
+        &self.0.computer_name
+    }
+
+    /// Whether setup finished or failed.
+    async fn outcome(&self) -> GraphqlComputerSetupOutcome {
+        match self.0.outcome {
+            ComputerSetupOutcome::Ready => GraphqlComputerSetupOutcome::Ready,
+            ComputerSetupOutcome::Failed { .. } => GraphqlComputerSetupOutcome::Failed,
+        }
+    }
+
+    /// Why setup failed; absent when it finished.
+    async fn failure_reason(&self) -> Option<&str> {
+        match &self.0.outcome {
+            ComputerSetupOutcome::Ready => None,
+            ComputerSetupOutcome::Failed { failure_reason } => Some(failure_reason),
+        }
+    }
+}
+
+/// GraphQL wrapper for removed runtime access metadata.
+pub struct GraphqlRuntimeAccessRemovedMetadata(RuntimeAccessRemovedMetadata);
+
+/// An agent that stopped with its owner's runtime access.
+pub struct GraphqlStoppedAgent(StoppedAgent);
+
+/// An agent that stopped with its owner's runtime access.
+#[Object]
+impl GraphqlStoppedAgent {
+    /// The agent's bot id.
+    async fn bot_id(&self) -> ID {
+        ID(self.0.bot_id.to_string())
+    }
+
+    /// The agent's display name.
+    async fn name(&self) -> &str {
+        &self.0.name
+    }
+}
+
+/// Metadata for removed runtime access that stopped the recipient's agents.
+#[Object]
+impl GraphqlRuntimeAccessRemovedMetadata {
+    /// The runtime's name.
+    async fn runtime_name(&self) -> &str {
+        &self.0.runtime_name
+    }
+
+    /// The recipient's agents that stopped.
+    async fn agents(&self) -> Vec<GraphqlStoppedAgent> {
+        self.0
+            .agents
+            .iter()
+            .cloned()
+            .map(GraphqlStoppedAgent)
+            .collect()
+    }
+}
+
+/// GraphQL wrapper for team invitation metadata.
+pub struct GraphqlInviteToTeamMetadata(InviteToTeamMetadata);
+
+/// Metadata for a team invitation.
+#[Object]
+impl GraphqlInviteToTeamMetadata {
+    /// Team name.
+    async fn team_name(&self) -> &str {
+        &self.0.team_name
+    }
+
+    /// Team identifier.
+    async fn team_id(&self) -> ID {
+        ID(self.0.team_id.to_string())
+    }
+
+    /// Team invitation identifier.
+    async fn team_invite_id(&self) -> ID {
+        ID(self.0.team_invite_id.to_string())
+    }
+
+    /// Inviting user identifier.
+    async fn invited_by(&self) -> String {
+        self.0.invited_by.to_string()
+    }
+
+    /// Invited role.
+    async fn role(&self) -> Option<&str> {
+        self.0.role.as_deref()
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<String> {
+        self.0
+            .sender_profile_picture_url
+            .as_ref()
+            .map(ToString::to_string)
+    }
+}
+
+/// GraphQL wrapper for task assignment metadata.
+pub struct GraphqlTaskAssignedMetadata(TaskAssignedMetadata);
+
+/// Metadata for a task assignment.
+#[Object]
+impl GraphqlTaskAssignedMetadata {
+    /// Task identifier.
+    async fn task_id(&self) -> &str {
+        &self.0.task_id
+    }
+
+    /// Task name.
+    async fn task_name(&self) -> Option<&str> {
+        self.0.task_name.as_deref()
+    }
+
+    /// Task document subtype.
+    async fn sub_type(&self) -> Option<GraphqlNotificationDocumentSubType> {
+        self.0.sub_type.clone().map(Into::into)
+    }
+
+    /// Assigning user identifier.
+    async fn assigned_by(&self) -> String {
+        self.0.assigned_by.to_string()
+    }
+
+    /// Sender profile-picture URL.
+    async fn sender_profile_picture_url(&self) -> Option<&str> {
+        self.0.sender_profile_picture_url.as_deref()
+    }
+}
+
+/// GraphQL wrapper for reminder metadata.
+pub struct GraphqlReminderMetadata(ReminderMetadata);
+
+/// Metadata for a due reminder.
+#[Object]
+impl GraphqlReminderMetadata {
+    /// Reminder identifier.
+    async fn reminder_id(&self) -> ID {
+        ID(self.0.reminder_id.to_string())
+    }
+
+    /// Reminder description.
+    async fn description(&self) -> &str {
+        &self.0.description
+    }
+
+    /// Which firing this notification is for, in RFC 3339 format.
+    ///
+    /// The counterpart of a calendar alarm's `occurrenceKey`: it is what tells
+    /// two notifications from the same recurring reminder apart. Absent on
+    /// notifications written before recurring dispatch existed.
+    async fn scheduled_for(&self) -> Option<String> {
+        self.0.scheduled_for.map(|timestamp| timestamp.to_rfc3339())
+    }
+}
+
+/// GraphQL wrapper for calendar event reminder metadata.
+pub struct GraphqlCalendarEventReminderMetadata(CalendarEventReminderMetadata);
+
+/// Metadata for a due calendar event reminder.
+#[Object]
+impl GraphqlCalendarEventReminderMetadata {
+    /// Calendar event identifier.
+    async fn event_id(&self) -> ID {
+        ID(self.0.event_id.to_string())
+    }
+
+    /// Stable occurrence key of the event instance.
+    async fn occurrence_key(&self) -> &str {
+        &self.0.occurrence_key
+    }
+
+    /// Event display title.
+    async fn title(&self) -> &str {
+        &self.0.title
+    }
+
+    /// Timed event start in RFC 3339 format.
+    async fn starts_at(&self) -> Option<String> {
+        self.0.starts_at.map(|timestamp| timestamp.to_rfc3339())
+    }
+
+    /// Timed event end in RFC 3339 format.
+    async fn ends_at(&self) -> Option<String> {
+        self.0.ends_at.map(|timestamp| timestamp.to_rfc3339())
+    }
+
+    /// All-day event start date in ISO 8601 format.
+    async fn start_date(&self) -> Option<String> {
+        self.0.start_date.map(|date| date.to_string())
+    }
+
+    /// IANA time zone used to render the event.
+    async fn time_zone(&self) -> Option<&str> {
+        self.0.time_zone.as_deref()
+    }
+
+    /// Minutes before the event start when the alarm fires.
+    async fn minutes_before(&self) -> i32 {
+        self.0.minutes_before
+    }
+}
+
+/// GraphQL wrapper for AI response metadata.
+pub struct GraphqlAiResponseMetadata(AiResponseMetadata);
+
+/// Metadata for an AI response.
+#[Object]
+impl GraphqlAiResponseMetadata {
+    /// AI response summary.
+    async fn summary(&self) -> &str {
+        &self.0.summary
+    }
+
+    /// Response message identifier.
+    async fn message_id(&self) -> &str {
+        &self.0.message_id
+    }
+}
+
+/// GraphQL wrapper for GitHub pull-request lifecycle metadata.
+pub struct GraphqlGithubPrStatusChangedMetadata(GithubPrStatusChanged);
+
+/// Metadata for a GitHub pull-request lifecycle change.
+#[Object]
+impl GraphqlGithubPrStatusChangedMetadata {
+    /// Shared pull-request metadata.
+    #[graphql(flatten)]
+    async fn common(&self) -> GraphqlGithubPrNotificationCommon {
+        GraphqlGithubPrNotificationCommon(self.0.common.clone())
+    }
+
+    /// Current pull-request status.
+    async fn status(&self) -> GraphqlGithubPrEventStatus {
+        self.0.status.into()
+    }
+
+    /// Triggering webhook action.
+    async fn action(&self) -> GraphqlGithubPrEventAction {
+        self.0.action.into()
+    }
+
+    /// Previous pull-request status.
+    async fn previous_status(&self) -> Option<GraphqlGithubPrEventStatus> {
+        self.0.previous_status.map(Into::into)
+    }
+
+    /// Head branch.
+    async fn head_branch(&self) -> Option<&str> {
+        self.0.head_branch.as_deref()
+    }
+
+    /// Base branch.
+    async fn base_branch(&self) -> Option<&str> {
+        self.0.base_branch.as_deref()
+    }
+
+    /// Merge timestamp in RFC 3339 format.
+    async fn merged_at(&self) -> Option<String> {
+        self.0.merged_at.map(|timestamp| timestamp.to_rfc3339())
+    }
+}
+
+/// GraphQL wrapper for GitHub pull-request check-run metadata.
+pub struct GraphqlGithubPrCheckRunMetadata(GithubPrCheckRun);
+
+/// Metadata for a completed GitHub pull-request check run.
+#[Object]
+impl GraphqlGithubPrCheckRunMetadata {
+    /// Shared pull-request metadata.
+    #[graphql(flatten)]
+    async fn common(&self) -> GraphqlGithubPrNotificationCommon {
+        GraphqlGithubPrNotificationCommon(self.0.common.clone())
+    }
+
+    /// Check-run GitHub identifier.
+    async fn check_run_github_id(&self) -> ID {
+        ID(self.0.check_run_github_id.to_string())
+    }
+
+    /// Check name.
+    async fn check_name(&self) -> &str {
+        &self.0.check_name
+    }
+
+    /// Raw check status.
+    async fn check_status(&self) -> &str {
+        &self.0.check_status
+    }
+
+    /// Raw check conclusion.
+    async fn conclusion(&self) -> &str {
+        &self.0.conclusion
+    }
+
+    /// Normalized check state.
+    async fn state(&self) -> GraphqlGithubPrCheckRunState {
+        self.0.state.into()
+    }
+
+    /// Public check URL.
+    async fn check_url(&self) -> &str {
+        &self.0.check_url
+    }
+
+    /// Completion timestamp in RFC 3339 format.
+    async fn completed_at(&self) -> String {
+        self.0.completed_at.to_rfc3339()
+    }
+}
+
+/// GraphQL wrapper for GitHub review-request metadata.
+pub struct GraphqlGithubReviewRequestedMetadata(GithubReviewRequested);
+
+/// Metadata for a GitHub pull-request review request.
+#[Object]
+impl GraphqlGithubReviewRequestedMetadata {
+    /// Shared pull-request metadata.
+    #[graphql(flatten)]
+    async fn common(&self) -> GraphqlGithubPrNotificationCommon {
+        GraphqlGithubPrNotificationCommon(self.0.common.clone())
+    }
+
+    /// Requested reviewer GitHub login.
+    async fn requested_reviewer_github_login(&self) -> Option<&str> {
+        self.0.requested_reviewer_github_login.as_deref()
+    }
+
+    /// Requested reviewer GitHub user identifier.
+    async fn requested_reviewer_github_user_id(&self) -> Option<&str> {
+        self.0.requested_reviewer_github_user_id.as_deref()
+    }
+}
+
+/// GraphQL wrapper for GitHub pull-request comment metadata.
+pub struct GraphqlGithubPrCommentMetadata(GithubPrComment);
+
+/// Metadata for a GitHub pull-request comment.
+#[Object]
+impl GraphqlGithubPrCommentMetadata {
+    /// Shared pull-request metadata.
+    #[graphql(flatten)]
+    async fn common(&self) -> GraphqlGithubPrNotificationCommon {
+        GraphqlGithubPrNotificationCommon(self.0.common.clone())
+    }
+
+    /// Comment kind.
+    async fn comment_kind(&self) -> GraphqlGithubPrCommentKind {
+        self.0.comment_kind.into()
+    }
+
+    /// Comment GitHub identifier.
+    async fn comment_github_id(&self) -> Option<ID> {
+        self.0.comment_github_id.map(|id| ID(id.to_string()))
+    }
+
+    /// Public comment URL.
+    async fn comment_url(&self) -> Option<&str> {
+        self.0.comment_url.as_deref()
+    }
+
+    /// Truncated comment body.
+    async fn comment_snippet(&self) -> &str {
+        &self.0.comment_snippet
+    }
+}
+
+/// GraphQL wrapper for GitHub pull-request mention metadata.
+pub struct GraphqlGithubPrMentionMetadata(GithubPrMention);
+
+/// Metadata for a GitHub pull-request mention.
+#[Object]
+impl GraphqlGithubPrMentionMetadata {
+    /// Shared pull-request metadata.
+    #[graphql(flatten)]
+    async fn common(&self) -> GraphqlGithubPrNotificationCommon {
+        GraphqlGithubPrNotificationCommon(self.0.common.clone())
+    }
+
+    /// Mention location.
+    async fn location(&self) -> GraphqlGithubPrMentionLocation {
+        self.0.location.into()
+    }
+
+    /// Comment or review GitHub identifier.
+    async fn comment_github_id(&self) -> Option<ID> {
+        self.0.comment_github_id.map(|id| ID(id.to_string()))
+    }
+
+    /// Public URL for the mentioning text.
+    async fn comment_url(&self) -> Option<&str> {
+        self.0.comment_url.as_deref()
+    }
+
+    /// Truncated mentioning text.
+    async fn text_snippet(&self) -> &str {
+        &self.0.text_snippet
+    }
+}
+
+/// GraphQL wrapper for GitHub pull-request review metadata.
+pub struct GraphqlGithubPrReviewMetadata(GithubPrReview);
+
+/// Metadata for a GitHub pull-request review.
+#[Object]
+impl GraphqlGithubPrReviewMetadata {
+    /// Shared pull-request metadata.
+    #[graphql(flatten)]
+    async fn common(&self) -> GraphqlGithubPrNotificationCommon {
+        GraphqlGithubPrNotificationCommon(self.0.common.clone())
+    }
+
+    /// Review GitHub identifier.
+    async fn review_github_id(&self) -> Option<ID> {
+        self.0.review_github_id.map(|id| ID(id.to_string()))
+    }
+
+    /// Public review URL.
+    async fn review_url(&self) -> Option<&str> {
+        self.0.review_url.as_deref()
+    }
+
+    /// Review state.
+    async fn state(&self) -> GraphqlGithubPrReviewState {
+        self.0.state.into()
+    }
+
+    /// Truncated review body.
+    async fn review_snippet(&self) -> Option<&str> {
+        self.0.review_snippet.as_deref()
+    }
+}
+
+/// GraphQL wrapper for the session an agent-session notification is about.
+pub struct GraphqlAgentSessionRef(AgentSessionNotificationRef);
+
+/// The session an agent-session notification points at.
+#[Object]
+impl GraphqlAgentSessionRef {
+    /// Agent session identifier; what a click opens.
+    async fn session_id(&self) -> ID {
+        ID(self.0.session_id.to_string())
+    }
+
+    /// Session name at the time of the event.
+    async fn session_name(&self) -> &str {
+        &self.0.session_name
+    }
+
+    /// Bot identifier.
+    async fn bot_id(&self) -> ID {
+        ID(self.0.bot_id.to_string())
+    }
+
+    /// Bot display name; agent notifications read as being from the bot.
+    async fn bot_name(&self) -> &str {
+        &self.0.bot_name
+    }
+
+    /// Channel the session was opened from, when it was.
+    async fn channel_id(&self) -> Option<ID> {
+        self.0.channel_id.map(|id| ID(id.to_string()))
+    }
+
+    /// Thread the session was opened from, when it was.
+    async fn thread_id(&self) -> Option<ID> {
+        self.0.thread_id.map(|id| ID(id.to_string()))
+    }
+
+    /// The magic-chip message for the turn, when one was posted.
+    async fn announcement_message_id(&self) -> Option<ID> {
+        self.0.announcement_message_id.map(|id| ID(id.to_string()))
+    }
+}
+
+/// GraphQL wrapper for an agent session finishing a turn.
+pub struct GraphqlAgentSessionSettledMetadata(AgentSessionSettledMetadata);
+
+/// Metadata for an agent session that finished with nothing queued.
+#[Object]
+impl GraphqlAgentSessionSettledMetadata {
+    /// The session this is about.
+    async fn session(&self) -> GraphqlAgentSessionRef {
+        GraphqlAgentSessionRef(self.0.session.clone())
+    }
+
+    /// The turn that ended.
+    async fn turn(&self) -> i32 {
+        i32::try_from(self.0.turn).unwrap_or(i32::MAX)
+    }
+
+    /// Who prompted the turn.
+    async fn actor(&self) -> Option<String> {
+        self.0.actor.as_ref().map(ToString::to_string)
+    }
+
+    /// ACP stop reason, or `error`.
+    async fn stop_reason(&self) -> &str {
+        &self.0.stop_reason
+    }
+
+    /// The agent's last prose in the turn.
+    async fn excerpt(&self) -> Option<&str> {
+        self.0.excerpt.as_deref()
+    }
+}
+
+/// GraphQL wrapper for an agent session waiting on its owner.
+pub struct GraphqlAgentSessionWaitingForInputMetadata(AgentSessionWaitingForInputMetadata);
+
+/// Metadata for an agent session blocked on a question.
+#[Object]
+impl GraphqlAgentSessionWaitingForInputMetadata {
+    /// The session this is about.
+    async fn session(&self) -> GraphqlAgentSessionRef {
+        GraphqlAgentSessionRef(self.0.session.clone())
+    }
+
+    /// The turn asking.
+    async fn turn(&self) -> i32 {
+        i32::try_from(self.0.turn).unwrap_or(i32::MAX)
+    }
+
+    /// The question, as the agent phrased it.
+    async fn question(&self) -> &str {
+        &self.0.question
+    }
+}
+
+/// GraphQL wrapper for a mention in an agent-session prompt.
+pub struct GraphqlAgentSessionMentionedMetadata(AgentSessionMentionedMetadata);
+
+/// Metadata for being named in a prompt to an agent session.
+#[Object]
+impl GraphqlAgentSessionMentionedMetadata {
+    /// The session this is about.
+    async fn session(&self) -> GraphqlAgentSessionRef {
+        GraphqlAgentSessionRef(self.0.session.clone())
+    }
+
+    /// Who wrote the prompt.
+    async fn mentioned_by(&self) -> Option<String> {
+        self.0.mentioned_by.as_ref().map(ToString::to_string)
+    }
+
+    /// The action carrying the prompt.
+    async fn action_id(&self) -> ID {
+        ID(self.0.action_id.to_string())
+    }
+}
+
+/// Typed GraphQL union containing every supported notification event payload.
+#[derive(Union)]
+pub enum GraphqlNotifEvent {
+    /// A new live external chat message.
+    ExternalChatMessage(GraphqlExternalChatMessageMetadata),
+    /// Shared access workflow.
+    EntityAccessGranted(GraphqlEntityAccessGrantedMetadata),
+    /// Shared access workflow.
+    EntityAccessRequested(GraphqlEntityAccessRequestedMetadata),
+    /// Channel mention metadata.
+    ChannelMention(GraphqlChannelMentionMetadata),
+    /// Document mention metadata.
+    DocumentMention(GraphqlDocumentMentionMetadata),
+    /// Document-comment mention metadata.
+    MentionedInDocumentComment(GraphqlMentionedInDocumentCommentMetadata),
+    /// Document-comment thread reply metadata.
+    RepliedToDocumentCommentThread(GraphqlRepliedToDocumentCommentThreadMetadata),
+    /// Document comment metadata.
+    CommentedOnDocument(GraphqlCommentedOnDocumentMetadata),
+    /// Project discussion metadata.
+    InitiativeDiscussion(GraphqlInitiativeDiscussionMetadata),
+    /// CRM company or contact discussion metadata.
+    CrmDiscussion(GraphqlCrmDiscussionMetadata),
+    /// Channel invitation metadata.
+    ChannelInvite(GraphqlChannelInviteMetadata),
+    /// Channel message metadata.
+    ChannelMessageSend(GraphqlChannelMessageSendMetadata),
+    /// Channel message reaction metadata.
+    ChannelMessageReaction(GraphqlChannelMessageReactionMetadata),
+    /// Channel reply metadata.
+    ChannelMessageReply(GraphqlChannelReplyMetadata),
+    /// Started-call metadata.
+    CallStarted(GraphqlCallStartedMetadata),
+    /// New-email metadata.
+    NewEmail(GraphqlNewEmailMetadata),
+    /// Inbox reauthentication metadata.
+    InboxReauthRequired(GraphqlInboxReauthRequiredMetadata),
+    /// Team invitation metadata.
+    InviteToTeam(GraphqlInviteToTeamMetadata),
+    /// Task assignment metadata.
+    TaskAssigned(GraphqlTaskAssignedMetadata),
+    /// Reminder metadata.
+    Reminder(GraphqlReminderMetadata),
+    /// Calendar event reminder metadata.
+    CalendarEventReminder(GraphqlCalendarEventReminderMetadata),
+    /// AI response metadata.
+    AiResponse(GraphqlAiResponseMetadata),
+    /// GitHub pull-request lifecycle metadata.
+    GithubPrStatusChanged(GraphqlGithubPrStatusChangedMetadata),
+    /// GitHub pull-request check-run metadata.
+    GithubPrCheckRun(GraphqlGithubPrCheckRunMetadata),
+    /// GitHub review-request metadata.
+    GithubReviewRequested(GraphqlGithubReviewRequestedMetadata),
+    /// GitHub pull-request comment metadata.
+    GithubPrComment(GraphqlGithubPrCommentMetadata),
+    /// GitHub pull-request mention metadata.
+    GithubPrMention(GraphqlGithubPrMentionMetadata),
+    /// GitHub pull-request review metadata.
+    GithubPrReview(GraphqlGithubPrReviewMetadata),
+    /// Agent session finished metadata.
+    AgentSessionSettled(GraphqlAgentSessionSettledMetadata),
+    /// Agent session waiting-for-input metadata.
+    AgentSessionWaitingForInput(GraphqlAgentSessionWaitingForInputMetadata),
+    /// Agent session mention metadata.
+    AgentSessionMentioned(GraphqlAgentSessionMentionedMetadata),
+    /// Calendar event join request metadata.
+    CalendarEventJoinRequest(GraphqlCalendarEventJoinRequestMetadata),
+    /// Request-to-join-a-channel metadata.
+    ChannelAccessRequested(GraphqlChannelAccessRequestedMetadata),
+    /// Finished routine run metadata.
+    RoutineRunFinished(GraphqlRoutineRunFinishedMetadata),
+    /// Agent sign-in expiry metadata.
+    AgentSignInExpiry(GraphqlAgentSignInExpiryMetadata),
+    /// Computer setup metadata.
+    ComputerSetup(GraphqlComputerSetupMetadata),
+    /// Schema-only stub for released clients. Never returned.
+    WhatsappGroupMessage(GraphqlWhatsappGroupMessageMetadata),
+    /// Removed runtime access that stopped the recipient's agents.
+    RuntimeAccessRemoved(GraphqlRuntimeAccessRemovedMetadata),
+}
+
+impl From<NotifEvent> for GraphqlNotifEvent {
+    fn from(value: NotifEvent) -> Self {
+        match value {
+            NotifEvent::ExternalChatMessage(metadata) => {
+                Self::ExternalChatMessage(GraphqlExternalChatMessageMetadata(metadata))
+            }
+            NotifEvent::ChannelMention(metadata) => {
+                Self::ChannelMention(GraphqlChannelMentionMetadata(metadata))
+            }
+            NotifEvent::EntityAccessRequested(metadata) => {
+                Self::EntityAccessRequested(GraphqlEntityAccessRequestedMetadata(metadata))
+            }
+            NotifEvent::EntityAccessGranted(metadata) => {
+                Self::EntityAccessGranted(GraphqlEntityAccessGrantedMetadata(metadata))
+            }
+            NotifEvent::ChannelAccessRequested(metadata) => {
+                Self::ChannelAccessRequested(GraphqlChannelAccessRequestedMetadata(metadata))
+            }
+            NotifEvent::DocumentMention(metadata) => {
+                Self::DocumentMention(GraphqlDocumentMentionMetadata(metadata))
+            }
+            NotifEvent::MentionedInDocumentComment(metadata) => Self::MentionedInDocumentComment(
+                GraphqlMentionedInDocumentCommentMetadata(metadata),
+            ),
+            NotifEvent::RepliedToDocumentCommentThread(metadata) => {
+                Self::RepliedToDocumentCommentThread(GraphqlRepliedToDocumentCommentThreadMetadata(
+                    metadata,
+                ))
+            }
+            NotifEvent::CommentedOnDocument(metadata) => {
+                Self::CommentedOnDocument(GraphqlCommentedOnDocumentMetadata(metadata))
+            }
+            NotifEvent::InitiativeDiscussion(metadata) => {
+                Self::InitiativeDiscussion(metadata.into())
+            }
+            NotifEvent::CrmDiscussion(metadata) => Self::CrmDiscussion(metadata.into()),
+            NotifEvent::CalendarEventJoinRequest(metadata) => {
+                Self::CalendarEventJoinRequest(metadata.into())
+            }
+            NotifEvent::ChannelInvite(metadata) => {
+                Self::ChannelInvite(GraphqlChannelInviteMetadata(metadata))
+            }
+            NotifEvent::ChannelMessageSend(metadata) => {
+                Self::ChannelMessageSend(GraphqlChannelMessageSendMetadata(metadata))
+            }
+            NotifEvent::ChannelMessageReaction(metadata) => {
+                Self::ChannelMessageReaction(GraphqlChannelMessageReactionMetadata(metadata))
+            }
+            NotifEvent::ChannelMessageReply(metadata) => {
+                Self::ChannelMessageReply(GraphqlChannelReplyMetadata(metadata))
+            }
+            NotifEvent::CallStarted(metadata) => {
+                Self::CallStarted(GraphqlCallStartedMetadata(metadata))
+            }
+            NotifEvent::NewEmail(metadata) => Self::NewEmail(GraphqlNewEmailMetadata(metadata)),
+            NotifEvent::RoutineRunFinished(metadata) => {
+                Self::RoutineRunFinished(GraphqlRoutineRunFinishedMetadata(metadata))
+            }
+            NotifEvent::AgentSignInExpiry(metadata) => {
+                Self::AgentSignInExpiry(GraphqlAgentSignInExpiryMetadata(metadata))
+            }
+            NotifEvent::ComputerSetup(metadata) => {
+                Self::ComputerSetup(GraphqlComputerSetupMetadata(metadata))
+            }
+            NotifEvent::RuntimeAccessRemoved(metadata) => {
+                Self::RuntimeAccessRemoved(GraphqlRuntimeAccessRemovedMetadata(metadata))
+            }
+            NotifEvent::InboxReauthRequired(metadata) => {
+                Self::InboxReauthRequired(GraphqlInboxReauthRequiredMetadata(metadata))
+            }
+            NotifEvent::InviteToTeam(metadata) => {
+                Self::InviteToTeam(GraphqlInviteToTeamMetadata(metadata))
+            }
+            NotifEvent::TaskAssigned(metadata) => {
+                Self::TaskAssigned(GraphqlTaskAssignedMetadata(metadata))
+            }
+            NotifEvent::Reminder(metadata) => Self::Reminder(GraphqlReminderMetadata(metadata)),
+            NotifEvent::CalendarEventReminder(metadata) => {
+                Self::CalendarEventReminder(GraphqlCalendarEventReminderMetadata(metadata))
+            }
+            NotifEvent::AiResponse(metadata) => {
+                Self::AiResponse(GraphqlAiResponseMetadata(metadata))
+            }
+            NotifEvent::GithubPrStatusChanged(metadata) => {
+                Self::GithubPrStatusChanged(GraphqlGithubPrStatusChangedMetadata(metadata))
+            }
+            NotifEvent::GithubPrCheckRun(metadata) => {
+                Self::GithubPrCheckRun(GraphqlGithubPrCheckRunMetadata(metadata))
+            }
+            NotifEvent::GithubReviewRequested(metadata) => {
+                Self::GithubReviewRequested(GraphqlGithubReviewRequestedMetadata(metadata))
+            }
+            NotifEvent::GithubPrComment(metadata) => {
+                Self::GithubPrComment(GraphqlGithubPrCommentMetadata(metadata))
+            }
+            NotifEvent::GithubPrMention(metadata) => {
+                Self::GithubPrMention(GraphqlGithubPrMentionMetadata(metadata))
+            }
+            NotifEvent::GithubPrReview(metadata) => {
+                Self::GithubPrReview(GraphqlGithubPrReviewMetadata(metadata))
+            }
+            NotifEvent::AgentSessionSettled(metadata) => {
+                Self::AgentSessionSettled(GraphqlAgentSessionSettledMetadata(metadata))
+            }
+            NotifEvent::AgentSessionWaitingForInput(metadata) => Self::AgentSessionWaitingForInput(
+                GraphqlAgentSessionWaitingForInputMetadata(metadata),
+            ),
+            NotifEvent::AgentSessionMentioned(metadata) => {
+                Self::AgentSessionMentioned(GraphqlAgentSessionMentionedMetadata(metadata))
+            }
+        }
+    }
+}
+
+/// Shared entity access notification metadata.
+pub struct GraphqlEntityAccessRequestedMetadata(model_notifications::EntityAccessRequestedMetadata);
+
+/// Metadata for a request to view, comment on, or edit a shared item.
+#[Object]
+impl GraphqlEntityAccessRequestedMetadata {
+    /// Stable access request id.
+    async fn request_id(&self) -> ID {
+        ID(self.0.request_id.to_string())
+    }
+    /// Request revision.
+    async fn revision(&self) -> i32 {
+        self.0.revision
+    }
+    /// Entity display name.
+    async fn entity_name(&self) -> &str {
+        &self.0.entity_name
+    }
+    /// Document file extension, when applicable.
+    async fn file_type(&self) -> Option<&str> {
+        self.0.file_type.as_deref()
+    }
+    /// Requested or granted access.
+    async fn access_level(&self) -> &str {
+        match self.0.access_level {
+            model_notifications::RequestedAccessLevel::View => "view",
+            model_notifications::RequestedAccessLevel::Comment => "comment",
+            model_notifications::RequestedAccessLevel::Edit => "edit",
+        }
+    }
+}
+
+/// Shared entity access notification metadata.
+pub struct GraphqlEntityAccessGrantedMetadata(model_notifications::EntityAccessGrantedMetadata);
+
+/// Metadata for an approved access request and its granted permission.
+#[Object]
+impl GraphqlEntityAccessGrantedMetadata {
+    /// Stable access request id.
+    async fn request_id(&self) -> ID {
+        ID(self.0.request_id.to_string())
+    }
+    /// Request revision.
+    async fn revision(&self) -> i32 {
+        self.0.revision
+    }
+    /// Entity display name.
+    async fn entity_name(&self) -> &str {
+        &self.0.entity_name
+    }
+    /// Document file extension, when applicable.
+    async fn file_type(&self) -> Option<&str> {
+        self.0.file_type.as_deref()
+    }
+    /// Requested or granted access.
+    async fn access_level(&self) -> &str {
+        match self.0.access_level {
+            model_notifications::RequestedAccessLevel::View => "view",
+            model_notifications::RequestedAccessLevel::Comment => "comment",
+            model_notifications::RequestedAccessLevel::Edit => "edit",
+        }
+    }
+}

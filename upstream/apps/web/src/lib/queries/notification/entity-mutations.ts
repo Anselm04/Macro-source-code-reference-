@@ -1,0 +1,150 @@
+import type { UnifiedNotification } from '@notifications/types';
+import { refreshActiveGraphqlSoupQueries } from '@queries/soup/graphql/active-queries';
+import type {
+  GraphqlEntityType,
+  NotificationEntityInput,
+  NotificationUpdateOperation,
+} from '@service-storage/graphql/generated/graphql';
+import { updateNotificationsForEntities as updateGraphqlNotificationsForEntities } from '@service-storage/graphql-notifications';
+import {
+  graphqlCacheEnabled,
+  mapGraphqlNotification,
+} from '@service-storage/graphql-soup';
+
+type SimpleNotificationEntityType =
+  | 'agent_session'
+  | 'calendar_event'
+  | 'call'
+  | 'channel'
+  | 'chat'
+  | 'crm_company'
+  | 'crm_contact'
+  | 'document'
+  | 'email'
+  | 'email_thread'
+  | 'foreign'
+  | 'foreign_entity'
+  | 'initiative'
+  | 'project'
+  | 'reminder';
+
+/**
+ * Frontend entity reference accepted by entity-scoped notification writes.
+ * Channel message/thread targets require the canonical message id because a
+ * search-result entity's generic `id` may include its channel id.
+ */
+export type NotificationEntityRef =
+  | { type: SimpleNotificationEntityType; id: string }
+  | {
+      type: 'channel_message' | 'channel_thread';
+      id: string;
+      messageId: string;
+    };
+
+type FrontendNotificationEntity = {
+  type: string;
+  id: string;
+  messageId?: string;
+};
+
+/** Return a supported, canonical entity-mutation target when one exists. */
+export function toNotificationEntityRef(
+  entity: FrontendNotificationEntity
+): NotificationEntityRef | undefined {
+  switch (entity.type) {
+    case 'agent_session':
+    case 'calendar_event':
+    case 'call':
+    case 'channel':
+    case 'chat':
+    case 'crm_company':
+    case 'crm_contact':
+    case 'document':
+    case 'email':
+    case 'email_thread':
+    case 'foreign':
+    case 'foreign_entity':
+    case 'initiative':
+    case 'project':
+    case 'reminder':
+      return { type: entity.type, id: entity.id };
+    case 'channel_message':
+    case 'channel_thread':
+      return entity.messageId
+        ? { type: entity.type, id: entity.id, messageId: entity.messageId }
+        : undefined;
+    default:
+      return undefined;
+  }
+}
+
+/** Entity-wide operations. Undo intentionally remains notification-ID scoped. */
+export type NotificationEntityUpdateOperation = Exclude<
+  NotificationUpdateOperation,
+  'MARK_UNDONE'
+>;
+
+const ENTITY_TYPE_TO_GRAPHQL = {
+  agent_session: 'AGENT_SESSION',
+  calendar_event: 'CALENDAR_EVENT',
+  call: 'CALL',
+  channel: 'CHANNEL',
+  chat: 'CHAT',
+  crm_company: 'CRM_COMPANY',
+  crm_contact: 'CRM_CONTACT',
+  document: 'DOCUMENT',
+  email: 'EMAIL_THREAD',
+  email_thread: 'EMAIL_THREAD',
+  foreign: 'FOREIGN_ENTITY',
+  foreign_entity: 'FOREIGN_ENTITY',
+  initiative: 'INITIATIVE',
+  project: 'PROJECT',
+  reminder: 'REMINDER',
+} as const satisfies Record<SimpleNotificationEntityType, GraphqlEntityType>;
+
+/** Convert a frontend entity reference into the canonical GraphQL input. */
+export function toNotificationEntityInput(
+  entity: NotificationEntityRef
+): NotificationEntityInput {
+  if (entity.type === 'channel_message' || entity.type === 'channel_thread') {
+    return {
+      entityType: 'CHANNEL_MESSAGE',
+      entityId: entity.messageId,
+    };
+  }
+
+  return {
+    entityType: ENTITY_TYPE_TO_GRAPHQL[entity.type],
+    entityId: entity.id,
+  };
+}
+
+/**
+ * Mark all notifications associated with the supplied entities seen or done.
+ * The changed-row response updates the normalized GraphQL cache and every
+ * reader the cache maintains, and the rest are read again. A Done records the
+ * rows this client showed but the server left out
+ * (`confirmEntityNotificationsDone`); a mark seen that left out an expected
+ * row reads every reader again. Without the cache, mounted readers are read
+ * again. It is deliberately not mirrored into the legacy TanStack
+ * notification cache. Returned rows include only the exact IDs needed by a
+ * later ID-scoped undo.
+ */
+export async function updateNotificationsForEntities(args: {
+  entities: NotificationEntityRef[];
+  operation: NotificationEntityUpdateOperation;
+  /** Notifications this client shows as changing, to detect a stale view. */
+  expectedNotificationIds?: readonly string[];
+}): Promise<UnifiedNotification[]> {
+  if (args.entities.length === 0) return [];
+
+  const rows = await updateGraphqlNotificationsForEntities({
+    entities: args.entities.map(toNotificationEntityInput),
+    operation: args.operation,
+    expectedNotificationIds: args.expectedNotificationIds,
+  });
+  if (!graphqlCacheEnabled()) {
+    await refreshActiveGraphqlSoupQueries();
+  }
+  return rows.map((row) => mapGraphqlNotification(row));
+}

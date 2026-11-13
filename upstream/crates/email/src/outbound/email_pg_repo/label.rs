@@ -1,0 +1,529 @@
+use crate::domain::message_labels::state as label_state;
+use crate::domain::models::{
+    LabelListVisibility, LabelType, LinkLabel, MessageListVisibility, SimpleMessage,
+    StagedLabelChange, label::system_labels,
+};
+use crate::outbound::email_pg_repo::db_types::{
+    LabelListVisibilityDbRow, LabelTypeDbRow, MessageListVisibilityDbRow,
+};
+use crate::outbound::label_state_pg::PgLabelState;
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+/// DB row for a label looked up by ID.
+struct LinkLabelDbRow {
+    id: Uuid,
+    link_id: Uuid,
+    provider_label_id: String,
+    name: String,
+    created_at: DateTime<Utc>,
+    message_list_visibility: MessageListVisibilityDbRow,
+    label_list_visibility: LabelListVisibilityDbRow,
+    type_: LabelTypeDbRow,
+}
+
+impl From<LinkLabelDbRow> for LinkLabel {
+    fn from(row: LinkLabelDbRow) -> Self {
+        Self {
+            id: row.id,
+            link_id: row.link_id,
+            provider_label_id: row.provider_label_id,
+            name: row.name,
+            created_at: row.created_at,
+            message_list_visibility: match row.message_list_visibility {
+                MessageListVisibilityDbRow::Show => MessageListVisibility::Show,
+                MessageListVisibilityDbRow::Hide => MessageListVisibility::Hide,
+            },
+            label_list_visibility: match row.label_list_visibility {
+                LabelListVisibilityDbRow::LabelShow => LabelListVisibility::LabelShow,
+                LabelListVisibilityDbRow::LabelShowIfUnread => {
+                    LabelListVisibility::LabelShowIfUnread
+                }
+                LabelListVisibilityDbRow::LabelHide => LabelListVisibility::LabelHide,
+            },
+            type_: match row.type_ {
+                LabelTypeDbRow::System => LabelType::System,
+                LabelTypeDbRow::User => LabelType::User,
+            },
+        }
+    }
+}
+
+/// DB row for a simplified message in thread label operations.
+struct SimpleMessageDbRow {
+    id: Uuid,
+    provider_id: Option<String>,
+    thread_id: Uuid,
+    provider_thread_id: Option<String>,
+    replying_to_id: Option<Uuid>,
+    global_id: Option<String>,
+    link_id: Uuid,
+    subject: Option<String>,
+    snippet: Option<String>,
+    from_contact_id: Option<Uuid>,
+    provider_history_id: Option<String>,
+    internal_date_ts: Option<DateTime<Utc>>,
+    sent_at: Option<DateTime<Utc>>,
+    size_estimate: Option<i64>,
+    is_read: bool,
+    is_starred: bool,
+    is_sent: bool,
+    is_draft: bool,
+    has_attachments: bool,
+    headers_jsonb: Option<serde_json::Value>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl From<SimpleMessageDbRow> for SimpleMessage {
+    fn from(row: SimpleMessageDbRow) -> Self {
+        Self {
+            db_id: row.id,
+            provider_id: row.provider_id,
+            thread_db_id: row.thread_id,
+            provider_thread_id: row.provider_thread_id,
+            replying_to_id: row.replying_to_id,
+            global_id: row.global_id,
+            link_id: row.link_id,
+            subject: row.subject,
+            snippet: row.snippet,
+            from_contact_id: row.from_contact_id,
+            provider_history_id: row.provider_history_id,
+            internal_date_ts: row.internal_date_ts,
+            sent_at: row.sent_at,
+            size_estimate: row.size_estimate,
+            is_read: row.is_read,
+            is_starred: row.is_starred,
+            is_sent: row.is_sent,
+            is_draft: row.is_draft,
+            has_attachments: row.has_attachments,
+            headers_json: row.headers_jsonb,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+#[tracing::instrument(skip(pool), err)]
+pub(crate) async fn list_labels_by_link_id(
+    pool: &PgPool,
+    link_id: Uuid,
+) -> Result<Vec<LinkLabel>, sqlx::Error> {
+    let rows: Vec<LinkLabelDbRow> = sqlx::query_as!(
+        LinkLabelDbRow,
+        r#"
+        SELECT
+            id,
+            link_id,
+            provider_label_id,
+            name,
+            created_at,
+            message_list_visibility as "message_list_visibility: _",
+            label_list_visibility as "label_list_visibility: _",
+            type as "type_: _"
+        FROM email_labels
+        WHERE link_id = $1 AND NOT EXISTS(SELECT 1 FROM email_mailbox_settings_work w WHERE w.link_id=email_labels.link_id
+            AND w.kind='delete_label' AND w.resource_key=email_labels.provider_label_id AND w.completed_revision<w.revision)
+        ORDER BY name
+        "#,
+        link_id
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+#[tracing::instrument(skip(pool), err)]
+pub(crate) async fn get_label_by_id(
+    pool: &PgPool,
+    label_id: Uuid,
+    link_id: Uuid,
+) -> Result<Option<LinkLabel>, sqlx::Error> {
+    let row: Option<LinkLabelDbRow> = sqlx::query_as!(
+        LinkLabelDbRow,
+        r#"
+        SELECT
+            id,
+            link_id,
+            provider_label_id,
+            name,
+            created_at,
+            message_list_visibility as "message_list_visibility: _",
+            label_list_visibility as "label_list_visibility: _",
+            type as "type_: _"
+        FROM email_labels
+        WHERE id = $1 AND link_id = $2
+        "#,
+        label_id,
+        link_id
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(Into::into))
+}
+
+#[tracing::instrument(skip(executor), err)]
+pub(crate) async fn get_thread_label_messages(
+    executor: impl sqlx::PgExecutor<'_>,
+    thread_id: Uuid,
+    link_id: Uuid,
+) -> Result<Vec<SimpleMessage>, sqlx::Error> {
+    let rows: Vec<SimpleMessageDbRow> = sqlx::query_as!(
+        SimpleMessageDbRow,
+        r#"
+        SELECT
+            m.id,
+            m.provider_id,
+            m.thread_id,
+            m.provider_thread_id,
+            m.replying_to_id,
+            m.global_id,
+            m.link_id,
+            m.subject,
+            m.snippet,
+            m.from_contact_id,
+            m.provider_history_id,
+            m.internal_date_ts,
+            m.sent_at,
+            m.size_estimate,
+            m.is_read,
+            m.is_starred,
+            m.is_sent,
+            m.is_draft,
+            m.has_attachments,
+            m.headers_jsonb,
+            m.created_at,
+            m.updated_at
+        FROM email_messages m
+        WHERE m.thread_id = $1 AND m.link_id = $2
+        ORDER BY m.internal_date_ts DESC NULLS LAST
+        "#,
+        thread_id,
+        link_id
+    )
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Stage a label change on a thread for Gmail in one transaction: read which
+/// messages gain or lose the label, apply the change to every message with the
+/// flags it drives, and mark the changed messages Gmail knows about as waiting
+/// on `write_id`. `None` when the thread has no messages.
+#[tracing::instrument(skip(pool), err)]
+pub(super) async fn stage_thread_label_change(
+    pool: &PgPool,
+    thread_id: Uuid,
+    link_id: Uuid,
+    provider_label_id: &str,
+    add: bool,
+    write_id: Uuid,
+) -> Result<Option<StagedLabelChange>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    email_db_client::labels::pending_writes::lock_thread_label_writes(&mut tx, &[thread_id])
+        .await?;
+
+    let messages = get_thread_label_messages(&mut *tx, thread_id, link_id).await?;
+    if messages.is_empty() {
+        return Ok(None);
+    }
+    let message_ids: Vec<Uuid> = messages.iter().map(|message| message.db_id).collect();
+    let changed_ids = email_db_client::labels::get::messages_changing_label(
+        &mut *tx,
+        link_id,
+        &message_ids,
+        provider_label_id,
+        add,
+    )
+    .await?;
+
+    if add {
+        insert_message_labels_batch(&mut *tx, &message_ids, provider_label_id, link_id).await?;
+    } else {
+        delete_message_labels_batch(&mut *tx, &message_ids, provider_label_id, link_id).await?;
+    }
+    if provider_label_id == system_labels::INBOX {
+        set_thread_inbox_visible(&mut tx, thread_id, link_id, add).await?;
+    } else if provider_label_id == system_labels::UNREAD {
+        update_message_read_status_batch(&mut *tx, &message_ids, link_id, !add).await?;
+        super::thread::update_thread_read_status(&mut *tx, thread_id, link_id, !add).await?;
+    } else if provider_label_id == system_labels::STARRED {
+        update_message_starred_status_batch(&mut *tx, &message_ids, link_id, add).await?;
+    }
+
+    let pending_ids: Vec<Uuid> = messages
+        .iter()
+        .filter(|message| {
+            changed_ids.contains(&message.db_id)
+                && message
+                    .provider_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty())
+        })
+        .map(|message| message.db_id)
+        .collect();
+    label_state::mark_pending_label_writes(
+        &mut PgLabelState(&mut tx),
+        link_id,
+        &pending_ids,
+        provider_label_id,
+        add,
+        write_id,
+    )
+    .await?;
+
+    // Folder changes immediately alter the canonical All Mail preview, sort,
+    // and signal state; they must not wait for the Gmail worker's confirmation.
+    if matches!(
+        provider_label_id,
+        system_labels::SPAM | system_labels::TRASH
+    ) {
+        super::thread::update_thread_metadata(&mut tx, thread_id, link_id).await?;
+    }
+    tx.commit().await?;
+
+    Ok(Some(StagedLabelChange {
+        messages,
+        changed_ids,
+    }))
+}
+
+/// Undo a staged label change Gmail will never receive, in one transaction
+/// holding the thread's label-write lock: labels of `provider_message_ids`
+/// go back to the state Gmail will end up with (see
+/// `abandon_pending_label_writes`), `local_message_ids` (Macro-only drafts)
+/// lose the change, and the thread's state is derived again.
+#[tracing::instrument(skip(pool, provider_message_ids, local_message_ids), err)]
+#[expect(clippy::too_many_arguments, reason = "the parts of one staged change")]
+pub(super) async fn revert_staged_label_change(
+    pool: &PgPool,
+    thread_id: Uuid,
+    link_id: Uuid,
+    provider_label_id: &str,
+    add: bool,
+    write_id: Uuid,
+    provider_message_ids: &[Uuid],
+    local_message_ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    email_db_client::labels::pending_writes::lock_thread_label_writes(&mut tx, &[thread_id])
+        .await?;
+    label_state::abandon_pending_label_writes(
+        &mut PgLabelState(&mut tx),
+        link_id,
+        provider_message_ids,
+        write_id,
+    )
+    .await?;
+
+    if add {
+        delete_message_labels_batch(&mut *tx, local_message_ids, provider_label_id, link_id)
+            .await?;
+    } else {
+        insert_message_labels_batch(&mut *tx, local_message_ids, provider_label_id, link_id)
+            .await?;
+    }
+    if provider_label_id == system_labels::UNREAD {
+        update_message_read_status_batch(&mut *tx, local_message_ids, link_id, add).await?;
+    } else if provider_label_id == system_labels::STARRED {
+        update_message_starred_status_batch(&mut *tx, local_message_ids, link_id, !add).await?;
+    }
+
+    super::thread::update_thread_metadata(&mut tx, thread_id, link_id).await?;
+    tx.commit().await
+}
+
+async fn set_thread_inbox_visible(
+    tx: &mut sqlx::PgConnection,
+    thread_id: Uuid,
+    link_id: Uuid,
+    inbox_visible: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"
+        UPDATE email_threads
+        SET inbox_visible = $1, updated_at = NOW()
+        WHERE id = $2 AND link_id = $3
+        "#,
+        inbox_visible,
+        thread_id,
+        link_id,
+    )
+    .execute(tx)
+    .await?;
+    Ok(())
+}
+
+#[tracing::instrument(skip(executor), err)]
+pub(crate) async fn insert_message_labels_batch(
+    executor: impl sqlx::PgExecutor<'_>,
+    message_ids: &[Uuid],
+    provider_label_id: &str,
+    link_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query!(
+        r#"
+        INSERT INTO email_message_labels (message_id, label_id)
+        SELECT
+            unnested_message_id,
+            l.id
+        FROM
+            UNNEST($1::uuid[]) AS t(unnested_message_id)
+        CROSS JOIN
+            email_labels l
+        WHERE
+            l.link_id = $2 AND l.provider_label_id = $3
+        ON CONFLICT (message_id, label_id) DO NOTHING
+        "#,
+        message_ids,
+        link_id,
+        provider_label_id
+    )
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
+#[tracing::instrument(skip(executor), err)]
+pub(crate) async fn delete_message_labels_batch(
+    executor: impl sqlx::PgExecutor<'_>,
+    message_ids: &[Uuid],
+    provider_label_id: &str,
+    link_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query!(
+        r#"
+        DELETE FROM email_message_labels
+        WHERE
+            message_id = ANY($1)
+            AND label_id = (
+                SELECT id FROM email_labels
+                WHERE link_id = $2 AND provider_label_id = $3
+            )
+        "#,
+        message_ids,
+        link_id,
+        provider_label_id
+    )
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
+#[tracing::instrument(skip(executor), err)]
+pub(crate) async fn update_message_read_status_batch(
+    executor: impl sqlx::PgExecutor<'_>,
+    message_ids: &[Uuid],
+    link_id: Uuid,
+    is_read: bool,
+) -> Result<(), sqlx::Error> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query!(
+        r#"
+        UPDATE email_messages m
+        SET
+            is_read = $1,
+            updated_at = NOW()
+        WHERE
+            m.id = ANY($2)
+            AND m.link_id = $3
+        "#,
+        is_read,
+        message_ids,
+        link_id
+    )
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
+#[tracing::instrument(skip(executor), err)]
+pub(crate) async fn update_message_starred_status_batch(
+    executor: impl sqlx::PgExecutor<'_>,
+    message_ids: &[Uuid],
+    link_id: Uuid,
+    is_starred: bool,
+) -> Result<(), sqlx::Error> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query!(
+        r#"
+        UPDATE email_messages m
+        SET
+            is_starred = $1,
+            updated_at = NOW()
+        WHERE
+            m.id = ANY($2)
+            AND m.link_id = $3
+        "#,
+        is_starred,
+        message_ids,
+        link_id
+    )
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
+#[tracing::instrument(skip(pool), err)]
+pub(crate) async fn delete_scheduled_messages_batch(
+    pool: &PgPool,
+    message_ids: &[Uuid],
+    link_id: Uuid,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tx = pool.begin().await?;
+    // The caller's draft list may predate a concurrent send admission.
+    let drafts = sqlx::query_scalar!(
+        r#"
+        SELECT id FROM email_messages
+        WHERE id = ANY($1) AND link_id = $2 AND is_draft AND NOT is_sent
+        ORDER BY id FOR UPDATE
+        "#,
+        message_ids,
+        link_id
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let deleted = sqlx::query_scalar!(
+        r#"
+        DELETE FROM email_scheduled_messages
+        WHERE message_id = ANY($1) AND link_id = $2 AND sent = false
+          AND (delivery_status = 'failed' OR
+               (delivery_started_at IS NULL AND delivery_status <> 'unconfirmed'
+                AND (NOT processing OR delivery_claim_id IS NOT NULL)))
+        RETURNING message_id
+        "#,
+        &drafts,
+        link_id
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    super::send_attempt::cancel_revoked_attempts(&mut tx, &deleted, link_id).await?;
+    tx.commit().await?;
+    Ok(deleted)
+}

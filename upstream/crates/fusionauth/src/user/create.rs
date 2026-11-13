@@ -1,0 +1,124 @@
+use std::{borrow::Cow, net::IpAddr};
+
+use crate::{AuthedClient, Result, error::FusionAuthClientError};
+
+/// A user to create in FusionAuth.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct User<'a> {
+    /// The email address of the user
+    pub email: Cow<'a, str>,
+    /// The password of the user.
+    /// This is mandatory in fusionauth but we do not use it. As such, it's randomly generated at
+    /// creation time and thrown away immediately.
+    pub password: Cow<'a, str>,
+    /// The username of the user.
+    pub username: Option<Cow<'a, str>>,
+    /// Metadata FusionAuth stores on the user and repeats in its webhooks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateUserRequest<'a> {
+    /// The fusionauth application id
+    pub application_id: Cow<'a, str>,
+    /// Whether to skip verification of a user
+    /// Defaults to false
+    pub skip_verification: bool,
+    /// The user to create
+    pub user: User<'a>,
+}
+
+impl<'a> CreateUserRequest<'a> {
+    pub(crate) fn new(
+        application_id: Cow<'a, str>,
+        skip_verification: bool,
+        user: User<'a>,
+    ) -> Self {
+        Self {
+            application_id,
+            skip_verification,
+            user,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UserResponse<'a> {
+    /// The id of the user
+    pub id: Cow<'a, str>,
+    /// The email address of the user
+    pub email: Cow<'a, str>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateUserResponse<'a> {
+    /// The user
+    pub user: UserResponse<'a>,
+}
+
+/// Creates a user in fusionauth. When `user_id` is provided the user is created with
+/// that id (`POST /api/user/{id}`), letting callers align the FusionAuth id with an
+/// externally minted identifier.
+/// https://fusionauth.io/docs/apis/users#create-a-user
+/// Valid respones: 200, 400, 401, 500, 503, 504
+pub(crate) async fn create_user(
+    client: &AuthedClient,
+    base_url: &str,
+    user_id: Option<&str>,
+    request: CreateUserRequest<'_>,
+    client_ip: IpAddr,
+) -> Result<String> {
+    let url = match user_id {
+        Some(id) => format!("{base_url}/api/user/{id}"),
+        None => format!("{base_url}/api/user"),
+    };
+
+    let res = client
+        .client()
+        .post(url)
+        .header("X-Forwarded-For", &client_ip.to_string())
+        .json(&request)
+        .send()
+        .await
+        .map_err(FusionAuthClientError::transport)?;
+
+    match res.status() {
+        reqwest::StatusCode::OK => {
+            tracing::trace!("user created");
+            let body = res
+                .json::<CreateUserResponse>()
+                .await
+                .map_err(FusionAuthClientError::transport)?;
+
+            Ok(body.user.id.into())
+        }
+        reqwest::StatusCode::BAD_REQUEST => {
+            let status = res.status();
+            let headers = res.headers().clone();
+            let body = res.text().await.map_err(FusionAuthClientError::transport)?;
+
+            if body.contains("[duplicate]") {
+                Err(FusionAuthClientError::UserAlreadyExists)
+            } else {
+                Err(FusionAuthClientError::unexpected(status, &headers, body))
+            }
+        }
+        _ => {
+            let status = res.status();
+            let headers = res.headers().clone();
+            let body = res.text().await.map_err(FusionAuthClientError::transport)?;
+
+            if body.contains("[duplicate]user.email") {
+                tracing::error!("user already exists");
+                return Err(FusionAuthClientError::UserAlreadyExists);
+            }
+
+            Err(FusionAuthClientError::unexpected(status, &headers, body))
+        }
+    }
+}

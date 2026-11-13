@@ -1,0 +1,726 @@
+use bot_id::BotIdStr;
+use channel_sender::ChannelSender;
+use nom::{
+    Finish, IResult, Parser,
+    branch::alt,
+    bytes::complete::{tag, tag_no_case, take_till1, take_while1},
+    character::complete::anychar,
+    combinator::{eof, not, peek, recognize, verify},
+    multi::{many_till, many0},
+    sequence::{delimited, preceded, terminated},
+};
+use serde::Deserialize;
+use std::{
+    borrow::Cow,
+    fmt::{Formatter, Write},
+    marker::PhantomData,
+};
+use thiserror::Error;
+
+fn xml_tag(
+    start_delimiter: &'static str,
+    tag_name: &'static str,
+) -> impl Fn(&str) -> IResult<&str, &str> {
+    move |s: &str| delimited(tag(start_delimiter), tag_no_case(tag_name), tag(">")).parse(s)
+}
+
+fn xml_tag_open(tag_name: &'static str) -> impl Fn(&str) -> IResult<&str, &str> {
+    move |s: &str| xml_tag("<", tag_name).parse(s)
+}
+
+fn xml_tag_close(tag_name: &'static str) -> impl Fn(&str) -> IResult<&str, &str> {
+    move |s: &str| xml_tag("</", tag_name).parse(s)
+}
+
+fn tag_content(tag_name: &'static str) -> impl Fn(&str) -> IResult<&str, &str> {
+    move |s: &str| {
+        delimited(
+            xml_tag_open(tag_name),
+            recognize(many_till(anychar, peek(xml_tag_close(tag_name)))),
+            xml_tag_close(tag_name),
+        )
+        .parse(s)
+    }
+}
+
+pub trait XmlTaggedParsed<'de>: Deserialize<'de> {
+    const TAG_NAME: &'static str;
+
+    fn parse(s: &'de str) -> IResult<&'de str, Self> {
+        tag_content(Self::TAG_NAME)
+            .map_res(serde_json::from_str)
+            .parse(s)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ParsedUserMention<'a> {
+    #[serde(borrow)]
+    pub user_id: ChannelSender<'a>,
+    /// For a bot mention this carries the bot's display name; see
+    /// [`crate::serialize::bot_mention`].
+    #[serde(borrow, default)]
+    pub email: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub display_name: Option<Cow<'a, str>>,
+}
+
+impl ParsedUserMention<'_> {
+    /// Display name for a mentioned bot. Prefers the names written into the
+    /// tag by the composer, then the first-party bot registry, so a bot never
+    /// renders under another bot's name.
+    fn bot_display_name(&self, bot: &BotIdStr<'_>) -> &str {
+        [self.display_name.as_deref(), self.email.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|name| !name.trim().is_empty())
+            .or_else(|| bot_id::system_bot(bot.bot_id()).map(|system| system.name))
+            .unwrap_or("Bot")
+    }
+}
+
+impl<'de> XmlTaggedParsed<'de> for ParsedUserMention<'de> {
+    const TAG_NAME: &'static str = "m-user-mention";
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ParsedContactMention<'a> {
+    #[serde(borrow)]
+    pub name: Cow<'a, str>,
+}
+
+impl<'de> XmlTaggedParsed<'de> for ParsedContactMention<'de> {
+    const TAG_NAME: &'static str = "m-contact-mention";
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ParsedDateMention<'a> {
+    #[serde(borrow)]
+    pub display_format: Cow<'a, str>,
+}
+
+impl<'de> XmlTaggedParsed<'de> for ParsedDateMention<'de> {
+    const TAG_NAME: &'static str = "m-date-mention";
+
+    /// The body is the JSON object, or a bare ISO 8601 date or timestamp,
+    /// which models write in place of it.
+    fn parse(s: &'de str) -> IResult<&'de str, Self> {
+        tag_content(Self::TAG_NAME)
+            .map_res(|body: &'de str| match bare_date_label(body.trim()) {
+                Some(label) => Ok(Self {
+                    display_format: Cow::Owned(label),
+                }),
+                None => serde_json::from_str(body),
+            })
+            .parse(s)
+    }
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Label for a bare ISO date or timestamp, as written: "Nov 13, 2026" or
+/// "Nov 13, 2026, 3:00 PM". `None` when it is not a real date and time.
+/// `parseDateMentionBody` in `packages/lexical-core` labels them the same way.
+fn bare_date_label(body: &str) -> Option<String> {
+    let (_, year, month, day, hour, minute) = lazy_regex::regex_captures!(
+        r"^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2}))?$",
+        body
+    )?;
+    let year: u32 = year.parse().ok()?;
+    let month: usize = month.parse().ok()?;
+    let day: u32 = day.parse().ok()?;
+    let is_leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+    let days_in_month = match month {
+        2 if is_leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1..=12 => 31,
+        _ => return None,
+    };
+    if day == 0 || day > days_in_month {
+        return None;
+    }
+    let date = format!("{} {day}, {year}", MONTHS[month - 1]);
+    if hour.is_empty() {
+        return Some(date);
+    }
+    let hour: u32 = hour.parse().ok()?;
+    if hour > 23 || minute.parse::<u32>().ok()? > 59 {
+        return None;
+    }
+    let period = if hour < 12 { "AM" } else { "PM" };
+    let hour = match hour % 12 {
+        0 => 12,
+        hour => hour,
+    };
+    Some(format!("{date}, {hour}:{minute} {period}"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ParsedDocumentMention<'a> {
+    /// A cached label; agents leave it empty or omit it, since the app shows
+    /// the live name.
+    #[serde(borrow, default)]
+    pub document_name: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub block_name: Cow<'a, str>,
+    /// Free-form navigation parameters. Any shape is accepted, so an odd
+    /// value never stops the rest of the text from being formatted.
+    #[serde(default)]
+    pub block_params: serde_json::Value,
+}
+
+impl ParsedDocumentMention<'_> {
+    /// What the mention points at, as a lowercase noun, for text that cannot
+    /// show the live name.
+    pub fn kind(&self) -> &'static str {
+        let is_message = self
+            .block_params
+            .get("channel_message_id")
+            .is_some_and(|id| !id.is_null());
+
+        match self.block_name.as_ref() {
+            "channel" if is_message => "message",
+            "channel" => "channel",
+            "md" | "write" | "pdf" | "code" | "canvas" | "spreadsheet" | "csv" | "pptx" | "psd"
+            | "fig" | "ai" | "unknown" => "document",
+            "task" => "task",
+            "email" => "email",
+            "calendar" => "event",
+            "database" => "database",
+            "form" => "form",
+            "initiative" => "project",
+            "project" => "folder",
+            "company" => "company",
+            "contact" => "contact",
+            "pipeline" => "pipeline",
+            "call" => "call",
+            "chat" => "chat",
+            "agent" => "agent session",
+            "pr" => "pull request",
+            "image" => "image",
+            "video" => "video",
+            "skill" => "skill",
+            "snippet" => "snippet",
+            "routine" | "automation" => "routine",
+            _ => "item",
+        }
+    }
+}
+
+impl<'de> XmlTaggedParsed<'de> for ParsedDocumentMention<'de> {
+    const TAG_NAME: &'static str = "m-document-mention";
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ParsedLink<'a> {
+    #[serde(borrow)]
+    pub text: Cow<'a, str>,
+    #[serde(borrow)]
+    pub url: Cow<'a, str>,
+}
+
+impl<'de> XmlTaggedParsed<'de> for ParsedLink<'de> {
+    const TAG_NAME: &'static str = "m-link";
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ParsedGroupMention<'a> {
+    #[serde(borrow)]
+    pub group_alias: Cow<'a, str>,
+}
+
+impl<'de> XmlTaggedParsed<'de> for ParsedGroupMention<'de> {
+    const TAG_NAME: &'static str = "m-group-mention";
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ParsedAgentSessionMention<'a> {
+    #[serde(borrow)]
+    pub id: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub label: Option<Cow<'a, str>>,
+}
+
+impl<'de> XmlTaggedParsed<'de> for ParsedAgentSessionMention<'de> {
+    const TAG_NAME: &'static str = "m-agent-session-mention";
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ParsedPullRequestMention<'a> {
+    /// The Macro foreign entity id. Empty when an agent mentioned the PR by
+    /// its GitHub `url` alone.
+    #[serde(borrow, default)]
+    pub id: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub label: Option<Cow<'a, str>>,
+    /// The pull request's github.com URL.
+    #[serde(borrow, default)]
+    pub url: Option<Cow<'a, str>>,
+}
+
+impl ParsedPullRequestMention<'_> {
+    /// `owner/repo#123` from the mention's GitHub URL, if it has one. Agents
+    /// sometimes write that URL in `id`, so it is read from there too.
+    pub fn github_ref(&self) -> Option<String> {
+        let url = self
+            .url
+            .as_deref()
+            .filter(|url| !url.is_empty())
+            .unwrap_or(&self.id);
+        let path = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))?;
+        let path = path.strip_prefix("www.").unwrap_or(path);
+        let mut parts = path.strip_prefix("github.com/")?.split('/');
+        let (owner, repo, pull, number) =
+            (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        let number = number
+            .split(['?', '#'])
+            .next()
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))?;
+        (pull == "pull" && !owner.is_empty() && !repo.is_empty())
+            .then(|| format!("{owner}/{repo}#{number}"))
+    }
+}
+
+impl<'de> XmlTaggedParsed<'de> for ParsedPullRequestMention<'de> {
+    const TAG_NAME: &'static str = "m-pr-mention";
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ParsedBookingLinkMention<'a> {
+    #[serde(borrow, default)]
+    pub profile_id: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub slug: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub label: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub url: Cow<'a, str>,
+}
+
+impl ParsedBookingLinkMention<'_> {
+    pub fn display_label(&self) -> &str {
+        self.label
+            .as_deref()
+            .filter(|label| !label.is_empty())
+            .or_else(|| self.slug.as_deref().filter(|slug| !slug.is_empty()))
+            .unwrap_or("Booking link")
+    }
+}
+
+impl<'de> XmlTaggedParsed<'de> for ParsedBookingLinkMention<'de> {
+    const TAG_NAME: &'static str = "m-booking-link-mention";
+}
+
+#[derive(Debug)]
+pub enum XmlTag<'de> {
+    Link(ParsedLink<'de>),
+    Document(ParsedDocumentMention<'de>),
+    User(ParsedUserMention<'de>),
+    Contact(ParsedContactMention<'de>),
+    Date(ParsedDateMention<'de>),
+    Group(ParsedGroupMention<'de>),
+    AgentSession(ParsedAgentSessionMention<'de>),
+    PullRequest(ParsedPullRequestMention<'de>),
+    BookingLink(ParsedBookingLinkMention<'de>),
+}
+
+fn parse_xml_tag(s: &str) -> IResult<&str, XmlTag<'_>> {
+    alt((
+        ParsedLink::parse.map(XmlTag::Link),
+        ParsedDocumentMention::parse.map(XmlTag::Document),
+        ParsedUserMention::parse.map(XmlTag::User),
+        ParsedContactMention::parse.map(XmlTag::Contact),
+        ParsedDateMention::parse.map(XmlTag::Date),
+        ParsedGroupMention::parse.map(XmlTag::Group),
+        ParsedAgentSessionMention::parse.map(XmlTag::AgentSession),
+        ParsedPullRequestMention::parse.map(XmlTag::PullRequest),
+        ParsedBookingLinkMention::parse.map(XmlTag::BookingLink),
+    ))
+    .parse(s)
+}
+
+fn is_recognized_tag_name(name: &str) -> bool {
+    [
+        ParsedLink::TAG_NAME,
+        ParsedDocumentMention::TAG_NAME,
+        ParsedUserMention::TAG_NAME,
+        ParsedContactMention::TAG_NAME,
+        ParsedDateMention::TAG_NAME,
+        ParsedGroupMention::TAG_NAME,
+        ParsedAgentSessionMention::TAG_NAME,
+        ParsedPullRequestMention::TAG_NAME,
+        ParsedBookingLinkMention::TAG_NAME,
+    ]
+    .iter()
+    .any(|recognized| recognized.eq_ignore_ascii_case(name))
+}
+
+/// Consumes and discards an unrecognized `<m-*>` tag, either self-closing
+/// (`<m-*/>`) or a `<m-*>…</m-*>` pair. Tags with a recognized name are rejected
+/// here so a recognized tag carrying malformed content still surfaces as a parse
+/// error.
+fn parse_unknown_xml_tag(s: &str) -> IResult<&str, ()> {
+    let (after_name, name) = preceded(
+        tag("<"),
+        verify(
+            recognize((
+                tag_no_case("m-"),
+                take_while1(|c: char| c.is_ascii_alphanumeric() || c == '-'),
+            )),
+            |name: &str| !is_recognized_tag_name(name),
+        ),
+    )
+    .parse(s)?;
+
+    let (rest, _) = alt((
+        tag("/>").map(|_| ()),
+        (
+            tag(">"),
+            many_till(anychar, (tag("</"), tag_no_case(name), tag(">"))),
+        )
+            .map(|_| ()),
+    ))
+    .parse(after_name)?;
+
+    Ok((rest, ()))
+}
+
+#[derive(Debug)]
+pub enum TextSegment<'de> {
+    Xml(XmlTag<'de>),
+    Plain(&'de str),
+}
+
+#[non_exhaustive]
+pub struct ParsedXmlText<'de>(pub Vec<TextSegment<'de>>);
+
+#[derive(Debug, Error)]
+#[error(transparent)]
+pub struct ParseErr(#[from] nom::error::Error<String>);
+
+/// One piece of message markup: a recognized tag, a run of text up to the next
+/// `<`, or an unrecognized `<m-*>` tag, which is dropped.
+fn parse_segment(s: &str) -> IResult<&str, Option<TextSegment<'_>>> {
+    alt((
+        parse_xml_tag.map(|xml| Some(TextSegment::Xml(xml))),
+        take_till1(|c| c == '<').map(|text| Some(TextSegment::Plain(text))),
+        parse_unknown_xml_tag.map(|()| None),
+    ))
+    .parse(s)
+}
+
+impl<'de> ParsedXmlText<'de> {
+    pub fn parse(s: &'de str) -> Result<Self, ParseErr> {
+        let (_, (out, _)) = many0(parse_segment)
+            .and(eof)
+            .parse(s)
+            .finish()
+            .map_err(|e| e.cloned())?;
+        Ok(ParsedXmlText(out.into_iter().flatten().collect()))
+    }
+
+    /// Parses text that need not be valid message markup, such as an agent's
+    /// Markdown reply, where `Vec<String>` or `a < b` is ordinary prose. A `<`
+    /// that does not open an `<m-*>` tag stays as plain text instead of failing
+    /// the whole input, so the tags around it are still recognized.
+    ///
+    /// From the first `<m-*>` tag that does not parse, the rest is kept as
+    /// plain text. Retrying after it would rescan the remaining input for a
+    /// closing tag at every such tag, which is quadratic in a long reply.
+    pub fn parse_lenient(s: &'de str) -> Self {
+        let stray_lt = terminated(tag("<"), not(tag_no_case("m-")));
+        let parsed = many0(alt((
+            parse_segment,
+            stray_lt.map(|lt| Some(TextSegment::Plain(lt))),
+        )))
+        .parse(s);
+        let Ok((rest, out)) = parsed else {
+            // Every alternative consumes input or fails recoverably, so this is
+            // not reached; keep the text rather than lose it if it ever is.
+            return ParsedXmlText(vec![TextSegment::Plain(s)]);
+        };
+        let mut segments: Vec<_> = out.into_iter().flatten().collect();
+        if !rest.is_empty() {
+            segments.push(TextSegment::Plain(rest));
+        }
+        ParsedXmlText(segments)
+    }
+}
+
+pub struct ReformattedXmlText<T>(pub String, PhantomData<T>);
+
+pub trait XmlFormatter: Sized {
+    fn format_plain_text(s: &str, f: &mut Formatter<'_>) -> std::fmt::Result;
+    fn format_link(link: &ParsedLink<'_>, f: &mut Formatter<'_>) -> std::fmt::Result;
+    fn format_doc(doc: &ParsedDocumentMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result;
+    fn format_user(user: &ParsedUserMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result;
+    fn format_contact(
+        contact: &ParsedContactMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result;
+    fn format_date(date: &ParsedDateMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result;
+    fn format_group(group: &ParsedGroupMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result;
+    fn format_agent_session(
+        session: &ParsedAgentSessionMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result;
+    fn format_pull_request(
+        pr: &ParsedPullRequestMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result;
+    fn format_booking_link(
+        link: &ParsedBookingLinkMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result;
+
+    fn format_xml_text(text: ParsedXmlText<'_>) -> ReformattedXmlText<Self> {
+        use std::fmt::Display;
+
+        struct Adapter<F>(F);
+        impl<F: Fn(&mut Formatter<'_>) -> std::fmt::Result> Display for Adapter<F> {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                (self.0)(f)
+            }
+        }
+
+        let s = text.0.into_iter().fold(String::new(), |mut acc, cur| {
+            let _ = match cur {
+                TextSegment::Xml(XmlTag::Link(l)) => {
+                    write!(
+                        acc,
+                        "{}",
+                        Adapter(|f: &mut Formatter<'_>| Self::format_link(&l, f))
+                    )
+                }
+                TextSegment::Xml(XmlTag::Document(d)) => {
+                    write!(
+                        acc,
+                        "{}",
+                        Adapter(|f: &mut Formatter<'_>| Self::format_doc(&d, f))
+                    )
+                }
+                TextSegment::Xml(XmlTag::User(u)) => {
+                    write!(
+                        acc,
+                        "{}",
+                        Adapter(|f: &mut Formatter<'_>| Self::format_user(&u, f))
+                    )
+                }
+                TextSegment::Xml(XmlTag::Contact(c)) => {
+                    write!(
+                        acc,
+                        "{}",
+                        Adapter(|f: &mut Formatter<'_>| Self::format_contact(&c, f))
+                    )
+                }
+                TextSegment::Xml(XmlTag::Date(d)) => {
+                    write!(
+                        acc,
+                        "{}",
+                        Adapter(|f: &mut Formatter<'_>| Self::format_date(&d, f))
+                    )
+                }
+                TextSegment::Xml(XmlTag::Group(g)) => {
+                    write!(
+                        acc,
+                        "{}",
+                        Adapter(|f: &mut Formatter<'_>| Self::format_group(&g, f))
+                    )
+                }
+                TextSegment::Xml(XmlTag::AgentSession(s)) => {
+                    write!(
+                        acc,
+                        "{}",
+                        Adapter(|f: &mut Formatter<'_>| Self::format_agent_session(&s, f))
+                    )
+                }
+                TextSegment::Xml(XmlTag::PullRequest(p)) => {
+                    write!(
+                        acc,
+                        "{}",
+                        Adapter(|f: &mut Formatter<'_>| Self::format_pull_request(&p, f))
+                    )
+                }
+                TextSegment::Xml(XmlTag::BookingLink(b)) => {
+                    write!(
+                        acc,
+                        "{}",
+                        Adapter(|f: &mut Formatter<'_>| Self::format_booking_link(&b, f))
+                    )
+                }
+                TextSegment::Plain(s) => {
+                    write!(
+                        acc,
+                        "{}",
+                        Adapter(|f: &mut Formatter<'_>| Self::format_plain_text(s, f))
+                    )
+                }
+            };
+            acc
+        });
+        ReformattedXmlText(s, PhantomData)
+    }
+}
+
+/// xml formatter which converts xml tags to their plain text representation
+pub struct PlainTextFormatter;
+
+impl XmlFormatter for PlainTextFormatter {
+    fn format_plain_text(s: &str, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{s}")
+    }
+
+    fn format_link(link: &ParsedLink<'_>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", link.text)
+    }
+
+    /// A nameless mention reads as its kind in angle brackets, e.g. `<task>`.
+    /// The brackets are literal text: HTML consumers must escape them.
+    fn format_doc(doc: &ParsedDocumentMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if doc.document_name.trim().is_empty() {
+            return write!(f, "<{}>", doc.kind());
+        }
+        write!(f, "{}", doc.document_name)
+    }
+
+    fn format_user(user: &ParsedUserMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if let Some(bot) = user.user_id.as_bot() {
+            write!(f, "{}", user.bot_display_name(bot))
+        } else if let Some(account) = user.user_id.as_user() {
+            write!(f, "{}", account.email_part().as_ref())
+        } else {
+            write!(f, "Guest")
+        }
+    }
+
+    fn format_contact(
+        contact: &ParsedContactMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "{}", contact.name)
+    }
+
+    fn format_date(date: &ParsedDateMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", date.display_format)
+    }
+
+    fn format_group(group: &ParsedGroupMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "@{}", group.group_alias)
+    }
+
+    fn format_agent_session(
+        session: &ParsedAgentSessionMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            session
+                .label
+                .as_deref()
+                .filter(|label| !label.is_empty())
+                .unwrap_or("Agent session")
+        )
+    }
+
+    fn format_pull_request(
+        pr: &ParsedPullRequestMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        match pr.label.as_deref().filter(|label| !label.is_empty()) {
+            Some(label) => write!(f, "{label}"),
+            None => write!(
+                f,
+                "{}",
+                pr.github_ref().as_deref().unwrap_or("Pull request")
+            ),
+        }
+    }
+
+    fn format_booking_link(
+        link: &ParsedBookingLinkMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "{}", link.display_label())
+    }
+}
+
+/// xml formatter which completely removes the inner text of all xml tags
+pub struct NullXmlFormatter;
+
+impl XmlFormatter for NullXmlFormatter {
+    fn format_plain_text(s: &str, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{s}")
+    }
+
+    fn format_link(_link: &ParsedLink<'_>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "")
+    }
+
+    fn format_doc(_doc: &ParsedDocumentMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "")
+    }
+
+    fn format_user(_user: &ParsedUserMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "")
+    }
+
+    fn format_contact(
+        _contact: &ParsedContactMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "")
+    }
+
+    fn format_date(_date: &ParsedDateMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "")
+    }
+
+    fn format_group(_group: &ParsedGroupMention<'_>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "")
+    }
+
+    fn format_agent_session(
+        _session: &ParsedAgentSessionMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "")
+    }
+
+    fn format_pull_request(
+        _pr: &ParsedPullRequestMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "")
+    }
+
+    fn format_booking_link(
+        _link: &ParsedBookingLinkMention<'_>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "")
+    }
+}

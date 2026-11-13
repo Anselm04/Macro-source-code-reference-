@@ -1,0 +1,745 @@
+#[cfg(not(test))]
+use cached::proc_macro::cached;
+
+use std::sync::{Arc, LazyLock};
+
+use model::item::UserAccessibleItem;
+use single_flight::{DatabaseKey, SingleFlight};
+use sqlx::{Pool, Postgres};
+
+type AccessibleItemsKey = (DatabaseKey, String, Option<String>, bool);
+type AccessibleItems = Result<Arc<Vec<UserAccessibleItem>>, Arc<sqlx::Error>>;
+
+static RUNNING_LOOKUPS: LazyLock<SingleFlight<AccessibleItemsKey, AccessibleItems>> =
+    LazyLock::new(SingleFlight::new);
+
+/// Gets all accessible items for a user by querying entity_access with the user's source IDs
+/// (user ID, team memberships, and channel participations). Soft-deleted items and grants
+/// whose item row no longer exists are excluded.
+///
+/// Callers that miss the cache at the same time for the same database, user and
+/// filters share one run of the queries. A failure reaches all of them as an
+/// `Arc<sqlx::Error>`.
+pub async fn get_user_accessible_items(
+    db: &Pool<Postgres>,
+    user_id: &str,
+    item_type_filter: Option<String>,
+    exclude_owned: bool,
+) -> anyhow::Result<Vec<UserAccessibleItem>> {
+    let items = shared_accessible_items(db, user_id, item_type_filter, exclude_owned).await?;
+
+    // The caller's own copy is made here, after the cache lock is released.
+    Ok(Arc::unwrap_or_clone(items))
+}
+
+/// The list every caller of one lookup shares. The cache keeps it behind a
+/// pointer because it has one lock for all users, and a hit or a store that
+/// copied the list would hold that lock for the length of the list.
+///
+/// The span keeps the public function's name and, sitting above the cache,
+/// is opened only when the cache misses.
+#[tracing::instrument(
+    name = "get_user_accessible_items",
+    skip(db),
+    err,
+    fields(coalesced = tracing::field::Empty)
+)]
+#[cfg_attr(
+    not(test),
+    cached(
+        time = 10,
+        result = true,
+        key = "String",
+        convert = r#"{ format!("{}-{}-{}", user_id, item_type_filter.as_deref().unwrap_or("all"), exclude_owned) }"#
+    )
+)]
+async fn shared_accessible_items(
+    db: &Pool<Postgres>,
+    user_id: &str,
+    item_type_filter: Option<String>,
+    exclude_owned: bool,
+) -> anyhow::Result<Arc<Vec<UserAccessibleItem>>> {
+    let key = (
+        DatabaseKey::of(db),
+        user_id.to_string(),
+        item_type_filter.clone(),
+        exclude_owned,
+    );
+    let lookup = || {
+        let db = db.clone();
+        let user_id = user_id.to_string();
+        let item_type_filter = item_type_filter.clone();
+
+        async move {
+            query_accessible_items(&db, &user_id, item_type_filter.as_deref(), exclude_owned)
+                .await
+                .map(Arc::new)
+                .map_err(Arc::new)
+        }
+    };
+
+    // Boxed so the lookup adds one pointer, not its whole state machine, to
+    // the future of every caller up the stack: services near rustc's layout
+    // depth limit stop compiling otherwise.
+    Ok(Box::pin(RUNNING_LOOKUPS.run(key, lookup)).await?)
+}
+
+async fn query_accessible_items(
+    db: &Pool<Postgres>,
+    user_id: &str,
+    item_type_filter: Option<&str>,
+    exclude_owned: bool,
+) -> sqlx::Result<Vec<UserAccessibleItem>> {
+    let source_ids = user_source_ids(db, user_id).await?;
+    match item_type_filter {
+        Some("document") => accessible_documents(db, user_id, &source_ids, exclude_owned).await,
+        Some("chat") => accessible_chats(db, user_id, &source_ids, exclude_owned).await,
+        Some("project") => accessible_projects(db, user_id, &source_ids, exclude_owned).await,
+        Some(_) => Ok(vec![]),
+        None => {
+            let mut items = accessible_documents(db, user_id, &source_ids, exclude_owned).await?;
+            items.extend(accessible_chats(db, user_id, &source_ids, exclude_owned).await?);
+            items.extend(accessible_projects(db, user_id, &source_ids, exclude_owned).await?);
+            Ok(items)
+        }
+    }
+}
+
+fn to_items(ids: Vec<String>, item_type: &str) -> Vec<UserAccessibleItem> {
+    ids.into_iter()
+        .map(|item_id| UserAccessibleItem {
+            item_id,
+            item_type: item_type.to_string(),
+        })
+        .collect()
+}
+
+/// The user's active channels, team, and the user id itself: every
+/// `entity_access.source_id` that grants them access.
+///
+/// The per-type queries bind these as a constant `source_id = ANY($2)` rather
+/// than joining the same union as a CTE. Postgres costs a CTE join at the
+/// average source's grant count, so it planned users holding hundreds of
+/// thousands of grants with one item-table probe per grant; a constant array
+/// is estimated from `entity_access.source_id` statistics, which picks a hash
+/// join for them. The per-type queries run as unnamed statements because a
+/// cached prepared statement switches every user to one generic plan after
+/// five calls.
+async fn user_source_ids(db: &Pool<Postgres>, user_id: &str) -> sqlx::Result<Vec<String>> {
+    let source_ids = sqlx::query_scalar!(
+        r#"
+        SELECT cp.channel_id::text FROM comms_channel_participants cp
+            WHERE cp.user_id = $1 AND cp.left_at IS NULL
+        UNION ALL
+        SELECT t.team_id::text FROM team_user t
+            WHERE t.user_id = $1
+        UNION ALL
+        SELECT $1
+        "#,
+        user_id
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(source_ids.into_iter().flatten().collect())
+}
+
+async fn accessible_documents(
+    db: &Pool<Postgres>,
+    user_id: &str,
+    source_ids: &[String],
+    exclude_owned: bool,
+) -> sqlx::Result<Vec<UserAccessibleItem>> {
+    let ids = sqlx::query_scalar!(
+        r#"
+        SELECT d.id
+        FROM "Document" d
+        WHERE d.id IN (
+                SELECT ea.entity_id::text
+                FROM entity_access ea
+                WHERE ea.source_id = ANY($2)
+                    AND ea.entity_type = 'document'
+            )
+            AND d."deletedAt" IS NULL
+            AND (NOT $3 OR d.owner != $1)
+        "#,
+        user_id,
+        source_ids,
+        exclude_owned
+    )
+    .persistent(false)
+    .fetch_all(db)
+    .await?;
+
+    Ok(to_items(ids, "document"))
+}
+
+async fn accessible_chats(
+    db: &Pool<Postgres>,
+    user_id: &str,
+    source_ids: &[String],
+    exclude_owned: bool,
+) -> sqlx::Result<Vec<UserAccessibleItem>> {
+    let ids = sqlx::query_scalar!(
+        r#"
+        SELECT c.id
+        FROM "Chat" c
+        WHERE c.id IN (
+                SELECT ea.entity_id::text
+                FROM entity_access ea
+                WHERE ea.source_id = ANY($2)
+                    AND ea.entity_type = 'chat'
+            )
+            AND c."deletedAt" IS NULL
+            AND (NOT $3 OR c."userId" != $1)
+        "#,
+        user_id,
+        source_ids,
+        exclude_owned
+    )
+    .persistent(false)
+    .fetch_all(db)
+    .await?;
+
+    Ok(to_items(ids, "chat"))
+}
+
+async fn accessible_projects(
+    db: &Pool<Postgres>,
+    user_id: &str,
+    source_ids: &[String],
+    exclude_owned: bool,
+) -> sqlx::Result<Vec<UserAccessibleItem>> {
+    let ids = sqlx::query_scalar!(
+        r#"
+        SELECT p.id
+        FROM "Project" p
+        WHERE p.id IN (
+                SELECT ea.entity_id::text
+                FROM entity_access ea
+                WHERE ea.source_id = ANY($2)
+                    AND ea.entity_type = 'project'
+            )
+            AND p."deletedAt" IS NULL
+            AND (NOT $3 OR p."userId" != $1)
+        "#,
+        user_id,
+        source_ids,
+        exclude_owned
+    )
+    .persistent(false)
+    .fetch_all(db)
+    .await?;
+
+    Ok(to_items(ids, "project"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // testing correct items get returned for items that user has explicit permission for
+    #[sqlx::test(fixtures(path = "../../fixtures", scripts("get_user_accessible_items_explicit")))]
+    async fn test_accessible_items_explicit(pool: Pool<Postgres>) -> anyhow::Result<()> {
+        let user_id = "user-1";
+
+        // --- Core Function: include_owned ---
+        {
+            let items = get_user_accessible_items(&pool, user_id, None, false).await?;
+            let item_ids: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "a0000000-0000-0000-0000-0000000e0001",
+                "a0000000-0000-0000-0000-0000000e0002",
+                "a0000000-0000-0000-0000-0000000e0003",
+                "a0000000-0000-0000-0000-0000000e0004",
+                "a0000000-0000-0000-0000-0000000e0005",
+                "a0000000-0000-0000-0000-0000000e0006",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                item_ids, expected_ids,
+                "Core function (include owned) failed"
+            );
+        }
+
+        // --- Core Function: exclude_owned ---
+        {
+            let items = get_user_accessible_items(&pool, user_id, None, true).await?;
+            let item_ids: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "a0000000-0000-0000-0000-0000000e0004",
+                "a0000000-0000-0000-0000-0000000e0005",
+                "a0000000-0000-0000-0000-0000000e0006",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                item_ids, expected_ids,
+                "Core function (exclude owned) failed"
+            );
+        }
+
+        // --- Documents Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("document".to_string()), false)
+                    .await?;
+            let id_set: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "a0000000-0000-0000-0000-0000000e0003",
+                "a0000000-0000-0000-0000-0000000e0006",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                id_set, expected_ids,
+                "Documents wrapper (include owned) failed"
+            );
+        }
+
+        // --- Documents Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("document".to_string()), true)
+                    .await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["a0000000-0000-0000-0000-0000000e0006"],
+                "Documents wrapper (exclude owned) failed"
+            );
+        }
+
+        // --- Chats Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("chat".to_string()), false).await?;
+            let id_set: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "a0000000-0000-0000-0000-0000000e0002",
+                "a0000000-0000-0000-0000-0000000e0005",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(id_set, expected_ids, "Chats wrapper (include owned) failed");
+        }
+
+        // --- Chats Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("chat".to_string()), true).await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["a0000000-0000-0000-0000-0000000e0005"],
+                "Chats wrapper (exclude owned) failed"
+            );
+        }
+
+        // --- Projects Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("project".to_string()), false)
+                    .await?;
+            let id_set: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "a0000000-0000-0000-0000-0000000e0001",
+                "a0000000-0000-0000-0000-0000000e0004",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                id_set, expected_ids,
+                "Projects wrapper (include owned) failed"
+            );
+        }
+
+        // --- Projects Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("project".to_string()), true)
+                    .await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["a0000000-0000-0000-0000-0000000e0004"],
+                "Projects wrapper (exclude owned) failed"
+            );
+        }
+
+        Ok(())
+    }
+    #[sqlx::test(fixtures(path = "../../fixtures", scripts("get_user_accessible_items_implicit")))]
+    async fn test_accessible_items_hierarchical(pool: Pool<Postgres>) -> anyhow::Result<()> {
+        let user_id = "user-1"; // This user has implicit access to items owned by user-2
+
+        // --- Core Function: include_owned ---
+        // Since user-1 owns nothing, this should return all 4 accessible items.
+        {
+            let items = get_user_accessible_items(&pool, user_id, None, false).await?;
+            let item_ids: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "b0000000-0000-0000-0000-0000000e0001",
+                "b0000000-0000-0000-0000-0000000e0002",
+                "b0000000-0000-0000-0000-0000000e0003",
+                "b0000000-0000-0000-0000-0000000e0004",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                item_ids, expected_ids,
+                "Core function (include owned) failed on hierarchical permissions"
+            );
+        }
+
+        // --- Core Function: exclude_owned ---
+        // Since user-1 owns nothing, excluding their items should have no effect.
+        {
+            let items = get_user_accessible_items(&pool, user_id, None, true).await?;
+            let item_ids: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "b0000000-0000-0000-0000-0000000e0001",
+                "b0000000-0000-0000-0000-0000000e0002",
+                "b0000000-0000-0000-0000-0000000e0003",
+                "b0000000-0000-0000-0000-0000000e0004",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                item_ids, expected_ids,
+                "Core function (exclude owned) should not change the result when the user owns nothing"
+            );
+        }
+
+        // --- Documents Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("document".to_string()), false)
+                    .await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["b0000000-0000-0000-0000-0000000e0004"],
+                "Documents wrapper (include owned) failed on hierarchical"
+            );
+        }
+
+        // --- Documents Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("document".to_string()), true)
+                    .await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["b0000000-0000-0000-0000-0000000e0004"],
+                "Documents wrapper (exclude owned) failed on hierarchical"
+            );
+        }
+
+        // --- Chats Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("chat".to_string()), false).await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["b0000000-0000-0000-0000-0000000e0003"],
+                "Chats wrapper (include owned) failed on hierarchical"
+            );
+        }
+
+        // --- Chats Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("chat".to_string()), true).await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["b0000000-0000-0000-0000-0000000e0003"],
+                "Chats wrapper (exclude owned) failed on hierarchical"
+            );
+        }
+
+        // --- Projects Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("project".to_string()), false)
+                    .await?;
+            let id_set: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "b0000000-0000-0000-0000-0000000e0001",
+                "b0000000-0000-0000-0000-0000000e0002",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                id_set, expected_ids,
+                "Projects wrapper (include owned) failed on hierarchical"
+            );
+        }
+
+        // --- Projects Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("project".to_string()), true)
+                    .await?;
+            let id_set: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "b0000000-0000-0000-0000-0000000e0001",
+                "b0000000-0000-0000-0000-0000000e0002",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                id_set, expected_ids,
+                "Projects wrapper (exclude owned) failed on hierarchical"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[sqlx::test(fixtures(path = "../../fixtures", scripts("get_user_accessible_items_nested")))]
+    async fn test_accessible_items_deep_hierarchy(pool: Pool<Postgres>) -> anyhow::Result<()> {
+        let user_id = "user-1"; // This user has implicit access via the top-level project
+
+        // --- Core Function: include_owned ---
+        // Should discover all 5 items in the hierarchy (3 projects, 1 chat, 1 document).
+        {
+            let items = get_user_accessible_items(&pool, user_id, None, false).await?;
+            let item_ids: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "c0000000-0000-0000-0000-0000000e0001",
+                "c0000000-0000-0000-0000-0000000e0002",
+                "c0000000-0000-0000-0000-0000000e0003",
+                "c0000000-0000-0000-0000-0000000e0004",
+                "c0000000-0000-0000-0000-0000000e0005",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                item_ids, expected_ids,
+                "Core function (include owned) failed on deep hierarchy"
+            );
+        }
+
+        // --- Core Function: exclude_owned ---
+        // Since user-1 owns none of the items, the result should be identical.
+        {
+            let items = get_user_accessible_items(&pool, user_id, None, true).await?;
+            let item_ids: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "c0000000-0000-0000-0000-0000000e0001",
+                "c0000000-0000-0000-0000-0000000e0002",
+                "c0000000-0000-0000-0000-0000000e0003",
+                "c0000000-0000-0000-0000-0000000e0004",
+                "c0000000-0000-0000-0000-0000000e0005",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                item_ids, expected_ids,
+                "Core function (exclude owned) failed on deep hierarchy"
+            );
+        }
+
+        // --- Documents Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("document".to_string()), false)
+                    .await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["c0000000-0000-0000-0000-0000000e0005"],
+                "Documents wrapper (include owned) failed on deep hierarchy"
+            );
+        }
+
+        // --- Documents Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("document".to_string()), true)
+                    .await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["c0000000-0000-0000-0000-0000000e0005"],
+                "Documents wrapper (exclude owned) failed on deep hierarchy"
+            );
+        }
+
+        // --- Chats Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("chat".to_string()), false).await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["c0000000-0000-0000-0000-0000000e0004"],
+                "Chats wrapper (include owned) failed on deep hierarchy"
+            );
+        }
+
+        // --- Chats Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("chat".to_string()), true).await?;
+            let ids: Vec<String> = items.into_iter().map(|item| item.item_id).collect();
+            assert_eq!(
+                ids,
+                vec!["c0000000-0000-0000-0000-0000000e0004"],
+                "Chats wrapper (exclude owned) failed on deep hierarchy"
+            );
+        }
+
+        // --- Projects Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("project".to_string()), false)
+                    .await?;
+            let id_set: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "c0000000-0000-0000-0000-0000000e0001",
+                "c0000000-0000-0000-0000-0000000e0002",
+                "c0000000-0000-0000-0000-0000000e0003",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                id_set, expected_ids,
+                "Projects wrapper (include owned) failed on deep hierarchy"
+            );
+        }
+
+        // --- Projects Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("project".to_string()), true)
+                    .await?;
+            let id_set: HashSet<String> = items.into_iter().map(|item| item.item_id).collect();
+            let expected_ids: HashSet<String> = [
+                "c0000000-0000-0000-0000-0000000e0001",
+                "c0000000-0000-0000-0000-0000000e0002",
+                "c0000000-0000-0000-0000-0000000e0003",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            assert_eq!(
+                id_set, expected_ids,
+                "Projects wrapper (exclude owned) failed on deep hierarchy"
+            );
+        }
+
+        Ok(())
+    }
+
+    // ensure a user doesn't get access to items they shouldn't.
+    #[sqlx::test(fixtures(
+        path = "../../fixtures",
+        scripts("get_user_accessible_items_unaccessible")
+    ))]
+    async fn test_accessible_items_isolation(pool: Pool<Postgres>) -> anyhow::Result<()> {
+        let user_id = "user-3"; // This user has no permissions to any items in the fixture.
+
+        // --- Core Function: include_owned ---
+        {
+            let items = get_user_accessible_items(&pool, user_id, None, false).await?;
+            assert!(
+                items.is_empty(),
+                "Core (include owned) should return no items for an isolated user"
+            );
+        }
+
+        // --- Core Function: exclude_owned ---
+        {
+            let items = get_user_accessible_items(&pool, user_id, None, true).await?;
+            assert!(
+                items.is_empty(),
+                "Core (exclude owned) should return no items for an isolated user"
+            );
+        }
+
+        // --- Documents Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("document".to_string()), false)
+                    .await?;
+            assert!(
+                items.is_empty(),
+                "Documents (include owned) should be empty for an isolated user"
+            );
+        }
+
+        // --- Documents Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("document".to_string()), true)
+                    .await?;
+            assert!(
+                items.is_empty(),
+                "Documents (exclude owned) should be empty for an isolated user"
+            );
+        }
+
+        // --- Chats Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("chat".to_string()), false).await?;
+            assert!(
+                items.is_empty(),
+                "Chats (include owned) should be empty for an isolated user"
+            );
+        }
+
+        // --- Chats Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("chat".to_string()), true).await?;
+            assert!(
+                items.is_empty(),
+                "Chats (exclude owned) should be empty for an isolated user"
+            );
+        }
+
+        // --- Projects Wrapper: include_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("project".to_string()), false)
+                    .await?;
+            assert!(
+                items.is_empty(),
+                "Projects (include owned) should be empty for an isolated user"
+            );
+        }
+
+        // --- Projects Wrapper: exclude_owned ---
+        {
+            let items =
+                get_user_accessible_items(&pool, user_id, Some("project".to_string()), true)
+                    .await?;
+            assert!(
+                items.is_empty(),
+                "Projects (exclude owned) should be empty for an isolated user"
+            );
+        }
+
+        Ok(())
+    }
+}

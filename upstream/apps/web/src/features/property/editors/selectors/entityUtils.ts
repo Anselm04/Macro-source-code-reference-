@@ -1,0 +1,308 @@
+import {
+  type Bucket,
+  type EntityItem,
+  type QuickAccessItem,
+  type UserItem,
+  useQuickAccess,
+} from '@core/context/quickAccess';
+import { BUCKET_COMBINATIONS } from '@core/context/quickAccess/types';
+import type { IUser } from '@core/user';
+import type { FreshSortConfig, TimestampedItem } from '@core/util/freshSort';
+import type {
+  ChannelEntity,
+  ChatEntity,
+  CrmCompanyEntity,
+  CrmContactEntity,
+  DocumentEntity,
+  EmailEntity,
+  EntityData,
+  InitiativeEntity,
+  ProjectEntity,
+  TaskEntity,
+} from '@entity';
+import type { EntityType } from '@service-properties/generated/schemas/entityType';
+import { type Accessor, createMemo, untrack } from 'solid-js';
+import { match, P } from 'ts-pattern';
+
+export type EntityTypeItemMap = {
+  USER: UserItem;
+  CHANNEL: EntityItem<ChannelEntity>;
+  DOCUMENT: EntityItem<DocumentEntity>;
+  PROJECT: EntityItem<ProjectEntity>;
+  CHAT: EntityItem<ChatEntity>;
+  TASK: EntityItem<TaskEntity>;
+  THREAD: EntityItem<EmailEntity>;
+  COMPANY: EntityItem<CrmCompanyEntity>;
+  CONTACT: EntityItem<CrmContactEntity>;
+  INITIATIVE: EntityItem<InitiativeEntity>;
+  // Call records aren't entity-reference targets in quickAccess.
+  CALL_RECORD: never;
+  CALENDAR_EVENT: never;
+  // Database rows aren't entity-reference targets in quickAccess.
+  DATABASE_ROW: never;
+};
+
+/**
+ * Maps EntityType to quickAccess buckets
+ */
+function entityTypeToBuckets(entityType: EntityType): readonly Bucket[] {
+  const buckets = match(entityType)
+    .with('USER', () => ['person'] as const)
+    .with('CHANNEL', () => ['channel', 'dm'] as const)
+    .with('DOCUMENT', () => ['document', 'note'] as const)
+    .with('PROJECT', () => ['project'] as const)
+    .with('CHAT', () => ['chat'] as const)
+    .with('TASK', () => ['task'] as const)
+    .with('THREAD', () => ['email'] as const) // Note: emails aren't in quickAccess yet, handled separately
+    .with('INITIATIVE', () => ['initiative'] as const)
+    .with('COMPANY', () => ['crm_company'] as const)
+    .with('CONTACT', () => ['crm_contact'] as const)
+    .with('CALL_RECORD', () => [] as const) // Call records aren't in quickAccess
+    .with('CALENDAR_EVENT', () => [] as const) // Calendar events aren't in quickAccess
+    .with('DATABASE_ROW', () => [] as const) // Database rows aren't in quickAccess
+    .exhaustive(() => [] as const);
+  return buckets;
+}
+
+/**
+ * Hook to get QuickAccessItems for a given EntityType.
+ * Returns items from the appropriate buckets based on entity type.
+ */
+export function useQuickAccessEntities<T extends EntityType>(
+  entityType: Accessor<T | T[] | null | undefined>,
+  searchTerm: Accessor<string> = () => '',
+  enabled: Accessor<boolean> = () => true,
+  excludedPeople?: Accessor<ReadonlySet<string>>
+) {
+  const quickAccess = useQuickAccess();
+
+  const buckets = createMemo(
+    () => {
+      const entityType_ = entityType();
+      if (!entityType_) return null;
+      if (Array.isArray(entityType_))
+        return entityType_.flatMap(entityTypeToBuckets);
+      return entityTypeToBuckets(entityType_);
+    },
+    undefined,
+    {
+      equals: (previous, next) =>
+        previous === next ||
+        (!!previous &&
+          !!next &&
+          previous.length === next.length &&
+          previous.every((bucket, index) => bucket === next[index])),
+    }
+  );
+  const list = createMemo(() => {
+    const b = buckets();
+    if (b?.length === 0) return;
+    // Factory setup may read query state. Only a bucket change should replace
+    // its owner; pagination/loading must not recreate the list at page one.
+    return untrack(() =>
+      quickAccess.useList({
+        buckets: b ?? BUCKET_COMBINATIONS.all,
+        searchTerm,
+        enabled,
+        peopleMode: 'property',
+        excludedPeople,
+      })
+    );
+  });
+  const items = (): EntityTypeItemMap[T][] =>
+    (list()?.items() ?? []) as EntityTypeItemMap[T][];
+  return {
+    items,
+    isLoading: () => enabled() && (list()?.isLoading() ?? false),
+    isLoadingMore: () => enabled() && (list()?.isLoadingMore() ?? false),
+    hasMore: () => enabled() && (list()?.hasMore() ?? false),
+    error: () => (enabled() ? list()?.error() : undefined),
+    windowKey: () => (enabled() ? list()?.windowKey?.() : undefined),
+    loadMore: async () => {
+      if (enabled()) await list()?.loadMore();
+    },
+  };
+}
+
+/** Combined entity type for unified handling across entity selectors */
+export type CombinedEntity =
+  | { kind: 'entity'; id: string; data: EntityData }
+  | { kind: 'user'; id: string; data: IUser };
+
+/** Converts a QuickAccessItem to CombinedEntity */
+export function quickAccessItemToEntity(item: QuickAccessItem): CombinedEntity {
+  if (item.kind === 'user') {
+    return { kind: 'user', id: item.id, data: item.data };
+  }
+  return { kind: 'entity', id: item.id, data: item.data };
+}
+
+/** Maps an EntityData to a CombinedEntity */
+function entityDataToEntity(data: EntityData): CombinedEntity {
+  return { kind: 'entity', id: data.id, data };
+}
+
+/** Maps an IUser to a CombinedEntity */
+export function userToEntity(user: IUser): CombinedEntity {
+  return { kind: 'user', id: user.id, data: user };
+}
+
+/** Maps an email entity to a CombinedEntity (alias for entityDataToEntity) */
+export function threadMapper(email: EmailEntity): CombinedEntity {
+  return entityDataToEntity(email);
+}
+
+/** Gets the display name for an entity */
+export function getEntityName(entity: CombinedEntity): string {
+  if (entity.kind === 'user') {
+    const { name, email } = entity.data;
+    if (name === email) return email.split('@')[0] || email;
+    return name;
+  }
+
+  const data = entity.data;
+  if (data.type === 'email') {
+    return data.name ?? 'No Subject';
+  }
+  return data.name ?? '';
+}
+
+/** Gets searchable text for an entity (used with createFreshSearch) */
+export function getEntitySearchText(entity: CombinedEntity): string {
+  if (entity.kind === 'user') {
+    const { name, email } = entity.data;
+    if (name === email) return `${email} | ${email}`;
+    return `${name} | ${email}`;
+  }
+  if (entity.data.type === 'crm_contact') {
+    return `${entity.data.name} | ${entity.data.email}`;
+  }
+
+  return entity.data.name ?? '';
+}
+
+/**
+ * The properties-service entity type for an entity, or `undefined` when the
+ * properties service can't reference it.
+ */
+export function getEntityType(entity: CombinedEntity): EntityType | undefined {
+  if (entity.kind === 'user') {
+    return 'USER';
+  }
+
+  return match<EntityData, EntityType | undefined>(entity.data)
+    .with({ type: 'channel' }, () => 'CHANNEL')
+    .with({ type: 'document' }, (data) =>
+      data.subType?.type === 'task' ? 'TASK' : 'DOCUMENT'
+    )
+    .with({ type: 'chat' }, () => 'CHAT')
+    .with({ type: 'project' }, () => 'PROJECT')
+    .with({ type: 'email' }, () => 'THREAD')
+    .with({ type: 'crm_company' }, () => 'COMPANY')
+    .with({ type: 'crm_contact' }, () => 'CONTACT')
+    .with({ type: 'initiative' }, () => 'INITIATIVE')
+    .with({ type: 'call' }, () => 'CALL_RECORD')
+    .with({ type: 'calendar_event' }, () => 'CALENDAR_EVENT')
+    .with(
+      {
+        type: P.union(
+          'agent_session',
+          'channel_message',
+          'channel_thread',
+          'database',
+          'form',
+          'harness',
+          'routine',
+          'foreign'
+        ),
+      },
+      () => undefined
+    )
+    .exhaustive(() => undefined);
+}
+
+/** Check if entity is a channel */
+export function isChannelEntity(item: CombinedEntity): boolean {
+  return item.kind === 'entity' && item.data.type === 'channel';
+}
+
+/** Get timestamped item from combined entity */
+export function getEntityTimestampedItem<T extends CombinedEntity>(
+  item: T
+): TimestampedItem {
+  if (item.kind === 'user') {
+    return {
+      lastInteraction: item.data.lastInteraction,
+    };
+  }
+
+  const data = item.data;
+  return {
+    updatedAt: data.updatedAt,
+    viewedAt: data.viewedAt,
+  };
+}
+
+/**
+ * Creates search config for entity searches with same-domain boost and self-boost.
+ * Uses the same preset as MentionsMenu and RecipientSelector for consistency.
+ * When currentUserId is provided, the current user will be boosted to the top of the list.
+ */
+export function createEntitySearchConfig<T extends CombinedEntity>(
+  currentUserDomain: Accessor<string | undefined>,
+  currentUserId?: Accessor<string | undefined>
+): FreshSortConfig<T> {
+  const boostFn = (item: T): number => {
+    // Boost self to top of list (high boost value ensures it appears first)
+    if (currentUserId && item.kind === 'user') {
+      const userId = currentUserId();
+      if (userId && item.data.id === userId) {
+        return 10; // High boost to ensure self appears at top
+      }
+    }
+
+    const userDomain = currentUserDomain();
+    if (!userDomain) return 0;
+
+    // Check if this is a user entity with email
+    if (item.kind === 'user' && item.data.email) {
+      const email = item.data.email;
+      const itemDomain = email.split('@')[1];
+      return itemDomain === userDomain ? 0.5 : 0;
+    }
+
+    return 0;
+  };
+
+  return {
+    fuzzyWeight: 0.5,
+    timeWeight: 0.4,
+    brevityWeight: 0.1,
+    boostFn,
+  };
+}
+
+/**
+ * Sorts entities with the current user (self) at the top of the list.
+ * Use this when displaying entities without a search query to ensure
+ * the current user appears first in the assignees list.
+ */
+export function sortEntitiesWithSelfFirst<T extends CombinedEntity>(
+  entities: T[],
+  currentUserId: string | undefined
+): T[] {
+  if (!currentUserId) return entities;
+
+  const selfIndex = entities.findIndex(
+    (e) => e.kind === 'user' && e.data.id === currentUserId
+  );
+
+  // If self not found or already at top, return as-is
+  if (selfIndex <= 0) return entities;
+
+  // Move self to the front
+  const result = [...entities];
+  const [self] = result.splice(selfIndex, 1);
+  result.unshift(self);
+  return result;
+}

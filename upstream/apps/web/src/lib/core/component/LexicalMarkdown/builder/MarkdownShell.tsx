@@ -1,0 +1,438 @@
+import { fileFolderDrop } from '@core/directive/fileFolderDrop';
+import { isMobile } from '@core/mobile/isMobile';
+import { onElementConnect } from '@core/util/onElementConnect';
+import { handleFileFolderDrop } from '@core/util/upload';
+import { Telemetry } from '@macro-inc/observability';
+import { cn } from '@ui';
+import {
+  COMMAND_PRIORITY_CRITICAL,
+  COMMAND_PRIORITY_HIGH,
+  KEY_ENTER_COMMAND,
+  KEY_ESCAPE_COMMAND,
+  KEY_TAB_COMMAND,
+} from 'lexical';
+import {
+  type Component,
+  createEffect,
+  createSignal,
+  on,
+  onCleanup,
+  onMount,
+  Show,
+  untrack,
+} from 'solid-js';
+import { DecoratorRenderer } from '../component/core/DecoratorRenderer';
+import { NodeAccessoryRenderer } from '../component/core/NodeAccessoryRenderer';
+import { ActionMenu } from '../component/menu/ActionsMenu';
+import { EmojiMenu } from '../component/menu/EmojiMenu';
+import { FloatingFormatMenu } from '../component/menu/FloatingFormatMenu';
+import { FloatingGifMenu } from '../component/menu/FloatingGifMenu';
+import { FloatingLinkMenu } from '../component/menu/FloatingLinkMenu';
+import { MentionsMenu } from '../component/menu/MentionsMenu';
+import { SkillsMenu } from '../component/menu/SkillsMenu';
+import { SnippetsMenu } from '../component/menu/SnippetsMenu';
+import { TagsMenu } from '../component/menu/TagsMenu';
+import { DragInsertIndicator } from '../component/misc/DragInsertIndicator';
+import { FloatingMenuGroup } from '../context/FloatingMenuContext';
+import { LexicalWrapperContext } from '../context/LexicalWrapperContext';
+import { autoRegister, registerCommandEffect } from '../plugins';
+import {
+  editorIsEmpty,
+  editorStateAsMarkdown,
+  focusEditorWithoutScroll,
+  initializeEditorEmpty,
+  initializeEditorWithState,
+  setEditorStateFromMarkdown,
+} from '../utils';
+import {
+  createFilesReadyHandler,
+  getDragDropPosition,
+} from '../utils/fileUploadUtils';
+import { MarkdownShellContent } from './MarkdownShellContent';
+import type { EditorBuilder, EditorComponentProps } from './types';
+
+export type MarkdownShellProps = EditorComponentProps & {
+  config: EditorBuilder;
+  /** Accessible name independent of a changing visual placeholder. */
+  ariaLabel?: string;
+};
+
+export const MarkdownShell: Component<MarkdownShellProps> = (props) => {
+  const handle = props.config.buildHandle();
+  const state = handle._internal;
+  const {
+    editor,
+    lexicalWrapper,
+    cleanupLexical,
+    builderConfig,
+    markdownState,
+  } = state;
+
+  const [showPlaceholder, setShowPlaceholder] = createSignal(true);
+
+  // Track initialization so onChange is not fired during setup
+  let didInitializeContent = false;
+  const [connected, setConnected] = createSignal(false);
+  let externalMarkdown: string | undefined;
+
+  const onConnect = () => {
+    if (props.autofocus) {
+      setTimeout(() => {
+        focusEditorWithoutScroll(editor);
+      });
+    }
+
+    const hasInitialContent =
+      props.initialState !== undefined || props.initialValue !== undefined;
+
+    if (props.value !== undefined) {
+      setEditorStateFromMarkdown(editor, props.value);
+      externalMarkdown = editorStateAsMarkdown(editor);
+    } else if (props.initialState) {
+      initializeEditorWithState(editor, props.initialState);
+    } else if (props.initialValue) {
+      setEditorStateFromMarkdown(editor, props.initialValue);
+    } else {
+      initializeEditorEmpty(editor);
+    }
+
+    didInitializeContent = true;
+
+    // The deferred markdownState effect misses the synchronous change inside
+    // init, so push the initial value out to onChange manually.
+    if (hasInitialContent && props.value === undefined) {
+      builderConfig.handlers.onChange?.(markdownState());
+    }
+
+    setConnected(true);
+    props.onConnect?.();
+  };
+
+  createEffect(() => {
+    const value = props.value;
+    if (!connected() || value === undefined) return;
+    untrack(() => {
+      if (value === editorStateAsMarkdown(editor)) return;
+      setEditorStateFromMarkdown(editor, value);
+      externalMarkdown = editorStateAsMarkdown(editor);
+    });
+  });
+
+  // Track editable state
+  createEffect(() => {
+    const enabled = !props.disabled;
+    editor.setEditable(enabled);
+    state.setIsInteractable(enabled);
+  });
+
+  // onChange callback
+  createEffect(
+    on(
+      markdownState,
+      () => {
+        if (!didInitializeContent) return;
+        const external = markdownState() === externalMarkdown;
+        externalMarkdown = undefined;
+        if (external) return;
+        builderConfig.handlers.onChange?.(markdownState());
+      },
+      { defer: true }
+    )
+  );
+
+  // Placeholder visibility
+  autoRegister(
+    editor.registerUpdateListener(({ editorState }) => {
+      setShowPlaceholder(editorIsEmpty(editorState));
+    })
+  );
+
+  // Register key handlers
+  registerCommandEffect(
+    editor,
+    KEY_ENTER_COMMAND,
+    () => {
+      const onEnter = builderConfig.handlers.onEnter;
+      if (!onEnter) return undefined;
+      return (e) => {
+        if (!e) return false;
+        if (e.shiftKey) {
+          // Shift+enter = regular newline
+          Object.defineProperty(e, 'shiftKey', { value: false });
+          return false;
+        }
+        const captured = onEnter(e, markdownState());
+        if (captured) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        return captured;
+      };
+    },
+    COMMAND_PRIORITY_HIGH
+  );
+
+  registerCommandEffect(
+    editor,
+    KEY_ESCAPE_COMMAND,
+    () => {
+      const onEscape = builderConfig.handlers.onEscape;
+      return onEscape ? (e) => onEscape(e) : undefined;
+    },
+    COMMAND_PRIORITY_CRITICAL
+  );
+
+  registerCommandEffect(
+    editor,
+    KEY_TAB_COMMAND,
+    () => {
+      const onTab = builderConfig.handlers.onTab;
+      return onTab ? (e) => onTab(e) : undefined;
+    },
+    COMMAND_PRIORITY_CRITICAL
+  );
+
+  onCleanup(cleanupLexical);
+
+  // File drop handler — wired to fileFolderDrop directive
+  const onFileDrop = state.fileDropConfig
+    ? (
+        fileEntries: FileSystemFileEntry[],
+        folderEntries: FileSystemDirectoryEntry[],
+        e?: DragEvent
+      ) => {
+        if (!e) return;
+        handleFileFolderDrop(
+          fileEntries,
+          folderEntries,
+          createFilesReadyHandler(
+            editor,
+            undefined,
+            undefined,
+            () => getDragDropPosition(editor, e, true),
+            undefined,
+            state.fileDropConfig!.constrainedMediaDimensions
+          )
+        ).catch((error) =>
+          Telemetry.error(error, { surface: 'markdown-file-drop' })
+        );
+      }
+    : undefined;
+
+  // Keep TS happy — ensures the directive import is not tree-shaken
+  void fileFolderDrop;
+
+  return (
+    <LexicalWrapperContext.Provider value={lexicalWrapper}>
+      <div
+        class={cn(
+          'relative h-full overflow-y-auto min-h-8 scrollbar-hidden text-base',
+          props.class
+        )}
+        on:keydown={(e) => e.stopPropagation()}
+        on:click={(e) => {
+          // Embedded controls own focus and need Solid's delegated clicks.
+          if (
+            e.target instanceof Element &&
+            e.target.closest('[data-lexical-interactive]')
+          )
+            return;
+          e.stopPropagation();
+          if (!isMobile()) editor.focus();
+        }}
+        on:mousedown={(e) => e.stopPropagation()}
+        on:mouseup={(e) => e.stopPropagation()}
+        use:fileFolderDrop={
+          onFileDrop
+            ? {
+                onDrop: onFileDrop,
+                disabled: props.disabled,
+              }
+            : undefined
+        }
+      >
+        <MarkdownShellContent
+          connectRoot={(element) => {
+            const connect = () => {
+              if (editor.getRootElement() === element) return;
+              editor.setRootElement(element);
+              onConnect();
+            };
+            // Mounted editors must accept typing before the next resize/paint.
+            onMount(() => {
+              if (element.isConnected) connect();
+            });
+            onElementConnect(element, connect);
+            props.refFn?.(element);
+          }}
+          disabled={!!props.disabled}
+          showPlaceholder={showPlaceholder()}
+          placeholder={props.placeholder}
+          ariaLabel={props.ariaLabel}
+        />
+
+        <DecoratorRenderer editor={editor} />
+
+        {/* Node Accessories (code blocks) */}
+        <Show when={state.accessoryStore}>
+          {(store) => <NodeAccessoryRenderer editor={editor} store={store()} />}
+        </Show>
+
+        <Show when={state.dragInsertStore}>
+          {(store) => (
+            <DragInsertIndicator state={store()} active={!props.disabled} />
+          )}
+        </Show>
+
+        <Show when={state.mentionsMenuOps}>
+          {(menu) => (
+            <MentionsMenu
+              editor={editor}
+              menu={menu()}
+              useBlockBoundary={false}
+              portalScope={props.portalScope}
+              block={builderConfig.mentions?.block as any}
+              showOpenTabs={builderConfig.mentions?.showOpenTabs}
+              entities={builderConfig.mentions?.entities}
+              users={builderConfig.mentions?.users}
+              transformUsers={builderConfig.mentions?.transformUsers}
+              onUserMention={builderConfig.mentions?.onUserMention}
+              onDocumentMention={builderConfig.mentions?.onDocumentMention}
+              onEmailMention={builderConfig.mentions?.onEmailMention}
+              disableMentionTracking={
+                builderConfig.mentions?.disableMentionTracking
+              }
+              sources={builderConfig.mentions?.sources}
+            />
+          )}
+        </Show>
+
+        <Show when={state.tagsMenuOps}>
+          {(menu) => (
+            <TagsMenu
+              editor={editor}
+              menu={menu()}
+              useBlockBoundary={false}
+              portalScope={props.portalScope}
+              applyTargetLabel={builderConfig.tags?.applyTargetLabel}
+              isApplied={builderConfig.tags?.isApplied}
+              onApplyTag={builderConfig.tags?.onCreate}
+            />
+          )}
+        </Show>
+
+        <Show when={state.actionsMenuOps}>
+          {(menu) => (
+            <ActionMenu
+              editor={editor}
+              menu={menu()}
+              useBlockBoundary={false}
+              additionalActions={
+                (builderConfig.actions &&
+                  builderConfig.actions.additionalActions) ||
+                undefined
+              }
+              ignoreActionIds={
+                (builderConfig.actions &&
+                  builderConfig.actions.ignoreActionIds) ||
+                undefined
+              }
+              actionContext={{
+                sourceDocumentId: builderConfig.mentions?.sourceDocumentId,
+                sourceBlockName: builderConfig.mentions?.block,
+                disableMentionTracking:
+                  builderConfig.mentions?.disableMentionTracking,
+              }}
+              portalScope={props.portalScope}
+            />
+          )}
+        </Show>
+
+        {/* Emoji Menu */}
+        <Show when={state.emojisMenuOps}>
+          {(menu) => (
+            <EmojiMenu
+              editor={editor}
+              menu={menu()}
+              useBlockBoundary={false}
+              portalScope={props.portalScope}
+            />
+          )}
+        </Show>
+
+        {/* Snippets Menu */}
+        <Show when={state.snippetsMenuOps}>
+          {(menu) => (
+            <SnippetsMenu
+              editor={editor}
+              menu={menu()}
+              useBlockBoundary={false}
+              portalScope={props.portalScope}
+              sourceDocumentId={builderConfig.mentions?.sourceDocumentId}
+            />
+          )}
+        </Show>
+
+        {/* Skills Menu */}
+        <Show when={state.skillsMenuOps}>
+          {(menu) => (
+            <SkillsMenu
+              editor={editor}
+              menu={menu()}
+              useBlockBoundary={false}
+              portalScope={props.portalScope}
+            />
+          )}
+        </Show>
+
+        {/* Agent Commands Menu */}
+        <Show when={state.agentCommandsMenuOps}>
+          {(menu) => (
+            <SkillsMenu
+              editor={editor}
+              menu={menu()}
+              agentCommands={
+                builderConfig.agentCommands?.commands ?? (() => [])
+              }
+              useBlockBoundary={false}
+              portalScope={props.portalScope}
+            />
+          )}
+        </Show>
+
+        {/* Floating Link, Format, and GIF Menus */}
+        <Show
+          when={
+            builderConfig.links?.floatingMenu ||
+            builderConfig.floatingFormatMenu ||
+            state.actionsMenuOps
+          }
+        >
+          <FloatingMenuGroup>
+            <Show when={builderConfig.links?.floatingMenu}>
+              <FloatingLinkMenu
+                autoLinkMatchMode={builderConfig.links?.autoLinkMatchMode}
+              />
+            </Show>
+            <Show when={builderConfig.floatingFormatMenu}>
+              <FloatingFormatMenu
+                portalScope={props.portalScope}
+                showLinkButton={!!builderConfig.links?.floatingMenu}
+                extendedInlineFormats={
+                  typeof builderConfig.floatingFormatMenu === 'object' &&
+                  builderConfig.floatingFormatMenu.extendedInlineFormats
+                }
+              />
+            </Show>
+            <Show when={state.actionsMenuOps}>
+              <FloatingGifMenu
+                canEdit={() => !props.disabled}
+                portalScope={props.portalScope}
+              />
+            </Show>
+          </FloatingMenuGroup>
+        </Show>
+      </div>
+    </LexicalWrapperContext.Provider>
+  );
+};

@@ -1,0 +1,1011 @@
+import { SERVER_HOSTS } from '@core/constant/servers';
+import {
+  type FetchWithTokenErrorCode,
+  fetchWithToken,
+} from '@core/util/fetchWithToken';
+import type { ObjectLike, ResultError } from '@core/util/result';
+import type { SafeFetchInit } from '@core/util/safeFetch';
+import type { Span } from '@macro-inc/observability';
+import type {
+  CalendarEvent,
+  CalendarEventProviderUrl,
+  CalendarJoinRequest,
+  CalendarReplacementView,
+  CopyCalendarEventRequest,
+  CreateCalendarEventRequest,
+  InviteCalendarEventGuestsRequest,
+  ListCalendarsResponse,
+  PrepareCalendarReplacementRequest,
+  RespondToJoinRequestRequest,
+  RsvpCalendarEventRequest,
+  UpdateCalendarEventRequest,
+} from '@service-calendar/generated/schemas';
+import type { AvailabilityCalendarBody } from '@service-calendar/generated/schemas/availabilityCalendarBody';
+import type { AvailabilityCalendarsResponse } from '@service-calendar/generated/schemas/availabilityCalendarsResponse';
+import { CalendarMutationErrorCode } from '@service-calendar/generated/schemas/calendarMutationErrorCode';
+import type { TeamCalendarSharingBody } from '@service-calendar/generated/schemas/teamCalendarSharingBody';
+import type { Result } from 'neverthrow';
+import type {
+  AddDraftAttachmentRequest,
+  AddDraftAttachmentResponse,
+  ApiMessageOperation,
+  ApiPaginatedThreadCursor,
+  ArchiveThreadsRequest,
+  ArchiveThreadsResponse,
+  CreateDraftRequest,
+  CreateDraftResponse,
+  GetAttachmentDocumentIDResponse,
+  GetAttachmentResponse,
+  GetScheduledResponse,
+  GetThreadResponse,
+  InitResponse,
+  ListBackfillJobsResponse,
+  ListContactsResponse,
+  ListEmailFiltersResponse,
+  ListLabelsResponse,
+  ListLinksResponse,
+  MailboxSettingsOperation,
+  ParsedMessage,
+  PatchSettingsRequest,
+  PatchSettingsResponse,
+  ResolveMessageOperationRequest,
+  ResyncResponse,
+  SendMessageRequest,
+  SendMessageResponse,
+  SharedInboxConflictResponse,
+  ThreadReadReceipts,
+  TransferDraftRequest,
+  TransferDraftResponse,
+  TransferRecoveryResponse,
+  UpdateLabelBatchRequest,
+  UpdateLabelBatchResponse,
+  UpdateThreadLabelRequest,
+  UpdateThreadLabelsResponse,
+  UpsertEmailFilterRequest,
+  UpsertEmailFilterResponse,
+  UpsertScheduledRequest,
+  UpsertScheduledResponse,
+} from './generated/schemas';
+import type { EmptyResponse } from './generated/schemas/emptyResponse';
+import { ForwardCalendarEventErrorCode } from './generated/schemas/forwardCalendarEventErrorCode';
+import type { ForwardCalendarEventRequest } from './generated/schemas/forwardCalendarEventRequest';
+import type { ForwardCalendarEventResponse } from './generated/schemas/forwardCalendarEventResponse';
+import type { InvitationResolution } from './generated/schemas/invitationResolution';
+
+const emailHost: string = SERVER_HOSTS['email-service'];
+const calendarHost: string = SERVER_HOSTS['calendar-service'];
+
+/**
+ * Header that scopes a mutating email request to a specific inbox. Omitted for
+ * the primary inbox (the backend defaults to it when the header is absent).
+ */
+const EMAIL_LINK_ID_HEADER = 'X-Email-Link-Id';
+
+/** How much of a recurring series a calendar deletion removes. */
+export type CalendarDeletionScope = 'all' | 'this_event' | 'this_and_following';
+
+/** How much of a recurring series a calendar RSVP answers for. */
+export type CalendarRsvpScope = 'all' | 'this_event';
+
+/** How much of a recurring series a calendar update applies to. */
+export type CalendarUpdateScope = 'all' | 'this_event';
+
+/** How much of a recurring series an invitation adds guests to. */
+export type CalendarInviteScope = 'all' | 'this_event';
+
+function emailLinkHeaders(linkId?: string): Record<string, string> | undefined {
+  return linkId ? { [EMAIL_LINK_ID_HEADER]: linkId } : undefined;
+}
+
+/**
+ * Calendar mutation failures carry a machine-readable `{ code, message }`
+ * body; surface it so callers can branch on the code and show the message.
+ */
+async function calendarMutationErrorHandler(response: Response) {
+  const body = (await response.json().catch(() => null)) as {
+    code?: string;
+    message?: string;
+  } | null;
+  const code =
+    body?.code && body.code in CalendarMutationErrorCode
+      ? (body.code as CalendarMutationErrorCode)
+      : undefined;
+  if (code) {
+    return { code, message: body?.message ?? '' };
+  }
+  return {
+    code: 'HTTP_ERROR' as const,
+    message: `HTTP error! status: ${response.status}`,
+  };
+}
+
+async function forwardCalendarEventErrorHandler(response: Response) {
+  const body = (await response.json().catch(() => null)) as {
+    code?: string;
+    message?: string;
+  } | null;
+  const code =
+    body?.code && body.code in ForwardCalendarEventErrorCode
+      ? (body.code as ForwardCalendarEventErrorCode)
+      : undefined;
+  if (code) {
+    return { code, message: body?.message ?? '' };
+  }
+  return {
+    code: 'HTTP_ERROR' as const,
+    message: `HTTP error! status: ${response.status}`,
+  };
+}
+
+function emailFetch(
+  url: string,
+  init?: SafeFetchInit
+): Promise<Result<void, ResultError<FetchWithTokenErrorCode>[]>>;
+function emailFetch<T extends ObjectLike>(
+  url: string,
+  init?: SafeFetchInit
+): Promise<Result<T, ResultError<FetchWithTokenErrorCode>[]>>;
+function emailFetch<T extends ObjectLike = never>(
+  url: string,
+  init?: SafeFetchInit
+):
+  | Promise<Result<T, ResultError<FetchWithTokenErrorCode>[]>>
+  | Promise<Result<void, ResultError<FetchWithTokenErrorCode>[]>> {
+  return fetchWithToken<T>(`${emailHost}${url}`, init);
+}
+
+/**
+ * Error code `init` returns when the target mailbox is already connected by another
+ * macro user. The caller confirms with the user, then retries with `forceShare`.
+ */
+export const SHARED_INBOX_CONFLICT_CODE = 'SHARED_INBOX_CONFLICT' as const;
+
+/** Error code `init` returns (HTTP 400) when the inbox is already provisioned. */
+export const ALREADY_INITIALIZED_CODE = 'ALREADY_INITIALIZED' as const;
+
+/**
+ * Error code `init` returns (HTTP 400) when the user holds no Gmail grant to
+ * provision from — the Gmail scope was declined at consent or the grant was
+ * removed. The add-inbox flow re-runs consent and clears it.
+ */
+export const NO_GMAIL_GRANT_CODE = 'NO_GMAIL_GRANT' as const;
+
+type InitErrorCode =
+  | 'PAYMENT_REQUIRED'
+  | typeof SHARED_INBOX_CONFLICT_CODE
+  | typeof ALREADY_INITIALIZED_CODE
+  | typeof NO_GMAIL_GRANT_CODE;
+
+/**
+ * Error code `patchSettings` returns (HTTP 422) when a signature has images that
+ * couldn't be fetched/rehosted and would render broken for recipients. The whole
+ * patch is rejected; the error message carries the count so the UI can prompt a
+ * re-add.
+ */
+export const SIGNATURE_IMAGES_UNRESOLVED_CODE =
+  'SIGNATURE_IMAGES_UNRESOLVED' as const;
+
+export const emailClient = {
+  settingsOperations: (linkId: string) =>
+    emailFetch<MailboxSettingsOperation[]>('/email/settings/operations', {
+      headers: emailLinkHeaders(linkId),
+    }),
+
+  async threadOperations(threadId: string) {
+    return emailFetch<import('./generated/schemas').MailboxOperation[]>(
+      `/email/threads/${threadId}/operations`
+    );
+  },
+
+  async getCalendarInvitations(threadId: string) {
+    return emailFetch<Record<string, InvitationResolution>>(
+      `/email/threads/${threadId}/calendar-invitations`
+    );
+  },
+  async copyCalendarInvitation(
+    target: { threadId: string; messageId: string; invitationId: string },
+    args: CopyCalendarEventRequest
+  ) {
+    return fetchWithToken<CalendarEvent, CalendarMutationErrorCode>(
+      `${emailHost}/email/threads/${target.threadId}/messages/${target.messageId}/calendar-invitations/${encodeURIComponent(target.invitationId)}/copy`,
+      {
+        method: 'POST',
+        body: JSON.stringify(args),
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async forwardCalendarEvent(
+    eventId: string,
+    args: ForwardCalendarEventRequest
+  ) {
+    return fetchWithToken<
+      ForwardCalendarEventResponse,
+      ForwardCalendarEventErrorCode
+    >(`${emailHost}/email/calendar-events/${eventId}/forward`, {
+      method: 'POST',
+      body: JSON.stringify(args),
+      errorResponseHandler: forwardCalendarEventErrorHandler,
+    });
+  },
+  async getThreadReadReceipts(threadId: string) {
+    return emailFetch<ThreadReadReceipts>(
+      `/email/threads/${threadId}/read-receipts`
+    );
+  },
+  async init(args?: { linkId?: string; forceShare?: boolean }) {
+    const params = new URLSearchParams();
+    if (args?.linkId) params.set('link_id', args.linkId);
+    if (args?.forceShare) params.set('force_share', 'true');
+    const query = params.toString();
+    const path = query ? `/email/init?${query}` : '/email/init';
+
+    return fetchWithToken<InitResponse, InitErrorCode>(`${emailHost}${path}`, {
+      method: 'POST',
+      // A custom handler replaces safeFetch's default status mapping. 409 carries
+      // the shared-inbox conflict fields and 400 a machine-readable code; other
+      // statuses fall back to the same HTTP_ERROR shape callers already branch on.
+      errorResponseHandler: async (response) => {
+        if (response.status === 402)
+          return {
+            code: 'PAYMENT_REQUIRED',
+            message:
+              'A professional subscription is required to add another inbox',
+          };
+        if (response.status === 409) {
+          const body = (await response
+            .json()
+            .catch(() => null)) as SharedInboxConflictResponse | null;
+          return {
+            code: SHARED_INBOX_CONFLICT_CODE,
+            // The caller formats the prompt; the fields it needs ride along as JSON.
+            message: JSON.stringify({
+              emailAddress: body?.email_address ?? '',
+              existingOwnerEmail: body?.existing_owner_email ?? '',
+            }),
+          };
+        }
+        if (response.status === 400) {
+          const body = (await response.json().catch(() => null)) as {
+            code?: string;
+            message?: string;
+          } | null;
+          if (
+            body?.code === ALREADY_INITIALIZED_CODE ||
+            body?.code === NO_GMAIL_GRANT_CODE
+          ) {
+            return { code: body.code, message: body.message ?? '' };
+          }
+        }
+        return {
+          code: 'HTTP_ERROR',
+          message: `HTTP error! status: ${response.status}`,
+        };
+      },
+    });
+  },
+  async getThread(args: {
+    offset?: number;
+    limit?: number;
+    thread_id: string;
+  }) {
+    const { offset, limit, thread_id } = args;
+    return (
+      await emailFetch<GetThreadResponse>(
+        `/email/threads/${thread_id}?offset=${offset ?? 0}&limit=${limit ?? 5}`,
+        {
+          method: 'GET',
+        }
+      )
+    ).map((result) => result);
+  },
+  async getMessage(args: { message_id: string }) {
+    return (
+      await emailFetch<ParsedMessage>(`/email/messages/${args.message_id}`, {
+        method: 'GET',
+      })
+    ).map((result) => result);
+  },
+  /** The message's original source as `.eml` bytes. */
+  async getMessageEml(args: { message_id: string }) {
+    return fetchWithToken<Uint8Array<ArrayBuffer>>(
+      `${emailHost}/email/messages/${args.message_id}/eml`,
+      { method: 'GET' }
+    );
+  },
+  async getUserLabels() {
+    return (
+      await emailFetch<ListLabelsResponse>(`/email/labels`, {
+        method: 'GET',
+      })
+    ).map((result) => result);
+  },
+  async getPreviews(
+    args: {
+      view: string;
+      limit?: number;
+      sort_method?: string;
+      cursor?: string;
+    },
+    init?: SafeFetchInit
+  ) {
+    const { view, ...params } = args;
+    const p = Object.entries(params)
+      .filter(([, v]) => v != null)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('&');
+    const qp = p.length > 0 ? '?' + p : '';
+
+    return (
+      await emailFetch<ApiPaginatedThreadCursor>(
+        `/email/threads/previews/cursor/${view}${qp}`,
+        {
+          method: 'GET',
+          ...init,
+        }
+      )
+    ).map((result) => result);
+  },
+  async updateMessageLabelBatch(args: UpdateLabelBatchRequest) {
+    const { message_ids, label_id, value } = args;
+    return (
+      await emailFetch<UpdateLabelBatchResponse>(`/email/messages/labels`, {
+        method: 'PATCH',
+        body: JSON.stringify({ value, label_id, message_ids }),
+      })
+    ).map((result) => result);
+  },
+  async messageOperation(messageId: string) {
+    return emailFetch<{ operation?: ApiMessageOperation | null }>(
+      `/email/drafts/${messageId}/operation`,
+      { method: 'GET' }
+    );
+  },
+  async resolveMessageOperation(
+    messageId: string,
+    input: ResolveMessageOperationRequest
+  ) {
+    return emailFetch(`/email/drafts/${messageId}/resolve`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    });
+  },
+  async updateThreadState(args: {
+    thread_id: string;
+    field: 'read' | 'starred' | 'trashed' | 'junk';
+    value: boolean;
+  }) {
+    return emailFetch(`/email/threads/${args.thread_id}/state`, {
+      method: 'PATCH',
+      body: JSON.stringify({ field: args.field, value: args.value }),
+    });
+  },
+  async updateThreadLabel(
+    args: { thread_id: string } & UpdateThreadLabelRequest
+  ) {
+    const { thread_id, label_id, value } = args;
+    return (
+      await emailFetch<UpdateThreadLabelsResponse>(
+        `/email/threads/${thread_id}/labels`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ label_id, value }),
+        }
+      )
+    ).map((result) => result);
+  },
+  async updateThreadProject(args: {
+    thread_id: string;
+    projectId: string | null;
+  }) {
+    const { thread_id, projectId } = args;
+    return emailFetch<{ oldProjectId: string | null }>(
+      `/email/threads/${thread_id}/project`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ projectId }),
+      }
+    );
+  },
+  async flagArchived(args: { value: boolean; id: string }, linkId?: string) {
+    const { value, id } = args;
+    return (
+      await emailFetch<EmptyResponse>(`/email/threads/${id}/archived`, {
+        method: 'PATCH',
+        body: JSON.stringify({ value }),
+        headers: emailLinkHeaders(linkId),
+      })
+    ).map((result) => result);
+  },
+  /** One request for up to 100 threads; the server reports threads it could not change. */
+  async flagArchivedBatch(args: ArchiveThreadsRequest) {
+    return await emailFetch<ArchiveThreadsResponse>('/email/threads/archived', {
+      method: 'PATCH',
+      body: JSON.stringify(args),
+    });
+  },
+  async startSync() {
+    return (
+      await emailFetch<EmptyResponse>('/email/sync', {
+        method: 'POST',
+      })
+    ).map((result) => result);
+  },
+  async stopSync() {
+    return (
+      await emailFetch<EmptyResponse>('/email/sync', {
+        method: 'DELETE',
+      })
+    ).map((result) => result);
+  },
+
+  async sendMessage(args: SendMessageRequest, linkId?: string) {
+    return (
+      await emailFetch<SendMessageResponse>('/email/messages', {
+        method: 'POST',
+        body: JSON.stringify(args),
+        headers: emailLinkHeaders(linkId),
+      })
+    ).map((result) => result);
+  },
+
+  async scheduleMessage(
+    args: {
+      draftID: string;
+      draftGeneration?: number;
+    } & UpsertScheduledRequest,
+    linkId?: string
+  ) {
+    const { draftID, draftGeneration, ...rest } = args;
+    return (
+      await emailFetch<UpsertScheduledResponse>(
+        `/email/drafts/scheduled/${draftID}?draft_generation=${draftGeneration ?? 0}`,
+        {
+          method: 'PUT',
+          body: JSON.stringify(rest),
+          headers: emailLinkHeaders(linkId),
+        }
+      )
+    ).map((result) => result);
+  },
+
+  async unscheduleMessage(
+    args: { draftID: string; draftGeneration?: number },
+    linkId?: string
+  ) {
+    return (
+      await emailFetch<EmptyResponse>(
+        `/email/drafts/scheduled/${args.draftID}?draft_generation=${args.draftGeneration ?? 0}`,
+        {
+          method: 'DELETE',
+          headers: emailLinkHeaders(linkId),
+        }
+      )
+    ).map((result) => result);
+  },
+
+  async getScheduledMessages(
+    args: { offset: number; limit: number },
+    linkId?: string
+  ) {
+    const params = new URLSearchParams({
+      offset: String(args.offset),
+      limit: String(args.limit),
+    });
+    return emailFetch<GetScheduledResponse>(
+      `/email/drafts/scheduled?${params.toString()}`,
+      {
+        method: 'GET',
+        headers: emailLinkHeaders(linkId),
+      }
+    );
+  },
+
+  async getLinks() {
+    return (
+      await emailFetch<ListLinksResponse>('/email/links', {
+        method: 'GET',
+      })
+    ).map((result) => result);
+  },
+
+  async listBackfillJobs() {
+    return (
+      await emailFetch<ListBackfillJobsResponse>('/email/backfill/gmail', {
+        method: 'GET',
+      })
+    ).map((result) => result);
+  },
+
+  // Patches the settings for one inbox. Scoped to `linkId` via the
+  // X-Email-Link-Id header (the backend resolves the link from it); omit for
+  // the primary inbox. Partial: fields omitted from `settings` are left as-is.
+  async patchSettings(
+    args: PatchSettingsRequest,
+    linkId?: string,
+    parentSpan?: Span
+  ) {
+    return fetchWithToken<
+      PatchSettingsResponse,
+      typeof SIGNATURE_IMAGES_UNRESOLVED_CODE
+    >(`${emailHost}/email/settings`, {
+      method: 'PATCH',
+      body: JSON.stringify(args),
+      headers: emailLinkHeaders(linkId),
+      trace: { parentSpan },
+      // The 422 body carries how many signature images couldn't be loaded;
+      // surface it as the error message so the caller can prompt a re-add.
+      // Other statuses fall back to the default HTTP_ERROR shape.
+      errorResponseHandler: async (response) => {
+        if (response.status === 422) {
+          const body = (await response.json().catch(() => null)) as {
+            unresolved_image_count?: number;
+          } | null;
+          return {
+            code: SIGNATURE_IMAGES_UNRESOLVED_CODE,
+            message: String(body?.unresolved_image_count ?? 0),
+          };
+        }
+        return {
+          code: 'HTTP_ERROR',
+          message: `HTTP error! status: ${response.status}`,
+        };
+      },
+    });
+  },
+
+  async deleteLink(args: { linkId: string }) {
+    const { linkId } = args;
+    return (
+      await emailFetch<EmptyResponse>(
+        `/email/links/${encodeURIComponent(linkId)}`,
+        {
+          method: 'DELETE',
+        }
+      )
+    ).map((result) => result);
+  },
+
+  /**
+   * Turns calendar off for one connected inbox: its calendar data is removed
+   * and the calendar scopes leave its Google grant, so the inbox comes back as
+   * needing calendar permission until the user grants it again. Gmail sync is
+   * unaffected.
+   */
+  async disableLinkCalendar(args: { linkId: string }) {
+    const { linkId } = args;
+    return (
+      await emailFetch<EmptyResponse>(
+        `/email/links/${encodeURIComponent(linkId)}/calendar`,
+        {
+          method: 'DELETE',
+        }
+      )
+    ).map((result) => result);
+  },
+
+  async resyncLink(args: { linkId: string }) {
+    const { linkId } = args;
+    return (
+      await emailFetch<ResyncResponse>(
+        `/email/links/${encodeURIComponent(linkId)}/resync`,
+        {
+          method: 'POST',
+        }
+      )
+    ).map((result) => result);
+  },
+
+  async healthCheckLinks() {
+    return (
+      await emailFetch<EmptyResponse>('/email/links/health-check', {
+        method: 'POST',
+      })
+    ).map((result) => result);
+  },
+
+  async listContacts() {
+    return (
+      await emailFetch<ListContactsResponse>('/email/contacts', {
+        method: 'GET',
+      })
+    ).map((result) => result);
+  },
+  async getAttachmentUrl(args: { id: string }) {
+    const { id } = args;
+    return (
+      await emailFetch<GetAttachmentResponse>(`/email/attachments/${id}`, {
+        method: 'GET',
+      })
+    ).map((result) => result);
+  },
+  async getOrCreateAttachmentDocumentId(args: { id: string }) {
+    const { id } = args;
+    return (
+      await emailFetch<GetAttachmentDocumentIDResponse>(
+        `/email/attachments/${id}/document_id`,
+        {
+          method: 'GET',
+        }
+      )
+    ).map((result) => result);
+  },
+  async createDraft(args: CreateDraftRequest, linkId?: string) {
+    return (
+      await emailFetch<CreateDraftResponse>('/email/drafts', {
+        method: 'POST',
+        body: JSON.stringify(args),
+        headers: emailLinkHeaders(linkId),
+      })
+    ).map((result) => result);
+  },
+  async recoverDraftTransfer(id: string) {
+    return emailFetch<TransferRecoveryResponse>(
+      `/email/draft-transfers/${id}/recover`,
+      { method: 'POST' }
+    );
+  },
+  async transferDraft(id: string, body: TransferDraftRequest, linkId: string) {
+    return emailFetch<TransferDraftResponse>(`/email/drafts/${id}/transfer`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+      headers: emailLinkHeaders(linkId),
+    });
+  },
+  async deleteDraft(
+    args: { id: string; draftGeneration?: number },
+    linkId?: string
+  ) {
+    const { id } = args;
+    return (
+      await emailFetch<EmptyResponse>(
+        `/email/drafts/${id}?draft_generation=${args.draftGeneration ?? 0}`,
+        {
+          method: 'DELETE',
+          headers: emailLinkHeaders(linkId),
+        }
+      )
+    ).map((result) => result);
+  },
+  async addDraftAttachment(
+    args: {
+      draftID: string;
+      draftGeneration?: number;
+      attachment: AddDraftAttachmentRequest;
+    },
+    linkId?: string
+  ) {
+    return (
+      await emailFetch<AddDraftAttachmentResponse>(
+        `/email/drafts/${args.draftID}/attachments?draft_generation=${args.draftGeneration ?? 0}`,
+        {
+          method: 'POST',
+          body: JSON.stringify(args.attachment),
+          headers: emailLinkHeaders(linkId),
+        }
+      )
+    ).map((result) => result);
+  },
+  async completeDraftAttachment(
+    args: { draftID: string; attachmentID: string; draftGeneration?: number },
+    linkId?: string
+  ) {
+    return emailFetch<EmptyResponse>(
+      `/email/drafts/${args.draftID}/attachments/${args.attachmentID}/complete?draft_generation=${args.draftGeneration ?? 0}`,
+      { method: 'POST', headers: emailLinkHeaders(linkId) }
+    );
+  },
+  async removeDraftAttachment(
+    args: { draftID: string; attachmentID: string; draftGeneration?: number },
+    linkId?: string
+  ) {
+    return (
+      await emailFetch<EmptyResponse>(
+        `/email/drafts/${args.draftID}/attachments/${args.attachmentID}?draft_generation=${args.draftGeneration ?? 0}`,
+        {
+          method: 'DELETE',
+          headers: emailLinkHeaders(linkId),
+        }
+      )
+    ).map((result) => result);
+  },
+  async addForwardedAttachment(
+    args: {
+      draftID: string;
+      draftGeneration?: number;
+      attachmentID: string;
+    },
+    linkId?: string
+  ) {
+    return (
+      await emailFetch<{
+        attachment_id: string;
+        filename: string | null;
+        mime_type: string | null;
+        size_bytes: number | null;
+      }>(
+        `/email/drafts/${args.draftID}/forwarded-attachments?draft_generation=${args.draftGeneration ?? 0}`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ attachment_id: args.attachmentID }),
+          headers: emailLinkHeaders(linkId),
+        }
+      )
+    ).map((result) => result);
+  },
+  async removeForwardedAttachment(
+    args: {
+      draftID: string;
+      draftGeneration?: number;
+      attachmentID: string;
+    },
+    linkId?: string
+  ) {
+    return (
+      await emailFetch<EmptyResponse>(
+        `/email/drafts/${args.draftID}/forwarded-attachments/${args.attachmentID}?draft_generation=${args.draftGeneration ?? 0}`,
+        {
+          method: 'DELETE',
+          headers: emailLinkHeaders(linkId),
+        }
+      )
+    ).map((result) => result);
+  },
+  async markThreadAsSeen(args: { thread_id: string }, linkId?: string) {
+    const { thread_id } = args;
+    return (
+      await emailFetch<EmptyResponse>(`/email/threads/${thread_id}/seen`, {
+        method: 'POST',
+        headers: emailLinkHeaders(linkId),
+      })
+    ).map((result) => result);
+  },
+  async blockSender(args: { email_address: string }, linkId?: string) {
+    return emailFetch('/email/contacts/block', {
+      method: 'POST',
+      body: JSON.stringify({ email_address: args.email_address }),
+      headers: emailLinkHeaders(linkId),
+    });
+  },
+  async unblockSender(args: { email_address: string }, linkId?: string) {
+    return emailFetch('/email/contacts/unblock', {
+      method: 'POST',
+      body: JSON.stringify({ email_address: args.email_address }),
+      headers: emailLinkHeaders(linkId),
+    });
+  },
+  // Filters are stored per linked inbox, so every filter call is scoped to
+  // `linkId` via the X-Email-Link-Id header; omit for the primary inbox.
+  async listEmailFilters(linkId?: string) {
+    return (
+      await emailFetch<ListEmailFiltersResponse>('/email/filters', {
+        method: 'GET',
+        headers: emailLinkHeaders(linkId),
+      })
+    ).map((result) => result);
+  },
+  async upsertEmailFilter(args: UpsertEmailFilterRequest, linkId?: string) {
+    return (
+      await emailFetch<UpsertEmailFilterResponse>('/email/filters', {
+        method: 'PUT',
+        body: JSON.stringify(args),
+        headers: emailLinkHeaders(linkId),
+      })
+    ).map((result) => result);
+  },
+  async deleteEmailFilter(args: { id: string }, linkId?: string) {
+    return emailFetch(`/email/filters/${args.id}`, {
+      method: 'DELETE',
+      headers: emailLinkHeaders(linkId),
+    });
+  },
+  async prepareCalendarReplacement(
+    eventId: string,
+    args: PrepareCalendarReplacementRequest
+  ) {
+    return fetchWithToken<CalendarReplacementView, CalendarMutationErrorCode>(
+      `${calendarHost}/events/${eventId}/replacement`,
+      {
+        method: 'POST',
+        body: JSON.stringify(args),
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async confirmCalendarReplacement(operationId: string) {
+    return fetchWithToken<CalendarReplacementView, CalendarMutationErrorCode>(
+      `${calendarHost}/replacements/${operationId}/confirm`,
+      {
+        method: 'POST',
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async calendarReplacementStatus(operationId: string) {
+    return fetchWithToken<CalendarReplacementView, CalendarMutationErrorCode>(
+      `${calendarHost}/replacements/${operationId}`,
+      {
+        method: 'GET',
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async discardCalendarReplacement(operationId: string) {
+    return fetchWithToken<EmptyResponse, CalendarMutationErrorCode>(
+      `${calendarHost}/replacements/${operationId}`,
+      {
+        method: 'DELETE',
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async calendarEventProviderUrl(
+    eventId: string,
+    options: { calendarId?: string; recurrenceId?: string }
+  ) {
+    const params = new URLSearchParams();
+    if (options.calendarId) params.set('calendarId', options.calendarId);
+    if (options.recurrenceId) params.set('recurrenceId', options.recurrenceId);
+    return fetchWithToken<CalendarEventProviderUrl, CalendarMutationErrorCode>(
+      `${calendarHost}/events/${eventId}/provider-url?${params}`,
+      {
+        method: 'GET',
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async listCalendars() {
+    return fetchWithToken<ListCalendarsResponse>(`${calendarHost}/calendars`, {
+      method: 'GET',
+    });
+  },
+
+  async getTeamCalendarSharing(signal?: AbortSignal) {
+    return fetchWithToken<TeamCalendarSharingBody>(
+      `${calendarHost}/team-sharing`,
+      { method: 'GET', signal }
+    );
+  },
+
+  async setTeamCalendarSharing(body: TeamCalendarSharingBody) {
+    return fetchWithToken<TeamCalendarSharingBody>(
+      `${calendarHost}/team-sharing`,
+      { method: 'PUT', body: JSON.stringify(body) }
+    );
+  },
+
+  async getAvailabilityCalendars(signal?: AbortSignal) {
+    return fetchWithToken<AvailabilityCalendarsResponse>(
+      `${calendarHost}/availability-calendars`,
+      { method: 'GET', signal }
+    );
+  },
+
+  async setAvailabilityCalendar(
+    calendarId: string,
+    body: AvailabilityCalendarBody
+  ) {
+    return fetchWithToken<EmptyResponse>(
+      `${calendarHost}/availability-calendars/${encodeURIComponent(calendarId)}`,
+      { method: 'PUT', body: JSON.stringify(body) }
+    );
+  },
+  async createCalendarEvent(args: CreateCalendarEventRequest) {
+    return fetchWithToken<CalendarEvent, CalendarMutationErrorCode>(
+      `${calendarHost}/events`,
+      {
+        method: 'POST',
+        body: JSON.stringify(args),
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async updateCalendarEvent(eventId: string, args: UpdateCalendarEventRequest) {
+    return fetchWithToken<CalendarEvent, CalendarMutationErrorCode>(
+      `${calendarHost}/events/${eventId}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(args),
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async deleteCalendarEvent(
+    eventId: string,
+    options?: {
+      scope?: CalendarDeletionScope;
+      recurrenceId?: string;
+      calendarId?: string;
+    }
+  ) {
+    const params = new URLSearchParams();
+    if (options?.scope && options.scope !== 'all') {
+      params.set('scope', options.scope);
+    }
+    if (options?.recurrenceId) {
+      params.set('recurrenceId', options.recurrenceId);
+    }
+    if (options?.calendarId) {
+      params.set('calendarId', options.calendarId);
+    }
+    const query = params.toString();
+    return fetchWithToken<EmptyResponse, CalendarMutationErrorCode>(
+      `${calendarHost}/events/${eventId}${query ? `?${query}` : ''}`,
+      {
+        method: 'DELETE',
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async rsvpCalendarEvent(eventId: string, args: RsvpCalendarEventRequest) {
+    return fetchWithToken<CalendarEvent, CalendarMutationErrorCode>(
+      `${calendarHost}/events/${eventId}/rsvp`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(args),
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async inviteCalendarEventGuests(
+    eventId: string,
+    args: InviteCalendarEventGuestsRequest
+  ) {
+    return fetchWithToken<CalendarEvent, CalendarMutationErrorCode>(
+      `${calendarHost}/events/${eventId}/guests`,
+      {
+        method: 'POST',
+        body: JSON.stringify(args),
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async respondToCalendarJoinRequest(
+    requestId: string,
+    args: RespondToJoinRequestRequest
+  ) {
+    return fetchWithToken<CalendarJoinRequest, CalendarMutationErrorCode>(
+      `${calendarHost}/join-requests/${requestId}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(args),
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+  async copyCalendarEvent(eventId: string, args: CopyCalendarEventRequest) {
+    return fetchWithToken<CalendarEvent, CalendarMutationErrorCode>(
+      `${calendarHost}/events/${eventId}/copy`,
+      {
+        method: 'POST',
+        body: JSON.stringify(args),
+        errorResponseHandler: calendarMutationErrorHandler,
+      }
+    );
+  },
+
+  async importGmailSignature(linkId?: string, parentSpan?: Span) {
+    return fetchWithToken<
+      PatchSettingsResponse,
+      'NO_SIGNATURE_FOUND' | typeof SIGNATURE_IMAGES_UNRESOLVED_CODE
+    >(`${emailHost}/email/settings/import-signature`, {
+      method: 'POST',
+      headers: emailLinkHeaders(linkId),
+      trace: { parentSpan },
+      errorResponseHandler: async (response) => {
+        if (response.status === 404) {
+          return { code: 'NO_SIGNATURE_FOUND' as const, message: '' };
+        }
+        // Same 422 contract as patchSettings: Gmail images that couldn't be
+        // rehosted, so nothing was saved.
+        if (response.status === 422) {
+          return { code: SIGNATURE_IMAGES_UNRESOLVED_CODE, message: '' };
+        }
+        return {
+          code: 'HTTP_ERROR' as const,
+          message: `HTTP error! status: ${response.status}`,
+        };
+      },
+    });
+  },
+};

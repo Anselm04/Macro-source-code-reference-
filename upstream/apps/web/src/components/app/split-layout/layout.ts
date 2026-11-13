@@ -1,0 +1,156 @@
+import { globalSplitManager } from '@app/signal/splitLayout';
+import { isTouchDevice } from '@core/mobile/isTouchDevice';
+import {
+  captureElementScrollAnchor,
+  holdScrollAnchor,
+} from '@core/util/scrollAnchor';
+import { useContext } from 'solid-js';
+import { SplitPanelContext } from './context';
+import type {
+  OpenSplitResult,
+  OpenWithSplitOptions,
+  PopoverSplitOptions,
+  ReferredFrom,
+  ReplaceAllSplitsOptions,
+  SplitContent,
+} from './layoutManager';
+
+export function useSplitLayout() {
+  const splitPanelContext = useContext(SplitPanelContext);
+
+  /** Warms a destination on navigation intent (hover, focus) without opening it. */
+  function preloadContent(content: SplitContent) {
+    globalSplitManager()?.preloadContent(content);
+  }
+
+  function openWithSplit(
+    content: SplitContent,
+    options?: OpenWithSplitOptions
+  ): OpenSplitResult {
+    const splitManager = globalSplitManager();
+    const preferNewSplit = isTouchDevice() ? false : options?.preferNewSplit;
+
+    if (!splitManager) {
+      console.error('No split manager found');
+      return { status: 'unavailable' };
+    }
+
+    // Use the source panel for navigation. Popover handles cannot replace
+    // content, so navigation from a popover falls back to the active split.
+    const requestedHandle = options?.handle ?? splitPanelContext?.handle;
+    const handle = requestedHandle?.isPopover() ? undefined : requestedHandle;
+
+    // A new split narrows this one and reflows its content under an unchanged
+    // scrollTop, which can push what was just clicked out of view.
+    const clickedAnchor = preferNewSplit
+      ? captureElementScrollAnchor(splitPanelContext?.pointerTarget?.())
+      : undefined;
+
+    const result = splitManager.openWithSplit(content, {
+      ...options,
+      preferNewSplit,
+      handle,
+    });
+
+    if (
+      clickedAnchor &&
+      result.status === 'opened' &&
+      result.split.id !== splitPanelContext?.handle.id
+    ) {
+      holdScrollAnchor(clickedAnchor.scroller, clickedAnchor.anchor);
+    }
+    return result;
+  }
+
+  function replaceOrInsertSplit(
+    content: SplitContent,
+    referredFrom: ReferredFrom = null
+  ) {
+    return openWithSplit(content, {
+      referredFrom,
+      handle: splitPanelContext?.handle,
+      activate: true,
+    }).split;
+  }
+
+  function replaceSplit(options: {
+    content: SplitContent;
+    mergeHistory?: boolean;
+    referredFrom?: ReferredFrom;
+  }) {
+    const { content, mergeHistory, referredFrom } = options;
+
+    return openWithSplit(content, {
+      mergeHistory,
+      referredFrom,
+      handle: splitPanelContext?.handle,
+      preferNewSplit: false,
+    }).split;
+  }
+
+  function insertSplit(
+    content: SplitContent,
+    referredFrom: ReferredFrom = null,
+    options: Pick<OpenWithSplitOptions, 'beside'> = {}
+  ) {
+    return openWithSplit(content, {
+      activate: true,
+      referredFrom,
+      preferNewSplit: true,
+      ...options,
+    }).split;
+  }
+
+  function popoverSplit(
+    content: SplitContent,
+    options: Omit<PopoverSplitOptions, 'content'> = {}
+  ) {
+    const splitManager = globalSplitManager();
+    if (!splitManager) {
+      console.error('no split manager found');
+      return;
+    }
+    return splitManager.createPopoverSplit({ ...options, content });
+  }
+
+  function replaceAllSplits(
+    content: SplitContent,
+    options?: ReplaceAllSplitsOptions
+  ) {
+    const splitManager = globalSplitManager();
+    if (!splitManager) {
+      console.error('No split manager found');
+      return;
+    }
+    return splitManager.replaceAllSplits(content, options);
+  }
+
+  function resetSplit() {
+    if (!splitPanelContext) {
+      console.error('No split panel context found');
+      return;
+    }
+
+    splitPanelContext.handle.reset();
+  }
+
+  function getSplitCount() {
+    const splitManager = globalSplitManager();
+    if (!splitManager) {
+      return 0;
+    }
+    return splitManager.getVisibleSplitCount();
+  }
+
+  return {
+    openWithSplit,
+    preloadContent,
+    getSplitCount,
+    replaceOrInsertSplit,
+    replaceSplit,
+    insertSplit,
+    resetSplit,
+    popoverSplit,
+    replaceAllSplits,
+  };
+}

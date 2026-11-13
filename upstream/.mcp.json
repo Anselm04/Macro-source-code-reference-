@@ -1,0 +1,39 @@
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "bunx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--browser-url",
+        "http://127.0.0.1:9222"
+      ]
+    },
+    "goalert": {
+      "command": "goalert-mcp-macro"
+    },
+    "grafana": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "--network",
+        "host",
+        "-e",
+        "GRAFANA_URL=http://localhost:3001",
+        "mcp/grafana",
+        "-t",
+        "stdio"
+      ]
+    },
+    "macro": {
+      "type": "http",
+      "url": "https://mcp-server.macro.com/mcp"
+    },
+    "posthog": {
+      "type": "http",
+      "url": "https://mcp.posthog.com/mcp"
+    }
+  }
+}

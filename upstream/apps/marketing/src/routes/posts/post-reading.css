@@ -1,0 +1,290 @@
+/* Article typography must not leak into the shared product UI. */
+@scope (:root) to (.post-product-ui) {
+/* Slab headlines and monochrome artwork follow the public homepage. */
+.posts-article .posts-title {
+  color: var(--post-ink);
+  font-family: 'Roboto Slab Variable', display, serif;
+  font-size: 40px;
+  font-weight: calc(320 + var(--cream-slab-weight-increase, 0));
+  letter-spacing: -0.04em;
+  line-height: 1.06;
+  margin: 0 auto 24px;
+  text-wrap: balance;
+}
+
+.posts-article .posts-lede {
+  color: var(--post-muted);
+  font: 370 17.5px/1.65 'Inter Variable', Inter, sans-serif;
+  margin: 0 auto;
+  max-width: 640px;
+  text-wrap: balance;
+}
+
+.posts-article .posts-byline {
+  font-family: 'Inter Variable', Inter, sans-serif;
+  font-size: 13px;
+}
+
+.posts-article .posts-hero-art {
+  background: none;
+}
+
+.posts-article .post-cover-svg {
+  filter: grayscale(1);
+}
+
+/* Share the feature pages’ reading scale and measure. */
+.posts-article .post-body {
+  color: var(--post-muted);
+  font-family: 'Inter Variable', Inter, sans-serif;
+  font-size: 17.5px;
+  font-weight: 370;
+  line-height: 1.8;
+  max-width: 640px;
+  overflow-wrap: anywhere;
+}
+
+.posts-article .post-body > div {
+  color: inherit;
+  font-family: inherit;
+}
+
+.posts-article .post-body h2,
+.posts-article .post-body h3,
+.posts-article .post-body h4 {
+  color: var(--post-ink);
+  font-family: 'Roboto Slab Variable', display, serif;
+  font-weight: calc(320 + var(--cream-slab-weight-increase, 0));
+  letter-spacing: -0.035em;
+}
+
+.posts-article .post-body h2 {
+  font-size: 40px;
+  line-height: 1.2;
+  margin: 80px 0 28px;
+}
+
+.posts-article .post-body h3 {
+  font-size: 28px;
+  line-height: 1.4;
+  margin: 48px 0 16px;
+}
+
+.posts-article .post-body h2::before,
+.posts-article .post-body h3::before {
+  content: none;
+}
+
+.posts-article .post-body p {
+  margin-bottom: 20px;
+}
+
+.posts-article .post-body a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--post-faint);
+  text-underline-offset: 4px;
+}
+
+.posts-article .post-body a:hover {
+  color: var(--post-ink);
+}
+
+.posts-article .post-body a:focus-visible,
+.post-faq__item summary:focus-visible {
+  border-radius: 2px;
+  outline: 1px solid var(--post-ink);
+  outline-offset: 4px;
+}
+
+.posts-article .post-section-rule {
+  border: 0;
+  border-top: 1px solid #292929;
+  margin: 80px 0 40px;
+  width: 48px;
+}
+
+.posts-article .post-section-rule + h2 {
+  margin-top: 0;
+}
+
+.posts-article .post-body .mvn-testimonial blockquote {
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.posts-article .post-body .mvn-figcaption {
+  color: var(--post-faint);
+  font-size: 12px;
+  line-height: 24px;
+  margin: 12px 0 40px;
+}
+
+.posts-article .post-body .post-faq-title {
+  font-size: 28px;
+  line-height: 1.4;
+  margin: 48px 0 16px;
+}
+
+.post-faq {
+  border-top: 1px solid var(--post-rule);
+  margin-bottom: 32px;
+}
+
+.post-faq__item {
+  border-bottom: 1px solid var(--post-rule);
+}
+
+.post-faq__item summary {
+  align-items: flex-start;
+  color: var(--post-muted);
+  cursor: pointer;
+  display: flex;
+  font-size: 14px;
+  font-weight: 500;
+  gap: 20px;
+  justify-content: space-between;
+  line-height: 24px;
+  list-style: none;
+  padding: 20px 0;
+}
+
+.post-faq__item summary::-webkit-details-marker {
+  display: none;
+}
+
+.post-faq__item summary:hover {
+  color: var(--post-ink);
+}
+
+.post-faq__item summary svg {
+  color: var(--post-faint);
+  flex-shrink: 0;
+  height: 16px;
+  margin-top: 4px;
+  transition: transform 150ms ease;
+  width: 16px;
+}
+
+.post-faq__item[open] summary svg {
+  transform: rotate(180deg);
+}
+
+.post-faq__answer {
+  padding: 0 24px 24px 0;
+}
+
+.posts-article .post-faq__answer p:last-child {
+  margin-bottom: 0;
+}
+
+.posts-article .post-body .post-footnote {
+  color: var(--post-faint);
+  font-size: 12px;
+  line-height: 24px;
+}
+
+@media (max-width: 699px) {
+  .posts-article .posts-title {
+    font-size: clamp(34px, 8vw, 40px);
+    letter-spacing: -0.035em;
+    line-height: 1.1;
+  }
+
+  .posts-article .post-body h2 {
+    font-size: 28px;
+  }
+
+  .posts-article .post-body h3 {
+    font-size: 24px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .post-faq__item summary svg {
+    transition: none;
+  }
+}
+
+/* Older entries share the same reading styles, including their lead copy. */
+.posts-article .post-body [class$="-lede"] {
+  color: var(--post-muted);
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.posts-article .post-body [class$="-figcaption"] {
+  color: var(--post-faint);
+  font-size: 12px;
+  line-height: 24px;
+}
+
+.posts-article .mvn-section-glyph {
+  border-top: 1px solid #292929;
+  height: 1px;
+  margin: 80px 0 40px;
+  width: 48px;
+}
+
+.posts-article .mvn-section-glyph svg {
+  display: none;
+}
+
+.posts-article .mvn-section-glyph + h2 {
+  margin-top: 0;
+}
+
+.posts-article .mvn-graphic-frame,
+.posts-article .aie-shot-frame {
+  background: transparent;
+  border: 1px solid #292929;
+  padding: 0;
+}
+
+.posts-article .mvn-graphic-frame::before {
+  content: none;
+}
+
+.posts-article .mvn-graphic-inner {
+  border: 0;
+  border-radius: inherit;
+}
+
+.posts-article .pdg-diagram {
+  font-family: 'Inter Variable', Inter, sans-serif;
+}
+
+.posts-article .mvn-authors-note-label {
+  color: var(--post-faint);
+  font-family: 'Inter Variable', Inter, sans-serif;
+  font-size: 12px;
+  font-weight: 370;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.posts-article .post-body h4 { font-size: 22px; line-height: 1.4; }
+.posts-article .post-body :is(ul, ol) { padding-left: 24px; }
+.posts-article .post-body li + li { margin-top: 8px; }
+.posts-article .post-body code { font-family: ui-monospace, monospace; font-size: .86em; }
+.posts-article .post-body pre { max-width: 100%; overflow-x: auto; font-size: 14px; }
+.posts-article .post-body pre code { font-size: inherit; }
+.posts-article .post-body :is(.mvn-table-wrap, .mfs-table-wrap) { width: 100%; max-width: 100%; left: auto; transform: none; border: 0; border-radius: 0; }
+.posts-article .post-body :is(.mvn-table, .mfs-table) :is(th, td) { color: var(--post-muted); }
+
+.posts-article .post-body :is(h2,h3,h4) :is(strong,b) { font-weight: inherit; }
+
+/* Use the feature pages' visual column; prose and tables keep the reading measure. */
+.posts-article .post-body :is(.mvn-graphic, .mvn-video, .pdg-figure) {
+  position: relative;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 100cqw;
+  max-width: none;
+}
+@media (max-width: 699px) {
+  .posts-article .post-body,
+  .posts-article-header { width: calc(100% - 16px); }
+}
+
+}

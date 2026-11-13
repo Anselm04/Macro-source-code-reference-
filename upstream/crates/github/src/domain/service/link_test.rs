@@ -1,0 +1,1656 @@
+mod lookup;
+mod pull_request_state;
+mod recovery;
+use std::sync::{Arc, Mutex};
+
+use chrono::Utc;
+use entity_access::domain::models::{EntityAccessReceipt, ViewAccessLevel};
+use foreign_entity::domain::{
+    models::{
+        CreateForeignEntity, ForeignEntity, ForeignEntityError, PatchForeignEntity, SourceId,
+    },
+    ports::{ForeignEntityListQuery, ForeignEntityService},
+};
+use github_pull_requests::domain::{
+    models::{GithubPullRequestRow, GithubPullRequestWrite},
+    ports::GithubPullRequestRepository,
+    service::GithubPullRequestServiceImpl,
+};
+use macro_user_id::{
+    lowercased::Lowercase,
+    user_id::{MacroUserId, MacroUserIdStr},
+};
+
+use crate::domain::{
+    models::{
+        EnrichedGithubPullRequest, GITHUB_PULL_REQUEST_FOREIGN_ENTITY_SOURCE, GithubAccessToken,
+        GithubDraftOutcome, GithubError, GithubExchangeTokenResponse, GithubGrantLinkOutcome,
+        GithubLink, GithubMergeMethod, GithubMergeOutcome, GithubMergeRejection,
+        GithubPullRequestDetails, GithubPullRequestMerge, GithubPullRequestMergeability,
+        GithubPullRequestMergeabilityEntry, GithubPullRequestNumber, GithubPullRequestRef,
+        GithubPullRequestState, GithubPullRequestUpdateRejection, GithubRepositoryMergeSettings,
+        GithubStateOutcome, GithubUserInfo, MergeGithubPullRequestRequest,
+        SetGithubPullRequestDraftRequest,
+    },
+    ports::{Auth, GithubLinkService, GithubOauth, GithubRepo},
+};
+
+use upstream_error::{UpstreamError, UpstreamFailure};
+
+use super::{GithubLinkConfig, GithubLinkServiceImpl};
+
+#[derive(Clone)]
+struct StubGithubRepo {
+    account_lock: Arc<tokio::sync::Mutex<()>>,
+    state: Arc<Mutex<StubGithubRepoState>>,
+}
+
+struct StubGithubRepoState {
+    /// Link returned by `get_github_link_by_user_id`.
+    link_by_user_id: Option<GithubLink>,
+    /// Link returned by `get_github_link_by_github_user_id`.
+    link_by_github_user_id: Option<GithubLink>,
+    /// Value returned by `count_github_links_by_github_user_id`.
+    link_count: i64,
+    inserted_links: Vec<GithubLink>,
+    delete_github_link_calls: u32,
+    delete_in_progress_user_link_calls: u32,
+}
+
+impl Default for StubGithubRepoState {
+    fn default() -> Self {
+        Self {
+            link_by_user_id: None,
+            link_by_github_user_id: None,
+            link_count: 1,
+            inserted_links: Vec::new(),
+            delete_github_link_calls: 0,
+            delete_in_progress_user_link_calls: 0,
+        }
+    }
+}
+
+impl StubGithubRepo {
+    fn new(state: StubGithubRepoState) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            account_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    fn linked(link: GithubLink) -> Self {
+        Self::new(StubGithubRepoState {
+            link_by_user_id: Some(link),
+            ..StubGithubRepoState::default()
+        })
+    }
+
+    fn unlinked() -> Self {
+        Self::new(StubGithubRepoState::default())
+    }
+
+    /// Sets the link returned by `get_github_link_by_github_user_id`.
+    fn with_account_owner(self, owner: GithubLink) -> Self {
+        self.state.lock().unwrap().link_by_github_user_id = Some(owner);
+        self
+    }
+
+    /// Sets the value returned by `count_github_links_by_github_user_id`.
+    fn with_link_count(self, link_count: i64) -> Self {
+        self.state.lock().unwrap().link_count = link_count;
+        self
+    }
+
+    fn inserted_links(&self) -> Vec<GithubLink> {
+        self.state.lock().unwrap().inserted_links.clone()
+    }
+
+    fn delete_github_link_calls(&self) -> u32 {
+        self.state.lock().unwrap().delete_github_link_calls
+    }
+
+    fn delete_in_progress_user_link_calls(&self) -> u32 {
+        self.state
+            .lock()
+            .unwrap()
+            .delete_in_progress_user_link_calls
+    }
+}
+
+impl GithubRepo for StubGithubRepo {
+    type Err = anyhow::Error;
+    type LinkGuard = Option<tokio::sync::OwnedMutexGuard<()>>;
+
+    async fn lock_user_link(&self, _user_id: &str) -> Result<Self::LinkGuard, Self::Err> {
+        Ok(None)
+    }
+    async fn lock_github_account(
+        &self,
+        guard: &mut Self::LinkGuard,
+        _github_user_id: &str,
+    ) -> Result<(), Self::Err> {
+        *guard = Some(self.account_lock.clone().lock_owned().await);
+        Ok(())
+    }
+
+    async fn get_github_link_by_user_id<'a>(
+        &self,
+        _macro_user_id: &MacroUserId<Lowercase<'a>>,
+    ) -> Result<Option<GithubLink>, Self::Err> {
+        Ok(self.state.lock().unwrap().link_by_user_id.clone())
+    }
+
+    async fn get_github_link_by_github_user_id(
+        &self,
+        _github_user_id: &str,
+    ) -> Result<Option<GithubLink>, Self::Err> {
+        Ok(self.state.lock().unwrap().link_by_github_user_id.clone())
+    }
+
+    async fn count_github_links_by_github_user_id(
+        &self,
+        _github_user_id: &str,
+    ) -> Result<i64, Self::Err> {
+        Ok(self.state.lock().unwrap().link_count)
+    }
+
+    async fn get_github_link_by_id(&self, _id: &uuid::Uuid) -> Result<GithubLink, Self::Err> {
+        Err(anyhow::anyhow!("not implemented"))
+    }
+
+    async fn insert_github_link(&self, link: &GithubLink) -> Result<(), Self::Err> {
+        self.state.lock().unwrap().inserted_links.push(link.clone());
+        Ok(())
+    }
+
+    async fn reassign_github_grant(
+        &self,
+        github_user_id: &str,
+        previous_owner: &uuid::Uuid,
+        new_owner: &uuid::Uuid,
+    ) -> Result<(), Self::Err> {
+        let mut state = self.state.lock().unwrap();
+        for link in [&mut state.link_by_user_id].into_iter().flatten() {
+            if link.github_user_id == github_user_id && link.fusionauth_user_id == *previous_owner {
+                link.fusionauth_user_id = *new_owner;
+            }
+        }
+        if let Some(link) = &mut state.link_by_github_user_id {
+            if link.github_user_id == github_user_id && link.fusionauth_user_id == *previous_owner {
+                link.fusionauth_user_id = *new_owner;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_in_progress_user_link(
+        &self,
+        _in_progress_link_id: &uuid::Uuid,
+    ) -> Result<(), Self::Err> {
+        self.state
+            .lock()
+            .unwrap()
+            .delete_in_progress_user_link_calls += 1;
+        Ok(())
+    }
+
+    async fn delete_github_link(&self, _link_id: &uuid::Uuid) -> Result<(), Self::Err> {
+        self.state.lock().unwrap().delete_github_link_calls += 1;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct StubGithubOauth {
+    state: Arc<Mutex<StubGithubOauthState>>,
+}
+
+#[derive(Default)]
+struct StubGithubOauthState {
+    token_is_expired: bool,
+    token_check_failure: Option<UpstreamFailure>,
+    validated_tokens: Vec<String>,
+    pull_request_detail_calls: Vec<PullRequestDetailCall>,
+    pull_request_details: Option<GithubPullRequestDetails>,
+    pull_request_detail_error: Option<String>,
+    merge_settings: Option<GithubRepositoryMergeSettings>,
+    merge_settings_error: Option<String>,
+    merge_settings_calls: u32,
+    merge_outcome: Option<GithubMergeOutcome>,
+    merge_calls: Vec<MergeCall>,
+    draft_outcome: Option<GithubDraftOutcome>,
+    draft_calls: Vec<(String, u64, bool)>,
+    state_outcome: Option<GithubStateOutcome>,
+    state_calls: Vec<(String, u64, GithubPullRequestState)>,
+    mergeability_calls: Vec<Vec<GithubPullRequestNumber>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PullRequestDetailCall {
+    access_token: String,
+    owner: String,
+    repo: String,
+    number: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MergeCall {
+    access_token: String,
+    owner: String,
+    repo: String,
+    number: u64,
+    merge_method: GithubMergeMethod,
+}
+
+impl StubGithubOauth {
+    fn new(token_is_expired: bool) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(StubGithubOauthState {
+                token_is_expired,
+                ..StubGithubOauthState::default()
+            })),
+        }
+    }
+
+    fn fail_token_check(self, failure: UpstreamFailure) -> Self {
+        self.state.lock().unwrap().token_check_failure = Some(failure);
+        self
+    }
+
+    fn validated_tokens(&self) -> Vec<String> {
+        self.state.lock().unwrap().validated_tokens.clone()
+    }
+
+    fn pull_request_detail_calls(&self) -> Vec<PullRequestDetailCall> {
+        self.state.lock().unwrap().pull_request_detail_calls.clone()
+    }
+
+    fn fail_pull_request_details(&self, error: &str) {
+        self.state.lock().unwrap().pull_request_detail_error = Some(error.to_string());
+    }
+
+    fn with_pull_request_details(self, details: GithubPullRequestDetails) -> Self {
+        self.state.lock().unwrap().pull_request_details = Some(details);
+        self
+    }
+
+    fn with_merge_settings(self, settings: GithubRepositoryMergeSettings) -> Self {
+        self.state.lock().unwrap().merge_settings = Some(settings);
+        self
+    }
+
+    fn fail_merge_settings(self, error: &str) -> Self {
+        self.state.lock().unwrap().merge_settings_error = Some(error.to_string());
+        self
+    }
+
+    fn with_merge_outcome(self, outcome: GithubMergeOutcome) -> Self {
+        self.state.lock().unwrap().merge_outcome = Some(outcome);
+        self
+    }
+
+    fn merge_settings_calls(&self) -> u32 {
+        self.state.lock().unwrap().merge_settings_calls
+    }
+
+    fn merge_calls(&self) -> Vec<MergeCall> {
+        self.state.lock().unwrap().merge_calls.clone()
+    }
+
+    fn with_draft_outcome(self, outcome: GithubDraftOutcome) -> Self {
+        self.state.lock().unwrap().draft_outcome = Some(outcome);
+        self
+    }
+
+    fn draft_calls(&self) -> Vec<(String, u64, bool)> {
+        self.state.lock().unwrap().draft_calls.clone()
+    }
+
+    fn with_state_outcome(self, outcome: GithubStateOutcome) -> Self {
+        self.state.lock().unwrap().state_outcome = Some(outcome);
+        self
+    }
+
+    fn state_calls(&self) -> Vec<(String, u64, GithubPullRequestState)> {
+        self.state.lock().unwrap().state_calls.clone()
+    }
+
+    fn mergeability_calls(&self) -> Vec<Vec<GithubPullRequestNumber>> {
+        self.state.lock().unwrap().mergeability_calls.clone()
+    }
+}
+
+fn merged_outcome() -> GithubMergeOutcome {
+    GithubMergeOutcome::Merged(GithubPullRequestMerge {
+        sha: "6dcb09b5".to_string(),
+        message: "Pull Request successfully merged".to_string(),
+    })
+}
+
+fn merge_request(merge_method: Option<GithubMergeMethod>) -> MergeGithubPullRequestRequest {
+    MergeGithubPullRequestRequest {
+        owner: "macro".to_string(),
+        repo: "app".to_string(),
+        number: 7,
+        merge_method,
+    }
+}
+
+fn default_pull_request_details() -> GithubPullRequestDetails {
+    GithubPullRequestDetails {
+        title: "Add token validation".to_string(),
+        state: "open".to_string(),
+        repository_id: None,
+        merged_at: None,
+        additions: 12,
+        deletions: 3,
+        author_login: None,
+        author_id: None,
+        description: None,
+        comments: None,
+        checks: None,
+        participant_github_user_ids: None,
+        draft: None,
+        requested_reviewer_github_user_ids: None,
+        github_updated_at: None,
+        assignees: None,
+        labels: None,
+        reviews: None,
+        base: None,
+        head: None,
+    }
+}
+
+impl GithubOauth for StubGithubOauth {
+    type Err = GithubError;
+
+    fn construct_oauth_url(
+        &self,
+        _client_id: &str,
+        _redirect_uri: &str,
+        _state: &str,
+    ) -> Result<String, Self::Err> {
+        Ok("https://github.example/oauth".to_string())
+    }
+
+    async fn exchange_oauth_code_for_tokens(
+        &self,
+        _client_id: &str,
+        _client_secret: &str,
+        _redirect_uri: &str,
+        _code: &str,
+    ) -> Result<GithubExchangeTokenResponse, Self::Err> {
+        Ok(GithubExchangeTokenResponse {
+            access_token: "access-token".to_string(),
+            token_type: "bearer".to_string(),
+            scope: "repo user:email".to_string(),
+            refresh_token: None,
+            expires_in: None,
+            refresh_token_expires_in: None,
+        })
+    }
+
+    async fn get_user_info(&self, _access_token: &str) -> Result<GithubUserInfo, Self::Err> {
+        Ok(GithubUserInfo {
+            id: 1,
+            login: "octocat".to_string(),
+            email: None,
+            name: None,
+        })
+    }
+
+    async fn is_access_token_expired(&self, access_token: &str) -> Result<bool, Self::Err> {
+        let mut state = self.state.lock().unwrap();
+        state.validated_tokens.push(access_token.to_string());
+        if let Some(failure) = state.token_check_failure {
+            return Err(github_upstream("GitHub", failure));
+        }
+        Ok(state.token_is_expired)
+    }
+
+    async fn get_pull_request_details(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<GithubPullRequestDetails, Self::Err> {
+        let mut state = self.state.lock().unwrap();
+        state.pull_request_detail_calls.push(PullRequestDetailCall {
+            access_token: access_token.to_string(),
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+        });
+
+        if let Some(error) = &state.pull_request_detail_error {
+            return Err(GithubError::Internal(anyhow::anyhow!(error.clone())));
+        }
+
+        Ok(state
+            .pull_request_details
+            .clone()
+            .unwrap_or_else(default_pull_request_details))
+    }
+
+    async fn get_repository_merge_settings(
+        &self,
+        _access_token: &str,
+        _owner: &str,
+        _repo: &str,
+    ) -> Result<GithubRepositoryMergeSettings, Self::Err> {
+        let mut state = self.state.lock().unwrap();
+        state.merge_settings_calls += 1;
+        if let Some(error) = &state.merge_settings_error {
+            return Err(GithubError::Internal(anyhow::anyhow!(error.clone())));
+        }
+        Ok(state
+            .merge_settings
+            .unwrap_or(GithubRepositoryMergeSettings {
+                allow_merge_commit: true,
+                allow_squash_merge: true,
+                allow_rebase_merge: true,
+            }))
+    }
+
+    async fn merge_pull_request(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        merge_method: GithubMergeMethod,
+    ) -> Result<GithubMergeOutcome, Self::Err> {
+        let mut state = self.state.lock().unwrap();
+        state.merge_calls.push(MergeCall {
+            access_token: access_token.to_string(),
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+            merge_method,
+        });
+        state
+            .merge_outcome
+            .clone()
+            .ok_or_else(|| GithubError::Internal(anyhow::anyhow!("GitHub unreachable")))
+    }
+
+    async fn set_pull_request_draft(
+        &self,
+        _access_token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        draft: bool,
+    ) -> Result<GithubDraftOutcome, Self::Err> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .draft_calls
+            .push((format!("{owner}/{repo}"), number, draft));
+        state
+            .draft_outcome
+            .clone()
+            .ok_or_else(|| GithubError::Internal(anyhow::anyhow!("GitHub unreachable")))
+    }
+
+    async fn set_pull_request_state(
+        &self,
+        _access_token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        pull_request_state: GithubPullRequestState,
+    ) -> Result<GithubStateOutcome, Self::Err> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .state_calls
+            .push((format!("{owner}/{repo}"), number, pull_request_state));
+        state
+            .state_outcome
+            .clone()
+            .ok_or_else(|| GithubError::Internal(anyhow::anyhow!("GitHub unreachable")))
+    }
+
+    async fn get_pull_request_mergeability(
+        &self,
+        _access_token: &str,
+        pull_requests: &[GithubPullRequestNumber],
+    ) -> Result<Vec<GithubPullRequestMergeabilityEntry>, Self::Err> {
+        let mut state = self.state.lock().unwrap();
+        state.mergeability_calls.push(pull_requests.to_vec());
+        Ok(pull_requests
+            .iter()
+            .map(|pull_request| GithubPullRequestMergeabilityEntry {
+                owner: pull_request.owner.clone(),
+                repo: pull_request.repo.clone(),
+                number: pull_request.number,
+                mergeability: GithubPullRequestMergeability::Conflicting,
+            })
+            .collect())
+    }
+}
+
+#[derive(Clone)]
+struct StubAuth {
+    access_token: String,
+    state: Arc<Mutex<StubAuthState>>,
+}
+
+#[derive(Default)]
+struct StubAuthState {
+    link_user_calls: u32,
+    delete_user_link_calls: u32,
+    access_token_error: Option<String>,
+    access_token_failure: Option<UpstreamFailure>,
+    missing_access_token: bool,
+    missing_identity: Option<uuid::Uuid>,
+    link_error: Option<String>,
+    linked_identities: Vec<uuid::Uuid>,
+    link_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+
+fn github_upstream(service: &'static str, failure: UpstreamFailure) -> GithubError {
+    GithubError::Upstream(UpstreamError { service, failure })
+}
+
+impl StubAuth {
+    fn new(access_token: &str) -> Self {
+        Self {
+            access_token: access_token.to_string(),
+            state: Arc::new(Mutex::new(StubAuthState::default())),
+        }
+    }
+
+    fn fail_access_token(self, error: &str) -> Self {
+        self.state.lock().unwrap().access_token_error = Some(error.to_string());
+        self
+    }
+
+    fn fail_access_token_upstream(self, failure: UpstreamFailure) -> Self {
+        self.state.lock().unwrap().access_token_failure = Some(failure);
+        self
+    }
+
+    fn link_user_calls(&self) -> u32 {
+        self.state.lock().unwrap().link_user_calls
+    }
+
+    fn delete_user_link_calls(&self) -> u32 {
+        self.state.lock().unwrap().delete_user_link_calls
+    }
+}
+
+impl Auth for StubAuth {
+    type Err = GithubError;
+
+    async fn link_user(
+        &self,
+        fusionauth_user_id: &uuid::Uuid,
+        _idp_id: &str,
+        _github_user_id: &str,
+        _username: &str,
+        _access_token: &str,
+    ) -> Result<GithubGrantLinkOutcome, Self::Err> {
+        let barrier = self.state.lock().unwrap().link_barrier.take();
+        if let Some((started, finish)) = barrier {
+            started.notify_one();
+            finish.notified().await;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.link_user_calls += 1;
+        state.linked_identities.push(*fusionauth_user_id);
+        if state.missing_identity == Some(*fusionauth_user_id) {
+            return Ok(GithubGrantLinkOutcome::IdentityMissing);
+        }
+        if let Some(error) = &state.link_error {
+            return Err(GithubError::Internal(anyhow::anyhow!(error.clone())));
+        }
+        Ok(GithubGrantLinkOutcome::Linked)
+    }
+
+    async fn delete_user_link(
+        &self,
+        _github_link: &GithubLink,
+        _github_idp_id: &str,
+    ) -> Result<(), Self::Err> {
+        self.state.lock().unwrap().delete_user_link_calls += 1;
+        Ok(())
+    }
+
+    async fn retreive_access_token(
+        &self,
+        _fusionauth_user_id: &uuid::Uuid,
+        _github_idp_id: &str,
+        _github_user_id: &str,
+    ) -> Result<Option<GithubAccessToken>, Self::Err> {
+        if let Some(error) = &self.state.lock().unwrap().access_token_error {
+            return Err(GithubError::Internal(anyhow::anyhow!(error.clone())));
+        }
+        if let Some(failure) = self.state.lock().unwrap().access_token_failure {
+            return Err(github_upstream("The sign-in service", failure));
+        }
+        if self.state.lock().unwrap().missing_access_token {
+            return Ok(None);
+        }
+        Ok(Some(GithubAccessToken::new(self.access_token.clone())))
+    }
+}
+
+#[derive(Clone, Default)]
+struct StubForeignEntityService {
+    state: Arc<Mutex<StubForeignEntityState>>,
+}
+
+#[derive(Default)]
+struct StubForeignEntityState {
+    entities: Vec<ForeignEntity>,
+    fetch_error: Option<String>,
+    patch_error: Option<String>,
+    fetch_calls: Vec<FetchForeignEntitiesCall>,
+    patch_calls: Vec<PatchForeignEntityCall>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FetchForeignEntitiesCall {
+    foreign_entity_id: String,
+    foreign_entity_source: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PatchForeignEntityCall {
+    id: uuid::Uuid,
+    patch: PatchForeignEntity,
+}
+
+impl StubForeignEntityService {
+    fn with_entities(entities: Vec<ForeignEntity>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(StubForeignEntityState {
+                entities,
+                ..StubForeignEntityState::default()
+            })),
+        }
+    }
+
+    fn fail_patches(&self, error: &str) {
+        self.state.lock().unwrap().patch_error = Some(error.to_string());
+    }
+
+    fn fetch_calls(&self) -> Vec<FetchForeignEntitiesCall> {
+        self.state.lock().unwrap().fetch_calls.clone()
+    }
+
+    fn patch_calls(&self) -> Vec<PatchForeignEntityCall> {
+        self.state.lock().unwrap().patch_calls.clone()
+    }
+
+    fn foreign_entity_by_id(&self, id: uuid::Uuid) -> Option<ForeignEntity> {
+        self.state
+            .lock()
+            .unwrap()
+            .entities
+            .iter()
+            .find(|entity| entity.id == id)
+            .cloned()
+    }
+}
+
+fn unimplemented_foreign_entity_error() -> ForeignEntityError {
+    ForeignEntityError::Internal(anyhow::anyhow!("not implemented"))
+}
+
+impl ForeignEntityService for StubForeignEntityService {
+    async fn get_foreign_entity(
+        &self,
+        _receipt: EntityAccessReceipt<ViewAccessLevel>,
+    ) -> Result<ForeignEntity, ForeignEntityError> {
+        Err(unimplemented_foreign_entity_error())
+    }
+
+    async fn get_foreign_entity_by_id(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<ForeignEntity, ForeignEntityError> {
+        self.foreign_entity_by_id(id)
+            .ok_or(ForeignEntityError::NotFound(id))
+    }
+
+    async fn get_foreign_entities_by_foreign_entity_id(
+        &self,
+        foreign_entity_id: &str,
+        foreign_entity_source: Option<&str>,
+    ) -> Result<Vec<ForeignEntity>, ForeignEntityError> {
+        let mut state = self.state.lock().unwrap();
+        state.fetch_calls.push(FetchForeignEntitiesCall {
+            foreign_entity_id: foreign_entity_id.to_string(),
+            foreign_entity_source: foreign_entity_source.map(str::to_string),
+        });
+
+        if let Some(error) = &state.fetch_error {
+            return Err(ForeignEntityError::Internal(anyhow::anyhow!(error.clone())));
+        }
+
+        Ok(state
+            .entities
+            .iter()
+            .filter(|entity| {
+                let source_matches = match foreign_entity_source {
+                    Some(source) => entity.foreign_entity_source == source,
+                    None => true,
+                };
+
+                entity.foreign_entity_id == foreign_entity_id && source_matches
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn get_foreign_entities_for_user(
+        &self,
+        _requesting_user: Option<String>,
+        _source_ids: Vec<SourceId>,
+        _limit: u32,
+        _query: ForeignEntityListQuery,
+    ) -> Result<Vec<ForeignEntity>, ForeignEntityError> {
+        Err(unimplemented_foreign_entity_error())
+    }
+
+    async fn create_foreign_entity(
+        &self,
+        _create: CreateForeignEntity,
+    ) -> Result<ForeignEntity, ForeignEntityError> {
+        Err(unimplemented_foreign_entity_error())
+    }
+
+    async fn delete_foreign_entity(&self, _id: uuid::Uuid) -> Result<(), ForeignEntityError> {
+        Err(unimplemented_foreign_entity_error())
+    }
+
+    async fn patch_foreign_entity(
+        &self,
+        id: uuid::Uuid,
+        patch: PatchForeignEntity,
+    ) -> Result<ForeignEntity, ForeignEntityError> {
+        let mut state = self.state.lock().unwrap();
+        state.patch_calls.push(PatchForeignEntityCall {
+            id,
+            patch: patch.clone(),
+        });
+
+        if let Some(error) = &state.patch_error {
+            return Err(ForeignEntityError::Internal(anyhow::anyhow!(error.clone())));
+        }
+
+        let entity = state
+            .entities
+            .iter_mut()
+            .find(|entity| entity.id == id)
+            .ok_or(ForeignEntityError::NotFound(id))?;
+
+        if let Some(foreign_entity_id) = patch.foreign_entity_id {
+            entity.foreign_entity_id = foreign_entity_id;
+        }
+
+        if let Some(foreign_entity_source) = patch.foreign_entity_source {
+            entity.foreign_entity_source = foreign_entity_source;
+        }
+
+        if let Some(metadata) = patch.metadata {
+            entity.metadata = metadata;
+        }
+
+        if let Some(stored_for_id) = patch.stored_for_id {
+            entity.stored_for_id = stored_for_id;
+        }
+
+        if let Some(stored_for_auth_entity) = patch.stored_for_auth_entity {
+            entity.stored_for_auth_entity = stored_for_auth_entity;
+        }
+
+        entity.updated_at = Utc::now();
+
+        Ok(entity.clone())
+    }
+}
+
+fn test_user_id() -> MacroUserId<Lowercase<'static>> {
+    MacroUserIdStr::try_from_email("user@example.com")
+        .unwrap()
+        .0
+}
+
+fn test_link(user_id: &MacroUserId<Lowercase<'static>>) -> GithubLink {
+    GithubLink {
+        id: uuid::Uuid::nil(),
+        macro_id: MacroUserIdStr((*user_id).clone()),
+        fusionauth_user_id: uuid::Uuid::nil(),
+        github_username: "octocat".to_string(),
+        github_user_id: "1".to_string(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn owner_link(fusionauth_user_id: uuid::Uuid) -> GithubLink {
+    let owner_user_id = MacroUserIdStr::try_from_email("owner@example.com")
+        .unwrap()
+        .0;
+    GithubLink {
+        id: uuid::Uuid::from_u128(0xFFFF),
+        macro_id: MacroUserIdStr(owner_user_id),
+        fusionauth_user_id,
+        github_username: "octocat".to_string(),
+        github_user_id: "1".to_string(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn pull_request_ref() -> GithubPullRequestRef {
+    GithubPullRequestRef {
+        github_key: "macro/app/pull/7".to_string(),
+        owner: "macro".to_string(),
+        repo: "app".to_string(),
+        number: 7,
+        url: "https://github.com/macro/app/pull/7".to_string(),
+        display_name: "macro/app#7".to_string(),
+    }
+}
+
+fn foreign_entity(
+    id: uuid::Uuid,
+    foreign_entity_id: &str,
+    foreign_entity_source: &str,
+    metadata: serde_json::Value,
+) -> ForeignEntity {
+    ForeignEntity {
+        id,
+        foreign_entity_id: foreign_entity_id.to_string(),
+        foreign_entity_source: foreign_entity_source.to_string(),
+        metadata,
+        stored_for_id: "stored-for-id".to_string(),
+        stored_for_auth_entity: "user".to_string(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+type TestGithubLinkService = GithubLinkServiceImpl<
+    StubGithubRepo,
+    StubGithubOauth,
+    StubAuth,
+    GithubPullRequestServiceImpl<StubForeignEntityService, NoPullRequestRows>,
+>;
+
+struct NoPullRequestRows;
+
+impl GithubPullRequestRepository for NoPullRequestRows {
+    type Err = std::convert::Infallible;
+
+    async fn github_key_for(
+        &self,
+        _repository_id: i64,
+        _number: i64,
+    ) -> Result<Option<String>, Self::Err> {
+        Ok(None)
+    }
+
+    async fn upsert_row(&self, _row: &GithubPullRequestWrite) -> Result<(), Self::Err> {
+        Ok(())
+    }
+
+    async fn rename_row(&self, _from: &str, _to: &str) -> Result<(), Self::Err> {
+        Ok(())
+    }
+
+    async fn pull_request_row(
+        &self,
+        _github_key: &str,
+    ) -> Result<Option<GithubPullRequestRow>, Self::Err> {
+        Ok(None)
+    }
+}
+
+fn service(repo: StubGithubRepo, oauth: StubGithubOauth, auth: StubAuth) -> TestGithubLinkService {
+    service_with_foreign_entities(repo, oauth, auth, StubForeignEntityService::default())
+}
+
+fn service_with_foreign_entities(
+    repo: StubGithubRepo,
+    oauth: StubGithubOauth,
+    auth: StubAuth,
+    foreign_entity_service: StubForeignEntityService,
+) -> TestGithubLinkService {
+    GithubLinkServiceImpl::new(
+        repo,
+        oauth,
+        auth,
+        GithubPullRequestServiceImpl::new(foreign_entity_service, NoPullRequestRows),
+        GithubLinkConfig {
+            client_id: "client-id".to_string(),
+            client_secret: "client-secret".to_string(),
+            idp_id: "github-idp".to_string(),
+        },
+    )
+}
+
+#[tokio::test]
+async fn enrich_pull_requests_reauthenticates_before_details() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(true);
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("expired-token"),
+    );
+
+    let result = service
+        .enrich_pull_requests(&user_id, vec![pull_request_ref()])
+        .await;
+
+    assert!(matches!(result, Err(GithubError::ReauthenticationRequired)));
+    assert_eq!(oauth.validated_tokens(), vec!["expired-token".to_string()]);
+    assert!(oauth.pull_request_detail_calls().is_empty());
+}
+
+#[tokio::test]
+async fn enrich_pull_requests_patches_existing_foreign_entities_on_success() {
+    let user_id = test_user_id();
+    let pull_request = pull_request_ref();
+    let first_foreign_entity_id = uuid::Uuid::from_u128(1);
+    let second_foreign_entity_id = uuid::Uuid::from_u128(2);
+    let skipped_foreign_entity_id = uuid::Uuid::from_u128(3);
+    let existing_metadata = serde_json::json!({
+        "comments": [
+            {
+                "id": 42,
+                "body": "existing comment",
+                "source": "issue_comment"
+            }
+        ],
+        "checks": [
+            {
+                "id": 99,
+                "name": "ci",
+                "status": "completed"
+            }
+        ]
+    });
+    let foreign_entity_service = StubForeignEntityService::with_entities(vec![
+        foreign_entity(
+            first_foreign_entity_id,
+            &pull_request.github_key,
+            GITHUB_PULL_REQUEST_FOREIGN_ENTITY_SOURCE,
+            existing_metadata.clone(),
+        ),
+        foreign_entity(
+            second_foreign_entity_id,
+            &pull_request.github_key,
+            GITHUB_PULL_REQUEST_FOREIGN_ENTITY_SOURCE,
+            serde_json::json!({ "other": true }),
+        ),
+        foreign_entity(
+            skipped_foreign_entity_id,
+            &pull_request.github_key,
+            "github_issue",
+            serde_json::json!({ "unchanged": true }),
+        ),
+    ]);
+    let service = service_with_foreign_entities(
+        StubGithubRepo::linked(test_link(&user_id)),
+        StubGithubOauth::new(false),
+        StubAuth::new("valid-token"),
+        foreign_entity_service.clone(),
+    );
+
+    let pull_requests = service
+        .enrich_pull_requests(&user_id, vec![pull_request.clone()])
+        .await
+        .unwrap();
+
+    assert_eq!(pull_requests.len(), 1);
+    let enriched_pull_request = &pull_requests[0];
+    assert_eq!(
+        enriched_pull_request.name.as_deref(),
+        Some("Add token validation")
+    );
+    assert_eq!(
+        foreign_entity_service.fetch_calls(),
+        vec![FetchForeignEntitiesCall {
+            foreign_entity_id: pull_request.github_key.clone(),
+            foreign_entity_source: Some(GITHUB_PULL_REQUEST_FOREIGN_ENTITY_SOURCE.to_string()),
+        }]
+    );
+
+    let patch_calls = foreign_entity_service.patch_calls();
+    assert_eq!(patch_calls.len(), 2);
+    assert_eq!(patch_calls[0].id, first_foreign_entity_id);
+    assert_eq!(patch_calls[1].id, second_foreign_entity_id);
+
+    let first_metadata = foreign_entity_service
+        .foreign_entity_by_id(first_foreign_entity_id)
+        .unwrap()
+        .metadata;
+    let expected_first_metadata = enriched_pull_request
+        .foreign_entity_metadata(Some(&existing_metadata))
+        .unwrap();
+    assert_eq!(first_metadata, expected_first_metadata);
+    assert_eq!(first_metadata["comments"], existing_metadata["comments"]);
+    assert_eq!(first_metadata["checks"], existing_metadata["checks"]);
+
+    let second_metadata = foreign_entity_service
+        .foreign_entity_by_id(second_foreign_entity_id)
+        .unwrap()
+        .metadata;
+    assert_eq!(
+        second_metadata,
+        enriched_pull_request.foreign_entity_metadata(None).unwrap()
+    );
+
+    let skipped_metadata = foreign_entity_service
+        .foreign_entity_by_id(skipped_foreign_entity_id)
+        .unwrap()
+        .metadata;
+    assert_eq!(skipped_metadata, serde_json::json!({ "unchanged": true }));
+}
+
+#[tokio::test]
+async fn enrich_pull_requests_does_not_patch_foreign_entities_on_detail_failure() {
+    let user_id = test_user_id();
+    let pull_request = pull_request_ref();
+    let oauth = StubGithubOauth::new(false);
+    oauth.fail_pull_request_details("GitHub details unavailable");
+    let foreign_entity_service = StubForeignEntityService::with_entities(vec![foreign_entity(
+        uuid::Uuid::from_u128(1),
+        &pull_request.github_key,
+        GITHUB_PULL_REQUEST_FOREIGN_ENTITY_SOURCE,
+        serde_json::json!({}),
+    )]);
+    let service = service_with_foreign_entities(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth,
+        StubAuth::new("valid-token"),
+        foreign_entity_service.clone(),
+    );
+    let expected_pull_request = EnrichedGithubPullRequest::from_reference(pull_request.clone());
+
+    let pull_requests = service
+        .enrich_pull_requests(&user_id, vec![pull_request])
+        .await
+        .unwrap();
+
+    assert_eq!(pull_requests, vec![expected_pull_request]);
+    assert!(foreign_entity_service.fetch_calls().is_empty());
+    assert!(foreign_entity_service.patch_calls().is_empty());
+}
+
+#[tokio::test]
+async fn enrich_pull_requests_returns_enriched_response_when_foreign_entity_patch_fails() {
+    let user_id = test_user_id();
+    let pull_request = pull_request_ref();
+    let foreign_entity_service = StubForeignEntityService::with_entities(vec![foreign_entity(
+        uuid::Uuid::from_u128(1),
+        &pull_request.github_key,
+        GITHUB_PULL_REQUEST_FOREIGN_ENTITY_SOURCE,
+        serde_json::json!({}),
+    )]);
+    foreign_entity_service.fail_patches("database unavailable");
+    let service = service_with_foreign_entities(
+        StubGithubRepo::linked(test_link(&user_id)),
+        StubGithubOauth::new(false),
+        StubAuth::new("valid-token"),
+        foreign_entity_service.clone(),
+    );
+
+    let pull_requests = service
+        .enrich_pull_requests(&user_id, vec![pull_request])
+        .await
+        .unwrap();
+
+    assert_eq!(pull_requests.len(), 1);
+    assert_eq!(
+        pull_requests[0].name.as_deref(),
+        Some("Add token validation")
+    );
+    assert_eq!(foreign_entity_service.patch_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn merge_pull_request_requires_a_valid_grant_before_merging() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(true).with_merge_outcome(merged_outcome());
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("expired-token"),
+    );
+
+    let result = service
+        .merge_pull_request(&user_id, merge_request(None))
+        .await;
+
+    assert!(matches!(result, Err(GithubError::ReauthenticationRequired)));
+    assert!(oauth.merge_calls().is_empty());
+
+    let unlinked = service_with_foreign_entities(
+        StubGithubRepo::unlinked(),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+        StubForeignEntityService::default(),
+    );
+    let result = unlinked
+        .merge_pull_request(&user_id, merge_request(None))
+        .await;
+
+    assert!(matches!(result, Err(GithubError::NoLinkFound)));
+    assert!(oauth.merge_calls().is_empty());
+}
+
+#[tokio::test]
+async fn merge_pull_request_uses_the_requested_method_without_reading_settings() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(false).with_merge_outcome(merged_outcome());
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+    );
+
+    let response = service
+        .merge_pull_request(&user_id, merge_request(Some(GithubMergeMethod::Rebase)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.sha, "6dcb09b5");
+    assert_eq!(response.message, "Pull Request successfully merged");
+    assert_eq!(oauth.merge_settings_calls(), 0);
+    assert_eq!(
+        oauth.merge_calls(),
+        vec![MergeCall {
+            access_token: "valid-token".to_string(),
+            owner: "macro".to_string(),
+            repo: "app".to_string(),
+            number: 7,
+            merge_method: GithubMergeMethod::Rebase,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn merge_pull_request_picks_the_first_allowed_method_when_none_requested() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(false)
+        .with_merge_settings(GithubRepositoryMergeSettings {
+            allow_merge_commit: false,
+            allow_squash_merge: true,
+            allow_rebase_merge: true,
+        })
+        .with_merge_outcome(merged_outcome());
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+    );
+
+    service
+        .merge_pull_request(&user_id, merge_request(None))
+        .await
+        .unwrap();
+
+    assert_eq!(oauth.merge_settings_calls(), 1);
+    assert_eq!(
+        oauth.merge_calls()[0].merge_method,
+        GithubMergeMethod::Squash
+    );
+}
+
+#[tokio::test]
+async fn merge_pull_request_rejects_when_the_repository_allows_no_method() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(false)
+        .with_merge_settings(GithubRepositoryMergeSettings {
+            allow_merge_commit: false,
+            allow_squash_merge: false,
+            allow_rebase_merge: false,
+        })
+        .with_merge_outcome(merged_outcome());
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+    );
+
+    let result = service
+        .merge_pull_request(&user_id, merge_request(None))
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(GithubError::PullRequestMergeRejected {
+            rejection: GithubMergeRejection::NotMergeable,
+            ..
+        })
+    ));
+    assert!(oauth.merge_calls().is_empty());
+}
+
+#[tokio::test]
+async fn merge_pull_request_falls_back_to_a_merge_commit_when_settings_are_unreadable() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(false)
+        .fail_merge_settings("settings unavailable")
+        .with_merge_outcome(merged_outcome());
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+    );
+
+    service
+        .merge_pull_request(&user_id, merge_request(None))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        oauth.merge_calls()[0].merge_method,
+        GithubMergeMethod::Merge
+    );
+}
+
+#[tokio::test]
+async fn merge_pull_request_surfaces_githubs_refusal_with_its_message() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(false).with_merge_outcome(GithubMergeOutcome::Rejected {
+        rejection: GithubMergeRejection::NotMergeable,
+        message: "Required status check \"ci\" is expected.".to_string(),
+    });
+    let foreign_entity_service = StubForeignEntityService::with_entities(vec![foreign_entity(
+        uuid::Uuid::from_u128(1),
+        "macro/app/pull/7",
+        GITHUB_PULL_REQUEST_FOREIGN_ENTITY_SOURCE,
+        serde_json::json!({ "status": "open" }),
+    )]);
+    let service = service_with_foreign_entities(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+        foreign_entity_service.clone(),
+    );
+
+    let error = service
+        .merge_pull_request(&user_id, merge_request(Some(GithubMergeMethod::Merge)))
+        .await
+        .unwrap_err();
+
+    match error {
+        GithubError::PullRequestMergeRejected { rejection, message } => {
+            assert_eq!(rejection, GithubMergeRejection::NotMergeable);
+            assert_eq!(message, "Required status check \"ci\" is expected.");
+        }
+        other => panic!("expected a merge rejection, got {other:?}"),
+    }
+    assert!(oauth.pull_request_detail_calls().is_empty());
+    assert!(foreign_entity_service.patch_calls().is_empty());
+}
+
+#[tokio::test]
+async fn merge_pull_request_refreshes_foreign_entities_as_merged() {
+    let user_id = test_user_id();
+    let merged_details = GithubPullRequestDetails {
+        state: "closed".to_string(),
+        merged_at: Some(Utc::now()),
+        ..default_pull_request_details()
+    };
+    let oauth = StubGithubOauth::new(false)
+        .with_merge_outcome(merged_outcome())
+        .with_pull_request_details(merged_details);
+    let foreign_entity_id = uuid::Uuid::from_u128(1);
+    let foreign_entity_service = StubForeignEntityService::with_entities(vec![foreign_entity(
+        foreign_entity_id,
+        "macro/app/pull/7",
+        GITHUB_PULL_REQUEST_FOREIGN_ENTITY_SOURCE,
+        serde_json::json!({ "status": "open", "comments": [{ "id": 1 }] }),
+    )]);
+    let service = service_with_foreign_entities(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+        foreign_entity_service.clone(),
+    );
+
+    let response = service
+        .merge_pull_request(&user_id, merge_request(Some(GithubMergeMethod::Merge)))
+        .await
+        .unwrap();
+
+    let pull_request = response.pull_request.expect("refreshed pull request");
+    assert_eq!(pull_request.github_key, "macro/app/pull/7");
+    assert_eq!(
+        pull_request.status,
+        Some(crate::domain::models::GithubPullRequestStatus::Merged)
+    );
+    assert_eq!(
+        oauth.pull_request_detail_calls(),
+        vec![PullRequestDetailCall {
+            access_token: "valid-token".to_string(),
+            owner: "macro".to_string(),
+            repo: "app".to_string(),
+            number: 7,
+        }]
+    );
+    let metadata = foreign_entity_service
+        .foreign_entity_by_id(foreign_entity_id)
+        .unwrap()
+        .metadata;
+    assert_eq!(metadata["status"], "merged");
+    // A refresh carries existing discussion forward rather than dropping it.
+    assert_eq!(metadata["comments"], serde_json::json!([{ "id": 1 }]));
+}
+
+#[tokio::test]
+async fn merge_pull_request_still_reports_the_merge_when_the_refresh_fails() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(false).with_merge_outcome(merged_outcome());
+    oauth.fail_pull_request_details("GitHub details unavailable");
+    let foreign_entity_service = StubForeignEntityService::with_entities(vec![foreign_entity(
+        uuid::Uuid::from_u128(1),
+        "macro/app/pull/7",
+        GITHUB_PULL_REQUEST_FOREIGN_ENTITY_SOURCE,
+        serde_json::json!({ "status": "open" }),
+    )]);
+    let service = service_with_foreign_entities(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth,
+        StubAuth::new("valid-token"),
+        foreign_entity_service.clone(),
+    );
+
+    let response = service
+        .merge_pull_request(&user_id, merge_request(Some(GithubMergeMethod::Merge)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.sha, "6dcb09b5");
+    assert!(response.pull_request.is_none());
+    assert!(foreign_entity_service.patch_calls().is_empty());
+}
+
+fn draft_request(draft: bool) -> SetGithubPullRequestDraftRequest {
+    SetGithubPullRequestDraftRequest {
+        owner: "macro".to_string(),
+        repo: "app".to_string(),
+        number: 7,
+        draft,
+    }
+}
+
+#[tokio::test]
+async fn set_pull_request_draft_changes_state_and_refreshes() {
+    let user_id = test_user_id();
+    let oauth =
+        StubGithubOauth::new(false).with_draft_outcome(GithubDraftOutcome::Changed { draft: true });
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+    );
+
+    let response = service
+        .set_pull_request_draft(&user_id, draft_request(true))
+        .await
+        .unwrap();
+
+    assert!(response.draft);
+    assert_eq!(
+        response
+            .pull_request
+            .map(|pull_request| pull_request.github_key),
+        Some("macro/app/pull/7".to_string())
+    );
+    assert_eq!(
+        oauth.draft_calls(),
+        vec![("macro/app".to_string(), 7, true)]
+    );
+    assert_eq!(oauth.pull_request_detail_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn set_pull_request_draft_surfaces_githubs_refusal() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(false).with_draft_outcome(GithubDraftOutcome::Rejected {
+        rejection: GithubPullRequestUpdateRejection::Forbidden,
+        message: "Resource not accessible by integration".to_string(),
+    });
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+    );
+
+    let result = service
+        .set_pull_request_draft(&user_id, draft_request(false))
+        .await;
+
+    match result {
+        Err(GithubError::PullRequestUpdateRejected { rejection, message }) => {
+            assert_eq!(rejection, GithubPullRequestUpdateRejection::Forbidden);
+            assert_eq!(message, "Resource not accessible by integration");
+        }
+        other => panic!("expected an update rejection, got {other:?}"),
+    }
+    assert!(oauth.pull_request_detail_calls().is_empty());
+}
+
+#[tokio::test]
+async fn set_pull_request_draft_requires_a_valid_grant() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(true);
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("expired-token"),
+    );
+
+    let result = service
+        .set_pull_request_draft(&user_id, draft_request(true))
+        .await;
+
+    assert!(matches!(result, Err(GithubError::ReauthenticationRequired)));
+    assert!(oauth.draft_calls().is_empty());
+}
+
+fn pull_request_number(number: u64) -> GithubPullRequestNumber {
+    GithubPullRequestNumber {
+        owner: "macro".to_string(),
+        repo: "app".to_string(),
+        number,
+    }
+}
+
+#[tokio::test]
+async fn get_pull_request_mergeability_reads_each_pull_request() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(false);
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+    );
+
+    let entries = service
+        .get_pull_request_mergeability(
+            &user_id,
+            vec![pull_request_number(7), pull_request_number(8)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[1].mergeability,
+        GithubPullRequestMergeability::Conflicting
+    );
+    assert_eq!(oauth.mergeability_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn get_pull_request_mergeability_skips_github_for_an_empty_request() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(false);
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+    );
+
+    let entries = service
+        .get_pull_request_mergeability(&user_id, Vec::new())
+        .await
+        .unwrap();
+
+    assert!(entries.is_empty());
+    assert!(oauth.mergeability_calls().is_empty());
+}
+
+#[tokio::test]
+async fn get_pull_request_mergeability_rejects_too_many_pull_requests() {
+    let user_id = test_user_id();
+    let oauth = StubGithubOauth::new(false);
+    let service = service(
+        StubGithubRepo::linked(test_link(&user_id)),
+        oauth.clone(),
+        StubAuth::new("valid-token"),
+    );
+
+    let result = service
+        .get_pull_request_mergeability(&user_id, (0..101).map(pull_request_number).collect())
+        .await;
+
+    assert!(matches!(result, Err(GithubError::TooManyPullRequests)));
+    assert!(oauth.mergeability_calls().is_empty());
+}
+
+#[tokio::test]
+async fn link_user_as_sharer_refreshes_owner_grant() {
+    let user_id = test_user_id();
+    let owner_fusionauth_user_id = uuid::Uuid::from_u128(0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
+    let arg_fusionauth_user_id = uuid::Uuid::from_u128(0xBBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB);
+
+    let repo = StubGithubRepo::unlinked().with_account_owner(owner_link(owner_fusionauth_user_id));
+    let auth = StubAuth::new("valid-token");
+    let service = service(repo.clone(), StubGithubOauth::new(false), auth.clone());
+
+    let result = service
+        .link_user(
+            &user_id,
+            &arg_fusionauth_user_id,
+            &uuid::Uuid::nil(),
+            "https://redirect.example",
+            "code",
+        )
+        .await;
+
+    assert!(result.is_ok());
+
+    let inserted = repo.inserted_links();
+    assert_eq!(inserted.len(), 1);
+    // SHARER reuses the OWNER's fusionauth grant, not the argument.
+    assert_eq!(inserted[0].fusionauth_user_id, owner_fusionauth_user_id);
+    assert_ne!(inserted[0].fusionauth_user_id, arg_fusionauth_user_id);
+
+    assert_eq!(auth.link_user_calls(), 1);
+    assert_eq!(repo.delete_in_progress_user_link_calls(), 1);
+}
+
+#[tokio::test]
+async fn link_user_idempotent_relink_same_account_skips_insert() {
+    let user_id = test_user_id();
+    let existing = test_link(&user_id);
+
+    let repo = StubGithubRepo::linked(existing.clone()).with_account_owner(existing.clone());
+    let auth = StubAuth::new("valid-token");
+    let service = service(repo.clone(), StubGithubOauth::new(false), auth.clone());
+
+    let result = service
+        .link_user(
+            &user_id,
+            &uuid::Uuid::from_u128(0xBBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB),
+            &uuid::Uuid::nil(),
+            "https://redirect.example",
+            "code",
+        )
+        .await;
+
+    let link = result.expect("idempotent relink should succeed");
+    // GithubLink does not derive PartialEq; compare identifying fields.
+    assert_eq!(link.id, existing.id);
+    assert_eq!(link.github_user_id, existing.github_user_id);
+    assert_eq!(link.fusionauth_user_id, existing.fusionauth_user_id);
+
+    assert_eq!(auth.link_user_calls(), 1);
+    assert_eq!(repo.inserted_links().len(), 0);
+    assert_eq!(repo.delete_in_progress_user_link_calls(), 1);
+}
+
+#[tokio::test]
+async fn link_user_as_owner_creates_grant() {
+    let user_id = test_user_id();
+    let arg_fusionauth_user_id = uuid::Uuid::from_u128(0xBBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB);
+
+    // No link for this user and no existing owner for the github account.
+    let repo = StubGithubRepo::unlinked();
+    let auth = StubAuth::new("valid-token");
+    let service = service(repo.clone(), StubGithubOauth::new(false), auth.clone());
+
+    let result = service
+        .link_user(
+            &user_id,
+            &arg_fusionauth_user_id,
+            &uuid::Uuid::nil(),
+            "https://redirect.example",
+            "code",
+        )
+        .await;
+
+    assert!(result.is_ok());
+
+    let inserted = repo.inserted_links();
+    assert_eq!(inserted.len(), 1);
+    // OWNER (first linker) stores the argument's fusionauth grant.
+    assert_eq!(inserted[0].fusionauth_user_id, arg_fusionauth_user_id);
+
+    assert_eq!(auth.link_user_calls(), 1);
+    assert_eq!(repo.delete_in_progress_user_link_calls(), 1);
+}
+
+#[tokio::test]
+async fn delete_user_link_sharer_keeps_fusionauth_grant() {
+    let user_id = test_user_id();
+
+    let repo = StubGithubRepo::linked(test_link(&user_id)).with_link_count(2);
+    let auth = StubAuth::new("valid-token");
+    let service = service(repo.clone(), StubGithubOauth::new(false), auth.clone());
+
+    let result = service.delete_user_link(&user_id).await;
+
+    assert!(result.is_ok());
+    // Other sharers remain, so the FusionAuth grant must stay in place.
+    assert_eq!(auth.delete_user_link_calls(), 0);
+    assert_eq!(repo.delete_github_link_calls(), 1);
+}
+
+#[tokio::test]
+async fn delete_user_link_last_unlinks_fusionauth() {
+    let user_id = test_user_id();
+
+    let repo = StubGithubRepo::linked(test_link(&user_id)).with_link_count(1);
+    let auth = StubAuth::new("valid-token");
+    let service = service(repo.clone(), StubGithubOauth::new(false), auth.clone());
+
+    let result = service.delete_user_link(&user_id).await;
+
+    assert!(result.is_ok());
+    // Last/only row for this github account: tear down the FusionAuth grant.
+    assert_eq!(auth.delete_user_link_calls(), 1);
+    assert_eq!(repo.delete_github_link_calls(), 1);
+}

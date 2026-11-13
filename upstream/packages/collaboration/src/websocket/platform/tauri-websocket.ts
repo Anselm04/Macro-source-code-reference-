@@ -1,0 +1,615 @@
+import { Telemetry } from '@macro-inc/observability';
+import { Channel, invoke } from '@tauri-apps/api/core';
+import { match, P } from 'ts-pattern';
+import { isTauri } from '../../internal/platform';
+import type { MinimalWebSocket, WebSocketFactory } from './minimal-websocket';
+
+// This wrapper talks to the tauri websocket plugin's IPC surface directly
+// instead of going through @tauri-apps/plugin-websocket's JS glue:
+// - connect: we must pre-register our message handler BEFORE the connection
+//   is made, which the stock wrapper does not allow
+//   (https://github.com/tauri-apps/plugins-workspace/issues/3152)
+// - recover: only exists in our fork
+// The types below mirror the crate pinned in tauri/src-tauri/Cargo.toml
+// (github.com/seanaye/plugins-workspace, branch seanaye/feat/ws-replay-buffer,
+// plugins/websocket/src/lib.rs) and must be kept in sync with it.
+
+interface TauriMessageKind<T, D> {
+  type: T;
+  data: D;
+}
+
+interface TauriCloseFrame {
+  code: number;
+  reason: string;
+}
+
+type TauriMessage =
+  | TauriMessageKind<'Text', string>
+  | TauriMessageKind<'Binary', number[]>
+  | TauriMessageKind<'Ping', number[]>
+  | TauriMessageKind<'Pong', number[]>
+  | TauriMessageKind<'Close', TauriCloseFrame | null>;
+
+/**
+ * Envelope emitted by our fork of the websocket plugin
+ * (seanaye/feat/ws-replay-buffer). Every incoming message carries a
+ * per-connection sequence number so missed messages can be recovered after
+ * the webview was suspended.
+ *
+ * `message` is a `TauriMessage`, a bare string when the read failed (the
+ * plugin's display of the tungstenite error; the stream ends after it), or
+ * `null` for a raw frame. It stays `unknown` because native builds ship
+ * separately from this code and may send shapes this version does not know.
+ */
+interface ReplayEnvelope {
+  seq: number;
+  message: unknown;
+}
+
+/**
+ * How long the live channel may trail messages recover() already delivered
+ * before it is treated as stalled. A message that was only delayed arrives
+ * well within this; a lost one never does.
+ */
+export const CHANNEL_STALL_GRACE_MS = 5_000;
+
+type CallbackRegistry = { unregisterCallback?: (id: number) => void };
+
+/**
+ * Tauri's Channel delivers in index order and holds every later message until
+ * a missing index arrives, so a lost message makes it retain all traffic that
+ * follows. Its own cleanup only runs when its end index is reached, which a
+ * stalled channel never does; unregister it so it can be collected.
+ */
+function releaseChannel(channel: Channel<unknown>) {
+  channel.onmessage = () => {};
+  const internals: CallbackRegistry | undefined = Reflect.get(
+    window,
+    '__TAURI_INTERNALS__'
+  );
+  internals?.unregisterCallback?.(channel.id);
+}
+
+/** Native builds that predate the replay fork send bare messages. */
+const toEnvelope = (payload: unknown): ReplayEnvelope =>
+  match(payload)
+    .with({ seq: P.number }, (envelope) => ({
+      seq: envelope.seq,
+      message: 'message' in envelope ? envelope.message : undefined,
+    }))
+    .otherwise((message) => ({ seq: 0, message }));
+
+interface RecoverResponse {
+  messages: ReplayEnvelope[];
+  /**
+   * True when messages newer than `after` were already evicted from the
+   * Rust-side replay buffer; the connection must be resynced.
+   */
+  gap: boolean;
+}
+
+/**
+ * Tauri WebSocket wrapper that implements MinimalWebSocket interface.
+ * The static state constants let it stand in for the `WebSocket` constructor
+ * (e.g. graphql-ws's `webSocketImpl`).
+ */
+export class TauriWebSocketWrapper implements MinimalWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+
+  private socketId: number | null = null; // plugin connection id
+  private _readyState: number = 0; // CONNECTING
+  private _url: string;
+  private _protocol: string = '';
+  private _extensions: string = '';
+  private _binaryType: BinaryType = 'blob';
+  private _bufferedAmount: number = 0;
+  private closeReported = false;
+
+  // Event handlers
+  onclose: ((this: WebSocket, ev: CloseEvent) => any) | null = null;
+  onerror: ((this: WebSocket, ev: Event) => any) | null = null;
+  onmessage: ((this: WebSocket, ev: MessageEvent) => any) | null = null;
+  onopen: ((this: WebSocket, ev: Event) => any) | null = null;
+
+  private eventListeners: Map<string, Set<EventListener>> = new Map();
+  private removeListener?: () => void;
+
+  // Replay/recovery state (see seanaye/feat/ws-replay-buffer)
+  private lastSeq = 0;
+  private recovering = false;
+  private queued: ReplayEnvelope[] = [];
+  private deliver?: (envelope: ReplayEnvelope) => void;
+  private visibilityHandler?: () => void;
+  private channel?: Channel<unknown>;
+  // Highest sequence number the live channel has handed us.
+  private liveSeq = 0;
+  private stallCheck?: ReturnType<typeof setTimeout>;
+
+  // WebSocket state constants
+  readonly CONNECTING: 0 = 0;
+  readonly OPEN: 1 = 1;
+  readonly CLOSING: 2 = 2;
+  readonly CLOSED: 3 = 3;
+
+  constructor(url: string, protocols?: string | string[]) {
+    // The plugin does not report which of several offered subprotocols the
+    // server selected, so only a single one can be negotiated safely.
+    const offered = protocols === undefined ? [] : [protocols].flat();
+    if (offered.length > 1) {
+      throw new SyntaxError('Tauri WebSocket supports at most one subprotocol');
+    }
+    this._url = url;
+    this.initializeWebSocket(url, offered[0]);
+  }
+
+  private async initializeWebSocket(url: string, protocol?: string) {
+    try {
+      // We call invoke() directly and pre-register our handler BEFORE the
+      // connection is made, so messages sent by the server immediately after
+      // the handshake cannot be dropped (see module comment above).
+      const listeners = new Set<(message: unknown) => void>();
+
+      const handleMessage = (message: unknown) => {
+        match(message)
+          .with(P.string, () => this.handleFailure('receive'))
+          .with({ type: 'Text', data: P.string }, ({ data }) => {
+            this.handleMessage(data);
+          })
+          .with({ type: 'Binary', data: P.array(P.number) }, ({ data }) => {
+            // Convert number array back to Uint8Array/Blob based on binaryType
+            const messageData =
+              this._binaryType === 'arraybuffer'
+                ? new Uint8Array(data).buffer
+                : new Blob([new Uint8Array(data)]);
+            this.handleMessage(messageData);
+          })
+          .with(
+            { type: 'Close', data: { code: P.number, reason: P.string } },
+            ({ data }) => {
+              this.handleClose(
+                new CloseEvent('close', {
+                  code: data.code || 1000,
+                  reason: data.reason,
+                  wasClean: true,
+                })
+              );
+            }
+          )
+          .with({ type: 'Close' }, () => {
+            this.handleClose(
+              new CloseEvent('close', { code: 1000, wasClean: true })
+            );
+          })
+          .with({ type: P.union('Ping', 'Pong') }, () => {
+            // The plugin answers pings itself.
+          })
+          .otherwise((unknown) => {
+            console.warn(
+              `Tauri WebSocket ${url}: ignoring unrecognized message`,
+              unknown
+            );
+          });
+      };
+
+      // Register BEFORE invoke so any message that arrives during the handshake
+      // is dispatched to our handler rather than dropped into an empty Set.
+      listeners.add(handleMessage);
+      this.removeListener = () => {
+        listeners.delete(handleMessage);
+      };
+
+      // Unwrap the { seq, message } replay envelope, deduplicating messages
+      // that are delivered both live and via recover().
+      //
+      // Note: the live path can never present a forward gap (seq > lastSeq + 1
+      // with the hole unfilled). Tauri's Channel delivers messages strictly
+      // in-order (out-of-order arrivals are buffered internally), and
+      // recover() verifies contiguity Rust-side via the `gap` flag. Lost
+      // channel messages stall inside the Channel instead, which is exactly
+      // what recover() compensates for.
+      const deliver = (envelope: ReplayEnvelope) => {
+        if (envelope.seq > 0) {
+          if (envelope.seq <= this.lastSeq) {
+            return;
+          }
+          this.lastSeq = envelope.seq;
+        }
+        // A throw here would escape into Tauri's Channel, which then never
+        // advances past this message and stalls every later one.
+        listeners.forEach((l) => {
+          try {
+            l(envelope.message);
+          } catch (error) {
+            console.error(
+              `Tauri WebSocket ${url}: message handler threw`,
+              error
+            );
+          }
+        });
+      };
+      this.deliver = deliver;
+
+      const onMessage = new Channel<unknown>();
+      this.channel = onMessage;
+      onMessage.onmessage = (payload: unknown) => {
+        const envelope = toEnvelope(payload);
+        this.liveSeq = Math.max(this.liveSeq, envelope.seq);
+        if (this.recovering) {
+          this.queued.push(envelope);
+        } else {
+          deliver(envelope);
+        }
+      };
+
+      const id = await invoke<number>('plugin:websocket|connect', {
+        url,
+        onMessage,
+        // The plugin's handshake fails unless the server selects this
+        // protocol, so a completed connect has negotiated it.
+        ...(protocol && {
+          config: { headers: [['Sec-WebSocket-Protocol', protocol]] },
+        }),
+      });
+      this.socketId = id;
+
+      if (this._readyState !== this.CONNECTING) {
+        // Closed while connecting: that closure is already reported, so drop
+        // the late connection instead of opening it.
+        this.disconnectSocket().catch(() => {});
+        return;
+      }
+
+      this._protocol = protocol ?? '';
+      this._readyState = this.OPEN;
+
+      // Recover messages received by the Rust side while the webview was
+      // suspended (e.g. iOS backgrounding) whenever we become visible again.
+      this.visibilityHandler = () => {
+        if (document.visibilityState === 'visible') {
+          this.recover().catch((error: unknown) => {
+            console.error(`Tauri WebSocket recover failed for ${url}:`, error);
+          });
+        }
+      };
+      document.addEventListener('visibilitychange', this.visibilityHandler);
+
+      console.log(`initialized tauri websocket for ${url}`);
+      // Trigger open event
+      const openEvent = new Event('open');
+      this.handleOpen(openEvent);
+    } catch (error) {
+      // A close() during the failed connect has already reported the closure.
+      if (this._readyState !== this.CONNECTING) return;
+      console.error(`Failed to initialize Tauri WebSocket to ${url}:`, error);
+      this._readyState = this.CLOSED;
+      const errorEvent = new Event('error');
+      this.handleError(errorEvent);
+      // Fire a close event so the Websocket layer can schedule retries,
+      // matching native WebSocket behaviour where error is always followed by close.
+      const closeEvent = new CloseEvent('close', {
+        code: 1006,
+        reason: 'Connection failed',
+        wasClean: false,
+      });
+      this.handleClose(closeEvent);
+    }
+  }
+
+  private handleMessage(data: any) {
+    const event = new MessageEvent('message', { data });
+    if (this.onmessage) {
+      this.onmessage.call(this as any, event);
+    }
+    this.dispatchToEventListeners('message', event);
+  }
+
+  private handleOpen(event: Event) {
+    if (this.onopen) {
+      this.onopen.call(this as any, event);
+    }
+    this.dispatchToEventListeners('open', event);
+  }
+
+  private handleClose(event: CloseEvent) {
+    // One closure can be observed more than once (a local close and the
+    // server's echoed close frame); report it once.
+    if (this.closeReported) return;
+    this.closeReported = true;
+    this._readyState = this.CLOSED;
+    this.removeListener?.();
+    this.teardownVisibilityListener();
+    clearTimeout(this.stallCheck);
+    if (this.channel) releaseChannel(this.channel);
+    this.channel = undefined;
+    if (this.onclose) {
+      this.onclose.call(this as any, event);
+    }
+    this.dispatchToEventListeners('close', event);
+  }
+
+  private teardownVisibilityListener() {
+    if (this.visibilityHandler) {
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+      this.visibilityHandler = undefined;
+    }
+  }
+
+  /**
+   * Requests redelivery of messages that were received by the Rust side but
+   * did not reach this webview. If the replay buffer no longer covers the
+   * missed range (gap), the connection is force-closed so the upper layer
+   * reconnects and resyncs.
+   */
+  private async recover(): Promise<void> {
+    if (
+      this.socketId === null ||
+      this._readyState !== this.OPEN ||
+      this.recovering
+    ) {
+      return;
+    }
+    this.recovering = true;
+    // Set when missed messages cannot be recovered: either the replay buffer
+    // no longer covers them (gap) or the recover call itself failed. In both
+    // cases we must not continue with a hole in the stream.
+    let needsResync = false;
+    try {
+      const res = await invoke<RecoverResponse>('plugin:websocket|recover', {
+        id: this.socketId,
+        after: this.lastSeq,
+      });
+      for (const envelope of res.messages) {
+        this.deliver?.(envelope);
+      }
+      needsResync = res.gap;
+    } catch (error) {
+      console.error(`Tauri WebSocket recover failed for ${this._url}:`, error);
+      needsResync = true;
+    } finally {
+      const queued = this.queued;
+      this.queued = [];
+      this.recovering = false;
+      if (!needsResync) {
+        // flush messages that arrived live while we were recovering
+        for (const envelope of queued) {
+          this.deliver?.(envelope);
+        }
+      }
+      // when resyncing, the queued envelopes are dropped: the forced
+      // reconnect below triggers a full resync that covers them
+    }
+    if (needsResync) {
+      console.warn(
+        `Tauri WebSocket ${this._url}: unrecoverable missed messages, forcing reconnect`
+      );
+      this.failConnection('Replay gap detected');
+      return;
+    }
+    if (this.liveSeq < this.lastSeq) this.watchForStall(this.lastSeq);
+  }
+
+  /**
+   * recover() delivered messages the live channel has not. If the channel lost
+   * one of them it has stalled: it will never deliver again and retains every
+   * later message, so reconnect rather than let it grow for the session.
+   */
+  private watchForStall(recoveredSeq: number) {
+    clearTimeout(this.stallCheck);
+    this.stallCheck = setTimeout(() => {
+      if (this.liveSeq < recoveredSeq) this.handleFailure('channel_stall');
+    }, CHANNEL_STALL_GRACE_MS);
+  }
+
+  private handleError(event: Event) {
+    if (this.onerror) {
+      this.onerror.call(this as any, event);
+    }
+    this.dispatchToEventListeners('error', event);
+  }
+
+  private dispatchToEventListeners(type: string, event: Event) {
+    const listeners = this.eventListeners.get(type);
+    if (listeners) {
+      listeners.forEach((listener) => {
+        try {
+          listener(event);
+        } catch (error) {
+          console.error('Error in event listener:', error);
+        }
+      });
+    }
+  }
+
+  // Properties
+  get binaryType(): BinaryType {
+    return this._binaryType;
+  }
+
+  set binaryType(value: BinaryType) {
+    this._binaryType = value;
+  }
+
+  get bufferedAmount(): number {
+    return this._bufferedAmount;
+  }
+
+  get extensions(): string {
+    return this._extensions;
+  }
+
+  get protocol(): string {
+    return this._protocol;
+  }
+
+  get readyState(): number {
+    return this._readyState;
+  }
+
+  get url(): string {
+    return this._url;
+  }
+
+  // Methods
+  addEventListener<K extends keyof WebSocketEventMap>(
+    type: K,
+    listener: (this: WebSocket, ev: WebSocketEventMap[K]) => any,
+    _options?: boolean | AddEventListenerOptions
+  ): void {
+    if (!this.eventListeners.has(type)) {
+      this.eventListeners.set(type, new Set());
+    }
+
+    this.eventListeners.get(type)!.add(listener as EventListener);
+  }
+
+  removeEventListener<K extends keyof WebSocketEventMap>(
+    type: K,
+    listener: (this: WebSocket, ev: WebSocketEventMap[K]) => any,
+    _options?: boolean | EventListenerOptions
+  ): void {
+    const listeners = this.eventListeners.get(type);
+    if (listeners) {
+      listeners.delete(listener as EventListener);
+    }
+  }
+
+  dispatchEvent(event: Event): boolean {
+    this.dispatchToEventListeners(event.type, event);
+    return true;
+  }
+
+  /** Sends a message over the plugin connection. */
+  private async sendMessage(message: TauriMessage): Promise<void> {
+    await invoke('plugin:websocket|send', {
+      id: this.socketId,
+      message,
+    });
+  }
+
+  /** Closes the plugin connection with a close frame. */
+  private async disconnectSocket(
+    code = 1000,
+    reason = 'Disconnected by client'
+  ): Promise<void> {
+    await this.sendMessage({ type: 'Close', data: { code, reason } });
+  }
+
+  close(code = 1000, reason = ''): void {
+    if (this._readyState === this.CONNECTING) {
+      // Like a browser socket, abandoning the handshake reports an abnormal
+      // closure; the pending connect drops its connection if it completes.
+      this._readyState = this.CLOSING;
+      queueMicrotask(() =>
+        this.handleClose(
+          new CloseEvent('close', { code: 1006, reason, wasClean: false })
+        )
+      );
+      return;
+    }
+    if (this.socketId === null || this._readyState !== this.OPEN) return;
+    this._readyState = this.CLOSING;
+    this.disconnectSocket(code, reason)
+      .catch((error: any) => {
+        console.error('Error closing Tauri WebSocket:', error);
+      })
+      .finally(() => {
+        this.handleClose(
+          new CloseEvent('close', { code, reason, wasClean: true })
+        );
+      });
+  }
+
+  private handleFailure(operation: 'receive' | 'send' | 'channel_stall') {
+    if (this._readyState === this.CLOSING || this._readyState === this.CLOSED)
+      return;
+    const reason = match(operation)
+      .with('receive', () => 'Receive failed')
+      .with('send', () => 'Send failed')
+      .with('channel_stall', () => 'Live channel stalled')
+      .exhaustive();
+    const span = Telemetry.span('websocket.transport.failure');
+    span.setAttr('websocket.transport', 'tauri');
+    if (this.socketId !== null)
+      span.setAttr('websocket.socket_id', this.socketId);
+    span.setAttr('websocket.operation', operation);
+    span.setAttr('websocket.outcome', 'closed');
+    // Native errors may contain URLs or payloads. Record only the operation.
+    span.error(reason);
+    span.end();
+    this.failConnection(reason);
+  }
+
+  /** Reports an abnormal closure, like a browser socket's error then close. */
+  private failConnection(reason: string) {
+    this._readyState = this.CLOSED;
+    this.removeListener?.();
+    if (this.socketId !== null) this.disconnectSocket().catch(() => {});
+    this.handleError(new Event('error'));
+    this.handleClose(
+      new CloseEvent('close', { code: 1006, reason, wasClean: false })
+    );
+  }
+
+  send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
+    if (this.socketId === null || this._readyState !== this.OPEN) {
+      throw new Error(
+        `Websocket to: ${this.url} is in state ${this._readyState}`
+      );
+    }
+
+    if (typeof data === 'string') {
+      // Send as text message
+      this.sendMessage({ type: 'Text', data }).catch(() =>
+        this.handleFailure('send')
+      );
+    } else {
+      // Convert binary data to number array for Tauri
+      let uint8Array: Uint8Array;
+
+      if (data instanceof ArrayBuffer) {
+        uint8Array = new Uint8Array(data);
+      } else if (data instanceof Uint8Array) {
+        uint8Array = data;
+      } else if (data instanceof Blob) {
+        // For Blob, we need to read it first (this is async in real implementation)
+        throw new Error(
+          'Blob sending requires async handling - convert to ArrayBuffer first'
+        );
+      } else if (
+        'buffer' in data &&
+        'byteOffset' in data &&
+        'byteLength' in data
+      ) {
+        // Handle ArrayBufferView types
+        uint8Array = new Uint8Array(
+          data.buffer,
+          data.byteOffset,
+          data.byteLength
+        );
+      } else {
+        // Handle SharedArrayBuffer
+        uint8Array = new Uint8Array(data);
+      }
+
+      // Send as binary message with number array
+      this.sendMessage({ type: 'Binary', data: Array.from(uint8Array) }).catch(
+        () => this.handleFailure('send')
+      );
+    }
+  }
+}
+
+/**
+ * Tauri WebSocket factory that lazy loads the Tauri WebSocket plugin
+ */
+export const tauriWebSocketFactory: WebSocketFactory = (url, protocols) => {
+  if (!isTauri()) {
+    throw new Error('TauriWebSocket can only be used in Tauri environments');
+  }
+
+  return new TauriWebSocketWrapper(url.toString(), protocols);
+};

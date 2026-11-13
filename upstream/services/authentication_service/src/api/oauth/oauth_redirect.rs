@@ -1,0 +1,398 @@
+use crate::api::webhooks::user::create_user_webhook::{
+    mark_sso_signup_as_agent, revert_unconfirmed_agent,
+};
+use crate::api::{
+    context::ApiContext,
+    login::sso::{SsoState, is_allowed_original_url, redact_original_url_for_logging},
+    oauth2::ConsentFailure,
+    utils::{
+        append_signed_up_param_if_new_user, create_access_token_cookie,
+        create_refresh_token_cookie, default_redirect_url, generate_session_code,
+        spawn_first_inbox_provision,
+    },
+};
+use axum::{
+    Json,
+    extract::{self, State},
+    http::{HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+};
+use macro_auth::middleware::decode_jwt::decode_macro_access_token_allow_expired;
+use maud::{DOCTYPE, Markup, html};
+use model::response::ErrorResponse;
+use referral::domain::{models::ReferralCode, ports::ReferralService};
+use reqwest::{Url, header::CONTENT_TYPE};
+use serde::Deserialize;
+use serde_utils::JsonEncoded;
+use std::time::Duration;
+use thiserror::Error;
+use tokio::time::sleep;
+use tower_cookies::Cookies;
+
+#[cfg(test)]
+mod tests;
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OAuthCbParams {
+    code: Option<String>,
+    state: Option<JsonEncoded<SsoState>>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+    #[serde(default)]
+    error_reason: Option<String>,
+}
+
+/// Handles oauth redirect
+#[utoipa::path(
+        get,
+        path = "/oauth/redirect",
+        operation_id = "oauth_redirect",
+        responses(
+            (status = 200),
+            (status = 400, body=ErrorResponse),
+            (status = 401, body=ErrorResponse),
+            (status = 500, body=ErrorResponse),
+        )
+    )]
+#[tracing::instrument(skip(ctx, cookies, params))]
+#[axum::debug_handler]
+pub async fn handler(
+    State(ctx): State<ApiContext>,
+    cookies: Cookies,
+    extract::Query(params): extract::Query<OAuthCbParams>,
+) -> Result<Response, Response> {
+    let code = match params.code {
+        Some(c) => c,
+        None => {
+            let failure = ConsentFailure::classify(
+                params.error.as_deref(),
+                params.error_description.as_deref(),
+            );
+            tracing::warn!(
+                auth_handoff_failure = "missing_code",
+                outcome = failure.as_str(),
+                error = ?params.error,
+                error_reason = ?params.error_reason,
+                error_description = ?params.error_description,
+                "oauth redirect received without code",
+            );
+            let state = params.state.and_then(|state| state.decode().ok());
+            if let Some(url) = sign_in_failure_url(state.as_ref(), failure) {
+                return Ok(html_redirect(&url).into_response());
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    message: "Sign-in failed. Please try again or contact support.".into(),
+                }),
+            )
+                .into_response());
+        }
+    };
+
+    // Perform the oauth code grant
+    // NOTE: rust is so blazingly fast (super crazy, I know) that we actually need to sleep here temporarily
+    // to ensure we give time for the oauth authorization code to be setup in the backend.
+    // Obviously this is not ideal, but will work for now.
+    sleep(Duration::from_millis(500)).await;
+
+    let fusionauth::oauth::OAuth2Grant {
+        access_token,
+        refresh_token,
+        ..
+    } = match ctx
+        .auth_client
+        .complete_authorization_code_grant(&code)
+        .await
+    {
+        Ok(grant) => grant,
+        Err(e) => {
+            tracing::error!(
+                auth_handoff_failure = "code_grant_failed",
+                error=?e,
+                "unable to complete authorization code grant"
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+
+    let write_db = async |code: &SessionCode| {
+        ctx.macro_cache_client
+            .set_mobile_login_session(code.0.as_str(), &refresh_token)
+            .await
+            .inspect_err(|e| {
+                tracing::error!(
+                    auth_handoff_failure = "session_code_store_failed",
+                    error=?e,
+                    "unable to store mobile session code"
+                );
+            })
+            .map_err(InnerErr::MacroCacheErr)
+    };
+
+    let state: Option<SsoState> = if let Some(state) = params.state {
+        Some(
+            state
+                .decode()
+                .inspect_err(|e| {
+                    tracing::error!(
+                        auth_handoff_failure = "state_decode_failed",
+                        error=?e,
+                        "unable to decode oauth state"
+                    );
+                })
+                .map_err(|e| InnerErr::Serde(e).into_response())?,
+        )
+    } else {
+        None
+    };
+
+    let mut redirect_url = get_redirect_url(&state, write_db)
+        .await
+        .map_err(IntoResponse::into_response)?;
+
+    let decoded_user_id = decode_macro_access_token_allow_expired(&access_token, &ctx.jwt_args);
+
+    let just_signed_up = match decoded_user_id.as_ref() {
+        Ok(user_id) => {
+            append_signed_up_param_if_new_user(
+                &ctx.macro_cache_client,
+                user_id.email_str(),
+                &mut redirect_url,
+            )
+            .await
+        }
+        Err(_) => false,
+    };
+
+    let agent_signup = state.as_ref().is_some_and(|state| state.is_agent);
+    if let Ok(user_id) = decoded_user_id.as_ref() {
+        if just_signed_up && agent_signup {
+            mark_sso_signup_as_agent(&ctx, user_id.as_ref(), user_id.email_str()).await;
+        }
+        // A provider just verified this address, so a person is signing in,
+        // unless they came through the agent signup page.
+        if !just_signed_up && !agent_signup {
+            revert_unconfirmed_agent(&ctx, user_id.as_ref(), user_id.email_str()).await;
+        }
+    }
+
+    // Only a brand-new account counts as referred: an existing user who signs
+    // in through a referral link earns the referrer nothing.
+    if just_signed_up
+        && let Ok(user_id) = decoded_user_id.as_ref()
+        && let Some(state) = state.as_ref()
+        && let Some(referral_code) = state.referral_code.as_ref()
+    {
+        let _ = ctx
+            .referral_service
+            .track_referral(user_id, &ReferralCode(referral_code.clone()))
+            .await
+            .inspect_err(|e| tracing::error!(error=?e, "unable to track referral for new user"));
+    }
+
+    // Set cookies
+    cookies.add(create_access_token_cookie(&access_token));
+    cookies.add(create_refresh_token_cookie(&refresh_token));
+
+    spawn_first_inbox_provision(&ctx, &access_token);
+
+    Ok(html_redirect(&redirect_url).into_response())
+}
+
+#[derive(Debug, Error)]
+enum InnerErr {
+    #[error("{0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("Macro Cache Err {0}")]
+    MacroCacheErr(anyhow::Error),
+    #[error("Failed to parse url {0}")]
+    ParseErr(#[from] url::ParseError),
+    #[error("original_url is not allowed")]
+    DisallowedOriginalUrl,
+}
+
+impl IntoResponse for InnerErr {
+    fn into_response(self) -> Response {
+        match self {
+            InnerErr::Serde(_error) => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    message: "failed to deserialize input".into(),
+                }),
+            )
+                .into_response(),
+            InnerErr::MacroCacheErr(_e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: "unable to store session code".into(),
+                }),
+            )
+                .into_response(),
+
+            InnerErr::ParseErr(_e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: "unable to parse original url".into(),
+                }),
+            )
+                .into_response(),
+
+            InnerErr::DisallowedOriginalUrl => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    message: "provided original_url is not allowed".into(),
+                }),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// A freshly minted session code. It is a bearer credential until redeemed,
+/// so `Debug` never prints it.
+struct SessionCode(String);
+
+impl std::fmt::Debug for SessionCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionCode(<redacted>)")
+    }
+}
+
+/// The redirect URL carries the session code, and `original_url` can carry a
+/// stale one, so the span records neither: only what kind of return this is.
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(
+        has_state = state.is_some(),
+        is_mobile = state.as_ref().is_some_and(|state| state.is_mobile),
+    )
+)]
+async fn get_redirect_url(
+    state: &Option<SsoState>,
+    write_db: impl AsyncFnOnce(&SessionCode) -> Result<(), InnerErr>,
+) -> Result<Url, InnerErr> {
+    let Some(state) = state else {
+        // A mobile login cannot complete from here: without state there is no
+        // is_mobile flag, so no session code is minted and the app's
+        // macro:// callback never fires.
+        tracing::warn!(
+            auth_handoff_failure = "state_missing",
+            "oauth redirect received without state; redirecting to default app url"
+        );
+        return Ok(default_redirect_url());
+    };
+
+    // The state round-trips through the identity provider as a client-visible
+    // query param, so re-validate original_url here — /login/sso checking it
+    // on the way in does not prevent a forged state on the way back.
+    if let Some(url) = state
+        .original_url
+        .as_ref()
+        .filter(|url| !is_allowed_original_url(url))
+    {
+        let redacted_url = redact_original_url_for_logging(url);
+        tracing::error!(
+            auth_handoff_failure = "original_url_rejected",
+            original_url = %redacted_url,
+            "original_url in oauth state is not allowed"
+        );
+        return Err(InnerErr::DisallowedOriginalUrl);
+    }
+
+    // Generate the session code if necessary
+    let session_code = state.is_mobile.then(generate_session_code).map(SessionCode);
+    let res = update_url_with_session_code(
+        state
+            .original_url
+            .clone()
+            .unwrap_or_else(default_redirect_url),
+        session_code.as_ref(),
+        write_db,
+    )
+    .await?;
+
+    Ok(res)
+}
+
+/// The query param that tells the app why a provider sign-in came back without
+/// a code, so it can offer email sign-in instead of a dead end.
+const SSO_ERROR_PARAM: &str = "sso_error";
+
+/// Sends a sign-in that came back without a code to the page that started it,
+/// with the reason. `None` when there is no allowed page to return to.
+fn sign_in_failure_url(state: Option<&SsoState>, failure: ConsentFailure) -> Option<Url> {
+    let mut url = state?.original_url.clone()?;
+    // Re-validate: the state is client-visible and may be forged.
+    if !is_allowed_original_url(&url) {
+        return None;
+    }
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| key != SSO_ERROR_PARAM)
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(kept)
+        .append_pair(SSO_ERROR_PARAM, failure.as_str());
+    Some(url)
+}
+
+/// given an input url, attaches a session code as a query param if required.
+/// Side effect: write the code to db
+#[tracing::instrument(
+    err,
+    skip_all,
+    fields(session_code_issued = session_code.is_some())
+)]
+async fn update_url_with_session_code(
+    mut url: Url,
+    session_code: Option<&SessionCode>,
+    write_db: impl AsyncFnOnce(&SessionCode) -> Result<(), InnerErr>,
+) -> Result<Url, InnerErr> {
+    let Some(session_code) = session_code else {
+        return Ok(url);
+    };
+
+    // Strip any existing token params from the URL (e.g. from a previous login
+    // attempt embedded in the original_url) before appending the new one.
+    let filtered: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k != "token")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    url.query_pairs_mut().clear().extend_pairs(filtered);
+    url.query_pairs_mut().append_pair("token", &session_code.0);
+
+    write_db(session_code).await?;
+
+    Ok(url)
+}
+
+fn html_redirect_inner(url: &Url) -> Markup {
+    html! {
+        (DOCTYPE)
+        html {
+            head {
+                meta charset="utf-8";
+                title { "Redirect" }
+                meta http-equiv="refresh" content=(format!("0;url={url}"));
+            };
+        };
+    }
+}
+
+fn html_redirect(url: &Url) -> Response {
+    let s = html_redirect_inner(url).0;
+
+    // we can't use the html into_response bc it needs axum 0.8
+    let headers = [(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    )];
+    (headers, s).into_response()
+}

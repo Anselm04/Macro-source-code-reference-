@@ -1,0 +1,496 @@
+import { toast } from '@core/component/Toast/Toast';
+import { useIsAuthenticated, useUserId } from '@core/context/user';
+import { fireAndForget } from '@core/util/fireAndForget';
+import {
+  catchToResult,
+  ThrownResultError,
+  throwOnErr,
+} from '@core/util/result';
+import {
+  authServiceClient,
+  type ToggleAutoJoinDomainErrorCode,
+} from '@service-auth/client';
+import type { CreateTeamRequest } from '@service-auth/generated/schemas/createTeamRequest';
+import type { PatchTeamRequest } from '@service-auth/generated/schemas/patchTeamRequest';
+import type { Team } from '@service-auth/generated/schemas/team';
+import { TeamRole } from '@service-auth/generated/schemas/teamRole';
+import type { TeamWithMembers } from '@service-auth/generated/schemas/teamWithMembers';
+import type { ToggleAutoJoinDomainResponse } from '@service-auth/generated/schemas/toggleAutoJoinDomainResponse';
+import type { ToggleNonAdminInvitesResponse } from '@service-auth/generated/schemas/toggleNonAdminInvitesResponse';
+import { queryOptions, useMutation, useQuery } from '@tanstack/solid-query';
+import type { Accessor } from 'solid-js';
+import { authKeys } from '../auth';
+import { queryClient } from '../client';
+import { queryReadyGate } from '../gate';
+import { type MutationCallbacks, withCallbacks } from '../utils';
+import { teamKeys } from './keys';
+
+function fetchUserTeams() {
+  return throwOnErr(() => authServiceClient.getUserTeams());
+}
+
+function fetchTeam() {
+  return throwOnErr(() => authServiceClient.getTeam());
+}
+
+export const userTeamsQueryOptions = () =>
+  queryOptions({
+    queryKey: teamKeys.userTeams.queryKey,
+    queryFn: fetchUserTeams,
+  });
+
+export function useUserTeamsQuery() {
+  return useQuery(userTeamsQueryOptions);
+}
+
+export function useTeamQuery(teamId: Accessor<string>) {
+  return useQuery(() => ({
+    queryKey: teamKeys.detail(teamId()).queryKey,
+    queryFn: fetchTeam,
+    enabled: !!teamId(),
+  }));
+}
+
+/** The current user's team, or `null` if they don't belong to one. */
+export function useCurrentTeamQuery(enabled?: Accessor<boolean>) {
+  const authenticated = useIsAuthenticated();
+  return useQuery(() => ({
+    queryKey: teamKeys.currentTeam.queryKey,
+    queryFn: fetchTeam,
+    enabled: authenticated() === true && (enabled?.() ?? true),
+  }));
+}
+
+/**
+ * Reactive boolean: true iff the current user has admin or owner team
+ * role. When a team id is supplied, it must match that team. Drives
+ * admin-gated UI (e.g. the companies → hidden tab and detail-page Hide button).
+ */
+export function useIsTeamAdmin(): (teamId?: string) => boolean {
+  const userId = useUserId();
+  const teamQuery = useCurrentTeamQuery();
+  return (teamId) => {
+    const uid = userId();
+    if (!uid) return false;
+    if (!queryReadyGate(teamQuery)) return false;
+    const team = teamQuery.data;
+    if (!team) return false;
+    if (teamId !== undefined && team.team.id !== teamId) return false;
+    const member = team.members.find((m) => m.user_id === uid);
+    return member?.role === TeamRole.admin || member?.role === TeamRole.owner;
+  };
+}
+
+/** Reactive boolean: true iff the current user owns the current team. */
+export function useIsTeamOwner(): Accessor<boolean> {
+  const userId = useUserId();
+  const teamQuery = useCurrentTeamQuery();
+  return () => {
+    const uid = userId();
+    if (!uid) return false;
+    if (!queryReadyGate(teamQuery)) return false;
+    const team = teamQuery.data;
+    if (!team) return false;
+    return (
+      team.members.find((member) => member.user_id === uid)?.role ===
+      TeamRole.owner
+    );
+  };
+}
+
+export function invalidateUserTeams() {
+  queryClient.invalidateQueries({
+    queryKey: teamKeys.userTeams.queryKey,
+  });
+  queryClient.invalidateQueries({
+    queryKey: teamKeys.currentTeam.queryKey,
+  });
+}
+
+export function invalidateTeam(teamId: string) {
+  return queryClient.invalidateQueries({
+    queryKey: teamKeys.detail(teamId).queryKey,
+  });
+}
+
+type CreateTeamArgs = CreateTeamRequest;
+type CreateTeamCallbacks = MutationCallbacks<Team, Error, CreateTeamArgs>;
+
+function _useCreateTeamMutation(callbacks?: CreateTeamCallbacks) {
+  return useMutation(() => ({
+    mutationFn: async (args: CreateTeamArgs) =>
+      await throwOnErr(() => authServiceClient.createTeam(args)),
+
+    ...withCallbacks<Team, Error, CreateTeamArgs>(
+      {
+        onSuccess: () => {
+          invalidateUserTeams();
+          toast.success('Team created');
+        },
+
+        onError: (error) => {
+          console.error('Failed to create team', error);
+          toast.failure('Failed to create team');
+        },
+      },
+      callbacks
+    ),
+  }));
+}
+
+type PatchTeamArgs = { teamId: string; request: PatchTeamRequest };
+type PatchTeamCallbacks = MutationCallbacks<void, Error, PatchTeamArgs>;
+
+export function usePatchTeamMutation(callbacks?: PatchTeamCallbacks) {
+  return useMutation(() => ({
+    mutationFn: async ({ request }: PatchTeamArgs) => {
+      await throwOnErr(() => authServiceClient.patchTeam(request));
+    },
+
+    ...withCallbacks<void, Error, PatchTeamArgs>(
+      {
+        onSuccess: (_data, { teamId }) => {
+          fireAndForget(invalidateTeam(teamId), 'team-settings');
+          invalidateUserTeams();
+          toast.success('Team updated');
+        },
+
+        onError: (error) => {
+          console.error('Failed to update team', error);
+          toast.failure('Failed to update team');
+        },
+      },
+      callbacks
+    ),
+  }));
+}
+
+type ToggleAutoJoinDomainArgs = { teamId: string };
+type ToggleAutoJoinDomainCallbacks = MutationCallbacks<
+  ToggleAutoJoinDomainResponse,
+  Error,
+  ToggleAutoJoinDomainArgs
+>;
+
+/** True when the failure is the backend rejecting a generic email provider
+ *  domain (e.g. gmail.com) — the one case whose message we show verbatim. */
+function isGenericDomainError(error: Error): boolean {
+  return (
+    error instanceof ThrownResultError &&
+    error.errors.some(
+      (e) =>
+        e.code ===
+        ('GENERIC_DOMAIN_NOT_ALLOWED' satisfies ToggleAutoJoinDomainErrorCode)
+    )
+  );
+}
+
+export function useToggleAutoJoinDomainMutation(
+  callbacks?: ToggleAutoJoinDomainCallbacks
+) {
+  return useMutation(() => ({
+    mutationFn: async (_args: ToggleAutoJoinDomainArgs) =>
+      await throwOnErr(() => authServiceClient.toggleTeamAutoJoinDomain()),
+
+    ...withCallbacks<
+      ToggleAutoJoinDomainResponse,
+      Error,
+      ToggleAutoJoinDomainArgs
+    >(
+      {
+        onSuccess: (data, { teamId }) => {
+          // The response carries the authoritative new value — reflect it
+          // in the cached team right away so the switch doesn't lag behind
+          // the refetch, then invalidate as usual.
+          const applyDomain = (old: TeamWithMembers | null | undefined) =>
+            old
+              ? {
+                  ...old,
+                  team: {
+                    ...old.team,
+                    auto_join_domain: data.auto_join_domain ?? null,
+                  },
+                }
+              : old;
+          queryClient.setQueryData<TeamWithMembers | null>(
+            teamKeys.detail(teamId).queryKey,
+            applyDomain
+          );
+          queryClient.setQueryData<TeamWithMembers | null>(
+            teamKeys.currentTeam.queryKey,
+            applyDomain
+          );
+          fireAndForget(invalidateTeam(teamId), 'team-settings');
+          invalidateUserTeams();
+          toast.success(
+            data.auto_join_domain
+              ? `Auto-join enabled for @${data.auto_join_domain}`
+              : 'Auto-join disabled'
+          );
+        },
+
+        onError: (error) => {
+          console.error('Failed to toggle team auto-join', error);
+          toast.failure(
+            isGenericDomainError(error)
+              ? error.message
+              : 'Failed to update auto-join'
+          );
+        },
+      },
+      callbacks
+    ),
+  }));
+}
+
+type ToggleNonAdminInvitesArgs = { teamId: string };
+type ToggleNonAdminInvitesCallbacks = MutationCallbacks<
+  ToggleNonAdminInvitesResponse,
+  Error,
+  ToggleNonAdminInvitesArgs
+>;
+
+export function useToggleNonAdminInvitesMutation(
+  callbacks?: ToggleNonAdminInvitesCallbacks
+) {
+  return useMutation(() => ({
+    mutationFn: async (_args: ToggleNonAdminInvitesArgs) =>
+      await throwOnErr(() => authServiceClient.toggleTeamNonAdminInvites()),
+
+    ...withCallbacks<
+      ToggleNonAdminInvitesResponse,
+      Error,
+      ToggleNonAdminInvitesArgs
+    >(
+      {
+        onSuccess: (data, { teamId }) => {
+          // The response carries the authoritative new value - reflect it
+          // in the cached team right away so the switch doesn't lag behind
+          // the refetch, then invalidate as usual.
+          const applySetting = (old: TeamWithMembers | null | undefined) =>
+            old
+              ? {
+                  ...old,
+                  team: {
+                    ...old.team,
+                    allow_non_admin_invites: data.allow_non_admin_invites,
+                  },
+                }
+              : old;
+          queryClient.setQueryData<TeamWithMembers | null>(
+            teamKeys.detail(teamId).queryKey,
+            applySetting
+          );
+          queryClient.setQueryData<TeamWithMembers | null>(
+            teamKeys.currentTeam.queryKey,
+            applySetting
+          );
+          fireAndForget(invalidateTeam(teamId), 'team-settings');
+          invalidateUserTeams();
+          toast.success(
+            data.allow_non_admin_invites
+              ? 'All members can now invite'
+              : 'Inviting is now limited to admins'
+          );
+        },
+
+        onError: (error) => {
+          console.error('Failed to toggle member invites', error);
+          toast.failure('Failed to update member invites');
+        },
+      },
+      callbacks
+    ),
+  }));
+}
+
+type DeleteTeamArgs = { teamId: string };
+type DeleteTeamContext = { previousTeams: Team[] | undefined };
+type DeleteTeamCallbacks = MutationCallbacks<
+  void,
+  Error,
+  DeleteTeamArgs,
+  DeleteTeamContext
+>;
+
+export function useDeleteTeamMutation(callbacks?: DeleteTeamCallbacks) {
+  return useMutation(() => ({
+    mutationFn: async (_args: DeleteTeamArgs) => {
+      await throwOnErr(() => authServiceClient.deleteTeam());
+    },
+
+    ...withCallbacks<void, Error, DeleteTeamArgs, DeleteTeamContext>(
+      {
+        onMutate: async ({ teamId }) => {
+          await queryClient.cancelQueries({
+            queryKey: teamKeys.userTeams.queryKey,
+          });
+
+          const previousTeams = queryClient.getQueryData<Team[]>(
+            teamKeys.userTeams.queryKey
+          );
+
+          queryClient.setQueryData<Team[]>(teamKeys.userTeams.queryKey, (old) =>
+            old?.filter((team) => team.id !== teamId)
+          );
+
+          return { previousTeams };
+        },
+
+        onSuccess: () => {
+          invalidateUserTeams();
+          toast.success('Team deleted');
+        },
+
+        onError: (error, _args, context) => {
+          console.error('Failed to delete team', error);
+          toast.failure('Failed to delete team');
+
+          if (context?.previousTeams) {
+            queryClient.setQueryData(
+              teamKeys.userTeams.queryKey,
+              context.previousTeams
+            );
+          }
+        },
+      },
+      callbacks
+    ),
+  }));
+}
+
+type CreateTeamWithInvitesArgs = {
+  name: string;
+  invites?: { email: string }[];
+  /** Whether people on the owner's work domain join automatically. Omitted
+   * keeps the server default. */
+  allowDomainJoin?: boolean;
+  /** Whether to email the owner's same-domain contacts that the team exists.
+   * Sent only when `allowDomainJoin` is also `true` and the team got an
+   * auto-join domain; the server sends nothing to a team without one. */
+  notifyDomain?: boolean;
+};
+type CreateTeamWithInvitesContext = { previousTeams: Team[] | undefined };
+
+/** The domain notice goes out only when both domain join and the notice were
+ * explicitly chosen and the server gave the team an auto-join domain (a
+ * personal email domain gets none). The server also sends nothing without
+ * one; checking here skips a request that can't send anything. */
+export function shouldSendDomainNotice(
+  args: Pick<CreateTeamWithInvitesArgs, 'allowDomainJoin' | 'notifyDomain'>,
+  team: Pick<Team, 'auto_join_domain'>
+): boolean {
+  return (
+    args.allowDomainJoin === true &&
+    args.notifyDomain === true &&
+    !!team.auto_join_domain
+  );
+}
+type CreateTeamWithInvitesCallbacks = MutationCallbacks<
+  Team,
+  Error,
+  CreateTeamWithInvitesArgs,
+  CreateTeamWithInvitesContext
+>;
+
+export function useCreateTeamWithInvitesMutation(
+  callbacks?: CreateTeamWithInvitesCallbacks
+) {
+  return useMutation(() => ({
+    mutationFn: async ({
+      name,
+      invites,
+      allowDomainJoin,
+      notifyDomain,
+    }: CreateTeamWithInvitesArgs) => {
+      const team = await throwOnErr(() =>
+        authServiceClient.createTeam({
+          name,
+          allow_domain_join: allowDomainJoin,
+        })
+      );
+
+      if (invites && invites.length > 0) {
+        await throwOnErr(() => authServiceClient.inviteToTeam({ invites }));
+      }
+
+      // After the invites, so invitees aren't also sent the notice. The
+      // team already exists, so a failed notice doesn't fail creation.
+      if (shouldSendDomainNotice({ allowDomainJoin, notifyDomain }, team)) {
+        const notice = await catchToResult(() =>
+          throwOnErr(() => authServiceClient.sendTeamDomainNotice())
+        );
+        if (notice.isErr()) {
+          console.error('Failed to send team domain notice', notice);
+        }
+      }
+
+      return team;
+    },
+
+    ...withCallbacks<
+      Team,
+      Error,
+      CreateTeamWithInvitesArgs,
+      CreateTeamWithInvitesContext
+    >(
+      {
+        onMutate: async ({ name }) => {
+          await queryClient.cancelQueries({
+            queryKey: teamKeys.userTeams.queryKey,
+          });
+
+          const previousTeams = queryClient.getQueryData<Team[]>(
+            teamKeys.userTeams.queryKey
+          );
+
+          const userInfo = queryClient.getQueryData<{ userId: string }>(
+            authKeys.userInfo.queryKey
+          );
+
+          if (userInfo?.userId) {
+            const optimisticTeam: Team = {
+              id: `optimistic-${Date.now()}`,
+              name,
+              slug: 'MACRO', // optimisitc slug
+              owner_id: userInfo.userId,
+              crm_enabled: false,
+              auto_join_domain: null,
+              enterprise: false,
+              allow_non_admin_invites: true,
+              default_link_share: 'TEAM',
+            };
+
+            queryClient.setQueryData<Team[]>(
+              teamKeys.userTeams.queryKey,
+              (old) => (old ? [...old, optimisticTeam] : [optimisticTeam])
+            );
+          }
+
+          return { previousTeams };
+        },
+
+        onSuccess: (_team, { invites }) => {
+          invalidateUserTeams();
+          const hasInvites = invites && invites.length > 0;
+          toast.success(
+            hasInvites ? 'Team created and invitations sent' : 'Team created'
+          );
+        },
+
+        onError: (error, _args, context) => {
+          console.error('Failed to create team', error);
+          toast.failure('Failed to create team');
+
+          if (context?.previousTeams) {
+            queryClient.setQueryData(
+              teamKeys.userTeams.queryKey,
+              context.previousTeams
+            );
+          }
+        },
+      },
+      callbacks
+    ),
+  }));
+}

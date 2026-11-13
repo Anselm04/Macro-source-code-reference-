@@ -1,0 +1,871 @@
+import type { EntityData } from '@entity';
+import {
+  onlineManager,
+  QueryClient,
+  QueryClientProvider,
+} from '@tanstack/solid-query';
+import { err, errAsync, ok, okAsync } from 'neverthrow';
+import { render } from 'solid-js/web';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { TaskEntity } from '../types/entity';
+
+const mocks = vi.hoisted(() => ({
+  graphqlEnabled: vi.fn(() => true),
+  deleteItem: vi.fn(),
+  deleteCall: vi.fn(),
+  deleteChannel: vi.fn(),
+  deleteCallGraphql: vi.fn(),
+  deleteReminder: vi.fn(),
+  deleteSchedule: vi.fn(),
+  trashDatabase: vi.fn(),
+  graphqlClient: { mutation: vi.fn() },
+  moveToFolder: vi.fn(),
+  copyItem: vi.fn(),
+  removeSoup: vi.fn(),
+  removeSearch: vi.fn(),
+  rollbackSoup: vi.fn(),
+  rollbackSearch: vi.fn(),
+  refresh: vi.fn(),
+  failure: vi.fn(),
+}));
+vi.mock('@block-database/queries/trash-database', () => ({
+  trashDatabase: mocks.trashDatabase,
+}));
+vi.mock('@core/component/FileList/itemOperations', () => ({
+  deleteItem: mocks.deleteItem,
+  copyItem: mocks.copyItem,
+  canDuplicateItemType: () => true,
+  moveToFolder: mocks.moveToFolder,
+}));
+vi.mock('@core/component/Toast/Toast', () => ({
+  toast: { failure: mocks.failure },
+}));
+vi.mock('@core/constant/featureFlags', () => ({
+  enableGraphqlSoup: {},
+  isFeatureEnabled: mocks.graphqlEnabled,
+}));
+vi.mock('@queries/client', () => ({
+  get queryClient() {
+    return client;
+  },
+}));
+vi.mock('@queries/agent-session/entity-mutations', () => ({
+  deleteAgentSession: vi.fn(),
+}));
+vi.mock('@queries/soup/cache', () => ({
+  removeSoupEntities: mocks.removeSoup,
+  removeSearchEntities: mocks.removeSearch,
+  getSoupEntityById: vi.fn(),
+  optimisticUpdateSoupEntity: vi.fn(() => ({ rollback: vi.fn() })),
+  invalidateSoupEntity: vi.fn(),
+  invalidateSoupQueriesReferencing: vi.fn(),
+  removeSoupEntitiesFromQueriesReferencing: vi.fn(() => ({
+    rollback: vi.fn(),
+  })),
+}));
+vi.mock('@queries/soup/graphql/active-queries', () => ({
+  refreshActiveGraphqlSoupQueries: mocks.refresh,
+}));
+vi.mock('@queries/storage/entity-mutations', () => ({
+  permanentlyDeleteEntity: mocks.deleteCallGraphql,
+}));
+vi.mock('@service-call/client', () => ({
+  callServiceClient: { deleteCallRecord: mocks.deleteCall },
+}));
+vi.mock('@service-scheduled-action/client', () => ({
+  scheduledActionClient: { deleteSchedule: mocks.deleteSchedule },
+}));
+vi.mock('@service-storage/client', () => ({
+  storageServiceClient: {
+    deleteChannel: mocks.deleteChannel,
+    reminders: { deleteReminder: mocks.deleteReminder },
+  },
+}));
+vi.mock('@service-storage/graphql-soup', () => ({
+  getEntityGraphqlClient: () => mocks.graphqlClient,
+}));
+
+import { scheduledActionKeys } from '@app/features/routines/queries/keys';
+import { callKeys } from '@queries/call/keys';
+import { channelKeys } from '@queries/channel/keys';
+import {
+  GRAPHQL_SOUP_DELETE_MUTATION_KEY,
+  GRAPHQL_SOUP_DELETE_RETENTION_MS,
+  type GraphqlSoupDeleteContext,
+  usePendingGraphqlSoupDeleteKeys,
+} from '@queries/soup/graphql/optimistic-deletions';
+import { databasesKeys, formsKeys } from '@queries/storage/keys';
+import { BulkDeleteFailure } from './bulk-delete-result';
+import {
+  createBulkCopyDssEntityMutation,
+  createBulkDeleteDssItemsMutation,
+  createBulkMoveToProjectDssEntityMutation,
+  createBulkRemoveFromProjectDssEntityMutation,
+  createMoveToProjectDssEntityMutation,
+} from './dss';
+
+let client: QueryClient;
+let dispose: (() => void) | undefined;
+const entity = (id: string, type: EntityData['type'] = 'document') =>
+  ({ id, type }) as EntityData;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function mount() {
+  let result!: {
+    mutation: ReturnType<typeof createBulkDeleteDssItemsMutation>;
+    pendingKeys: ReturnType<typeof usePendingGraphqlSoupDeleteKeys>;
+  };
+  dispose = render(
+    () => (
+      <QueryClientProvider client={client}>
+        {(() => {
+          result = {
+            mutation: createBulkDeleteDssItemsMutation(),
+            pendingKeys: usePendingGraphqlSoupDeleteKeys(),
+          };
+          return null;
+        })()}
+      </QueryClientProvider>
+    ),
+    document.body
+  );
+  return result;
+}
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  mocks.graphqlEnabled.mockReturnValue(true);
+  mocks.removeSoup.mockReturnValue({ rollback: mocks.rollbackSoup });
+  mocks.removeSearch.mockReturnValue({ rollback: mocks.rollbackSearch });
+  mocks.refresh.mockResolvedValue(undefined);
+  mocks.deleteItem.mockResolvedValue(true);
+  mocks.deleteChannel.mockReturnValue(okAsync(undefined));
+  mocks.trashDatabase.mockReturnValue(okAsync(undefined));
+  mocks.moveToFolder.mockResolvedValue(true);
+  mocks.copyItem.mockResolvedValue('copied-task');
+  onlineManager.setOnline(true);
+  client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+});
+afterEach(() => {
+  for (const mutation of client.getMutationCache().getAll()) {
+    (
+      mutation.state.context as GraphqlSoupDeleteContext | undefined
+    )?.graphqlDeletion?.release();
+  }
+  dispose?.();
+  client.clear();
+  vi.useRealTimers();
+  document.body.replaceChildren();
+  vi.restoreAllMocks();
+});
+
+function cacheRows(
+  remove: typeof mocks.removeSoup,
+  rollback: typeof mocks.rollbackSoup,
+  initial: string[]
+) {
+  let rows = new Set(initial);
+  remove.mockImplementation((ids: Set<string>) => {
+    const previous = new Set(rows);
+    rows = new Set([...rows].filter((id) => !ids.has(id)));
+    return {
+      rollback: () => {
+        rollback();
+        rows = new Set(previous);
+      },
+    };
+  });
+  return () => [...rows].sort();
+}
+
+function mountMutation<T>(factory: () => T): T {
+  let mutation!: T;
+  function Probe() {
+    mutation = factory();
+    return null;
+  }
+  dispose = render(
+    () => (
+      <QueryClientProvider client={client}>
+        <Probe />
+      </QueryClientProvider>
+    ),
+    document.body
+  );
+  return mutation;
+}
+
+const folderTask: TaskEntity = {
+  id: 'task',
+  type: 'document',
+  name: 'Task',
+  ownerId: 'viewer',
+  fileType: 'md',
+  subType: { type: 'task' },
+  projectId: 'source',
+};
+
+// These writes still use REST transport even when Soup readers use GraphQL.
+// Their successful completion must revalidate GraphQL membership too; marking
+// only TanStack soup keys stale cannot update a mounted urql list.
+describe('GraphQL Soup membership after list actions', () => {
+  it.each([true, false])(
+    'revalidates single folder moves only for GraphQL Soup (%s)',
+    async (graphql) => {
+      mocks.graphqlEnabled.mockReturnValue(graphql);
+      const mutation = mountMutation(createMoveToProjectDssEntityMutation);
+      await mutation.mutateAsync({
+        entity: folderTask,
+        project: { id: 'destination' },
+      });
+      expect(mocks.moveToFolder).toHaveBeenCalledWith({
+        itemType: 'document',
+        id: 'task',
+        folderId: 'destination',
+      });
+      expect(mocks.refresh).toHaveBeenCalledTimes(graphql ? 1 : 0);
+    }
+  );
+
+  it.each([true, false])(
+    'revalidates bulk folder moves only for GraphQL Soup (%s)',
+    async (graphql) => {
+      mocks.graphqlEnabled.mockReturnValue(graphql);
+      const mutation = mountMutation(createBulkMoveToProjectDssEntityMutation);
+      await mutation.mutateAsync({
+        entities: [folderTask],
+        project: { id: 'destination', name: 'Destination' },
+      });
+      expect(mocks.moveToFolder).toHaveBeenCalledWith({
+        itemType: 'document',
+        id: 'task',
+        folderId: 'destination',
+      });
+      expect(mocks.refresh).toHaveBeenCalledTimes(graphql ? 1 : 0);
+    }
+  );
+
+  it.each([true, false])(
+    'revalidates folder removal only for GraphQL Soup (%s)',
+    async (graphql) => {
+      mocks.graphqlEnabled.mockReturnValue(graphql);
+      const mutation = mountMutation(
+        createBulkRemoveFromProjectDssEntityMutation
+      );
+      await mutation.mutateAsync({
+        entities: [folderTask],
+      });
+      expect(mocks.moveToFolder).toHaveBeenCalledWith({
+        itemType: 'document',
+        id: 'task',
+        folderId: null,
+      });
+      expect(mocks.refresh).toHaveBeenCalledTimes(graphql ? 1 : 0);
+    }
+  );
+
+  it.each([true, false])(
+    'refreshes GraphQL Soup after duplicate returns its new id (%s)',
+    async (graphql) => {
+      mocks.graphqlEnabled.mockReturnValue(graphql);
+      const response = deferred<string>();
+      mocks.copyItem.mockReturnValue(response.promise);
+      const mutation = mountMutation(createBulkCopyDssEntityMutation);
+      const result = mutation.mutateAsync({
+        entities: [folderTask],
+        name: 'Task copy',
+      });
+      try {
+        await vi.waitFor(() => expect(mocks.copyItem).toHaveBeenCalledOnce());
+        // No optimistic placeholder is required when the new id is unknown.
+        expect(mocks.refresh).not.toHaveBeenCalled();
+      } finally {
+        response.resolve('copied-task');
+        await result;
+      }
+      expect(mocks.refresh).toHaveBeenCalledTimes(graphql ? 1 : 0);
+    }
+  );
+});
+
+describe('bulk delete GraphQL optimism', () => {
+  it.each(['throw', 'false'] as const)(
+    'restores only failed rows in Soup and search after a partial %s failure',
+    async (failure) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const soup = cacheRows(mocks.removeSoup, mocks.rollbackSoup, [
+        'failed',
+        'deleted',
+        'other',
+      ]);
+      const search = cacheRows(mocks.removeSearch, mocks.rollbackSearch, [
+        'failed',
+        'deleted',
+        'other',
+      ]);
+      const failed = entity('failed');
+      const deleted = entity('deleted');
+      if (failure === 'throw')
+        mocks.deleteItem.mockRejectedValueOnce(new Error('failed delete'));
+      else mocks.deleteItem.mockResolvedValueOnce(false);
+      mocks.deleteItem.mockResolvedValueOnce(true);
+      const refreshed = deferred<void>();
+      mocks.refresh.mockReturnValue(refreshed.promise);
+      const { mutation, pendingKeys } = mount();
+      try {
+        await expect(
+          mutation.mutateAsync([failed, deleted])
+        ).rejects.toMatchObject({
+          results: [false, true],
+          deletedEntities: [deleted],
+          failedEntities: [failed],
+        });
+        expect(soup()).toEqual(['failed', 'other']);
+        expect(search()).toEqual(['failed', 'other']);
+        expect([...pendingKeys()]).toEqual(['GraphqlSoupDocument:deleted']);
+        expect(mocks.failure).toHaveBeenCalledWith(
+          'Deleted 1 of 2 items; 1 failed'
+        );
+        expect(mocks.removeSoup).toHaveBeenLastCalledWith(
+          new Set(['deleted']),
+          expect.any(Function)
+        );
+        expect(mocks.removeSearch).toHaveBeenLastCalledWith(
+          new Set(['deleted']),
+          expect.any(Function)
+        );
+      } finally {
+        refreshed.resolve();
+      }
+    }
+  );
+
+  it('reconciles successful call/routine deletes despite sibling failures', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const invalidate = vi
+      .spyOn(client, 'invalidateQueries')
+      .mockResolvedValue(undefined);
+    const schedules = [
+      { id: 'deleted-auto' },
+      { id: 'failed-auto' },
+      { id: 'other-auto' },
+    ];
+    client.setQueryData(scheduledActionKeys.list.queryKey, schedules);
+    mocks.deleteItem.mockRejectedValue(new Error('document delete failed'));
+    mocks.deleteCallGraphql.mockResolvedValue(undefined);
+    mocks.deleteSchedule.mockImplementation(
+      async ({ scheduleId }: { scheduleId: string }) =>
+        scheduleId === 'deleted-auto'
+          ? ok(undefined)
+          : err([{ code: 'FORBIDDEN', message: 'schedule delete failed' }])
+    );
+    const { mutation } = mount();
+    await expect(
+      mutation.mutateAsync([
+        entity('failed-document'),
+        entity('deleted-call', 'call'),
+        entity('deleted-auto', 'routine'),
+        entity('failed-auto', 'routine'),
+      ])
+    ).rejects.toBeInstanceOf(BulkDeleteFailure);
+    expect(mocks.deleteCallGraphql).toHaveBeenCalledWith({
+      type: 'CALL',
+      id: 'deleted-call',
+    });
+    expect(mocks.deleteCall).not.toHaveBeenCalled();
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: callKeys._def });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: scheduledActionKeys.list.queryKey,
+    });
+    expect(client.getQueryData(scheduledActionKeys.list.queryKey)).toEqual([
+      schedules[1],
+      schedules[2],
+    ]);
+    expect(mocks.failure).toHaveBeenCalledWith(
+      'Deleted 2 of 4 items; 2 failed'
+    );
+  });
+
+  it('re-reads the database and form lists after a folder is deleted', async () => {
+    const invalidate = vi
+      .spyOn(client, 'invalidateQueries')
+      .mockResolvedValue(undefined);
+    mocks.deleteItem.mockResolvedValue(true);
+    const { mutation } = mount();
+    await expect(
+      mutation.mutateAsync([entity('folder-1', 'project')])
+    ).resolves.toEqual([true]);
+    // Its databases and forms return to the root on the server.
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: databasesKeys.list.queryKey,
+    });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: formsKeys.list.queryKey,
+    });
+  });
+
+  it('trashes databases through the database API instead of DSS delete', async () => {
+    const { mutation } = mount();
+    await expect(
+      mutation.mutateAsync([entity('db-1', 'database')])
+    ).resolves.toEqual([true]);
+    expect(mocks.trashDatabase).toHaveBeenCalledWith(
+      mocks.graphqlClient,
+      'db-1'
+    );
+    expect(mocks.deleteItem).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    'restores a refused database deletion with GraphQL Soup enabled=%s',
+    async (enabled) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      mocks.graphqlEnabled.mockReturnValue(enabled);
+      mocks.trashDatabase.mockReturnValue(errAsync({ kind: 'unreachable' }));
+      const { mutation } = mount();
+      await expect(
+        mutation.mutateAsync([entity('db-1', 'database')])
+      ).rejects.toBeDefined();
+      expect(mocks.rollbackSoup).toHaveBeenCalled();
+      expect(mocks.rollbackSearch).toHaveBeenCalled();
+      expect(mocks.failure).toHaveBeenCalled();
+    }
+  );
+
+  it('does not remove or invalidate unsuccessful side-effect entities', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const invalidate = vi
+      .spyOn(client, 'invalidateQueries')
+      .mockResolvedValue(undefined);
+    const schedules = [{ id: 'failed-auto' }];
+    client.setQueryData(scheduledActionKeys.list.queryKey, schedules);
+    mocks.deleteCallGraphql.mockRejectedValue(new Error('failed call'));
+    mocks.deleteSchedule.mockRejectedValue(new Error('failed schedule'));
+    const { mutation } = mount();
+    await expect(
+      mutation.mutateAsync([
+        entity('failed-call', 'call'),
+        entity('failed-auto', 'routine'),
+      ])
+    ).rejects.toThrow('failed call');
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(client.getQueryData(scheduledActionKeys.list.queryKey)).toEqual(
+      schedules
+    );
+  });
+
+  it.each([true, false])(
+    'restores a boolean-only total failure with GraphQL Soup enabled=%s',
+    async (graphql) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      mocks.graphqlEnabled.mockReturnValue(graphql);
+      mocks.deleteItem.mockResolvedValue(false);
+      const { mutation } = mount();
+      const result = mutation.mutateAsync([entity('failed')]);
+      await expect(result).rejects.toThrow('Failed to delete items');
+      expect(mocks.rollbackSoup).toHaveBeenCalledOnce();
+      expect(mocks.rollbackSearch).toHaveBeenCalledOnce();
+      expect(mocks.failure).toHaveBeenCalledWith('Failed to delete items');
+    }
+  );
+
+  it('hides only deletable ids until deletion and GraphQL refresh both finish', async () => {
+    const network = deferred<boolean>();
+    const refreshed = deferred<void>();
+    mocks.deleteItem.mockReturnValue(network.promise);
+    mocks.refresh.mockReturnValue(refreshed.promise);
+    const { mutation, pendingKeys } = mount();
+    const result = mutation.mutateAsync([
+      entity('task-1'),
+      entity('task-2'),
+      entity('message', 'channel_message'),
+    ]);
+    await vi.waitFor(() =>
+      expect([...pendingKeys()]).toEqual([
+        'GraphqlSoupDocument:task-1',
+        'GraphqlSoupDocument:task-2',
+      ])
+    );
+    expect(mocks.deleteItem).toHaveBeenCalledTimes(2);
+    expect(mocks.refresh).not.toHaveBeenCalled();
+    network.resolve(true);
+    await expect(result).resolves.toEqual([true, true]);
+    await vi.waitFor(() => expect(mutation.isPending).toBe(false));
+    expect(mocks.refresh).toHaveBeenCalledWith({ throwOnError: true });
+    expect([...pendingKeys()]).toEqual([
+      'GraphqlSoupDocument:task-1',
+      'GraphqlSoupDocument:task-2',
+    ]);
+    refreshed.resolve();
+    await vi.waitFor(() => expect(pendingKeys().size).toBe(0));
+  });
+
+  it('restores failed deletions even while revalidation is still pending', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const network = deferred<boolean>();
+    const refreshed = deferred<void>();
+    mocks.deleteItem.mockReturnValue(network.promise);
+    mocks.refresh.mockReturnValue(refreshed.promise);
+    const { mutation, pendingKeys } = mount();
+    const error = new Error('delete failed');
+    const result = expect(
+      mutation.mutateAsync([entity('task')])
+    ).rejects.toThrow(error);
+    await vi.waitFor(() =>
+      expect(pendingKeys().has('GraphqlSoupDocument:task')).toBe(true)
+    );
+    network.reject(error);
+    await vi.waitFor(() => expect(mocks.refresh).toHaveBeenCalledOnce());
+    expect(mocks.rollbackSoup).toHaveBeenCalledOnce();
+    expect(mocks.rollbackSearch).toHaveBeenCalledOnce();
+    expect(mocks.failure).toHaveBeenCalledWith('Failed to delete items');
+    expect(pendingKeys().has('GraphqlSoupDocument:task')).toBe(false);
+    await result;
+    refreshed.resolve();
+    await vi.waitFor(() => expect(pendingKeys().size).toBe(0));
+  });
+
+  it('revalidates partial boolean failures without treating every item as deleted', async () => {
+    mocks.deleteItem.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const refreshed = deferred<void>();
+    mocks.refresh.mockReturnValue(refreshed.promise);
+    const { mutation, pendingKeys } = mount();
+    await expect(
+      mutation.mutateAsync([entity('deleted'), entity('retained')])
+    ).rejects.toMatchObject({
+      results: [true, false],
+      message: 'Deleted 1 of 2 items; 1 failed',
+    });
+    expect(mocks.refresh).toHaveBeenCalledOnce();
+    expect([...pendingKeys()]).toEqual(['GraphqlSoupDocument:deleted']);
+    refreshed.resolve();
+    await vi.waitFor(() => expect(pendingKeys().size).toBe(0));
+  });
+
+  it('retains only the successful entity type when equal IDs have different outcomes', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    mocks.deleteItem.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const refreshed = deferred<void>();
+    mocks.refresh.mockReturnValue(refreshed.promise);
+    const { mutation, pendingKeys } = mount();
+    await expect(
+      mutation.mutateAsync([
+        entity('shared', 'document'),
+        entity('shared', 'chat'),
+      ])
+    ).rejects.toBeInstanceOf(BulkDeleteFailure);
+    expect([...pendingKeys()]).toEqual(['GraphqlSoupDocument:shared']);
+    refreshed.resolve();
+    await vi.waitFor(() => expect(pendingKeys().size).toBe(0));
+  });
+  it.each([true, false])(
+    'latches the GraphQL flag at creation (initially %s)',
+    async (enabled) => {
+      mocks.graphqlEnabled.mockReturnValue(enabled);
+      const network = deferred<boolean>();
+      const refreshed = deferred<void>();
+      mocks.deleteItem.mockReturnValue(network.promise);
+      mocks.refresh.mockReturnValue(refreshed.promise);
+      const { mutation, pendingKeys } = mount();
+      mocks.graphqlEnabled.mockReturnValue(!enabled);
+      const result = mutation.mutateAsync([entity('task')]);
+      await vi.waitFor(() => expect(mocks.deleteItem).toHaveBeenCalledOnce());
+      expect(pendingKeys().has('GraphqlSoupDocument:task')).toBe(enabled);
+      const cached = client.getMutationCache().getAll()[0];
+      expect(cached.options.mutationKey).toEqual(
+        enabled ? GRAPHQL_SOUP_DELETE_MUTATION_KEY : undefined
+      );
+      expect(
+        Boolean(
+          (cached.state.context as GraphqlSoupDeleteContext).graphqlDeletion
+        )
+      ).toBe(enabled);
+      mocks.graphqlEnabled.mockReturnValue(enabled);
+      network.resolve(true);
+      await result;
+      expect(mocks.refresh).toHaveBeenCalledTimes(enabled ? 1 : 0);
+      expect(mocks.graphqlEnabled).toHaveBeenCalledTimes(1);
+      refreshed.resolve();
+      await vi.waitFor(() => expect(pendingKeys().size).toBe(0));
+    }
+  );
+
+  it('does not recreate deletion state after the client is cleared during an API request', async () => {
+    const network = deferred<boolean>();
+    mocks.deleteItem.mockReturnValue(network.promise);
+    const { mutation } = mount();
+    const result = mutation.mutateAsync([entity('task')]);
+    await vi.waitFor(() => expect(mocks.deleteItem).toHaveBeenCalledOnce());
+    client.clear();
+    network.resolve(true);
+    await result;
+    expect(mocks.refresh).not.toHaveBeenCalled();
+    expect(client.getQueryCache().getAll()).toEqual([]);
+  });
+
+  it('does not restore old snapshots when a partial failure arrives after client clearing', async () => {
+    const network = deferred<boolean>();
+    mocks.deleteItem
+      .mockReturnValueOnce(network.promise)
+      .mockResolvedValueOnce(true);
+    const { mutation } = mount();
+    const result = expect(
+      mutation.mutateAsync([entity('failed'), entity('deleted')])
+    ).rejects.toBeInstanceOf(BulkDeleteFailure);
+    await vi.waitFor(() => expect(mocks.deleteItem).toHaveBeenCalledTimes(2));
+    client.clear();
+    network.resolve(false);
+    await result;
+    expect(mocks.rollbackSoup).not.toHaveBeenCalled();
+    expect(mocks.rollbackSearch).not.toHaveBeenCalled();
+    expect(mocks.refresh).not.toHaveBeenCalled();
+    expect(client.getQueryCache().getAll()).toEqual([]);
+  });
+
+  it('retains successful deletes after a refresh error and clears them on retry success', async () => {
+    vi.useFakeTimers();
+    mocks.refresh
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue(undefined);
+    const { mutation, pendingKeys } = mount();
+    await mutation.mutateAsync([entity('task')]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mutation.isPending).toBe(false);
+    expect([...pendingKeys()]).toEqual(['GraphqlSoupDocument:task']);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(mocks.refresh).toHaveBeenCalledTimes(2);
+    expect(pendingKeys().size).toBe(0);
+    await vi.advanceTimersByTimeAsync(GRAPHQL_SOUP_DELETE_RETENTION_MS);
+    expect(mocks.refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it('retains the successful siblings when another delete throws, waiting for every outcome', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const slowSuccess = deferred<boolean>();
+    const refreshed = deferred<void>();
+    mocks.deleteItem
+      .mockRejectedValueOnce(new Error('delete failed'))
+      .mockReturnValueOnce(slowSuccess.promise);
+    mocks.refresh.mockReturnValue(refreshed.promise);
+    const { mutation, pendingKeys } = mount();
+    const result = expect(
+      mutation.mutateAsync([entity('failed'), entity('deleted')])
+    ).rejects.toThrow('Deleted 1 of 2 items; 1 failed');
+    await vi.waitFor(() => expect(mocks.deleteItem).toHaveBeenCalledTimes(2));
+    expect(mocks.refresh).not.toHaveBeenCalled();
+    slowSuccess.resolve(true);
+    await result;
+    expect([...pendingKeys()]).toEqual(['GraphqlSoupDocument:deleted']);
+    refreshed.resolve();
+    await vi.waitFor(() => expect(pendingKeys().size).toBe(0));
+  });
+
+  it.each([false, true])(
+    'preserves disabled-path behavior (failure: %s)',
+    async (fails) => {
+      mocks.graphqlEnabled.mockReturnValue(false);
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const network = deferred<boolean>();
+      mocks.deleteItem.mockReturnValue(network.promise);
+      const { mutation, pendingKeys } = mount();
+      const result = mutation.mutateAsync([entity('task')]);
+      const settled = fails
+        ? expect(result).rejects.toThrow('delete failed')
+        : expect(result).resolves.toEqual([true]);
+      await vi.waitFor(() => expect(mocks.deleteItem).toHaveBeenCalledOnce());
+      expect(mocks.removeSoup).toHaveBeenCalledWith(new Set(['task']));
+      expect(mocks.removeSearch).toHaveBeenCalledWith(new Set(['task']));
+      expect(pendingKeys().size).toBe(0);
+      expect(
+        client.getMutationCache().getAll()[0].options.mutationKey
+      ).toBeUndefined();
+      expect(
+        client.getMutationCache().getAll()[0].options.onSettled
+      ).toBeUndefined();
+      if (fails) network.reject(new Error('delete failed'));
+      else network.resolve(true);
+      await settled;
+      expect(mocks.refresh).not.toHaveBeenCalled();
+      expect(mocks.rollbackSoup).toHaveBeenCalledTimes(fails ? 1 : 0);
+      expect(mocks.rollbackSearch).toHaveBeenCalledTimes(fails ? 1 : 0);
+    }
+  );
+});
+
+describe('moving databases and forms between folders', () => {
+  const listedDatabase = {
+    database: {
+      id: 'intake',
+      name: 'Client intake',
+      owner_id: 'viewer',
+      created_at: '2026-10-01T00:00:00Z',
+      trashed_at: null,
+      project_id: null,
+    },
+    grant: 'owner',
+    tables: [],
+  };
+  const listedForm = {
+    form: { id: 'survey', name: 'Survey', projectId: 'old' },
+    access: 'owner',
+  };
+  const filed = () => ({
+    database: (
+      client.getQueryData(databasesKeys.list.queryKey) as
+        | (typeof listedDatabase)[]
+        | undefined
+    )?.[0]?.database.project_id,
+    form: (
+      client.getQueryData(formsKeys.list.queryKey) as
+        | (typeof listedForm)[]
+        | undefined
+    )?.[0]?.form.projectId,
+  });
+  const seed = () => {
+    client.setQueryData(databasesKeys.list.queryKey, [listedDatabase]);
+    client.setQueryData(formsKeys.list.queryKey, [listedForm]);
+  };
+
+  it('files them in the Drive lists at once and moves each through moveToFolder', async () => {
+    seed();
+    const pending = deferred<boolean>();
+    mocks.moveToFolder.mockReturnValue(pending.promise);
+    const mutation = mountMutation(createBulkMoveToProjectDssEntityMutation);
+    const result = mutation.mutateAsync({
+      entities: [
+        { ...entity('intake', 'database'), name: 'Client intake' },
+        { ...entity('survey', 'form'), name: 'Survey' },
+      ],
+      project: { id: 'clients', name: 'Clients' },
+    });
+    await vi.waitFor(() =>
+      expect(filed()).toEqual({ database: 'clients', form: 'clients' })
+    );
+    pending.resolve(true);
+    await result;
+    expect(mocks.moveToFolder.mock.calls).toEqual([
+      [{ itemType: 'database', id: 'intake', folderId: 'clients' }],
+      [{ itemType: 'form', id: 'survey', folderId: 'clients' }],
+    ]);
+    expect(
+      client.getQueryState(databasesKeys.list.queryKey)?.isInvalidated
+    ).toBe(true);
+    expect(client.getQueryState(formsKeys.list.queryKey)?.isInvalidated).toBe(
+      true
+    );
+  });
+
+  it('puts them back when the move fails', async () => {
+    seed();
+    mocks.moveToFolder.mockResolvedValue(false);
+    const mutation = mountMutation(createBulkMoveToProjectDssEntityMutation);
+    await expect(
+      mutation.mutateAsync({
+        entities: [
+          { ...entity('intake', 'database'), name: 'Client intake' },
+          { ...entity('survey', 'form'), name: 'Survey' },
+        ],
+        project: { id: 'clients', name: 'Clients' },
+      })
+    ).rejects.toThrow();
+    expect(filed()).toEqual({ database: null, form: 'old' });
+  });
+
+  it('takes them out of their folder', async () => {
+    seed();
+    const mutation = mountMutation(
+      createBulkRemoveFromProjectDssEntityMutation
+    );
+    await mutation.mutateAsync({
+      entities: [entity('intake', 'database'), entity('survey', 'form')],
+    });
+    expect(filed()).toEqual({ database: null, form: null });
+    expect(mocks.moveToFolder.mock.calls).toEqual([
+      [{ itemType: 'database', id: 'intake', folderId: null }],
+      [{ itemType: 'form', id: 'survey', folderId: null }],
+    ]);
+  });
+});
+
+describe('channel deletion', () => {
+  it.each([true, false])(
+    'keeps confirmed channel deletions removed when a sibling fails (GraphQL: %s)',
+    async (graphql) => {
+      mocks.graphqlEnabled.mockReturnValue(graphql);
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      const soup = cacheRows(mocks.removeSoup, mocks.rollbackSoup, [
+        'deleted-channel',
+        'failed',
+        'other',
+      ]);
+      const search = cacheRows(mocks.removeSearch, mocks.rollbackSearch, [
+        'deleted-channel',
+        'failed',
+        'other',
+      ]);
+      const invalidate = vi.spyOn(client, 'invalidateQueries');
+      const failure = deferred<boolean>();
+      mocks.deleteItem.mockReturnValue(failure.promise);
+      const deleted = entity('deleted-channel', 'channel');
+      const failed = entity('failed');
+      const { mutation } = mount();
+
+      const result = expect(
+        mutation.mutateAsync([deleted, failed])
+      ).rejects.toMatchObject({
+        deletedEntities: [deleted],
+        failedEntities: [failed],
+        results: [true, false],
+      });
+      await vi.waitFor(() => expect(mocks.deleteItem).toHaveBeenCalledOnce());
+      expect(soup()).toEqual(['other']);
+      expect(search()).toEqual(['other']);
+      expect(mutation.isPending).toBe(true);
+      failure.reject(new Error('document delete failed'));
+      await result;
+
+      expect(soup()).toEqual(['failed', 'other']);
+      expect(search()).toEqual(['failed', 'other']);
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: channelKeys._def });
+      expect(mocks.failure).toHaveBeenCalledWith(
+        'Deleted 1 of 2 items; 1 failed'
+      );
+    }
+  );
+
+  it.each([true, false])(
+    'deletes channels and refreshes channel caches (GraphQL: %s)',
+    async (graphql) => {
+      mocks.graphqlEnabled.mockReturnValue(graphql);
+      const invalidate = vi.spyOn(client, 'invalidateQueries');
+      const { mutation } = mount();
+
+      await expect(
+        mutation.mutateAsync([entity('channel-id', 'channel')])
+      ).resolves.toEqual([true]);
+
+      if (graphql) {
+        expect(mocks.deleteCallGraphql).toHaveBeenCalledWith({
+          type: 'CHANNEL',
+          id: 'channel-id',
+        });
+        expect(mocks.deleteChannel).not.toHaveBeenCalled();
+      } else {
+        expect(mocks.deleteChannel).toHaveBeenCalledWith({
+          channel_id: 'channel-id',
+        });
+        expect(mocks.deleteCallGraphql).not.toHaveBeenCalled();
+      }
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: channelKeys._def });
+    }
+  );
+});

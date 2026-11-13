@@ -1,0 +1,117 @@
+---
+source: crates/folds/claude_fold/src/test.rs
+expression: messages
+---
+[
+  {
+    "turn": 0,
+    "author": {
+      "kind": "user",
+      "userId": null
+    },
+    "requestId": null,
+    "parts": [
+      {
+        "kind": "text",
+        "text": "Read the file."
+      }
+    ],
+    "stop": null,
+    "pending": false,
+    "postedAt": null
+  },
+  {
+    "turn": 0,
+    "author": {
+      "kind": "agent"
+    },
+    "requestId": null,
+    "parts": [
+      {
+        "kind": "thought",
+        "text": "I will inspect it."
+      },
+      {
+        "kind": "tool_use",
+        "id": "t1",
+        "name": {
+          "kind": "native",
+          "name": "Read"
+        },
+        "status": "failed",
+        "detail": {
+          "kind": "read",
+          "paths": []
+        }
+      },
+      {
+        "kind": "text",
+        "text": "The file is missing."
+      }
+    ],
+    "stop": {
+      "kind": "end_turn"
+    },
+    "pending": false,
+    "postedAt": null
+  },
+  {
+    "turn": 1,
+    "author": {
+      "kind": "user",
+      "userId": null
+    },
+    "requestId": null,
+    "parts": [
+      {
+        "kind": "text",
+        "text": "Thanks."
+      }
+    ],
+    "stop": null,
+    "pending": false,
+    "postedAt": null
+  },
+  {
+    "turn": 1,
+    "author": {
+      "kind": "agent"
+    },
+    "requestId": null,
+    "parts": [
+      {
+        "kind": "text",
+        "text": "You are welcome."
+      }
+    ],
+    "stop": {
+      "kind": "end_turn"
+    },
+    "pending": false,
+    "postedAt": null
+  },
+  {
+    "turn": 2,
+    "author": {
+      "kind": "agent"
+    },
+    "requestId": null,
+    "parts": [
+      {
+        "kind": "task_notification",
+        "status": "failed",
+        "summary": "Background command \"Run tests\" failed with exit code 1",
+        "event": null
+      },
+      {
+        "kind": "text",
+        "text": "The tests failed."
+      }
+    ],
+    "stop": {
+      "kind": "end_turn"
+    },
+    "pending": false,
+    "postedAt": null
+  }
+]

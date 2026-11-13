@@ -1,0 +1,118 @@
+.site-header {
+  --nav-ink: #fff;
+  --nav-muted: #b8b8bd;
+  --nav-surface: rgb(18 18 20 / 78%);
+  --nav-edge: rgb(255 255 255 / 13%);
+  --nav-menu-surface: rgb(21 21 23 / 96%);
+  --nav-mobile-surface: #121214;
+  --nav-menu-shadow: 0 20px 60px #000a, inset 0 1px 0 #ffffff12;
+  font-family: Inter, 'Inter Variable', -apple-system, BlinkMacSystemFont, sans-serif;
+  color: var(--nav-ink);
+  font-weight: 370;
+  letter-spacing: 0;
+  isolation: isolate;
+  zoom: calc(1 / var(--site-scale, 1));
+}
+.site-header { position: fixed; z-index: 80; top: 20px; left: 24px; right: 24px; display: flex; align-items: flex-start; justify-content: space-between; pointer-events: none; }
+.site-page-vignette { position: fixed; inset: 0; z-index: 50; pointer-events: none; }
+.site-page-vignette::before, .site-page-vignette::after { content: ''; position: absolute; inset-inline: 0; height: clamp(80px, 12vh, 132px); opacity: 0.8; }
+.site-page-vignette::before { top: 0; background: linear-gradient(to bottom, #000 0%, #000d 25%, #0006 58%, transparent 100%); }
+.site-page-vignette::after { bottom: 0; background: linear-gradient(to top, #000 0%, #000d 22%, #0006 55%, transparent 100%); }
+.site-menu { position: relative; display: flex; align-items: center; pointer-events: auto; }
+/* Keep the hover path connected across the gap to the dropdown. */
+.site-header[data-menu-open=true] .site-menu::after { content: ''; position: absolute; top: 100%; left: 0; width: min(560px, calc(100vw - 64px)); height: 12px; }
+
+.site-menu-trigger { display: grid; place-items: center; width: 68px; height: 68px; margin-inline: -10px; padding: 0; border: 0; background: transparent; color: var(--nav-ink); border-radius: 50%; transition: background-color 180ms ease; }
+/* One hamburger on touch/narrow screens; desktop keeps its home/hover link. */
+.site-menu-toggle { display: none; cursor: pointer; }
+.site-menu-toggle > svg { width: 26px; height: 26px; }
+@media (hover: none), (max-width: 767px) {
+  .site-menu-home { display: none; }
+  .site-menu-toggle { display: grid; }
+}
+.site-menu-trigger:is(:hover, :focus-visible, [aria-expanded=true]) { background: color-mix(in srgb, var(--nav-ink) 8%, transparent); }
+.site-menu-mark { position: relative; display: block; width: 36px; height: 36px; }
+.site-menu-mark > span { position: absolute; inset: 0; background: currentColor; transition: clip-path 440ms cubic-bezier(.22,1,.36,1); }
+.site-menu-mark > span:nth-child(2) { transition-delay: 35ms; }
+.site-menu-mark > span:nth-child(3) { transition-delay: 70ms; }
+.site-menu-panel { position: absolute; top: calc(100% + 12px); left: 0; display: grid; grid-template-columns: 1fr 1.25fr 1fr; gap: 24px; width: min(560px, calc(100vw - 64px)); max-height: calc(100dvh - 140px); overflow-y: auto; padding: 24px; box-sizing: border-box; border-radius: 24px; background: var(--nav-menu-surface); border: 1px solid var(--nav-edge); box-shadow: var(--nav-menu-shadow); backdrop-filter: blur(28px); -webkit-backdrop-filter: blur(28px); animation: site-menu-in 180ms ease-out; }
+.site-menu-group h2 { margin: 0 0 12px; padding: 0 10px; font: inherit; font-size: 11px; color: var(--nav-muted); }
+.site-menu-panel a { display: block; color: var(--nav-ink); padding: 9px 10px; border-radius: 10px; font: inherit; font-size: 14px; line-height: 20px; text-decoration: none; }
+.site-menu-panel a:hover { background: #ffffff0a; }
+.site-header-actions { display: flex; align-items: center; gap: 12px; pointer-events: auto; }
+.site-nav-demo { position: relative; display: inline-flex; align-items: center; justify-content: center; min-height: 40px; box-sizing: border-box; padding: 8px 18px; border: 0; border-radius: 999px; background: var(--nav-surface); box-shadow: inset 0 1px 0 #ffffff12, inset 0 -1px 1px #0006; color: var(--nav-muted); font: inherit; font-size: 14px; line-height: 24px; white-space: nowrap; text-decoration: none; }
+.site-nav-demo::after { content: ''; position: absolute; inset: 0; border-radius: inherit; padding: 1px; background: linear-gradient(135deg, #ffffff59 0%, #ffffff1f 24%, #ffffff05 60%, #ffffff14 100%); -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite: exclude; pointer-events: none; }
+.site-nav-demo:hover { color: var(--nav-ink); }
+.site-nav-start { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 12px; width: 140px; min-height: 40px; box-sizing: border-box; padding: 8px 12px; border: 0; border-radius: 999px; color: #000; background: linear-gradient(165deg, #fff 35%, #ededee 100%); box-shadow: inset 0 1px 0 #fff, inset 0 -2px 2px #00000018, 0 1px 0 #ffffff26, 0 10px 24px -12px #0008; font: inherit; font-size: 14px; font-weight: 500; line-height: 24px; white-space: nowrap; text-decoration: none; transition: filter 180ms ease; }
+/* The standard one-pixel glass rim, without an extruded base. */
+.site-nav-start::after { content: ''; position: absolute; inset: 0; border-radius: inherit; padding: 1px; background: linear-gradient(135deg, #ffffffb3 0%, #ffffff33 24%, #0000000a 60%, #00000038 100%); -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite: exclude; pointer-events: none; }
+.site-nav-start svg { flex-shrink: 0; width: 20px; height: 20px; }
+/* The highlight is clipped to the pill and sits beneath its text and rim. */
+.site-nav-start, .site-nav-demo { isolation: isolate; }
+.site-nav-start::before, .site-nav-demo::before { content: ''; position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; opacity: 0; transition: opacity 220ms ease; }
+.site-nav-demo::before { background: radial-gradient(ellipse 70% 150% at var(--glow-x, 50%) var(--glow-y, 50%), rgb(255 255 255 / 16%), rgb(255 255 255 / 5%) 42%, transparent 75%); }
+.site-nav-start::before { background: radial-gradient(ellipse 70% 150% at var(--glow-x, 50%) var(--glow-y, 50%), rgb(185 201 222 / 30%), rgb(255 255 255 / 75%) 38%, transparent 75%); }
+@media (hover: hover) and (pointer: fine) {
+  .site-nav-start:hover::before, .site-nav-demo:hover::before { opacity: .4; }
+}
+.site-nav-start:focus-visible::before, .site-nav-demo:focus-visible::before { opacity: .4; }
+@media (prefers-reduced-motion: reduce) {
+  .site-nav-start::before, .site-nav-demo::before { transition: none; }
+}
+.site-nav-start:active { filter: brightness(.93); }
+@keyframes site-menu-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+.site-header :focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+@media (min-width: 640px) { .site-header { left: 40px; } }
+@media (max-width: 600px) {
+  .site-header { top: 14px; left: 16px; right: 16px; align-items: center; }
+  .site-menu-trigger { width: 54px; height: 54px; margin-inline: -5px; }
+  .site-menu-mark { width: 32px; height: 32px; }
+  .site-header-actions { gap: 8px; }
+  .site-nav-demo { min-height: 40px; padding: 8px 12px; font-size: 13px; }
+  .site-nav-start { gap: 8px; font-size: 13px; }
+  .site-nav-start svg { width: 18px; height: 18px; }
+  .site-header a.site-nav-start { width: auto; min-height: 40px; padding: 8px 14px; gap: 8px; font-size: 13px; }
+  .site-menu-panel { grid-template-columns: 1fr 1.2fr; width: calc(100vw - 32px); max-height: calc(100dvh - 96px); padding: 20px 14px; gap: 20px 12px; }
+  .site-menu-group:first-child { grid-row: span 2; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .site-menu-trigger, .site-menu-mark > span, .site-nav-start { transition: none; }
+  .site-menu-panel { animation: none; }
+}
+/* The three bars fold into a close mark while the menu is open: the outer
+   bars rotate onto the diagonals and the middle bar collapses. Each state
+   keeps nine points so the shapes interpolate. Hover and focus leave the
+   bars alone, because a touch browser keeps :hover after a tap. */
+.site-menu-mark > span:nth-child(1) { clip-path: polygon(12.500% 20.833%, 50.000% 20.833%, 87.500% 20.833%, 87.500% 25.000%, 87.500% 29.167%, 50.000% 29.167%, 12.500% 29.167%, 12.500% 25.000%, 12.500% 20.833%); }
+.site-menu-trigger[aria-expanded=true] .site-menu-mark > span:nth-child(1) { clip-path: polygon(26.430% 20.540%, 52.950% 47.050%, 79.460% 73.570%, 76.520% 76.520%, 73.570% 79.460%, 47.050% 52.950%, 20.540% 26.430%, 23.480% 23.480%, 26.430% 20.540%); }
+.site-menu-mark > span:nth-child(2) { clip-path: polygon(12.500% 45.833%, 50.000% 45.833%, 87.500% 45.833%, 87.500% 50.000%, 87.500% 54.167%, 50.000% 54.167%, 12.500% 54.167%, 12.500% 50.000%, 12.500% 45.833%); }
+.site-menu-trigger[aria-expanded=true] .site-menu-mark > span:nth-child(2) { clip-path: polygon(50.000% 45.833%, 50.000% 45.833%, 50.000% 45.833%, 50.000% 50.000%, 50.000% 54.167%, 50.000% 54.167%, 50.000% 54.167%, 50.000% 50.000%, 50.000% 45.833%); }
+.site-menu-mark > span:nth-child(3) { clip-path: polygon(12.500% 70.833%, 50.000% 70.833%, 87.500% 70.833%, 87.500% 75.000%, 87.500% 79.167%, 50.000% 79.167%, 12.500% 79.167%, 12.500% 75.000%, 12.500% 70.833%); }
+.site-menu-trigger[aria-expanded=true] .site-menu-mark > span:nth-child(3) { clip-path: polygon(20.540% 73.570%, 47.050% 47.050%, 73.570% 20.540%, 76.520% 23.480%, 79.460% 26.430%, 52.950% 52.950%, 26.430% 79.460%, 23.480% 76.520%, 20.540% 73.570%); }
+
+.site-menu-panel[hidden] { display: none; }
+
+/* Solid mobile navigation with compact, comfortable two-column link groups. */
+@media (max-width: 767px) {
+  body:has(.site-header[data-menu-open=true]),
+  .onboarding-flow:has(.site-header[data-menu-open=true]) > .overflow-y-auto { overflow: hidden; }
+  .site-header[data-menu-open=true]::before { content: ''; position: fixed; inset: 0 0 auto; height: calc(84px + env(safe-area-inset-top, 0px)); z-index: 2; background: var(--nav-mobile-surface); }
+  .site-header[data-menu-open=true] .site-header-actions { visibility: hidden; pointer-events: none; }
+  .site-header[data-menu-open=true] :is(.site-menu-trigger, .site-menu-toggle) { position: relative; z-index: 3; background: transparent; }
+  .site-menu-panel {
+    position: fixed; inset: 0; z-index: 1; display: flex; flex-direction: column;
+    width: 100%; height: 100dvh; max-height: none; gap: 28px;
+    padding: calc(84px + env(safe-area-inset-top, 0px)) 20px calc(28px + env(safe-area-inset-bottom, 0px));
+    border: 0; border-radius: 0; background: var(--nav-mobile-surface); box-shadow: none;
+    backdrop-filter: none; -webkit-backdrop-filter: none; overscroll-behavior: contain;
+    animation: site-menu-in 240ms cubic-bezier(.16, 1, .3, 1);
+  }
+  .site-menu-group { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 16px; }
+  .site-menu-group h2 { grid-column: 1 / -1; margin: 0 0 8px; padding: 0 10px; font-size: 11px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; color: var(--nav-muted); }
+  .site-menu-panel a { display: flex; align-items: center; box-sizing: border-box; min-height: 48px; padding: 10px; border: 0; border-radius: 8px; font-size: 16px; font-weight: 370; line-height: 24px; letter-spacing: 0; }
+  .site-menu-group:first-child a { font-size: 18px; }
+  .site-menu-panel a:active { opacity: .55; }
+}
+@media (max-width: 767px) and (prefers-reduced-motion: reduce) {
+  .site-menu-panel { animation: none; }
+}

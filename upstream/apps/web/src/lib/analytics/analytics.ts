@@ -1,0 +1,636 @@
+import type { AppEventNames, AppEvents } from '@app/lib/analytics/app-events';
+import {
+  type GoogleConversionAction,
+  googleConversionSendTo,
+} from '@app/lib/analytics/googleConversions';
+import {
+  initializeGoogleAnalytics,
+  initializeMetaPixel,
+} from '@app/lib/analytics/providers';
+import { frontendInstanceId } from '@app/observability/frontend-instance';
+import {
+  DEV_MODE_ENV,
+  LOCAL_ONLY,
+  PROD_MODE_ENV,
+} from '@core/constant/featureFlags';
+import { isTouchDevice } from '@core/mobile/isTouchDevice';
+import { getPlatform, isTauri } from '@core/util/platform';
+import {
+  redactLinkTokenProperties,
+  redactLinkTokens,
+  redactPrivatePageTokens,
+} from '@core/util/telemetryUrl';
+import { getWebOrigin } from '@core/util/webOrigin';
+import type { Language } from '@service-auth/generated/schemas/language';
+import type { Team } from '@service-auth/generated/schemas/team';
+import { type CaptureOptions, PostHog } from 'posthog-js';
+import { match } from 'ts-pattern';
+import { isIgnorableException, rewriteNativeFrameUrls } from './exceptionList';
+import { normalizeAnalyticsEmail } from './mobileCaptureIdentity';
+import { getPlanAnalyticsProperties } from './planProperties';
+import {
+  clearMobileEmailAttribution,
+  mobileEmailPersonProperties,
+} from './signupAttribution';
+
+/**
+ * Resolves the user's device context for analytics enrichment.
+ *
+ * `getPlatform()` runtime-detects via `isTauri()` + `@tauri-apps/plugin-os`:
+ *   - Tauri iOS/Android → 'ios' | 'android' → 'mobile-app'
+ *   - Tauri desktop OS → 'desktop' → 'desktop-app'
+ *   - Plain browser → 'web'
+ *
+ * On web, `isTouchDevice()` (checks `pointer: coarse` media query) distinguishes
+ * a phone/tablet browser ('mobile-web') from a desktop browser ('desktop-web').
+ */
+const DEVICE_PROPERTY = 'macro_device' as const;
+const ENVIRONMENT_PROPERTY = 'macro_environment' as const;
+const PLAN_TIER_AT_EVENT_PROPERTY = 'plan_tier_at_event' as const;
+const HAS_PAID_ACCESS_AT_EVENT_PROPERTY = 'has_paid_access_at_event' as const;
+/**
+ * The interface language being shown, as a BCP 47 tag (`en`, `zh-Hans`):
+ * the person's choice, else the team's, else the browser's, else English.
+ * A person property, so a breakdown uses the current language.
+ */
+const INTERFACE_LANGUAGE_PROPERTY = 'interface_language' as const;
+/**
+ * Person property every flag evaluation carries, so a flag can target one
+ * deployment: dev and prod share user IDs. Backend loads send the same key.
+ */
+const FLAG_ENVIRONMENT_PROPERTY = 'environment' as const;
+/** PostHog group type for team analytics; server events send the same key. */
+const TEAM_GROUP_TYPE = 'team' as const;
+
+function getEnvironment(): 'dev' | 'prod' | 'unknown' {
+  if (PROD_MODE_ENV) return 'prod';
+  if (DEV_MODE_ENV) return 'dev';
+  return 'unknown';
+}
+
+function getDeviceType():
+  | 'desktop-app'
+  | 'desktop-web'
+  | 'mobile-web'
+  | 'mobile-app' {
+  const platform = getPlatform();
+  if (platform === 'ios' || platform === 'android') return 'mobile-app';
+  if (platform === 'desktop') return 'desktop-app';
+  return isTouchDevice() ? 'mobile-web' : 'desktop-web';
+}
+
+export type AnalyticsProvider = 'ga' | 'meta-pixel' | 'posthog';
+
+const DEFAULT_ANALYTICS_PROVIDERS: AnalyticsProvider[] = ['posthog'];
+
+type EventName = AppEventNames | (string & {});
+
+type TrackOptions = {
+  posthog?: CaptureOptions;
+};
+
+type TrackFn = <E extends EventName>(
+  event: E,
+  data?: E extends keyof AppEvents ? AppEvents[E] : Record<string, unknown>,
+  providersToSendTo?: AnalyticsProvider[],
+  options?: TrackOptions
+) => void;
+
+type TeamGroupInfo = Pick<Team, 'id' | 'name' | 'enterprise'>;
+
+interface UserIdentifyInfo {
+  email: string;
+  os: string;
+  /** Person properties applied once (`$set_once`), not on the event. */
+  setOnce: Record<string, string>;
+}
+
+const MERGED_EMAIL_KEY = 'macro_ph_merged_email:';
+
+const readMergedEmail = (userId: string): string | null => {
+  try {
+    return localStorage.getItem(MERGED_EMAIL_KEY + userId);
+  } catch {
+    return null;
+  }
+};
+
+const rememberMergedEmail = (userId: string, email: string) => {
+  try {
+    localStorage.setItem(MERGED_EMAIL_KEY + userId, email);
+  } catch {
+    // The merge was still sent. A repeat is safe; PostHog no-ops an id that
+    // already belongs to this person.
+  }
+};
+
+interface PageViewOptions {
+  /** Override the page path (defaults to window.location.pathname) */
+  path?: string;
+  /** Override the page location/URL (defaults to window.location.href) */
+  location?: string;
+}
+
+const GA_ID = 'G-52HPEL3FTV';
+
+// Meta Pixel distinguishes standard events (fbq('track', ...)) from custom
+// events (fbq('trackCustom', ...)). Calling `track` with a non-standard name
+// works but triggers Pixel Helper warnings and may affect Ads Manager
+// categorization. https://developers.facebook.com/docs/meta-pixel/reference
+const META_STANDARD_EVENT_NAMES = [
+  'AddPaymentInfo',
+  'AddToCart',
+  'AddToWishlist',
+  'CompleteRegistration',
+  'Contact',
+  'CustomizeProduct',
+  'Donate',
+  'FindLocation',
+  'InitiateCheckout',
+  'Lead',
+  'PageView',
+  'Purchase',
+  'Schedule',
+  'Search',
+  'StartTrial',
+  'SubmitApplication',
+  'Subscribe',
+  'ViewContent',
+] as const;
+
+export type MetaStandardEvent = (typeof META_STANDARD_EVENT_NAMES)[number];
+
+const META_STANDARD_EVENTS: Set<string> = new Set(META_STANDARD_EVENT_NAMES);
+
+// Privacy filter lists block the upstream filename; the proxy maps this opaque alias back.
+const POSTHOG_RECORDER_SCRIPT_NAME = 'posthog-recorder.js';
+const POSTHOG_RECORDER_PROXY_SCRIPT_NAME = 'runtime.js';
+
+function isPrivateCallPage() {
+  const path = window.location.pathname + window.location.hash;
+  return redactPrivatePageTokens(path) !== path;
+}
+
+// `reset()` clears flag person properties, so reapply after it.
+function setFlagEnvironment(
+  instance: Pick<PostHog, 'setPersonPropertiesForFlags'>
+) {
+  instance.setPersonPropertiesForFlags(
+    // Local stack bundles say `local`, as local backends do.
+    { [FLAG_ENVIRONMENT_PROPERTY]: LOCAL_ONLY ? 'local' : getEnvironment() },
+    false
+  );
+}
+
+const initializePosthog = (instance: PostHog) => {
+  const key = import.meta.env.VITE_POSTHOG_API_KEY;
+  if (!key) return;
+
+  instance.init(key, {
+    api_host: 'https://macro-prox.macroverse.workers.dev/i/ph',
+    ui_host: 'https://us.posthog.com',
+    defaults: '2026-01-30',
+    // Scroll depth listens to every scroll in the app (capture phase) and
+    // reads window geometry, forcing a layout per scroll. The app shell never
+    // scrolls the window, so the depth it reports is always zero.
+    disable_scroll_properties: true,
+    // PostHog captures utm_* and click ids on its own. `signup_flow` is added
+    // on the mobile-email desktop link so that path is its own campaign field.
+    custom_campaign_params: ['signup_flow'],
+    // Runs before the first `/flags` request.
+    loaded: setFlagEnvironment,
+    prepare_external_dependency_script: (script) => {
+      const url = new URL(script.src);
+
+      if (url.pathname.endsWith(`/static/${POSTHOG_RECORDER_SCRIPT_NAME}`)) {
+        url.pathname = `/i/ph/static/${POSTHOG_RECORDER_PROXY_SCRIPT_NAME}`;
+        script.src = url.toString();
+      }
+
+      return script;
+    },
+    before_send: (cr) => {
+      // Call URLs are bearer capabilities and meeting content must not replay.
+      if (isPrivateCallPage()) return null;
+      if (cr) {
+        cr.properties = redactLinkTokenProperties(cr.properties);
+        cr.properties.frontend_instance_id = frontendInstanceId;
+        if (cr.$set) cr.$set = redactLinkTokenProperties(cr.$set);
+        if (cr.$set_once) {
+          cr.$set_once = redactLinkTokenProperties(cr.$set_once);
+        }
+        cr.properties.env = DEV_MODE_ENV
+          ? 'DEV'
+          : PROD_MODE_ENV
+            ? 'PROD'
+            : 'LOCAL';
+      }
+
+      if (cr?.event !== '$exception') return cr;
+
+      if (isIgnorableException(cr.properties.$exception_list)) return null;
+
+      if (isTauri()) {
+        rewriteNativeFrameUrls(cr.properties.$exception_list, getWebOrigin());
+      }
+
+      return cr;
+    },
+  });
+};
+
+const tryInitialize = (callback: VoidFunction) => {
+  try {
+    callback();
+  } catch (e) {
+    console.error('[Analytics] Failed to initialize providers:', e);
+  }
+};
+
+const createAnalytics = () => {
+  const posthog = new PostHog();
+
+  const disabled = import.meta.env.DEV === true;
+  // Meta can submit events through hidden frames. Native navigation handlers
+  // can mistake those loads for external links and open the system browser.
+  const metaPixelEnabled = !isTauri();
+
+  const initializeProviders = () => {
+    if (disabled) return;
+
+    if (!isPrivateCallPage()) {
+      tryInitialize(initializeGoogleAnalytics);
+      if (metaPixelEnabled) tryInitialize(initializeMetaPixel);
+    }
+    tryInitialize(() => initializePosthog(posthog));
+  };
+
+  initializeProviders();
+
+  const sendEvent = (
+    provider: AnalyticsProvider,
+    event: EventName,
+    data?: Record<string, unknown>,
+    options?: TrackOptions & { eventID?: string }
+  ) => {
+    if (disabled || isPrivateCallPage()) return;
+
+    const enriched = {
+      ...data,
+      [DEVICE_PROPERTY]: getDeviceType(),
+      [ENVIRONMENT_PROPERTY]: getEnvironment(),
+    };
+
+    try {
+      match(provider)
+        .with('ga', () => {
+          gtag('event', event, enriched);
+        })
+        .with('meta-pixel', () => {
+          if (!metaPixelEnabled) return;
+          const fbqMethod = META_STANDARD_EVENTS.has(event)
+            ? 'track'
+            : 'trackCustom';
+          fbq(
+            fbqMethod,
+            event,
+            enriched,
+            options?.eventID ? { eventID: options.eventID } : undefined
+          );
+        })
+        .with('posthog', () => {
+          posthog.capture(event, enriched, options?.posthog);
+        })
+        .exhaustive();
+    } catch (e) {
+      console.error(`[Analytics] Failed to send event to ${provider}:`, e);
+    }
+  };
+
+  const track: TrackFn = (
+    event: EventName,
+    data?: Record<string, unknown>,
+    providersToSendTo: AnalyticsProvider[] = DEFAULT_ANALYTICS_PROVIDERS,
+    options?: TrackOptions
+  ) => {
+    for (const provider of providersToSendTo) {
+      sendEvent(provider, event, data, options);
+    }
+  };
+
+  /**
+   * Fires a Meta Pixel **standard** event via `fbq('track', ...)`. `event` is
+   * typed to `MetaStandardEvent` (Lead, Purchase, CompleteRegistration, etc.),
+   * so custom names and typos fail at compile time.
+   *
+   * Prefer this over `track(..., ['meta-pixel'])` for anything that maps to a
+   * standard event: Meta's optimization models are pre-trained on the standard
+   * taxonomy (faster learning-phase exit), standard events get priority slots
+   * in iOS 14.5+ Aggregated Event Measurement, and Ads Manager surfaces them
+   * natively in reports and conversion pickers.
+   *
+   * To split one standard event across multiple surfaces (e.g. two `Lead`
+   * funnels), attach a `content_name` in `data` and filter on it via a Custom
+   * Conversion in Ads Manager.
+   *
+   * For the rare event with no standard equivalent, fall back to
+   * `track(event, data, ['meta-pixel'])` — that path uses `trackCustom`.
+   *
+   * Pass `options.eventID` when the backend fires the same event through the
+   * Conversions API — Meta dedupes browser and server fires that share an
+   * event name + event id, so the pair counts once while keeping the
+   * browser's click-id cookies for attribution.
+   */
+  const trackMeta = (
+    event: MetaStandardEvent,
+    data?: Record<string, unknown>,
+    options?: { eventID?: string }
+  ) => {
+    sendEvent('meta-pixel', event, data, options);
+  };
+
+  /**
+   * Fires a Google Ads conversion via `gtag('event', 'conversion', ...)`.
+   * `action` is typed to `GoogleConversionAction`, resolved to its `AW-{id}/{label}`
+   * `send_to` via `googleConversionSendTo`.
+   *
+   * Pass `transaction_id` whenever possible — Google dedupes server-side on it,
+   * which matters here because both call sites fire from `onMount` and a refresh
+   * re-fires. A user id (post-signup) or the submitted email (mobile lead capture)
+   * are both fine.
+   *
+   * Per-action `value` lets a single campaign optimize across multiple primaries
+   * (Smart Bidding sums values across the goal). See `googleConversions.ts`.
+   */
+  const trackGoogleConversion = (
+    action: GoogleConversionAction,
+    data?: { value?: number; currency?: string; transaction_id?: string }
+  ) => {
+    if (disabled) return;
+
+    try {
+      gtag('event', 'conversion', {
+        send_to: googleConversionSendTo(action),
+        ...data,
+      });
+    } catch (e) {
+      console.error('[Analytics] Failed to send Google Ads conversion:', e);
+    }
+  };
+
+  /**
+   * Mobile capture identifies PostHog as the normalized email. This app and
+   * the create-user webhook use `macro|{email}`. `identify` only merges an
+   * anonymous id into an identified one, and `alias` refuses an id that was
+   * already passed to `identify`, so those two persons stay split.
+   * `$merge_dangerously` is the merge PostHog applies; the event's distinct
+   * id is the person that survives.
+   *
+   * The account id is preferred, matching server `sign_up`. When this browser
+   * is already identified as the email (in-app capture), `identify(accountId)`
+   * is dropped, so the account id is merged into that email person instead.
+   */
+  const linkMobileCapturePerson = (
+    userId: string,
+    email: string | null | undefined
+  ) => {
+    if (disabled) return;
+    const normalized = normalizeAnalyticsEmail(email);
+    if (!normalized || normalized === userId) return;
+    if (readMergedEmail(userId) === normalized) return;
+
+    try {
+      const current = posthog.get_distinct_id();
+      if (current === userId) {
+        posthog.capture('$merge_dangerously', { alias: normalized });
+        rememberMergedEmail(userId, normalized);
+        return;
+      }
+      if (current === normalized) {
+        posthog.capture('$merge_dangerously', { alias: userId });
+        rememberMergedEmail(userId, normalized);
+      }
+    } catch (e) {
+      console.error('[Analytics] Failed to link mobile capture:', e);
+    }
+  };
+
+  const identify = (userID: string, info: Partial<UserIdentifyInfo>) => {
+    if (disabled) return;
+
+    const { setOnce, email: rawEmail, ...rest } = info;
+    const email = normalizeAnalyticsEmail(rawEmail);
+    const properties = {
+      ...rest,
+      ...(email ? { email } : {}),
+    };
+
+    try {
+      gtag('config', GA_ID, {
+        user_id: userID,
+        ...(email && { email }),
+        ...(rest.os && { os: rest.os }),
+      });
+
+      if (metaPixelEnabled) {
+        fbq('init', '639142540393286', {
+          external_id: userID,
+          em: email || undefined,
+        });
+      }
+
+      if (setOnce && Object.keys(setOnce).length > 0) {
+        posthog.identify(userID, properties, setOnce);
+      } else {
+        posthog.identify(userID, properties);
+      }
+      linkMobileCapturePerson(userID, email);
+      // The desktop link's parameters are cookied before the identity-provider
+      // redirect strips the query string. Apply them only after this identify
+      // succeeds, then drop the cookie so a later account on this browser
+      // cannot inherit the campaign.
+      const attribution = mobileEmailPersonProperties();
+      if (attribution) {
+        posthog.setPersonProperties(attribution.set, attribution.once);
+        clearMobileEmailAttribution();
+      }
+    } catch (e) {
+      console.error('[Analytics] Failed to identify user:', e);
+    }
+  };
+
+  const setPlanProperties = (licenseStatus: string | undefined) => {
+    if (disabled) return;
+
+    try {
+      const properties = getPlanAnalyticsProperties(licenseStatus);
+
+      posthog.setPersonProperties(properties.person);
+      posthog.register(properties.event);
+    } catch (e) {
+      console.error('[Analytics] Failed to set plan properties:', e);
+    }
+  };
+
+  // Person properties are per PostHog identity. Forget the last value on
+  // reset so the next account is recorded even when the tag matches.
+  let reportedInterfaceLanguage: Language | undefined;
+
+  const setInterfaceLanguage = (language: Language) => {
+    if (disabled || reportedInterfaceLanguage === language) return;
+
+    try {
+      posthog.setPersonProperties({ [INTERFACE_LANGUAGE_PROPERTY]: language });
+      reportedInterfaceLanguage = language;
+    } catch (e) {
+      console.error('[Analytics] Failed to set interface language:', e);
+    }
+  };
+
+  // `group` with properties captures a `$groupidentify` event, so only send
+  // it when the team or its properties change, not on every team refetch.
+  let syncedTeamGroupKey: string | undefined;
+
+  const setTeamGroup = (team: TeamGroupInfo) => {
+    if (disabled) return;
+
+    const key = `${team.id}:${team.name}:${team.enterprise}`;
+    if (syncedTeamGroupKey === key) return;
+
+    try {
+      posthog.group(TEAM_GROUP_TYPE, team.id, {
+        name: team.name,
+        enterprise: team.enterprise,
+      });
+      syncedTeamGroupKey = key;
+    } catch (e) {
+      console.error('[Analytics] Failed to set team group:', e);
+    }
+  };
+
+  const clearTeamGroup = () => {
+    if (disabled) return;
+
+    syncedTeamGroupKey = undefined;
+    try {
+      // The group persists across reloads; clear it only when one is set,
+      // since `resetGroups` also reloads feature flags.
+      if (posthog.getGroups()[TEAM_GROUP_TYPE] === undefined) return;
+      posthog.resetGroups();
+    } catch (e) {
+      console.error('[Analytics] Failed to clear team group:', e);
+    }
+  };
+
+  const reset = () => {
+    if (disabled) return;
+
+    try {
+      gtag('config', GA_ID, { user_id: undefined });
+
+      // `posthog.reset()` clears the persisted groups.
+      syncedTeamGroupKey = undefined;
+
+      posthog.unregister(PLAN_TIER_AT_EVENT_PROPERTY);
+      posthog.unregister(HAS_PAID_ACCESS_AT_EVENT_PROPERTY);
+      reportedInterfaceLanguage = undefined;
+      posthog.reset();
+      setFlagEnvironment(posthog);
+    } catch (e) {
+      console.error('[Analytics] Failed to reset:', e);
+    }
+  };
+
+  const pageView = (pageTitle: string, opts?: PageViewOptions) => {
+    if (disabled) return;
+
+    if (isPrivateCallPage()) return;
+    const pagePath = redactLinkTokens(opts?.path ?? window.location.pathname);
+    const pageLocation = redactLinkTokens(
+      opts?.location ?? window.location.href
+    );
+    const deviceType = getDeviceType();
+    const environment = getEnvironment();
+
+    try {
+      gtag('event', 'page_view', {
+        [DEVICE_PROPERTY]: deviceType,
+        [ENVIRONMENT_PROPERTY]: environment,
+        page_title: pageTitle,
+        page_location: pageLocation,
+        page_path: pagePath,
+      });
+
+      if (metaPixelEnabled) {
+        fbq('track', 'PageView', {
+          [DEVICE_PROPERTY]: deviceType,
+          [ENVIRONMENT_PROPERTY]: environment,
+          content_name: pageTitle,
+        });
+      }
+
+      posthog.capture('$pageview', {
+        [DEVICE_PROPERTY]: deviceType,
+        [ENVIRONMENT_PROPERTY]: environment,
+        $current_url: pageLocation,
+        $pathname: pagePath,
+        $title: pageTitle,
+      });
+    } catch (e) {
+      console.error('[Analytics] Failed to send page_view:', e);
+    }
+  };
+
+  return {
+    posthog,
+    initializeProviders,
+    track,
+    trackMeta,
+    trackGoogleConversion,
+    identify,
+    linkMobileCapturePerson,
+    setPlanProperties,
+    setInterfaceLanguage,
+    setTeamGroup,
+    clearTeamGroup,
+    reset,
+    pageView,
+  };
+};
+
+export type AnalyticsInterface = {
+  posthog: PostHog;
+  track: TrackFn;
+  trackMeta: (
+    event: MetaStandardEvent,
+    data?: Record<string, unknown>,
+    options?: { eventID?: string }
+  ) => void;
+  trackGoogleConversion: (
+    action: GoogleConversionAction,
+    data?: { value?: number; currency?: string; transaction_id?: string }
+  ) => void;
+  identify: (userID: string, info: Partial<UserIdentifyInfo>) => void;
+  linkMobileCapturePerson: (
+    userId: string,
+    email: string | null | undefined
+  ) => void;
+  setPlanProperties: (licenseStatus: string | undefined) => void;
+  /** Records the interface language currently shown, for usage breakdowns. */
+  setInterfaceLanguage: (language: Language) => void;
+  /** Associates this user's events with their team (PostHog group analytics). */
+  setTeamGroup: (team: TeamGroupInfo) => void;
+  /** Detaches events from any team, e.g. after leaving it. */
+  clearTeamGroup: () => void;
+  reset: () => void;
+  pageView: (pageTitle: string, opts?: PageViewOptions) => void;
+};
+
+/**
+ * Singleton analytics instance for use in utility functions that cannot use hooks.
+ *
+ * @deprecated **Do not use in components.** Use `useAnalytics()` hook from
+ * `@app/lib/analytics/analytics-context` instead. This singleton exists only for
+ * standalone utility functions (e.g., upload.ts) that run outside Solid context.
+ */
+export const analytics = createAnalytics();

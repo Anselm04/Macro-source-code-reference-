@@ -1,0 +1,535 @@
+//! Egress service for delivering notifications.
+//!
+//! This service handles the worker-facing side of notifications:
+//! consuming from the queue and delivering via realtime, push, and email.
+
+use crate::domain::models::android::FCMMessage;
+use crate::domain::models::apple::{APNSPushNotification, Alert};
+use crate::domain::models::email_notification_digest::ports::{
+    ClaimResult, DigestBatch, DigestBatcher, MessageId, NotificationSendChecker,
+};
+use crate::domain::models::email_notification_digest::{
+    BulkDigestEgressStateMachine, ResumeMachineBRequest,
+};
+use crate::domain::models::mobile::{MessageAttributes, PushEndpointUnavailable, PushType};
+use crate::domain::models::queue_message::{
+    APNSTargets, ConnGatewayNotification, DeliveryFailure, DeliverySuccess, EmailCreateBundle,
+    EmailNotification, NotificationChannel, QueueMessage,
+};
+use crate::domain::models::{NotificationExtEmail, NotificationTypeName, RateLimitResult};
+use crate::domain::ports::{
+    EmailSender, NotificationEgress, NotificationQueue, NotificationRepository, NotificationSender,
+    RateLimitService, RealtimeSender,
+};
+use cowlike::CowLike;
+use either::Either;
+use futures::stream::{FuturesUnordered, StreamExt};
+use macro_user_id::user_id::MacroUserIdStr;
+use rootcause::prelude::ResultExt;
+use rootcause::{Report, report};
+use std::time::Duration;
+
+/// Maximum time to wait for a single notification delivery before timing out.
+pub(crate) const DELIVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Wraps a single mobile push notification send for the bulk-digest state machine.
+///
+/// The state machine calls [`NotificationSendChecker::send_notification`] to perform the actual
+/// push delivery, then records the SNS message ID or queues for batch email on failure.
+struct MobilePushSend<'a, M> {
+    mobile: &'a M,
+    endpoint_arn: &'a str,
+    notif: MobilePayload<'a>,
+    attributes: &'a MessageAttributes,
+}
+
+impl<M: NotificationSender> NotificationSendChecker for MobilePushSend<'_, M> {
+    type Ok = String;
+    type Err = Report;
+
+    async fn send_notification(self) -> Result<String, Report> {
+        match self.notif {
+            MobilePayload::Ios(notif) => {
+                self.mobile
+                    .send_ios_push_notification(self.endpoint_arn, notif, self.attributes)
+                    .await
+            }
+            MobilePayload::Android(notif) => {
+                self.mobile
+                    .send_android_push_notification(self.endpoint_arn, notif, self.attributes)
+                    .await
+            }
+        }
+    }
+
+    fn extract_message_id(res: &String) -> MessageId {
+        MessageId(res.clone())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MobilePayload<'a> {
+    Ios(&'a APNSPushNotification<serde_json::Value>),
+    Android(&'a FCMMessage<serde_json::Value>),
+}
+
+impl MobilePayload<'_> {
+    fn success(self) -> DeliverySuccess {
+        match self {
+            Self::Ios(_) => DeliverySuccess::Ios,
+            Self::Android(_) => DeliverySuccess::Android,
+        }
+    }
+}
+
+fn android_notification(
+    apns: &APNSTargets<serde_json::Value>,
+    recipient_id: MacroUserIdStr<'static>,
+) -> FCMMessage<serde_json::Value> {
+    let data = apns.notif.push_notification_data.clone();
+    let identifier = apns.attributes.collapse_key.clone();
+    if matches!(apns.attributes.push_type, PushType::Background) {
+        return FCMMessage::clear(identifier, data, recipient_id);
+    }
+    let (mut title, body) = match &apns.notif.aps.alert {
+        Some(Alert::Simple(body)) => (String::new(), body.clone()),
+        Some(Alert::Dictionary(alert)) => (
+            [alert.title.as_deref(), alert.subtitle.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" — "),
+            alert.body.clone().unwrap_or_default(),
+        ),
+        None => (String::new(), String::new()),
+    };
+    // Android rejects visible pushes without text. Keep silent clears above
+    // separate from alerts whose source payload omitted display content.
+    if title.trim().is_empty() && body.trim().is_empty() {
+        title = "New notification".to_owned();
+    }
+    FCMMessage::notification(title, body, identifier, data, recipient_id)
+}
+
+fn ios_notification(
+    apns: &APNSPushNotification<serde_json::Value>,
+    recipient_id: &MacroUserIdStr<'_>,
+) -> APNSPushNotification<serde_json::Value> {
+    let mut notification = apns.clone();
+    if let Some(data) = notification.push_notification_data.as_object_mut() {
+        data.insert("recipientId".into(), recipient_id.as_ref().into());
+    }
+    notification
+}
+
+#[cfg(test)]
+mod test;
+
+/// Service for delivering notifications (egress side).
+///
+/// Handles consuming from queue and delivering via realtime, push, and email.
+pub struct NotificationEgressService<Q, N, RT, M, E, R, S, D> {
+    /// Queue for receiving notification messages.
+    pub queue: Q,
+    /// Notification repository for DB operations.
+    pub repository: N,
+    /// Realtime notification sender.
+    pub realtime: RT,
+    /// Mobile push sender (APNS/FCM).
+    pub mobile: M,
+    /// Email sender.
+    pub email: E,
+    /// Rate limiter.
+    pub rate_limiter: R,
+    /// Bulk digest egress state machine.
+    pub state_machine: S,
+    /// Digest batcher for claiming ready email digests.
+    pub digest_batcher: D,
+}
+
+impl<Q, N, RT, M, E, R, S, D> NotificationEgressService<Q, N, RT, M, E, R, S, D>
+where
+    Q: NotificationQueue,
+    N: NotificationRepository,
+    RT: RealtimeSender,
+    M: NotificationSender,
+    E: EmailSender,
+    R: RateLimitService,
+    S: BulkDigestEgressStateMachine,
+    D: DigestBatcher,
+{
+    /// Deliver a notification from a queue message.
+    ///
+    /// Processes the delivery chain, attempting each channel and falling back
+    /// on failure. Returns a list of results for each delivery attempt.
+    ///
+    /// If a rate limit is configured and exceeded, returns an empty list (no delivery).
+    #[tracing::instrument(ret, skip_all, fields(message_type = message.message_type()))]
+    pub async fn deliver_notification(
+        &self,
+        message: QueueMessage<'static, serde_json::Value, serde_json::Value>,
+    ) -> Vec<Result<DeliverySuccess, Report<DeliveryFailure>>> {
+        let access_request = message.message_type() == "entity_access_requested";
+        let message_type = message.message_type().to_owned();
+        let content = message.into_inner();
+        if access_request {
+            let notification_id = match &content {
+                NotificationChannel::ConnGateway(conn) => conn.notif.notification_id,
+                NotificationChannel::Ios(apns) => {
+                    match serde_json::from_value::<crate::domain::models::apple::PushNotificationData>(
+                        apns.notif.push_notification_data.clone(),
+                    ) {
+                        Ok(data) => data.notification_id,
+                        Err(error) => {
+                            return vec![Err(report!(error).context(DeliveryFailure::Other))];
+                        }
+                    }
+                }
+                NotificationChannel::Email(_) => {
+                    return vec![Err(report!("access requests do not use email delivery")
+                        .context(DeliveryFailure::Other))];
+                }
+            };
+            match self
+                .repository
+                .notification_is_withdrawn(notification_id)
+                .await
+            {
+                Ok(true) => return Vec::new(),
+                Ok(false) => {}
+                Err(error) => return vec![Err(error.context(DeliveryFailure::Other))],
+            }
+        }
+
+        let results = match content {
+            NotificationChannel::ConnGateway(ref conn) => Either::Left([self
+                .deliver_conn_gateway(conn)
+                .await
+                .context(DeliveryFailure::Other)]),
+            NotificationChannel::Email(email) => {
+                Either::Left([self.deliver_email(&message_type, email).await])
+            }
+            NotificationChannel::Ios(apns) => Either::Right(
+                self.deliver_mobile(&apns)
+                    .await
+                    .into_iter()
+                    .map(|r| r.context(DeliveryFailure::Mobile)),
+            ),
+        };
+
+        results.into_iter().collect()
+    }
+
+    /// Deliver via connection gateway (WebSocket).
+    async fn deliver_conn_gateway(
+        &self,
+        conn: &ConnGatewayNotification<'static, serde_json::Value>,
+    ) -> Result<DeliverySuccess, Report> {
+        self.realtime
+            .send_notifications(&conn.recipients, &conn.notif)
+            .await?;
+        Ok(DeliverySuccess::ConnGateway)
+    }
+
+    /// Deliver mobile push (APNS and FCM) within one per-user fallback decision.
+    ///
+    /// Iterates per-user. If a user has a digest state machine entry, all
+    /// endpoints are passed to [`BulkDigestEgressStateMachine::continue_machine`]
+    /// in a single call. The state machine records SNS message IDs for successes
+    /// and only queues a batch email if ALL endpoints fail.
+    /// Users without a state machine entry are sent directly.
+    async fn deliver_mobile(
+        &self,
+        apns: &APNSTargets<serde_json::Value>,
+    ) -> Vec<Result<DeliverySuccess, Report>> {
+        let total: usize = apns
+            .ios_device_endpoints
+            .values()
+            .map(|u| u.endpoints.len() + u.android_endpoints.len())
+            .sum();
+        let mut out = Vec::with_capacity(total);
+
+        for (user_id, user_apns) in &apns.ios_device_endpoints {
+            let ios = ios_notification(&apns.notif, user_id);
+            let android = (!user_apns.android_endpoints.is_empty())
+                .then(|| android_notification(apns, user_id.clone()));
+            let checkers: Vec<_> = user_apns
+                .endpoints
+                .iter()
+                .map(|endpoint| MobilePushSend {
+                    mobile: &self.mobile,
+                    endpoint_arn: endpoint,
+                    notif: MobilePayload::Ios(&ios),
+                    attributes: &apns.attributes,
+                })
+                .chain(android.iter().flat_map(|android| {
+                    user_apns
+                        .android_endpoints
+                        .iter()
+                        .map(move |endpoint| MobilePushSend {
+                            mobile: &self.mobile,
+                            endpoint_arn: endpoint,
+                            notif: MobilePayload::Android(android),
+                            attributes: &apns.attributes,
+                        })
+                }))
+                .collect();
+            let targets: Vec<_> = checkers
+                .iter()
+                .map(|checker| (checker.endpoint_arn, checker.notif))
+                .collect();
+            let results = if let Some(ref entry) = user_apns.digest_state {
+                let req = ResumeMachineBRequest {
+                    notification_enabled: entry.inner().clone(),
+                    send_notifs: checkers,
+                };
+                let (results, batch_decision) = self.state_machine.continue_machine(req).await;
+                if let Either::Right(Err(ref batch_err)) = batch_decision {
+                    tracing::error!(error=?batch_err, "failed to queue digest batch after all pushes failed");
+                }
+                results
+            } else {
+                let mut results = Vec::with_capacity(checkers.len());
+                for checker in checkers {
+                    results.push(checker.send_notification().await);
+                }
+                results
+            };
+            for (result, (endpoint_arn, platform)) in results.into_iter().zip(targets) {
+                if let Err(e) = &result
+                    && e.downcast_current_context::<PushEndpointUnavailable>()
+                        .is_some()
+                {
+                    self.remove_unavailable_endpoint(endpoint_arn).await;
+                }
+                out.push(result.map(|_| platform.success()));
+            }
+        }
+
+        out
+    }
+
+    /// Remove the device registration for an endpoint SNS will no longer deliver to, so
+    /// later notifications stop targeting it. The device gets a fresh registration the next
+    /// time the app registers its push token.
+    async fn remove_unavailable_endpoint(&self, endpoint_arn: &str) {
+        tracing::info!(
+            endpoint_arn,
+            "removing device registration for unavailable push endpoint"
+        );
+        let _ = self
+            .repository
+            .delete_device_by_endpoint(endpoint_arn)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(error=?e, endpoint_arn, "failed to remove device registration for unavailable push endpoint");
+            });
+    }
+
+    /// Deliver via email.
+    async fn deliver_email(
+        &self,
+        notification_type: &str,
+        email: EmailNotification<'static>,
+    ) -> Result<DeliverySuccess, Report<DeliveryFailure>> {
+        let EmailNotification {
+            content,
+            to: recipient,
+            rate_limit_config,
+            rate_limit_key,
+        } = email;
+
+        let ticket = self
+            .rate_limiter
+            .check_rate_limit(rate_limit_key, rate_limit_config)
+            .await
+            .context(DeliveryFailure::Other)?;
+
+        let ticket_ok = match ticket {
+            RateLimitResult::Err(exceeded) => {
+                return Err(report!(
+                    "Rate limit key was exceeded. Current count is {} but max count is {}",
+                    exceeded.current_count,
+                    exceeded.max_count
+                )
+                .context(DeliveryFailure::RateLimit(exceeded)));
+            }
+            RateLimitResult::Ok(ticket) => ticket,
+        };
+
+        if let Err(e) = self
+            .email
+            .send_email(recipient.clone(), notification_type, &content)
+            .await
+            .inspect_err(|e| {
+                // The subject can carry the sender's name, so the type identifies the email.
+                tracing::error!(
+                    error = ?e,
+                    recipient = %recipient,
+                    notification_type,
+                    "Email delivery failed"
+                );
+            })
+        {
+            let _ = self
+                .rate_limiter
+                .rollback_ticket(ticket_ok)
+                .await
+                .inspect_err(|e| {
+                    tracing::error!(error=?e, "Failed to rollback rate limit after email failure");
+                });
+            return Err(e.context(DeliveryFailure::Other));
+        }
+
+        Ok(DeliverySuccess::Email)
+    }
+}
+
+impl<Q, N, RT, M, E, R, S, D> NotificationEgress
+    for NotificationEgressService<Q, N, RT, M, E, R, S, D>
+where
+    Q: NotificationQueue,
+    N: NotificationRepository,
+    RT: RealtimeSender,
+    M: NotificationSender,
+    E: EmailSender,
+    R: RateLimitService,
+    S: BulkDigestEgressStateMachine,
+    D: DigestBatcher,
+{
+    #[tracing::instrument(ret, skip(self))]
+    async fn poll_and_deliver(&self) -> Vec<Result<DeliverySuccess, Report>> {
+        let messages = match self.queue.receive_messages().await {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                return vec![Err(e)];
+            }
+        };
+
+        let mut results = Vec::new();
+
+        // Deliver all messages concurrently
+        let delivery_futures: FuturesUnordered<_> = messages
+            .into_iter()
+            .map(async |message| {
+                let receipt_handle = message.receipt_handle;
+                let delivery_results = match tokio::time::timeout(
+                    DELIVERY_TIMEOUT,
+                    self.deliver_notification(message.body),
+                )
+                .await
+                {
+                    Ok(x) => x,
+                    Err(_) => {
+                        tracing::warn!("Notification egress task timed out");
+                        vec![Err(report!(DeliveryFailure::Timeout))]
+                    }
+                };
+                (receipt_handle, delivery_results)
+            })
+            .collect();
+
+        let outcomes: Vec<_> = delivery_futures.collect().await;
+
+        for (receipt_handle, delivery_results) in outcomes {
+            let any_succeeded = delivery_results.iter().any(Result::is_ok);
+            let all_mobile_failed = delivery_results.iter().all(
+                |e| matches!(e, Err(e) if matches!(e.current_context(), DeliveryFailure::Mobile )),
+            );
+            let rate_limited = delivery_results.iter().any(|e| {
+                matches!(
+                    e.as_ref().map_err(Report::current_context),
+                    Err(DeliveryFailure::RateLimit(_))
+                )
+            });
+
+            // Delete from the queue if any delivery succeeded, all failures were
+            // mobile push failures, or delivery was rejected by the rate limit. Rate-limit
+            // rejection is terminal; retrying the same notification would only
+            // deliver stale notifications after the limit window expires.
+            if (any_succeeded || all_mobile_failed || rate_limited)
+                && let Err(e) = self.queue.delete_message(&receipt_handle).await
+            {
+                results.push(Err(e))
+            }
+
+            for result in delivery_results {
+                results.push(result.map_err(Report::from));
+            }
+        }
+
+        results
+    }
+
+    // #[tracing::instrument(err, skip(self))]
+    async fn poll_email_digests<
+        'a,
+        T: NotificationExtEmail,
+        F: Fn(DigestBatch) -> Result<T, Report> + Send + Sync + 'static,
+    >(
+        &'a self,
+        f: &'a F,
+    ) -> Result<ClaimResult<()>, Report> {
+        let mut batch =
+            match tokio::time::timeout(DELIVERY_TIMEOUT, self.digest_batcher.claim_ready_digest())
+                .await
+                .context("Dequeing redis batch exceeded timeout")??
+            {
+                ClaimResult::Ready(batch) => batch,
+                v @ ClaimResult::Empty | v @ ClaimResult::Wait(_) => return Ok(v.map(|_| ())),
+            };
+
+        let recipient: MacroUserIdStr<'static> = batch.user_id.clone();
+        let notification_ids: Vec<_> = batch
+            .notifications
+            .iter()
+            .map(|notification| notification.notification_id)
+            .collect();
+        let eligible_notification_ids = self
+            .repository
+            .get_digest_eligible_notification_ids(recipient.copied(), &notification_ids)
+            .await?;
+        let original_count = batch.notifications.len();
+        batch.notifications.retain(|notification| {
+            eligible_notification_ids.contains(&notification.notification_id)
+        });
+
+        if batch.notifications.is_empty() {
+            tracing::info!(
+                user_id = %recipient,
+                original_count,
+                "Skipping email digest publish — all queued notifications are now read, deleted, or missing"
+            );
+            return Ok(ClaimResult::Ready(()));
+        }
+
+        let email_notif = f(batch)?;
+
+        let typename = NotificationTypeName::new_from_notif(&email_notif);
+
+        // Check if the user has disabled this notification type
+        let type_disabled_users = self
+            .repository
+            .get_users_with_type_disabled(typename.as_ref(), &[recipient.copied()])
+            .await?;
+
+        if type_disabled_users.contains(&recipient) {
+            tracing::info!(
+                user_id = %recipient,
+                notification_type = %typename.as_ref(),
+                "Skipping email digest publish — user has disabled this notification type"
+            );
+            return Ok(ClaimResult::Ready(()));
+        }
+
+        let email_content = EmailCreateBundle::new(&email_notif).with_recipient(recipient);
+
+        let message: QueueMessage<'static, T, ()> =
+            QueueMessage::new_from_email(email_content, &typename);
+
+        self.queue.publish(vec![message]).await?;
+
+        Ok(ClaimResult::Ready(()))
+    }
+}

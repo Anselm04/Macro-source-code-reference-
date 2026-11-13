@@ -1,0 +1,476 @@
+import { isNativeCallEnabled } from '@channel/Call/native-call-platform';
+import {
+  registerPushRegistrationLifecycle,
+  syncPushRegistrations,
+} from '@core/auth/push-registration-lifecycle';
+import { hasLoginCookie } from '@core/util/cookies';
+import { fireAndForget } from '@core/util/fireAndForget';
+import type { NotificationRegistrationResult } from '@inkibra/tauri-plugins/packages/tauri-plugin-notifications';
+import {
+  type PlatformNotificationInterface,
+  PlatformNotificationProvider,
+} from '@notifications';
+import {
+  receiveNotificationTap,
+  setPendingNotificationNavigationId,
+} from '@notifications/notification-navigation-intent';
+import { endNotificationOpen } from '@notifications/notification-open-trace';
+import {
+  fetchPushRecipient,
+  registerPushDevice,
+  unregisterPushDevice,
+} from '@queries/notification/device-registration';
+import { makePersisted } from '@solid-primitives/storage';
+import { removeAllActive } from '@tauri-apps/plugin-notification';
+import { Mutex } from 'async-mutex';
+import {
+  createContext,
+  createEffect,
+  createSignal,
+  type JSX,
+  onCleanup,
+} from 'solid-js';
+import { createTauriNotificationInterface } from './notification';
+import {
+  createPushApi,
+  type PushEvent,
+  releaseNotificationCover,
+} from './push-api';
+import { useExpectTauri } from './TauriProvider';
+
+function usePushNotifications(
+  deviceType: 'android' | 'ios',
+  onPushNotification?: (
+    event: PushEvent,
+    acknowledge: (deliveryId: string) => Promise<void>
+  ) => boolean
+) {
+  const api = createPushApi(deviceType);
+  // Bumped by every registration-changing action so an in-flight one can
+  // detect it was superseded (logout, opt-out, a newer sync) and stop.
+  let registrationEpoch = 0;
+  // Keep token writes ordered across logout/account switching. Native writes
+  // have their own queue so logout can disarm without waiting for the network.
+  const registrationMutex = new Mutex();
+  const recipientMutex = new Mutex();
+  let disposed = false;
+  let requestingPermission = false;
+  let notificationWatch: Promise<void> | undefined;
+  let watchRetryTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  const [registrationResult, setRegistrationResult] = makePersisted(
+    createSignal<NotificationRegistrationResult | undefined>(undefined)
+  );
+
+  const [permission, setPermission] = makePersisted(
+    createSignal<'granted' | 'denied' | undefined>(undefined)
+  );
+
+  // Tracks an explicit in-app opt-out, as opposed to a logout or a fresh
+  // login/account-switch. Only this flag should suppress the automatic
+  // re-registration in syncDeviceRegistration; registrationResult/permission
+  // are cleared on logout too and can't be used to detect opt-out.
+  const [pushDisabledByUser, setPushDisabledByUser] = makePersisted(
+    createSignal(false)
+  );
+
+  function isStale(epoch: number) {
+    return epoch !== registrationEpoch;
+  }
+
+  // A registration step must stop once a newer sync started or the session
+  // ended, otherwise late async completion could bind the wrong account.
+  function aborted(epoch: number) {
+    return isStale(epoch) || !hasLoginCookie();
+  }
+
+  async function registerDeviceWithNotificationService(
+    token: string,
+    epoch: number
+  ): Promise<'granted' | 'denied'> {
+    return registrationMutex.runExclusive(async () => {
+      if (aborted(epoch)) return 'denied';
+      const recipient = await fetchRecipient();
+      if (recipient === undefined) return 'denied';
+      if (aborted(epoch)) return 'denied';
+      const res = await registerPushDevice({
+        deviceType,
+        token,
+        ...(deviceType === 'android'
+          ? { nativeCallCapable: isNativeCallEnabled() }
+          : {}),
+      });
+      if (res.isErr()) {
+        // Transient failures must not erase a previously granted permission.
+        console.error('failed to register device for push', res.error);
+        return 'denied';
+      }
+      try {
+        if (aborted(epoch)) return 'denied';
+        await configureRecipient(recipient, epoch);
+        if (aborted(epoch)) return 'denied';
+        setPermission('granted');
+        setPushDisabledByUser(false);
+        await startWatch();
+        if (aborted(epoch)) return 'denied';
+        return 'granted';
+      } finally {
+        // A successful backend write may finish after logout/opt-out. Roll it
+        // back before a newer registration can acquire the lock and bind it.
+        if (aborted(epoch)) await unregisterDevice(token);
+      }
+    });
+  }
+
+  async function configureRecipient(recipient: string | null, epoch: number) {
+    await recipientMutex.runExclusive(async () => {
+      if (isStale(epoch)) return;
+      try {
+        await api.configureRecipient(recipient);
+      } finally {
+        // The bridge may finish an old configure after logout has started.
+        // Disarm before releasing the lock to any newer account's configure.
+        if (recipient !== null && aborted(epoch)) {
+          await api.configureRecipient(null);
+        }
+      }
+    });
+  }
+
+  async function unregisterDevice(token: string) {
+    const res = await unregisterPushDevice({ deviceType, token });
+    if (res.isErr()) throw new Error('failed to unregister device for push');
+  }
+
+  // Bind both native receivers to the account that owns the registration.
+  async function fetchRecipient(): Promise<string | null | undefined> {
+    try {
+      return await fetchPushRecipient();
+    } catch (error) {
+      // Transient like a failed registration: leave persisted state alone so
+      // the lifecycle retry gets another go.
+      console.error('failed to resolve push recipient', error);
+      return undefined;
+    }
+  }
+
+  async function requestNotificationRegistration() {
+    requestingPermission = true;
+    try {
+      return await requestAndRegister();
+    } finally {
+      requestingPermission = false;
+    }
+  }
+
+  async function requestAndRegister() {
+    const epoch = ++registrationEpoch;
+    const perm = await api.requestPermissions();
+    if (isStale(epoch)) return 'denied';
+    if (perm.status !== 'granted') {
+      setPermission(undefined);
+      setRegistrationResult(undefined);
+      await configureRecipient(null, epoch);
+      return 'denied';
+    }
+    const reg = await api.register();
+    if (isStale(epoch)) return 'denied';
+    if (!reg.token) {
+      console.error('push registration returned no token', reg.error);
+      setPermission(undefined);
+      setRegistrationResult(undefined);
+      return 'denied';
+    }
+    setRegistrationResult(reg);
+    return await registerDeviceWithNotificationService(reg.token, epoch);
+  }
+
+  async function unregisterPushNotifications(disabledByUser = true) {
+    const epoch = ++registrationEpoch;
+    const token = registrationResult()?.token;
+    setPermission(undefined);
+    setPushDisabledByUser(disabledByUser);
+    setRegistrationResult(undefined);
+    // Queue removal immediately, before another login can enqueue a token
+    // registration. Disarming the receiver is independent of backend latency.
+    await Promise.all([
+      configureRecipient(null, epoch),
+      registrationMutex.runExclusive(async () => {
+        if (!token) return;
+        try {
+          await unregisterDevice(token);
+        } catch (error) {
+          console.error('failed to unregister device for push', error);
+        }
+      }),
+    ]);
+  }
+
+  // (Re-)register this device under whoever is currently logged in. The
+  // backend keys a token to a single user, so this must run on every login —
+  // not just when the APNs token rotates — or the previous account keeps
+  // receiving this device's pushes.
+  async function syncDeviceRegistration() {
+    if (
+      disposed ||
+      requestingPermission ||
+      pushDisabledByUser() ||
+      !hasLoginCookie()
+    )
+      return;
+    const epoch = ++registrationEpoch;
+    const sysPerm = await api.checkPermissions();
+    if (isStale(epoch)) return;
+    if (sysPerm.status !== 'granted') {
+      setPermission(undefined);
+      await configureRecipient(null, epoch);
+      const token = registrationResult()?.token;
+      if (deviceType === 'android' && token) {
+        await registrationMutex.runExclusive(async () => {
+          if (!isStale(epoch)) await unregisterDevice(token);
+        });
+      }
+      return;
+    }
+    const freshResult = await api.register();
+    if (isStale(epoch)) return;
+    if (!freshResult.token) {
+      console.error('push registration returned no token', freshResult.error);
+      return;
+    }
+    const storedToken = registrationResult()?.token;
+    if (storedToken && storedToken !== freshResult.token) {
+      // Best-effort: unregister the old token
+      try {
+        await registrationMutex.runExclusive(async () => {
+          if (!isStale(epoch)) await unregisterDevice(storedToken);
+        });
+      } catch (error) {
+        console.error('failed to unregister rotated push token', error);
+      }
+    }
+    if (isStale(epoch)) return;
+    setRegistrationResult(freshResult);
+    const result = await registerDeviceWithNotificationService(
+      freshResult.token,
+      epoch
+    );
+    if (result !== 'granted') {
+      // Surface the failure so the lifecycle's retry (and its logging) see it.
+      throw new Error('push device registration did not complete');
+    }
+  }
+
+  async function unregisterForLogout() {
+    setPendingNotificationNavigationId(undefined);
+    endNotificationOpen('logout');
+    // The logged-out account's already-delivered notifications must not
+    // linger in the system notification center for the next account to see.
+    await Promise.all([
+      clearDisplayedNotifications(),
+      unregisterPushNotifications(false),
+      api.clearPending(),
+    ]);
+  }
+
+  async function clearDisplayedNotifications() {
+    try {
+      await removeAllActive();
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  const removeLifecycle = registerPushRegistrationLifecycle({
+    syncRegistration: syncDeviceRegistration,
+    unregisterForLogout,
+  });
+  onCleanup(removeLifecycle);
+  onCleanup(() => {
+    disposed = true;
+    ++registrationEpoch;
+    clearTimeout(watchRetryTimeout);
+    fireAndForget(stopWatch(), 'push-notifications');
+  });
+
+  async function stopWatch() {
+    try {
+      await api.unwatch();
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  // On launch, re-register the device so the backend registration tracks the
+  // current user (covering both a token rotation and an account switch since
+  // the last launch). The lifecycle sync also clears state when the OS
+  // permission was revoked; only the cases it skips are handled here.
+  fireAndForget(reconcileOnLaunch(), 'push-notifications');
+
+  async function reconcileOnLaunch() {
+    const epoch = registrationEpoch;
+    try {
+      if (!hasLoginCookie()) {
+        // A tapped destination may still be awaiting sign-in. Explicit logout
+        // clears it through unregisterForLogout; startup must not discard it.
+        setPermission(undefined);
+        return;
+      }
+      if (pushDisabledByUser()) {
+        setPermission(undefined);
+        await configureRecipient(null, epoch);
+        return;
+      }
+      await syncPushRegistrations('resume');
+    } catch (error) {
+      console.error('push launch sync failed', error);
+    }
+  }
+
+  createEffect(() => {
+    if (!onPushNotification) return;
+    // Delivered notifications can be tapped before APNs registration finishes
+    // or when registration fails. Attach the listener so native buffered taps
+    // can navigate independently of acquiring a token for future pushes.
+    fireAndForget(startWatch(), 'push-notifications');
+  });
+
+  function startWatch() {
+    if (disposed || !onPushNotification) return;
+    if (notificationWatch) return notificationWatch;
+    clearTimeout(watchRetryTimeout);
+    notificationWatch = watchNotifications();
+    return notificationWatch;
+  }
+
+  async function watchNotifications() {
+    const epoch = registrationEpoch;
+    try {
+      if (deviceType === 'android' && !hasLoginCookie())
+        await configureRecipient(null, epoch);
+      await api.watch((event) => {
+        fireAndForget(handlePushEvent(event), 'push-notifications');
+      });
+      if (disposed) await api.unwatch();
+    } catch (error) {
+      notificationWatch = undefined;
+      console.error('failed to watch push notifications', error);
+      if (!disposed) {
+        watchRetryTimeout = setTimeout(
+          () => fireAndForget(startWatch(), 'push-notifications'),
+          1000
+        );
+      }
+    }
+  }
+
+  async function handlePushEvent(event: PushEvent) {
+    if (disposed) return;
+    try {
+      if (!hasLoginCookie()) {
+        onPushNotification?.(event, api.acknowledge);
+        await releaseNotificationCover();
+        return;
+      }
+      if (event.type === 'TOKEN_REFRESH' || event.type === 'RESUME') {
+        await syncPushRegistrations('resume');
+        return;
+      }
+      const pendingNavigation = onPushNotification?.(event, api.acknowledge);
+      if (event.deliveryId && !pendingNavigation)
+        await api.acknowledge(event.deliveryId);
+    } catch (error) {
+      console.error('push event handling failed', error);
+    }
+  }
+
+  return {
+    permission,
+    requestNotificationRegistration,
+    registrationResult,
+    unregisterPushNotifications,
+    checkPermissions: api.checkPermissions,
+  };
+}
+
+type ContextVal = ReturnType<typeof usePushNotifications>;
+
+const PushNotificationContext = createContext<
+  ContextVal | 'not-supported' | undefined
+>(undefined);
+
+/// component which will register push
+export function MaybePushNotificationRegistration(props: {
+  children: JSX.Element;
+}) {
+  const { os } = useExpectTauri();
+
+  if (os !== 'ios' && os !== 'android') {
+    return (
+      <PushNotificationContext.Provider value={'not-supported'}>
+        <PlatformNotificationProvider
+          overrideDefault={createTauriNotificationInterface}
+        >
+          {props.children}
+        </PlatformNotificationProvider>
+      </PushNotificationContext.Provider>
+    );
+  }
+
+  const push = usePushNotifications(os, receiveNotificationTap);
+
+  // now we compose the standard tauri notif plugin with the push notification plugin
+  function curriedTauriPushNotification(
+    setDisabled: () => Promise<void>
+  ): PlatformNotificationInterface {
+    const {
+      requestPermission,
+      unregisterNotifications,
+      getCurrentPermission,
+      showNotification: baseShowNotification,
+    } = createTauriNotificationInterface(setDisabled);
+
+    return {
+      showNotification: async (data) => {
+        // If remote push is enabled, the OS will display notifications for us.
+        // Avoid also generating a local notification from websocket events,
+        // which would cause duplicates.
+        if (push.permission() === 'granted') {
+          return 'not-granted';
+        }
+        return baseShowNotification(data);
+      },
+      getCurrentPermission: async () => {
+        const sysPerm = await push.checkPermissions();
+        // Quiet (provisional) delivery keeps the in-app prompt for full alerts.
+        if (sysPerm.status === 'prompt' || sysPerm.provisional) {
+          return 'default';
+        }
+        const appNotification = await getCurrentPermission();
+        if (appNotification === 'granted' && push.permission() === 'granted') {
+          return 'granted';
+        }
+        return 'denied';
+      },
+      requestPermission: async () => {
+        const res = await requestPermission();
+        const next = await push.requestNotificationRegistration();
+        return next === 'granted' && res === 'granted' ? 'granted' : 'denied';
+      },
+      unregisterNotifications: async () => {
+        await push.unregisterPushNotifications();
+        return await unregisterNotifications();
+      },
+    };
+  }
+
+  return (
+    <PushNotificationContext.Provider value={push}>
+      <PlatformNotificationProvider
+        overrideDefault={curriedTauriPushNotification}
+      >
+        {props.children}
+      </PlatformNotificationProvider>
+    </PushNotificationContext.Provider>
+  );
+}

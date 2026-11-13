@@ -1,0 +1,1054 @@
+import type {
+  SearchCacheArgs,
+  SearchCachePage,
+  SearchDocumentWire,
+} from '@graphql-cache/index';
+import { createRoot, createSignal } from 'solid-js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  createProjectedList,
+  MAX_BROWSE_PAGES_PER_LOAD,
+  UNANSWERED_SEARCH_LIMIT_MS,
+} from './projected-list';
+import { type Bucket, exclude } from './types';
+
+const cleanups: (() => void)[] = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+function root<T>(fn: () => T): T {
+  return createRoot((dispose) => {
+    cleanups.push(dispose);
+    return fn();
+  });
+}
+function document(id: string, bucket = 'note'): SearchDocumentWire {
+  return {
+    profile: 'quick-access-v1',
+    recordKey: `GraphqlSoupDocument:${id}`,
+    bucket,
+    searchText: id,
+    timestampMs: 1,
+    sourceHash: 'hash',
+  };
+}
+function page(ids: string[], more = false): SearchCachePage {
+  return {
+    documents: ids.map((id) => document(id)),
+    nextCursor: more
+      ? { recordKey: `GraphqlSoupDocument:${ids.at(-1)}`, timestampMs: 1 }
+      : null,
+  };
+}
+const materialize = async (documents: SearchDocumentWire[]) =>
+  documents.map((document) => ({ id: document.recordKey }));
+const ids = (count: number, start = 0) =>
+  Array.from({ length: count }, (_, i) => `${start + i}`);
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+describe('Quick Access local projection', () => {
+  it('keeps the listed rows when a cache revision replays the same search result', async () => {
+    const [revision, setRevision] = createSignal(0);
+    const search = vi
+      .fn()
+      .mockResolvedValueOnce(page(['a', 'b']))
+      .mockResolvedValueOnce(page(['a', 'b']))
+      .mockResolvedValueOnce(page(['a', 'c']));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision,
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.items()).toHaveLength(2));
+    const listed = list.items();
+
+    setRevision(1);
+    await vi.waitFor(() => expect(search).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(list.items()).toBe(listed);
+
+    setRevision(2);
+    await vi.waitFor(() =>
+      expect(list.items().map((item) => item.id)).toEqual([
+        'GraphqlSoupDocument:a',
+        'GraphqlSoupDocument:c',
+      ])
+    );
+    expect(list.items()[0]).toBe(listed[0]);
+  });
+
+  it('publishes a new list after a load-more that found no new row', async () => {
+    const search = vi
+      .fn()
+      .mockResolvedValueOnce(page(['a', 'b'], true))
+      .mockResolvedValue(page(['a', 'b']));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.items()).toHaveLength(2));
+    const listed = list.items();
+
+    await list.loadMore();
+
+    expect(list.items()).not.toBe(listed);
+    expect(list.items().map((item) => item.id)).toEqual([
+      'GraphqlSoupDocument:a',
+      'GraphqlSoupDocument:b',
+    ]);
+  });
+
+  it('distinguishes a failed initial read from a successful empty retry', async () => {
+    const [revision, setRevision] = createSignal(0);
+    const error = new Error('Cache unavailable');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const search = vi
+      .fn()
+      .mockRejectedValueOnce(error)
+      .mockResolvedValueOnce(page([]));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision,
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(list.error()).toBe(error);
+    expect(list.items()).toEqual([]);
+    expect(list.hasMore()).toBe(false);
+    setRevision(1);
+    expect(list.isLoading()).toBe(true);
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(list.error()).toBeUndefined();
+    expect(list.items()).toEqual([]);
+  });
+
+  it('reports an initial read as pending before mount effects start it', () => {
+    const search = vi.fn().mockResolvedValue(page([]));
+    root(() => {
+      const list = createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        materialize,
+      });
+      // Consumers restore history from eager memos before createEffect runs.
+      expect(list.isLoading()).toBe(true);
+      expect(list.items()).toEqual([]);
+    });
+  });
+
+  it('retains matching rows until the next query commits, without retaining its cursor', async () => {
+    const [query, setQuery] = createSignal('sea');
+    const pending = deferred<SearchCachePage>();
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockResolvedValueOnce(page(['seamus', 'sean'], true))
+      .mockReturnValueOnce(pending.promise);
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        searchTerm: query,
+        filterPreviousItems: (items, term) =>
+          items.filter((item) => item.id.includes(term)),
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.items()).toHaveLength(2));
+    const retained = list.items()[0];
+    setQuery('seam');
+    expect(list.items()).toEqual([retained]);
+    expect(list.items()[0]).toBe(retained);
+    expect(list.isLoading()).toBe(true);
+    expect(list.hasMore()).toBe(false);
+    await list.loadMore();
+    expect(search).toHaveBeenCalledTimes(2);
+    expect(search.mock.calls[1][0].cursor).toBeUndefined();
+    pending.resolve(page(['seamus', 'seamless']));
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(list.items()).toEqual([
+      { id: 'GraphqlSoupDocument:seamus' },
+      { id: 'GraphqlSoupDocument:seamless' },
+    ]);
+  });
+
+  it('reports searching until the current query answers, but not while a loaded window replays', async () => {
+    const [query, setQuery] = createSignal('sea');
+    const [revision, setRevision] = createSignal(0);
+    const first = deferred<SearchCachePage>();
+    const replay = deferred<SearchCachePage>();
+    const next = deferred<SearchCachePage>();
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(replay.promise)
+      .mockReturnValueOnce(next.promise)
+      .mockRejectedValueOnce(new Error('Cache unavailable'));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision,
+        searchTerm: query,
+        filterPreviousItems: (items, term) =>
+          items.filter((item) => item.id.includes(term)),
+        materialize,
+      })
+    );
+    expect(list.isSearching()).toBe(true);
+    first.resolve(page(['seamus', 'sean']));
+    await vi.waitFor(() => expect(list.isSearching()).toBe(false));
+
+    setRevision(1);
+    expect(list.isLoading()).toBe(true);
+    expect(list.isSearching()).toBe(false);
+    replay.resolve(page(['seamus', 'sean']));
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+
+    setQuery('seam');
+    expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:seamus' }]);
+    expect(list.isSearching()).toBe(true);
+    next.resolve(page(['seamus', 'seamless']));
+    await vi.waitFor(() => expect(list.isSearching()).toBe(false));
+    expect(list.items()).toHaveLength(2);
+
+    setQuery('seaml');
+    expect(list.isSearching()).toBe(true);
+    await vi.waitFor(() => expect(list.error()).toBeDefined());
+    expect(list.isSearching()).toBe(false);
+  });
+
+  it('replays a search refused while the cache changes owner once the replacement engine arrives', async () => {
+    const refused = Object.assign(new Error('cache reads unavailable'), {
+      errorCode: 'owner-handoff-blocked',
+    });
+    let engineReplaced = () => {};
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockRejectedValueOnce(refused)
+      .mockResolvedValueOnce(page(['seamus']));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const list = root(() =>
+      createProjectedList({
+        host: {
+          search,
+          onCacheGenerationChanged: (listener) => {
+            engineReplaced = () => listener({ storage: 'preserved' });
+            return () => {};
+          },
+        },
+        buckets: ['note'],
+        revision: () => 0,
+        searchTerm: () => 'sea',
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.error()).toBe(refused));
+    expect(list.isLoading()).toBe(false);
+    expect(list.isSearching()).toBe(true);
+    expect(search).toHaveBeenCalledTimes(1);
+
+    engineReplaced();
+    await vi.waitFor(() =>
+      expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:seamus' }])
+    );
+    expect(list.isSearching()).toBe(false);
+    expect(list.error()).toBeUndefined();
+
+    engineReplaced();
+    await Promise.resolve();
+    expect(search).toHaveBeenCalledTimes(2);
+  });
+
+  it('replays a search lost with its engine once the replacement arrives', async () => {
+    const lost = Object.assign(new Error('owner epoch lost'), {
+      errorCode: 'owner-epoch-lost',
+    });
+    let engineReplaced = () => {};
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockRejectedValueOnce(lost)
+      .mockResolvedValueOnce(page(['seamus']));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const list = root(() =>
+      createProjectedList({
+        host: {
+          search,
+          onCacheGenerationChanged: (listener) => {
+            engineReplaced = () => listener({ storage: 'preserved' });
+            return () => {};
+          },
+        },
+        buckets: ['note'],
+        revision: () => 0,
+        searchTerm: () => 'sea',
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.error()).toBe(lost));
+    expect(list.isSearching()).toBe(true);
+
+    engineReplaced();
+    await vi.waitFor(() =>
+      expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:seamus' }])
+    );
+    expect(list.isSearching()).toBe(false);
+  });
+
+  it('stops reporting a refused search as pending after the limit, and still replays it when the engine arrives', async () => {
+    vi.useFakeTimers();
+    const refused = Object.assign(new Error('cache reads unavailable'), {
+      errorCode: 'owner-handoff-blocked',
+    });
+    let engineReplaced = () => {};
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockRejectedValueOnce(refused)
+      .mockResolvedValueOnce(page(['seamus']));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const list = root(() =>
+      createProjectedList({
+        host: {
+          search,
+          onCacheGenerationChanged: (listener) => {
+            engineReplaced = () => listener({ storage: 'preserved' });
+            return () => {};
+          },
+        },
+        buckets: ['note'],
+        revision: () => 0,
+        searchTerm: () => 'sea',
+        materialize,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(list.error()).toBe(refused);
+    expect(list.isSearching()).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(UNANSWERED_SEARCH_LIMIT_MS - 1);
+    expect(list.isSearching()).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(list.isSearching()).toBe(false);
+
+    engineReplaced();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:seamus' }]);
+  });
+
+  it('stops reporting a search the host never answers as pending after the limit', async () => {
+    vi.useFakeTimers();
+    const search = vi.fn(() => new Promise<SearchCachePage>(() => {}));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        searchTerm: () => 'sea',
+        materialize,
+      })
+    );
+    await vi.advanceTimersByTimeAsync(UNANSWERED_SEARCH_LIMIT_MS - 1);
+    expect(list.isSearching()).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(list.isSearching()).toBe(false);
+  });
+
+  it('tells the host to release a search once another query supersedes it', async () => {
+    const [query, setQuery] = createSignal('to');
+    const signals: (AbortSignal | undefined)[] = [];
+    const search = vi.fn(
+      (_args: SearchCacheArgs, options?: { signal?: AbortSignal }) => {
+        signals.push(options?.signal);
+        return new Promise<SearchCachePage>(() => {});
+      }
+    );
+    const dispose = createRoot((disposeRoot) => {
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        searchTerm: query,
+        materialize,
+      });
+      return disposeRoot;
+    });
+    await vi.waitFor(() => expect(signals).toHaveLength(1));
+    expect(signals[0]?.aborted).toBe(false);
+
+    setQuery('todo');
+    await vi.waitFor(() => expect(signals).toHaveLength(2));
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals[1]?.aborted).toBe(false);
+
+    dispose();
+    expect(signals[1]?.aborted).toBe(true);
+  });
+
+  it('does not replay other failed searches when the engine is replaced', async () => {
+    let engineReplaced = () => {};
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockRejectedValueOnce(new Error('Cache unavailable'));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const list = root(() =>
+      createProjectedList({
+        host: {
+          search,
+          onCacheGenerationChanged: (listener) => {
+            engineReplaced = () => listener({ storage: 'preserved' });
+            return () => {};
+          },
+        },
+        buckets: ['note'],
+        revision: () => 0,
+        searchTerm: () => 'sea',
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.error()).toBeDefined());
+    expect(list.isSearching()).toBe(false);
+    engineReplaced();
+    await Promise.resolve();
+    expect(search).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['buckets', 'disable'] as const)(
+    'does not retain matches when %s changes',
+    async (change) => {
+      const [buckets, setBuckets] = createSignal<Bucket[]>(['note']);
+      const [enabled, setEnabled] = createSignal(true);
+      const pending = deferred<SearchCachePage>();
+      const search = vi
+        .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+        .mockResolvedValueOnce(page(['seamus']))
+        .mockReturnValueOnce(pending.promise);
+      const list = root(() =>
+        createProjectedList({
+          host: { search },
+          get buckets() {
+            return buckets();
+          },
+          revision: () => 0,
+          enabled,
+          filterPreviousItems: (items) => items,
+          materialize,
+        })
+      );
+      await vi.waitFor(() => expect(list.items()).toHaveLength(1));
+      if (change === 'buckets') setBuckets(['task']);
+      else setEnabled(false);
+      expect(list.items()).toEqual([]);
+    }
+  );
+
+  it('removes nonmatches immediately and ignores an obsolete query completion', async () => {
+    const [query, setQuery] = createSignal('sea');
+    const obsolete = deferred<SearchCachePage>();
+    const latest = deferred<SearchCachePage>();
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockResolvedValueOnce(page(['seamus']))
+      .mockReturnValueOnce(obsolete.promise)
+      .mockReturnValueOnce(latest.promise);
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        searchTerm: query,
+        filterPreviousItems: (items, term) =>
+          items.filter((item) => item.id.includes(term)),
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.items()).toHaveLength(1));
+    setQuery('seam');
+    expect(list.items()).toHaveLength(1);
+    setQuery('xyz');
+    expect(list.items()).toEqual([]);
+    obsolete.resolve(page(['seamus']));
+    await obsolete.promise;
+    expect(list.items()).toEqual([]);
+    expect(list.isLoading()).toBe(true);
+    latest.resolve(page([]));
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(list.items()).toEqual([]);
+  });
+
+  it('follows the local browse cursor, deduplicates hits, and stops at the last page', async () => {
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockResolvedValueOnce(page(ids(50), true))
+      .mockResolvedValueOnce(page(['49', ...ids(30, 50)]));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.items()).toHaveLength(50));
+    expect(list.hasMore()).toBe(true);
+    await list.loadMore();
+    expect(search.mock.calls[1][0]).toMatchObject({
+      query: '',
+      limit: 50,
+      cursor: { recordKey: 'GraphqlSoupDocument:49', timestampMs: 1 },
+    });
+    expect(list.items()).toHaveLength(80);
+    expect(list.hasMore()).toBe(false);
+    await list.loadMore();
+    expect(search).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['search', 'materialize'] as const)(
+    'publishes a slow %s during continuous revisions and coalesces a follow-up',
+    async (stage) => {
+      const [revision, setRevision] = createSignal(0);
+      const first = deferred<SearchCachePage>();
+      const firstMaterialization = deferred<{ id: string }[]>();
+      const followUp = deferred<SearchCachePage>();
+      const search = vi
+        .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+        .mockReturnValueOnce(
+          stage === 'search' ? first.promise : Promise.resolve(page(['first']))
+        )
+        .mockReturnValueOnce(followUp.promise);
+      const project = vi.fn(materialize);
+      if (stage === 'materialize')
+        project.mockReturnValueOnce(firstMaterialization.promise);
+      const list = root(() =>
+        createProjectedList({
+          host: { search },
+          buckets: ['note'],
+          revision,
+          materialize: project,
+        })
+      );
+      if (stage === 'materialize')
+        await vi.waitFor(() => expect(project).toHaveBeenCalledOnce());
+      for (let i = 1; i <= 8; i++) setRevision(i);
+      expect(search).toHaveBeenCalledOnce();
+      first.resolve(page(['first']));
+      firstMaterialization.resolve([{ id: 'GraphqlSoupDocument:first' }]);
+      await vi.waitFor(() =>
+        expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:first' }])
+      );
+      expect(search).toHaveBeenCalledTimes(2);
+      expect(list.isLoading()).toBe(true);
+      followUp.resolve(page(['latest']));
+      await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+      expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:latest' }]);
+      expect(search).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it('commits a load-more page before replaying the enlarged window after hydration', async () => {
+    const [revision, setRevision] = createSignal(0);
+    const next = deferred<SearchCachePage>();
+    const replay = deferred<SearchCachePage>();
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockResolvedValueOnce(page(['one'], true))
+      .mockReturnValueOnce(next.promise)
+      .mockReturnValueOnce(replay.promise)
+      .mockResolvedValueOnce(page(['two', 'new']));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision,
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.hasMore()).toBe(true));
+    const append = list.loadMore();
+    setRevision(1);
+    setRevision(2);
+    expect(search).toHaveBeenCalledTimes(2);
+    next.resolve(page(['two'], true));
+    await append;
+    expect(list.items()).toHaveLength(2);
+    expect(search).toHaveBeenCalledTimes(3);
+    expect(search.mock.calls[2][0].cursor).toBeUndefined();
+    replay.resolve(page(['one'], true));
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(list.items()).toHaveLength(3);
+    expect(search).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(['query', 'buckets', 'disable', 'dispose'] as const)(
+    'drops a queued refresh and late results on %s changes',
+    async (change) => {
+      const [revision, setRevision] = createSignal(0);
+      const [query, setQuery] = createSignal('old');
+      const [buckets, setBuckets] = createSignal<Bucket[]>(['note']);
+      const [enabled, setEnabled] = createSignal(true);
+      const obsolete = deferred<SearchCachePage>();
+      const search = vi
+        .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+        .mockReturnValueOnce(obsolete.promise)
+        .mockResolvedValue(page(['new']));
+      const list = root(() =>
+        createProjectedList({
+          host: { search },
+          get buckets() {
+            return buckets();
+          },
+          revision,
+          searchTerm: query,
+          enabled,
+          materialize,
+        })
+      );
+      setRevision(1);
+      expect(search).toHaveBeenCalledOnce();
+      if (change === 'query') setQuery('new');
+      if (change === 'buckets') setBuckets(['task']);
+      if (change === 'disable') setEnabled(false);
+      if (change === 'dispose')
+        cleanups.splice(0).forEach((cleanup) => cleanup());
+      obsolete.resolve(page(['old']));
+      const replaced = change === 'query' || change === 'buckets';
+      await vi.waitFor(() =>
+        expect(list.items()).toEqual(
+          replaced ? [{ id: 'GraphqlSoupDocument:new' }] : []
+        )
+      );
+      await obsolete.promise;
+      await Promise.resolve();
+      expect(search).toHaveBeenCalledTimes(replaced ? 2 : 1);
+    }
+  );
+
+  it('resets the loaded window and cursor when reactive buckets change', async () => {
+    const [buckets, setBuckets] = createSignal<Bucket[]>([
+      'note',
+      'crm_company',
+    ]);
+    const refresh = deferred<SearchCachePage>();
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockResolvedValueOnce(page(['one'], true))
+      .mockResolvedValueOnce(page(['two'], true))
+      .mockReturnValueOnce(refresh.promise)
+      .mockResolvedValueOnce(page(['last']));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        get buckets() {
+          return buckets();
+        },
+        revision: () => 0,
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.hasMore()).toBe(true));
+    await list.loadMore();
+    expect(list.items()).toHaveLength(2);
+
+    setBuckets(['note']);
+    expect(list.items()).toEqual([]);
+    expect(search.mock.calls[2][0]).toMatchObject({ buckets: ['note'] });
+    expect(search.mock.calls[2][0].cursor).toBeUndefined();
+    refresh.resolve(page(['new'], true));
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(search).toHaveBeenCalledTimes(3);
+    expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:new' }]);
+    await list.loadMore();
+    expect(search.mock.calls[3][0].cursor?.recordKey).toBe(
+      'GraphqlSoupDocument:new'
+    );
+    expect(list.items()).toHaveLength(2);
+  });
+
+  it('ignores in-flight results for buckets that are no longer enabled', async () => {
+    const [buckets, setBuckets] = createSignal<Bucket[]>([
+      'crm_company',
+      'note',
+    ]);
+    const pending = deferred<SearchCachePage>();
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValueOnce(page(['note']));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        get buckets() {
+          return buckets();
+        },
+        revision: () => 0,
+        materialize,
+      })
+    );
+    setBuckets(['note']);
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    pending.resolve({
+      documents: [document('company', 'crm_company')],
+      nextCursor: null,
+    });
+    await pending.promise;
+    await Promise.resolve();
+    expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:note' }]);
+    expect(search).toHaveBeenCalledTimes(2);
+  });
+
+  it('replays the loaded window after hydration, retaining visible rows while it refreshes', async () => {
+    const [revision, setRevision] = createSignal(0);
+    const refresh = deferred<SearchCachePage>();
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockResolvedValueOnce(page(['one'], true))
+      .mockResolvedValueOnce(page(['two']))
+      .mockReturnValueOnce(refresh.promise)
+      .mockResolvedValueOnce(page(['two', 'newly-hydrated']));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision,
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.hasMore()).toBe(true));
+    await list.loadMore();
+    setRevision(1);
+    expect(list.items()).toHaveLength(2);
+    refresh.resolve(page(['one'], true));
+    await vi.waitFor(() => expect(list.items()).toHaveLength(3));
+    expect(search).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    { stage: 'search', failurePage: 1 },
+    { stage: 'search', failurePage: 2 },
+    { stage: 'materialize', failurePage: 1 },
+    { stage: 'materialize', failurePage: 2 },
+  ])(
+    'retains the committed window after $stage fails on replay page $failurePage',
+    async ({ stage, failurePage }) => {
+      const [revision, setRevision] = createSignal(0);
+      let replaying = false;
+      let replayPage = 0;
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const search = vi.fn(
+        async (args: SearchCacheArgs): Promise<SearchCachePage> => {
+          if (replaying) {
+            replayPage += 1;
+            if (stage === 'search' && replayPage === failurePage)
+              throw new Error('cache search unavailable');
+            return page([`refreshed-${replayPage}`], true);
+          }
+          if (!args.cursor) return page(['one'], true);
+          if (args.cursor.recordKey === 'GraphqlSoupDocument:one')
+            return page(['two'], true);
+          if (args.cursor.recordKey === 'GraphqlSoupDocument:two')
+            return page(['three']);
+          throw new Error('pagination used an uncommitted cursor');
+        }
+      );
+      const list = root(() =>
+        createProjectedList({
+          host: { search },
+          buckets: ['note'],
+          revision,
+          materialize: async (documents) => {
+            if (
+              replaying &&
+              stage === 'materialize' &&
+              replayPage === failurePage
+            )
+              throw new Error('cache materialization unavailable');
+            return materialize(documents);
+          },
+        })
+      );
+      await vi.waitFor(() => expect(list.hasMore()).toBe(true));
+      await list.loadMore();
+      const committedRows = list.items();
+      expect(committedRows).toEqual([
+        { id: 'GraphqlSoupDocument:one' },
+        { id: 'GraphqlSoupDocument:two' },
+      ]);
+
+      // Repeated failures must retain the same committed cursor, including when
+      // part of a multi-page replay already succeeded before the error.
+      replaying = true;
+      for (const revision of [1, 2]) {
+        replayPage = 0;
+        setRevision(revision);
+        await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+        expect(replayPage).toBe(failurePage);
+        expect(list.items()).toBe(committedRows);
+        expect(list.hasMore()).toBe(true);
+        expect(list.isLoadingMore()).toBe(false);
+      }
+
+      replaying = false;
+      await list.loadMore();
+      expect(search.mock.calls.at(-1)?.[0].cursor).toEqual({
+        recordKey: 'GraphqlSoupDocument:two',
+        timestampMs: 1,
+      });
+      expect(list.items()).toEqual([
+        ...committedRows,
+        { id: 'GraphqlSoupDocument:three' },
+      ]);
+      expect(list.hasMore()).toBe(false);
+    }
+  );
+
+  it('does not carry a failed replay cursor into a different query', async () => {
+    const [revision, setRevision] = createSignal(0);
+    const [query, setQuery] = createSignal('');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockResolvedValueOnce(page(['old'], true))
+      .mockRejectedValueOnce(new Error('replay failed'))
+      .mockResolvedValueOnce(page(['new']));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision,
+        searchTerm: query,
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.hasMore()).toBe(true));
+    setRevision(1);
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(list.hasMore()).toBe(true);
+    setQuery('new');
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(search.mock.calls[2][0].cursor).toBeUndefined();
+    expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:new' }]);
+    expect(list.hasMore()).toBe(false);
+    await list.loadMore();
+    expect(search).toHaveBeenCalledTimes(3);
+  });
+
+  it('searches only materializable buckets before applying the limit', async () => {
+    const unsupportedHits = Array.from({ length: 500 }, (_, i) =>
+      document(`session-${i}`, 'agent_session')
+    );
+    const search = vi.fn(
+      async (args: SearchCacheArgs): Promise<SearchCachePage> => ({
+        documents: [...unsupportedHits, document('target')]
+          .filter((hit) => args.buckets?.includes(hit.bucket))
+          .slice(0, args.limit),
+        nextCursor: null,
+      })
+    );
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: exclude('person'),
+        revision: () => 0,
+        searchTerm: () => 'target',
+        materialize,
+      })
+    );
+    await vi.waitFor(() =>
+      expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:target' }])
+    );
+    expect(search.mock.calls[0][0].buckets).not.toEqual(
+      expect.arrayContaining(['agent_session'])
+    );
+    expect(search.mock.calls[0][0].buckets).toEqual(
+      expect.arrayContaining(['crm_company'])
+    );
+    expect(search.mock.calls[0][0].buckets).not.toEqual(
+      expect.arrayContaining(['agent_session'])
+    );
+  });
+
+  it('never interprets an unsupported-only list as an all-bucket search', async () => {
+    const search = vi.fn();
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['person', 'agent_session'],
+        revision: () => 0,
+        materialize,
+      })
+    );
+    expect(list.items()).toEqual([]);
+    expect(list.hasMore()).toBe(false);
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  it('continues past incomplete or duplicate pages instead of stranding scroll pagination', async () => {
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockResolvedValueOnce(page(['incomplete'], true))
+      .mockResolvedValueOnce(page(['one'], true))
+      .mockResolvedValueOnce(page(['one'], true))
+      .mockResolvedValueOnce(page(['two']));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        materialize: async (documents) =>
+          materialize(
+            documents.filter((doc) => !doc.recordKey.endsWith('incomplete'))
+          ),
+      })
+    );
+    await vi.waitFor(() => expect(list.items()).toHaveLength(1));
+    await list.loadMore();
+    expect(list.items()).toHaveLength(2);
+    expect(search).toHaveBeenCalledTimes(4);
+  });
+
+  it('bounds incomplete scans, preserves the cursor, and resumes on the next action', async () => {
+    const [revision, setRevision] = createSignal(0);
+    const search = vi.fn(
+      async (args: SearchCacheArgs): Promise<SearchCachePage> => {
+        const next = args.cursor
+          ? Number(args.cursor.recordKey.split(':')[1]) + 1
+          : 1;
+        return page([String(next)], true);
+      }
+    );
+    const project = vi.fn(materialize).mockResolvedValue([]);
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision,
+        materialize: project,
+      })
+    );
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(search).toHaveBeenCalledTimes(MAX_BROWSE_PAGES_PER_LOAD);
+    expect(list.items()).toEqual([]);
+    expect(list.hasMore()).toBe(true);
+    setRevision(1);
+    await vi.waitFor(() => expect(list.isLoading()).toBe(false));
+    expect(search).toHaveBeenCalledTimes(MAX_BROWSE_PAGES_PER_LOAD * 2);
+    await list.loadMore();
+    expect(search).toHaveBeenCalledTimes(MAX_BROWSE_PAGES_PER_LOAD * 3);
+    expect(list.hasMore()).toBe(true);
+    project.mockImplementation(materialize);
+    await list.loadMore();
+    expect(search.mock.calls.at(-1)?.[0].cursor?.recordKey).toBe(
+      `GraphqlSoupDocument:${MAX_BROWSE_PAGES_PER_LOAD * 2}`
+    );
+    expect(list.items()).toEqual([
+      { id: `GraphqlSoupDocument:${MAX_BROWSE_PAGES_PER_LOAD * 2 + 1}` },
+    ]);
+  });
+
+  it('drops an obsolete in-flight page when the query changes', async () => {
+    const [query, setQuery] = createSignal('');
+    const obsolete = deferred<SearchCachePage>();
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockResolvedValueOnce(page(['old'], true))
+      .mockReturnValueOnce(obsolete.promise)
+      .mockResolvedValueOnce(page(['new']));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        searchTerm: query,
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.items()).toHaveLength(1));
+    const loading = list.loadMore();
+    setQuery('new');
+    expect(list.items()).toEqual([]);
+    await vi.waitFor(() =>
+      expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:new' }])
+    );
+    obsolete.resolve(page(['obsolete']));
+    await loading;
+    expect(list.items()).toEqual([{ id: 'GraphqlSoupDocument:new' }]);
+    expect(search.mock.calls[2][0]).toMatchObject({ query: 'new', limit: 500 });
+    expect(search.mock.calls[2][0].cursor).toBeUndefined();
+  });
+
+  it('coalesces simultaneous loadMore calls and retains rows on failure', async () => {
+    const next = deferred<SearchCachePage>();
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const search = vi
+      .fn<(args: SearchCacheArgs) => Promise<SearchCachePage>>()
+      .mockResolvedValueOnce(page(['one'], true))
+      .mockReturnValueOnce(next.promise)
+      .mockRejectedValueOnce(new Error('cache unavailable'))
+      .mockResolvedValueOnce(page(['three']));
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        materialize,
+      })
+    );
+    await vi.waitFor(() => expect(list.hasMore()).toBe(true));
+    const pending = list.loadMore();
+    expect(list.isLoadingMore()).toBe(true);
+    await list.loadMore();
+    expect(search).toHaveBeenCalledTimes(2);
+    next.resolve(page(['two'], true));
+    await pending;
+    await list.loadMore();
+    expect(list.items()).toHaveLength(2);
+    expect(list.isLoadingMore()).toBe(false);
+    expect(list.hasMore()).toBe(true);
+    await list.loadMore();
+    expect(list.items()).toHaveLength(3);
+    warning.mockRestore();
+  });
+
+  it('disabling and disposing prevent late results from populating a list', async () => {
+    const [enabled, setEnabled] = createSignal(true);
+    const pending = deferred<SearchCachePage>();
+    const search = vi.fn().mockReturnValue(pending.promise);
+    const list = root(() =>
+      createProjectedList({
+        host: { search },
+        buckets: ['note'],
+        revision: () => 0,
+        enabled,
+        materialize,
+      })
+    );
+    setEnabled(false);
+    pending.resolve(page(['late']));
+    await pending.promise;
+    expect(list.items()).toEqual([]);
+    expect(list.isLoading()).toBe(false);
+    expect(list.hasMore()).toBe(false);
+    cleanups.splice(0).forEach((cleanup) => cleanup());
+  });
+});

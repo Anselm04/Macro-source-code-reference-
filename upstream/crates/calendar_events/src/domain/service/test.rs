@@ -1,0 +1,2222 @@
+use super::*;
+use crate::domain::ports::{CalendarEventChange, CalendarEventWriteOutcome, RetiredCalendarEvent};
+use crate::domain::{
+    models::{
+        AttendeeResponseStatus, CalendarAttendee, CalendarBackfillClaim,
+        CalendarBackfillFailureDisposition, CalendarBackfillFailureOutcome, CalendarBackfillJobKey,
+        CalendarCreationTarget, CalendarEvent, CalendarEventMutationTarget, CalendarEventSource,
+        CalendarOccurrence, CalendarSyncStatus, DisconnectedCalendar, EventReminders, EventStatus,
+        EventTime, EventTransparency, EventType, EventVisibility, GOOGLE_CALENDAR_FULL_SCOPE,
+        GOOGLE_CALENDAR_SCOPES, GoogleBackfillRunReport, GoogleCalendarSyncSnapshot,
+        GoogleEventSyncBatch, GoogleWatchChannel, GoogleWatchConfig, GuestPolicy, ProviderCalendar,
+        ProviderEventSource, StoredGoogleCalendar, ViewerCapabilities,
+    },
+    ports::{
+        CalendarBackfillRepository, CalendarEventWrite, CalendarProviderError,
+        CalendarReauthNotifier, CalendarRepository, GoogleCalendarProvider, GoogleEventSyncContext,
+    },
+};
+use chrono::{Duration, TimeZone, Utc};
+use macro_event_broker::NoopMacroEventBroker;
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone, Default)]
+struct FakeRepo {
+    team_ooo_changed: bool,
+    calendar_ooo_changed: bool,
+    upserts: Arc<Mutex<Vec<CalendarEventUpsert>>>,
+    stored_synced_at: Option<chrono::DateTime<Utc>>,
+    sync_snapshots: Arc<Mutex<Vec<GoogleCalendarSyncSnapshot>>>,
+    fail_sync_error_recording: bool,
+    /// Retirements the snapshot commit reports back, standing in for sources
+    /// the change feed cancelled or a full snapshot no longer observed.
+    sync_retirements: Vec<RetiredCalendarEvent>,
+    /// Provider calendars whose isolated sync failure was recorded, in order.
+    recorded_sync_errors: Arc<Mutex<Vec<String>>>,
+    /// Calendars recorded as refusing push channels, in order.
+    recorded_watch_unsupported: Arc<Mutex<Vec<Uuid>>>,
+    /// Copies `meeting_copies` reports for every event.
+    meeting_copies: Vec<crate::domain::models::MeetingCopy>,
+    /// What `event_export` resolves for every event.
+    export: Option<crate::domain::ics::CalendarEventExport>,
+    /// What `forwarded_copy` reads for every event.
+    forwarded: Option<crate::domain::ics::ForwardedCopy>,
+}
+
+impl CalendarRepository for FakeRepo {
+    async fn apply_google_grant(
+        &self,
+        _email_link_id: Uuid,
+        _scopes: GoogleScopeSet,
+        _intent: CalendarGrantIntent,
+    ) -> Result<AppliedGoogleGrant, Report> {
+        unreachable!()
+    }
+
+    async fn disconnect_provider_calendar(
+        &self,
+        _requester_id: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Option<DisconnectedCalendar>, Report> {
+        unreachable!()
+    }
+
+    async fn upsert_event(
+        &self,
+        write: CalendarEventWrite,
+    ) -> Result<CalendarEventWriteOutcome, Report> {
+        let upsert = match write {
+            #[cfg(feature = "outlook")]
+            CalendarEventWrite::OutlookSync { upsert, .. } => upsert,
+            CalendarEventWrite::GoogleBackfill { upsert, .. }
+            | CalendarEventWrite::UserMutation(upsert)
+            | CalendarEventWrite::Fixture(upsert) => upsert,
+        };
+        let id = upsert.event.id;
+        let owner_id = upsert.event.owner_id.clone();
+        let team_ooo_changed =
+            self.team_ooo_changed || upsert.event.event_type == EventType::OutOfOffice;
+        self.upserts.lock().unwrap().push(upsert);
+        Ok(CalendarEventWriteOutcome {
+            event_id: id,
+            owner_id,
+            change: CalendarEventChange::Created,
+            team_ooo_changed,
+            aligned_copies: Vec::new(),
+        })
+    }
+
+    async fn list_occurrences(
+        &self,
+        _owner_id: &str,
+        _range: OccurrenceRange,
+        _cursor: Option<CalendarOccurrenceCursor>,
+        _limit: u16,
+    ) -> Result<Vec<crate::domain::models::OccurrenceListing>, Report> {
+        Ok(Vec::new())
+    }
+
+    async fn sync_status(&self, _requester_id: &str) -> Result<CalendarSyncStatus, Report> {
+        Ok(CalendarSyncStatus::Ready)
+    }
+
+    async fn mention_previews(
+        &self,
+        _requester_id: &str,
+        items: Vec<crate::domain::models::CalendarMentionRequestItem>,
+        _now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<crate::domain::models::CalendarMentionPreview>, Report> {
+        Ok(items
+            .iter()
+            .map(|_| crate::domain::models::CalendarMentionPreview::DoesNotExist)
+            .collect())
+    }
+
+    async fn meeting_copies(
+        &self,
+        _requester_id: &str,
+        _event_id: Uuid,
+    ) -> Result<Vec<crate::domain::models::MeetingCopy>, Report> {
+        Ok(self.meeting_copies.clone())
+    }
+
+    async fn event_export(
+        &self,
+        _requester_id: &str,
+        _event_id: Uuid,
+    ) -> Result<Option<crate::domain::ics::CalendarEventExport>, Report> {
+        Ok(self.export.clone())
+    }
+
+    async fn forwarded_copy(
+        &self,
+        _requester_id: &str,
+        _event_id: Uuid,
+    ) -> Result<Option<crate::domain::ics::ForwardedCopy>, Report> {
+        Ok(self.forwarded.clone())
+    }
+
+    async fn open_join_request(
+        &self,
+        _event_id: Uuid,
+        _requester_id: &str,
+        _requester_email: &str,
+    ) -> Result<(crate::domain::join_requests::CalendarJoinRequest, bool), Report> {
+        unreachable!("join requests are not exercised by sync tests")
+    }
+
+    async fn find_join_request(
+        &self,
+        _event_id: Uuid,
+        _requester_id: &str,
+    ) -> Result<Option<crate::domain::join_requests::CalendarJoinRequest>, Report> {
+        unreachable!("join requests are not exercised by sync tests")
+    }
+
+    async fn list_pending_join_requests(
+        &self,
+        _event_id: Uuid,
+    ) -> Result<Vec<crate::domain::join_requests::CalendarJoinRequest>, Report> {
+        unreachable!("join requests are not exercised by sync tests")
+    }
+
+    async fn get_join_request(
+        &self,
+        _request_id: Uuid,
+    ) -> Result<Option<crate::domain::join_requests::CalendarJoinRequest>, Report> {
+        unreachable!("join requests are not exercised by sync tests")
+    }
+
+    async fn resolve_join_request(
+        &self,
+        _request_id: Uuid,
+        _status: crate::domain::join_requests::CalendarJoinRequestStatus,
+    ) -> Result<Option<crate::domain::join_requests::CalendarJoinRequest>, Report> {
+        unreachable!("join requests are not exercised by sync tests")
+    }
+
+    async fn list_team_out_of_office(
+        &self,
+        _requester_id: &str,
+        _range: OccurrenceRange,
+        _limit: u16,
+    ) -> Result<Vec<crate::domain::models::TeamOutOfOffice>, Report> {
+        Ok(Vec::new())
+    }
+
+    async fn get_event_mutation_target(
+        &self,
+        _requester_id: &str,
+        _event_id: Uuid,
+        _calendar_id: Option<Uuid>,
+    ) -> Result<Option<CalendarEventMutationTarget>, Report> {
+        unreachable!("mutation lookups are not exercised by sync tests")
+    }
+
+    async fn get_event_attendees(&self, _event_id: Uuid) -> Result<Vec<CalendarAttendee>, Report> {
+        unreachable!("mutation lookups are not exercised by sync tests")
+    }
+
+    async fn get_occurrence_override_attendees(
+        &self,
+        _event_id: Uuid,
+        _recurrence_id: &str,
+    ) -> Result<Option<Vec<CalendarAttendee>>, Report> {
+        unreachable!("mutation lookups are not exercised by sync tests")
+    }
+
+    async fn get_event_details(
+        &self,
+        _event_id: Uuid,
+        _occurrence_key: Option<&str>,
+    ) -> Result<Option<crate::domain::models::EventDetails>, Report> {
+        unreachable!("mutation lookups are not exercised by sync tests")
+    }
+
+    async fn record_guest_policy(
+        &self,
+        _event_id: Uuid,
+        _policy: GuestPolicy,
+    ) -> Result<(), Report> {
+        unreachable!("mutation writes are not exercised by sync tests")
+    }
+
+    async fn get_creation_target(
+        &self,
+        _requester_id: &str,
+        _email_link_id: Option<Uuid>,
+        _calendar_id: Option<Uuid>,
+    ) -> Result<Option<CalendarCreationTarget>, Report> {
+        unreachable!("mutation lookups are not exercised by sync tests")
+    }
+
+    async fn list_visible_calendars(
+        &self,
+        _requester_id: &str,
+    ) -> Result<Vec<crate::domain::models::VisibleCalendar>, Report> {
+        Ok(Vec::new())
+    }
+
+    async fn primary_time_zone(&self, _requester_id: &str) -> Result<Option<String>, Report> {
+        Ok(None)
+    }
+
+    async fn event_copies(
+        &self,
+        _event_ids: &[Uuid],
+    ) -> Result<Vec<crate::domain::labels::EventCopy>, Report> {
+        Ok(Vec::new())
+    }
+
+    async fn owned_inboxes(
+        &self,
+        _requester_id: &str,
+    ) -> Result<Vec<crate::domain::models::OwnedInbox>, Report> {
+        Ok(Vec::new())
+    }
+
+    async fn remove_provider_source(
+        &self,
+        _account_id: Uuid,
+        _calendar_id: Uuid,
+        _provider_event_id: &str,
+    ) -> Result<Vec<RetiredCalendarEvent>, Report> {
+        unreachable!("mutation cleanup is not exercised by sync tests")
+    }
+
+    async fn upsert_google_calendar(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _lease_token: Uuid,
+        _account_id: Uuid,
+        _calendar: ProviderCalendar,
+    ) -> Result<StoredGoogleCalendar, Report> {
+        Ok(StoredGoogleCalendar {
+            id: Uuid::nil(),
+            team_ooo_changed: self.calendar_ooo_changed,
+            sync_token: None,
+            materialized_range: None,
+            synced_at: self.stored_synced_at,
+            watch_expires_at: None,
+            watch_unsupported_at: (!self.recorded_watch_unsupported.lock().unwrap().is_empty())
+                .then(Utc::now),
+        })
+    }
+
+    async fn commit_google_calendar_sync(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _lease_token: Uuid,
+        _account_id: Uuid,
+        sync: GoogleCalendarSyncSnapshot,
+        _events_upserted: usize,
+    ) -> Result<Vec<RetiredCalendarEvent>, Report> {
+        self.sync_snapshots.lock().unwrap().push(sync);
+        Ok(self.sync_retirements.clone())
+    }
+
+    async fn reconcile_google_calendar_list(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _lease_token: Uuid,
+        _account_id: Uuid,
+        _calendar_ids: Vec<Uuid>,
+    ) -> Result<Vec<RetiredCalendarEvent>, Report> {
+        Ok(Vec::new())
+    }
+
+    async fn record_google_calendar_sync_error(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _lease_token: Uuid,
+        _account_id: Uuid,
+        _calendar_id: Uuid,
+        _kind: CalendarSyncFailure,
+        message: &str,
+    ) -> Result<(), Report> {
+        if self.fail_sync_error_recording {
+            return Err(rootcause::report!("cannot persist calendar coverage error"));
+        }
+        self.recorded_sync_errors
+            .lock()
+            .unwrap()
+            .push(message.to_string());
+        Ok(())
+    }
+
+    async fn record_watch_channel(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _lease_token: Uuid,
+        _account_id: Uuid,
+        _calendar_id: Uuid,
+        _channel: GoogleWatchChannel,
+    ) -> Result<(), Report> {
+        Ok(())
+    }
+
+    async fn record_watch_unsupported(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _lease_token: Uuid,
+        _account_id: Uuid,
+        calendar_id: Uuid,
+    ) -> Result<(), Report> {
+        self.recorded_watch_unsupported
+            .lock()
+            .unwrap()
+            .push(calendar_id);
+        Ok(())
+    }
+
+    async fn find_watch_target(
+        &self,
+        _channel_id: &str,
+        _resource_id: &str,
+    ) -> Result<Option<Uuid>, Report> {
+        Ok(None)
+    }
+
+    async fn schedule_google_sync_for_link(&self, _email_link_id: Uuid) -> Result<bool, Report> {
+        Ok(false)
+    }
+}
+
+fn provider_calendar(id: &str, primary: bool) -> ProviderCalendar {
+    ProviderCalendar {
+        provider_calendar_id: id.to_string(),
+        name: id.to_string(),
+        description: None,
+        time_zone: Some("UTC".to_string()),
+        color: None,
+        access_role: Some("owner".to_string()),
+        is_primary: primary,
+        is_selected: true,
+        default_reminders: Vec::new(),
+    }
+}
+
+fn two_calendars() -> Vec<ProviderCalendar> {
+    vec![
+        provider_calendar("primary", true),
+        provider_calendar("team", false),
+    ]
+}
+
+fn valid_upsert() -> CalendarEventUpsert {
+    let event_id = Uuid::now_v7();
+    let starts_at = Utc.with_ymd_and_hms(2026, 7, 24, 14, 0, 0).unwrap();
+    let ends_at = Utc.with_ymd_and_hms(2026, 7, 24, 15, 0, 0).unwrap();
+    CalendarEventUpsert {
+        event: CalendarEvent {
+            id: event_id,
+            owner_id: "macro|calendar@example.com".to_string(),
+            ical_uid: "meeting@example.com".to_string(),
+            calendar_id: None,
+            sources: Vec::new(),
+            title: "Meeting".to_string(),
+            description: None,
+            location: None,
+            status: EventStatus::Confirmed,
+            visibility: EventVisibility::Default,
+            transparency: EventTransparency::Opaque,
+            event_type: EventType::Default,
+            time: EventTime::Timed {
+                starts_at,
+                ends_at,
+                time_zone: Some("UTC".to_string()),
+            },
+            recurrence_lines: Vec::new(),
+            organizer_email: None,
+            organizer_name: None,
+            creator_email: None,
+            creator_name: None,
+            conference_url: None,
+            conference_provider: None,
+            sequence: 0,
+            is_read_only: true,
+            attendees: vec![CalendarAttendee {
+                email: "calendar@example.com".to_string(),
+                display_name: None,
+                response_status: AttendeeResponseStatus::Accepted,
+                is_organizer: false,
+                is_optional: false,
+                is_self: true,
+                comment: None,
+            }],
+            reminders: EventReminders::default(),
+            guest_policy: GuestPolicy::default(),
+            is_snapshot: false,
+            viewer_can: ViewerCapabilities::NONE,
+            created_at: starts_at,
+            updated_at: starts_at,
+        },
+        source: CalendarEventSource::Google(ProviderEventSource {
+            automatic_decline: None,
+            binding: None,
+            observed_access_role: Some("owner".to_owned()),
+            email_link_id: Uuid::now_v7(),
+            account_id: Uuid::now_v7(),
+            calendar_id: Uuid::now_v7(),
+            provider_event_id: "provider-event".to_string(),
+            provider_recurring_event_id: None,
+            provider_etag: None,
+            raw_payload: serde_json::json!({}),
+        }),
+        overrides: Vec::new(),
+        occurrences: vec![CalendarOccurrence {
+            event_id,
+            occurrence_key: starts_at.to_rfc3339(),
+            recurrence_id: None,
+            time: EventTime::Timed {
+                starts_at,
+                ends_at,
+                time_zone: Some("UTC".to_string()),
+            },
+            is_cancelled: false,
+        }],
+    }
+}
+
+#[test]
+fn accepts_valid_event() {
+    assert!(validate_upsert(&valid_upsert()).is_ok());
+}
+
+#[test]
+fn accepts_point_occurrence_but_rejects_reversed_time() {
+    let mut upsert = valid_upsert();
+    let starts_at = Utc.with_ymd_and_hms(2026, 7, 24, 14, 0, 0).unwrap();
+    upsert.occurrences[0].time = EventTime::Timed {
+        starts_at,
+        ends_at: starts_at,
+        time_zone: None,
+    };
+
+    assert!(validate_upsert(&upsert).is_ok());
+    if let EventTime::Timed { ends_at, .. } = &mut upsert.occurrences[0].time {
+        *ends_at -= Duration::seconds(1);
+    }
+    assert!(validate_upsert(&upsert).is_err());
+}
+
+#[test]
+fn complete_scope_capability_requires_every_requested_scope() {
+    let complete = GoogleScopeSet::parse(&GOOGLE_CALENDAR_SCOPES.join(" "));
+    assert!(complete.has_calendar_capability());
+
+    for scope in GOOGLE_CALENDAR_SCOPES {
+        let partial = GoogleScopeSet::parse(scope);
+        assert!(
+            !partial.has_calendar_capability(),
+            "{scope} alone must not read as the complete capability"
+        );
+    }
+}
+
+/// An inbox connected before Macro narrowed its request reports only the broad
+/// scope. It deliberately does not read as the capability — the user re-grants
+/// through the normal prompt, which records the scopes Macro asks for today.
+#[test]
+fn broad_calendar_grant_no_longer_reads_as_the_capability() {
+    let broad = GoogleScopeSet::parse(GOOGLE_CALENDAR_FULL_SCOPE);
+
+    assert!(!broad.has_calendar_capability());
+}
+
+/// Google re-issues an earlier broad grant alongside the narrow scopes it now
+/// grants, so turning calendar off has to strip the broad one too or the
+/// capability survives its own removal.
+#[test]
+fn turning_calendar_off_strips_a_re_issued_broad_scope() {
+    let reissued = GoogleScopeSet::parse(&format!(
+        "https://www.googleapis.com/auth/gmail.modify {GOOGLE_CALENDAR_FULL_SCOPE} {}",
+        GOOGLE_CALENDAR_SCOPES.join(" ")
+    ));
+    assert!(reissued.has_calendar_capability());
+
+    let stripped = reissued.without_calendar();
+    assert!(!stripped.has_calendar_capability());
+    assert!(!stripped.contains(GOOGLE_CALENDAR_FULL_SCOPE));
+    assert!(stripped.contains("https://www.googleapis.com/auth/gmail.modify"));
+}
+
+#[derive(Clone)]
+struct FakeGoogleProvider;
+
+impl GoogleCalendarProvider for FakeGoogleProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(Vec::new())
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        Ok(GoogleEventSyncBatch {
+            upserts: Vec::new(),
+            observed_provider_event_ids: Some(Vec::new()),
+            next_sync_token: "next".to_string(),
+            materialized_range: Some(context.target.range),
+            cancelled_provider_event_ids: Vec::new(),
+        })
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+#[derive(Clone)]
+struct ReauthGoogleProvider;
+
+impl GoogleCalendarProvider for ReauthGoogleProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Err(CalendarProviderError::new(
+            CalendarProviderErrorKind::ReauthRequired,
+            "insufficient permissions",
+        ))
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        _context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        unreachable!("calendar listing fails first")
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+#[derive(Clone)]
+struct FakeLifecycle {
+    claim: CalendarBackfillClaim,
+    completions: Arc<Mutex<Vec<()>>>,
+    failures: Arc<Mutex<Vec<CalendarBackfillFailureDisposition>>>,
+    failure_outcome: CalendarBackfillFailureOutcome,
+    lease_lost: bool,
+}
+
+impl FakeLifecycle {
+    fn claimed() -> Self {
+        Self {
+            claim: CalendarBackfillClaim::Claimed {
+                lease_token: Uuid::nil(),
+                account_id: Uuid::nil(),
+            },
+            completions: Arc::new(Mutex::new(Vec::new())),
+            failures: Arc::new(Mutex::new(Vec::new())),
+            failure_outcome: CalendarBackfillFailureOutcome {
+                job_transitioned: true,
+                link_reauth_transitioned: false,
+            },
+            lease_lost: false,
+        }
+    }
+
+    fn lease_lost() -> Self {
+        Self {
+            lease_lost: true,
+            ..Self::claimed()
+        }
+    }
+}
+
+impl CalendarBackfillRepository for FakeLifecycle {
+    async fn fail_unclaimed_google_backfill(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _disposition: CalendarBackfillFailureDisposition,
+        _message: &str,
+    ) -> Result<CalendarBackfillFailureOutcome, Report> {
+        Ok(self.failure_outcome)
+    }
+
+    async fn claim_google_backfill(
+        &self,
+        _key: CalendarBackfillJobKey,
+    ) -> Result<CalendarBackfillClaim, Report> {
+        Ok(self.claim)
+    }
+
+    async fn mark_google_account_syncing(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _lease_token: Uuid,
+    ) -> Result<(), Report> {
+        Ok(())
+    }
+
+    async fn maintain_google_backfill_lease(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _lease_token: Uuid,
+    ) -> Result<(), Report> {
+        if self.lease_lost {
+            return Ok(());
+        }
+        std::future::pending().await
+    }
+
+    async fn complete_google_backfill(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _lease_token: Uuid,
+    ) -> Result<(), Report> {
+        self.completions.lock().unwrap().push(());
+        Ok(())
+    }
+
+    async fn fail_google_backfill(
+        &self,
+        _key: CalendarBackfillJobKey,
+        _lease_token: Uuid,
+        disposition: CalendarBackfillFailureDisposition,
+        _message: &str,
+    ) -> Result<CalendarBackfillFailureOutcome, Report> {
+        self.failures.lock().unwrap().push(disposition);
+        Ok(self.failure_outcome)
+    }
+}
+
+/// Syncs the first calendar with one change, then fails the second.
+#[derive(Clone)]
+struct PartialFailureGoogleProvider;
+
+impl GoogleCalendarProvider for PartialFailureGoogleProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(two_calendars())
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        if context.target.provider_calendar_id == "team" {
+            return Err(CalendarProviderError::new(
+                CalendarProviderErrorKind::Transient,
+                "the second calendar's poll failed",
+            ));
+        }
+        let mut upsert = valid_upsert();
+        let source = upsert.source.details_mut();
+        source.calendar_id = Uuid::nil();
+        Ok(GoogleEventSyncBatch {
+            upserts: vec![upsert],
+            observed_provider_event_ids: Some(vec!["provider-event".to_string()]),
+            next_sync_token: "next".to_string(),
+            materialized_range: Some(context.target.range),
+            cancelled_provider_event_ids: Vec::new(),
+        })
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+/// A single healthy calendar with an optional changed event.
+#[derive(Clone)]
+struct ChangedCalendarProvider {
+    with_event: bool,
+}
+
+impl GoogleCalendarProvider for ChangedCalendarProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(vec![provider_calendar("primary", true)])
+    }
+
+    async fn sync_events(
+        &self,
+        access_token: &str,
+        context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        let mut batch = PartialFailureGoogleProvider
+            .sync_events(access_token, context)
+            .await?;
+        if !self.with_event {
+            batch.upserts.clear();
+        }
+        Ok(batch)
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+#[tokio::test]
+async fn backfill_refresh_reports_source_and_calendar_ooo_changes() {
+    for (with_event, source_changed, calendar_changed) in [
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+        (false, false, true),
+        (false, false, false),
+    ] {
+        let coordinator = GoogleCalendarBackfillCoordinator::new(
+            FakeRepo {
+                team_ooo_changed: source_changed,
+                calendar_ooo_changed: calendar_changed,
+                ..FakeRepo::default()
+            },
+            ChangedCalendarProvider { with_event },
+            FakeLifecycle::claimed(),
+            NoopMacroEventBroker,
+            None,
+        );
+        let mut report = GoogleBackfillRunReport::default();
+        coordinator
+            .run(
+                CalendarBackfillJobKey {
+                    job_id: Uuid::now_v7(),
+                    email_link_id: Uuid::now_v7(),
+                },
+                "macro|calendar@example.com",
+                "secret",
+                OccurrenceRange::maintenance_horizon(Utc::now()),
+                &mut report,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.changed(), with_event || calendar_changed);
+        assert_eq!(report.team_ooo_changed, source_changed || calendar_changed);
+    }
+}
+
+/// Fails the poll of every calendar it lists.
+#[derive(Clone)]
+struct TotalFailureGoogleProvider;
+
+impl GoogleCalendarProvider for TotalFailureGoogleProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(two_calendars())
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        _context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        Err(CalendarProviderError::new(
+            CalendarProviderErrorKind::Transient,
+            "every calendar's poll failed",
+        ))
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+/// Syncs the first calendar with one change, then returns a reauthorization
+/// signal on the second — standing in for a grant that lost calendar scope
+/// mid-run.
+#[derive(Clone)]
+struct ReauthOnColleagueCalendarProvider;
+
+impl GoogleCalendarProvider for ReauthOnColleagueCalendarProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(two_calendars())
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        if context.target.provider_calendar_id == "team" {
+            return Err(CalendarProviderError::new(
+                CalendarProviderErrorKind::ReauthRequired,
+                "insufficient permissions",
+            ));
+        }
+        let mut upsert = valid_upsert();
+        let source = upsert.source.details_mut();
+        source.calendar_id = Uuid::nil();
+        Ok(GoogleEventSyncBatch {
+            upserts: vec![upsert],
+            observed_provider_event_ids: Some(vec!["provider-event".to_string()]),
+            next_sync_token: "next".to_string(),
+            materialized_range: Some(context.target.range),
+            cancelled_provider_event_ids: Vec::new(),
+        })
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+/// Fails both calendars, one permanently and one transiently.
+#[derive(Clone)]
+struct MixedTotalFailureGoogleProvider;
+
+impl GoogleCalendarProvider for MixedTotalFailureGoogleProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(two_calendars())
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        // The transient failure comes first, so last-write-wins would surface
+        // the permanent one and fail the assertion.
+        if context.target.provider_calendar_id == "primary" {
+            Err(CalendarProviderError::new(
+                CalendarProviderErrorKind::Transient,
+                "the primary calendar is unavailable",
+            ))
+        } else {
+            Err(CalendarProviderError::new(
+                CalendarProviderErrorKind::Permanent,
+                "the colleague calendar was not found",
+            ))
+        }
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+/// Syncs one calendar whose watch call Google refuses as push-unsupported.
+#[derive(Clone, Default)]
+struct PushUnsupportedGoogleProvider {
+    watch_calls: Arc<Mutex<usize>>,
+}
+
+impl GoogleCalendarProvider for PushUnsupportedGoogleProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(vec![provider_calendar("holidays", false)])
+    }
+
+    async fn sync_events(
+        &self,
+        access_token: &str,
+        context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        FakeGoogleProvider.sync_events(access_token, context).await
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        *self.watch_calls.lock().unwrap() += 1;
+        Err(CalendarProviderError::new(
+            CalendarProviderErrorKind::PushUnsupported,
+            "Push notifications are not supported by this resource.",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn push_unsupported_watch_is_recorded_and_the_account_completes() {
+    let lifecycle = FakeLifecycle::claimed();
+    let repository = FakeRepo::default();
+    let recorded_watch_unsupported = repository.recorded_watch_unsupported.clone();
+    let recorded_sync_errors = repository.recorded_sync_errors.clone();
+    let provider = PushUnsupportedGoogleProvider::default();
+    let watch_calls = provider.watch_calls.clone();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        repository,
+        provider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        Some(GoogleWatchConfig {
+            address: "https://gateway.example.com/calendar/notifications".to_string(),
+            token: "token".to_string(),
+        }),
+    );
+
+    let key = CalendarBackfillJobKey {
+        job_id: Uuid::now_v7(),
+        email_link_id: Uuid::now_v7(),
+    };
+    for _ in 0..2 {
+        let mut report = GoogleBackfillRunReport::default();
+        coordinator
+            .run(
+                key,
+                "macro|calendar@example.com",
+                "secret",
+                OccurrenceRange::maintenance_horizon(Utc::now()),
+                &mut report,
+            )
+            .await
+            .expect("a calendar Google will not push for still syncs by polling");
+    }
+
+    assert_eq!(
+        *recorded_watch_unsupported.lock().unwrap(),
+        vec![Uuid::nil()],
+        "the refusal is recorded once"
+    );
+    assert_eq!(
+        *watch_calls.lock().unwrap(),
+        1,
+        "the recorded refusal stops the next run from re-watching"
+    );
+    assert!(recorded_sync_errors.lock().unwrap().is_empty());
+    assert_eq!(lifecycle.completions.lock().unwrap().len(), 2);
+    assert!(lifecycle.failures.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn one_failed_calendar_is_isolated_and_the_account_completes() {
+    let lifecycle = FakeLifecycle::claimed();
+    let repository = FakeRepo::default();
+    let recorded_sync_errors = repository.recorded_sync_errors.clone();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        repository,
+        PartialFailureGoogleProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+
+    let mut report = GoogleBackfillRunReport::default();
+    coordinator
+        .run(
+            CalendarBackfillJobKey {
+                job_id: Uuid::now_v7(),
+                email_link_id: Uuid::now_v7(),
+            },
+            "macro|calendar@example.com",
+            "secret",
+            OccurrenceRange::maintenance_horizon(Utc::now()),
+            &mut report,
+        )
+        .await
+        .expect("a single unreadable calendar must not fail the whole account");
+
+    assert_eq!(
+        report.events_upserted, 1,
+        "the healthy calendar's commit must still land"
+    );
+    assert!(report.changed());
+    assert!(
+        report.team_ooo_changed,
+        "isolated failures cannot certify unchanged OOO access"
+    );
+    let recorded = recorded_sync_errors.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the failed calendar records its own error"
+    );
+    assert!(recorded[0].contains("the second calendar's poll failed"));
+    assert_eq!(
+        lifecycle.completions.lock().unwrap().len(),
+        1,
+        "the run completes rather than failing"
+    );
+    assert!(lifecycle.failures.lock().unwrap().is_empty());
+}
+
+/// Every calendar failing is a wholesale outage: the run fails so the
+/// coordinator can classify it (transient here) for retry, rather than
+/// quietly reporting success on an account that synced nothing.
+#[tokio::test]
+async fn every_calendar_failing_fails_the_run_for_retry() {
+    let lifecycle = FakeLifecycle::claimed();
+    let repository = FakeRepo::default();
+    let recorded_sync_errors = repository.recorded_sync_errors.clone();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        repository,
+        TotalFailureGoogleProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+
+    let mut report = GoogleBackfillRunReport::default();
+    let error = coordinator
+        .run(
+            CalendarBackfillJobKey {
+                job_id: Uuid::now_v7(),
+                email_link_id: Uuid::now_v7(),
+            },
+            "macro|calendar@example.com",
+            "secret",
+            OccurrenceRange::maintenance_horizon(Utc::now()),
+            &mut report,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        GoogleCalendarBackfillRunError::Retryable(_)
+    ));
+    assert_eq!(report.events_upserted, 0);
+    assert!(
+        recorded_sync_errors.lock().unwrap().is_empty(),
+        "a wholesale outage is recorded on the account, not on every calendar"
+    );
+    assert!(lifecycle.completions.lock().unwrap().is_empty());
+}
+
+/// A reauthorization signal on one calendar is account-wide: it fails the run
+/// immediately (so the user is prompted) rather than being isolated and
+/// swallowed by the other calendars completing.
+#[tokio::test]
+async fn a_reauth_signal_on_one_calendar_fails_the_run_immediately() {
+    let lifecycle = FakeLifecycle::claimed();
+    let repository = FakeRepo::default();
+    let recorded_sync_errors = repository.recorded_sync_errors.clone();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        repository,
+        ReauthOnColleagueCalendarProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+
+    let mut report = GoogleBackfillRunReport::default();
+    let error = coordinator
+        .run(
+            CalendarBackfillJobKey {
+                job_id: Uuid::now_v7(),
+                email_link_id: Uuid::now_v7(),
+            },
+            "macro|calendar@example.com",
+            "secret",
+            OccurrenceRange::maintenance_horizon(Utc::now()),
+            &mut report,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        GoogleCalendarBackfillRunError::ReauthRequired { .. }
+    ));
+    assert_eq!(
+        report.events_upserted, 1,
+        "the first calendar's durable commit must surface through the failed run"
+    );
+    assert!(report.changed());
+    assert_eq!(
+        lifecycle.failures.lock().unwrap().as_slice(),
+        [CalendarBackfillFailureDisposition::CalendarPermissionRequired]
+    );
+    assert!(
+        recorded_sync_errors.lock().unwrap().is_empty(),
+        "a reauth signal propagates before it is recorded as an isolated failure"
+    );
+    assert!(lifecycle.completions.lock().unwrap().is_empty());
+}
+
+/// When every calendar fails with a mix of kinds, the surfaced error prefers a
+/// retryable one so one calendar's permanent error cannot stop the whole inbox
+/// from polling.
+#[tokio::test]
+async fn a_wholesale_failure_prefers_a_retryable_error() {
+    let lifecycle = FakeLifecycle::claimed();
+    let repository = FakeRepo::default();
+    let recorded_sync_errors = repository.recorded_sync_errors.clone();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        repository,
+        MixedTotalFailureGoogleProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+
+    let mut report = GoogleBackfillRunReport::default();
+    let error = coordinator
+        .run(
+            CalendarBackfillJobKey {
+                job_id: Uuid::now_v7(),
+                email_link_id: Uuid::now_v7(),
+            },
+            "macro|calendar@example.com",
+            "secret",
+            OccurrenceRange::maintenance_horizon(Utc::now()),
+            &mut report,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, GoogleCalendarBackfillRunError::Retryable(_)),
+        "a permanent failure on one calendar must not stop polling when another was transient"
+    );
+    assert_eq!(
+        lifecycle.failures.lock().unwrap().as_slice(),
+        [CalendarBackfillFailureDisposition::Retry]
+    );
+    assert_eq!(
+        recorded_sync_errors.lock().unwrap().as_slice(),
+        ["the colleague calendar was not found"],
+        "the calendar that failed for good records it; the transient one stays with the account"
+    );
+}
+
+#[tokio::test]
+async fn google_coordinator_owns_claim_and_completion_lifecycle() {
+    let lifecycle = FakeLifecycle::claimed();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        FakeRepo::default(),
+        FakeGoogleProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+
+    let mut report = GoogleBackfillRunReport::default();
+    coordinator
+        .run(
+            CalendarBackfillJobKey {
+                job_id: Uuid::now_v7(),
+                email_link_id: Uuid::now_v7(),
+            },
+            "macro|calendar@example.com",
+            "secret",
+            OccurrenceRange::historical_sync(Utc::now()),
+            &mut report,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report, GoogleBackfillRunReport::default());
+    assert_eq!(lifecycle.completions.lock().unwrap().len(), 1);
+}
+
+/// Records what the backfill published, so a retirement can be distinguished
+/// from an upsert.
+#[derive(Clone, Default)]
+struct RecordingEventBroker {
+    published: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+}
+
+impl macro_event_broker::MacroEventBroker for RecordingEventBroker {
+    fn send_event<E: macro_event_broker::MacroEvent + ?Sized>(
+        &self,
+        event: &E,
+    ) -> Result<
+        tokio::task::JoinHandle<Result<(), macro_event_broker::EventBrokerError>>,
+        macro_event_broker::EventBrokerError,
+    > {
+        self.published.lock().unwrap().push((
+            event.key().to_string(),
+            serde_json::to_value(event.event())?,
+        ));
+        Ok(tokio::spawn(async { Ok(()) }))
+    }
+}
+
+/// One ordinary calendar whose poll reports a cancelled provider event, so the
+/// snapshot commit runs and its retirements reach the publisher.
+#[derive(Clone)]
+struct CancellingCalendarProvider;
+
+impl GoogleCalendarProvider for CancellingCalendarProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(vec![ProviderCalendar {
+            provider_calendar_id: "primary".to_string(),
+            name: "Calendar".to_string(),
+            description: None,
+            time_zone: Some("UTC".to_string()),
+            color: None,
+            access_role: Some("owner".to_string()),
+            is_primary: true,
+            is_selected: true,
+            default_reminders: Vec::new(),
+        }])
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        Ok(GoogleEventSyncBatch {
+            upserts: Vec::new(),
+            observed_provider_event_ids: Some(Vec::new()),
+            next_sync_token: "next".to_string(),
+            materialized_range: Some(context.target.range),
+            cancelled_provider_event_ids: vec!["gone-at-google".to_string()],
+        })
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+/// Team clients clear their out-of-office rows on this hint, and every sync of
+/// a meeting's attendees carries it, so a removed meeting must not raise it.
+#[tokio::test]
+async fn retiring_a_regular_meeting_leaves_team_ooo_rows_alone() {
+    for sync_retirements in [
+        vec![RetiredCalendarEvent {
+            event_id: Uuid::now_v7(),
+            owner_id: "macro|owner".to_string(),
+            deleted: true,
+            team_ooo_changed: false,
+        }],
+        // A tombstone for something Macro never stored changes nothing.
+        Vec::new(),
+    ] {
+        let coordinator = GoogleCalendarBackfillCoordinator::new(
+            FakeRepo {
+                sync_retirements,
+                ..FakeRepo::default()
+            },
+            CancellingCalendarProvider,
+            FakeLifecycle::claimed(),
+            NoopMacroEventBroker,
+            None,
+        );
+        let mut report = GoogleBackfillRunReport::default();
+        coordinator
+            .run(
+                CalendarBackfillJobKey {
+                    job_id: Uuid::now_v7(),
+                    email_link_id: Uuid::now_v7(),
+                },
+                "macro|calendar@example.com",
+                "secret",
+                OccurrenceRange::historical_sync(Utc::now()),
+                &mut report,
+            )
+            .await
+            .unwrap();
+
+        assert!(report.changed());
+        assert!(!report.team_ooo_changed);
+    }
+}
+
+/// A provider-side deletion reaches search only through the topic: the row is
+/// gone once the snapshot commit lands, so the search backfill — which
+/// enumerates existing rows — can never rediscover it.
+#[tokio::test]
+async fn a_cancelled_provider_event_publishes_a_deletion() {
+    let removed = Uuid::now_v7();
+    let survivor = Uuid::now_v7();
+    let repo = FakeRepo {
+        sync_retirements: vec![
+            RetiredCalendarEvent {
+                event_id: removed,
+                owner_id: "macro|owner".to_string(),
+                deleted: true,
+                team_ooo_changed: true,
+            },
+            // Another source still backs this one, so its row was rewritten.
+            RetiredCalendarEvent {
+                event_id: survivor,
+                owner_id: "macro|owner".to_string(),
+                deleted: false,
+                team_ooo_changed: false,
+            },
+        ],
+        ..FakeRepo::default()
+    };
+    let broker = RecordingEventBroker::default();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        repo,
+        CancellingCalendarProvider,
+        FakeLifecycle::claimed(),
+        broker.clone(),
+        None,
+    );
+
+    let mut report = GoogleBackfillRunReport::default();
+    coordinator
+        .run(
+            CalendarBackfillJobKey {
+                job_id: Uuid::now_v7(),
+                email_link_id: Uuid::now_v7(),
+            },
+            "macro|calendar@example.com",
+            "secret",
+            OccurrenceRange::historical_sync(Utc::now()),
+            &mut report,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        report.team_ooo_changed,
+        "retired sources must withdraw cached OOO rows"
+    );
+    let published = broker.published.lock().unwrap().clone();
+    let deleted: Vec<&String> = published
+        .iter()
+        .filter(|(_, payload)| payload.get("calendar_event.deleted").is_some())
+        .map(|(key, _)| key)
+        .collect();
+    let updated: Vec<&String> = published
+        .iter()
+        .filter(|(_, payload)| payload.get("calendar_event.updated").is_some())
+        .map(|(key, _)| key)
+        .collect();
+
+    assert_eq!(
+        deleted,
+        vec![&removed.to_string()],
+        "the retired event must be announced as deleted, got {published:?}"
+    );
+    assert_eq!(
+        updated,
+        vec![&survivor.to_string()],
+        "an event that survived on another source is an update, not a deletion"
+    );
+}
+
+#[derive(Clone)]
+struct SystemCalendarProvider;
+
+impl GoogleCalendarProvider for SystemCalendarProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(vec![ProviderCalendar {
+            provider_calendar_id: "en.usa#holiday@group.v.calendar.google.com".to_string(),
+            name: "Holidays in United States".to_string(),
+            description: None,
+            time_zone: Some("UTC".to_string()),
+            color: None,
+            access_role: Some("reader".to_string()),
+            is_primary: false,
+            is_selected: true,
+            default_reminders: Vec::new(),
+        }])
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        _context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        unreachable!("freshly synced system calendars must not sync")
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+#[tokio::test]
+async fn freshly_synced_system_calendars_are_skipped() {
+    let lifecycle = FakeLifecycle::claimed();
+    let repo = FakeRepo {
+        stored_synced_at: Some(Utc::now()),
+        ..FakeRepo::default()
+    };
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        repo,
+        SystemCalendarProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+
+    let mut report = GoogleBackfillRunReport::default();
+    coordinator
+        .run(
+            CalendarBackfillJobKey {
+                job_id: Uuid::now_v7(),
+                email_link_id: Uuid::now_v7(),
+            },
+            "macro|calendar@example.com",
+            "secret",
+            OccurrenceRange::maintenance_horizon(Utc::now()),
+            &mut report,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report, GoogleBackfillRunReport::default());
+    assert_eq!(lifecycle.completions.lock().unwrap().len(), 1);
+}
+
+/// Lists a freshly synced system calendar beside a primary whose poll fails,
+/// so the only calendar attempted this run errors.
+#[derive(Clone)]
+struct FailingPrimaryBesideSystemCalendarProvider;
+
+impl GoogleCalendarProvider for FailingPrimaryBesideSystemCalendarProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(vec![
+            provider_calendar("primary", true),
+            provider_calendar("en.usa#holiday@group.v.calendar.google.com", false),
+        ])
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        if context.target.provider_calendar_id != "primary" {
+            unreachable!("freshly synced system calendars must not sync")
+        }
+        Err(CalendarProviderError::new(
+            CalendarProviderErrorKind::Transient,
+            "the primary calendar's poll failed",
+        ))
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+/// A freshly synced system calendar counts as healthy, so a failing calendar
+/// beside it is isolated rather than read as a wholesale outage.
+#[tokio::test]
+async fn a_fresh_system_calendar_keeps_a_failing_calendar_isolated() {
+    let lifecycle = FakeLifecycle::claimed();
+    let repository = FakeRepo {
+        stored_synced_at: Some(Utc::now()),
+        ..FakeRepo::default()
+    };
+    let recorded_sync_errors = repository.recorded_sync_errors.clone();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        repository,
+        FailingPrimaryBesideSystemCalendarProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+
+    let mut report = GoogleBackfillRunReport::default();
+    coordinator
+        .run(
+            CalendarBackfillJobKey {
+                job_id: Uuid::now_v7(),
+                email_link_id: Uuid::now_v7(),
+            },
+            "macro|calendar@example.com",
+            "secret",
+            OccurrenceRange::maintenance_horizon(Utc::now()),
+            &mut report,
+        )
+        .await
+        .expect("a fresh system calendar keeps the account healthy");
+
+    assert!(report.changed());
+    assert!(
+        report.team_ooo_changed,
+        "failed coverage cannot certify unchanged OOO access"
+    );
+    assert_eq!(
+        recorded_sync_errors.lock().unwrap().as_slice(),
+        ["the primary calendar's poll failed"]
+    );
+    assert_eq!(lifecycle.completions.lock().unwrap().len(), 1);
+    assert!(lifecycle.failures.lock().unwrap().is_empty());
+}
+
+#[derive(Clone)]
+struct HangingGoogleProvider;
+
+impl GoogleCalendarProvider for HangingGoogleProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        std::future::pending().await
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        _context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        unreachable!("provider hangs before syncing events")
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+#[tokio::test]
+async fn google_coordinator_surfaces_lease_loss_while_work_is_running() {
+    let lifecycle = FakeLifecycle::lease_lost();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        FakeRepo::default(),
+        HangingGoogleProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+
+    let error = coordinator
+        .run(
+            CalendarBackfillJobKey {
+                job_id: Uuid::now_v7(),
+                email_link_id: Uuid::now_v7(),
+            },
+            "macro|calendar@example.com",
+            "secret",
+            OccurrenceRange::historical_sync(Utc::now()),
+            &mut GoogleBackfillRunReport::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, GoogleCalendarBackfillRunError::LeaseLost));
+    assert!(lifecycle.completions.lock().unwrap().is_empty());
+    assert!(lifecycle.failures.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn google_coordinator_keeps_calendar_permission_health_separate_from_gmail() {
+    let lifecycle = FakeLifecycle::claimed();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        FakeRepo::default(),
+        ReauthGoogleProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+
+    let error = coordinator
+        .run(
+            CalendarBackfillJobKey {
+                job_id: Uuid::now_v7(),
+                email_link_id: Uuid::now_v7(),
+            },
+            "macro|calendar@example.com",
+            "secret",
+            OccurrenceRange::historical_sync(Utc::now()),
+            &mut GoogleBackfillRunReport::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        GoogleCalendarBackfillRunError::ReauthRequired {
+            link_reauth_transitioned: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        lifecycle.failures.lock().unwrap().as_slice(),
+        &[CalendarBackfillFailureDisposition::CalendarPermissionRequired]
+    );
+}
+
+#[derive(Clone, Default)]
+struct FakeReauthNotifier {
+    notified: Arc<Mutex<Vec<Uuid>>>,
+    fail: bool,
+}
+
+impl FakeReauthNotifier {
+    fn failing() -> Self {
+        Self {
+            notified: Arc::default(),
+            fail: true,
+        }
+    }
+}
+
+impl CalendarReauthNotifier for FakeReauthNotifier {
+    async fn notify_reauth_required(&self, email_link_id: Uuid) -> Result<(), Report> {
+        self.notified.lock().unwrap().push(email_link_id);
+        if self.fail {
+            return Err(rootcause::report!("reauth notifier unavailable"));
+        }
+        Ok(())
+    }
+}
+
+fn reauth_outcome(link_reauth_transitioned: bool) -> CalendarBackfillFailureOutcome {
+    CalendarBackfillFailureOutcome {
+        job_transitioned: true,
+        link_reauth_transitioned,
+    }
+}
+
+#[tokio::test]
+async fn reauth_announcer_fires_when_unclaimed_failure_consumed_the_edge() {
+    let notifier = FakeReauthNotifier::default();
+    let announcer = CalendarReauthAnnouncer::new(notifier.clone());
+    let link = Uuid::now_v7();
+
+    announcer
+        .announce_unclaimed(link, &reauth_outcome(true))
+        .await;
+
+    assert_eq!(notifier.notified.lock().unwrap().as_slice(), &[link]);
+}
+
+#[tokio::test]
+async fn reauth_announcer_is_silent_when_unclaimed_failure_did_not_transition() {
+    let notifier = FakeReauthNotifier::default();
+    let announcer = CalendarReauthAnnouncer::new(notifier.clone());
+
+    announcer
+        .announce_unclaimed(Uuid::now_v7(), &reauth_outcome(false))
+        .await;
+
+    assert!(notifier.notified.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reauth_announcer_fires_when_run_error_consumed_the_edge() {
+    let notifier = FakeReauthNotifier::default();
+    let announcer = CalendarReauthAnnouncer::new(notifier.clone());
+    let link = Uuid::now_v7();
+
+    announcer
+        .announce_run_error(
+            link,
+            &GoogleCalendarBackfillRunError::ReauthRequired {
+                message: "grant revoked".to_string(),
+                link_reauth_transitioned: true,
+            },
+        )
+        .await;
+
+    assert_eq!(notifier.notified.lock().unwrap().as_slice(), &[link]);
+}
+
+#[tokio::test]
+async fn reauth_announcer_is_silent_on_calendar_permission_required() {
+    // A `CalendarPermissionRequired` disposition surfaces as a `ReauthRequired`
+    // run error carrying `link_reauth_transitioned: false`: the calendar scope
+    // is missing but the Gmail grant is healthy, so no inbox edge was consumed.
+    let notifier = FakeReauthNotifier::default();
+    let announcer = CalendarReauthAnnouncer::new(notifier.clone());
+
+    announcer
+        .announce_run_error(
+            Uuid::now_v7(),
+            &GoogleCalendarBackfillRunError::ReauthRequired {
+                message: "calendar scope missing".to_string(),
+                link_reauth_transitioned: false,
+            },
+        )
+        .await;
+
+    assert!(notifier.notified.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reauth_announcer_is_silent_on_non_reauth_run_errors() {
+    let notifier = FakeReauthNotifier::default();
+    let announcer = CalendarReauthAnnouncer::new(notifier.clone());
+    let link = Uuid::now_v7();
+
+    for error in [
+        GoogleCalendarBackfillRunError::Permanent("permanent".to_string()),
+        GoogleCalendarBackfillRunError::Retryable("transient".to_string()),
+        GoogleCalendarBackfillRunError::LeaseLost,
+    ] {
+        announcer.announce_run_error(link, &error).await;
+    }
+
+    assert!(notifier.notified.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reauth_announcer_swallows_a_failing_notifier() {
+    let notifier = FakeReauthNotifier::failing();
+    let announcer = CalendarReauthAnnouncer::new(notifier.clone());
+    let link = Uuid::now_v7();
+
+    // A notifier failure must not surface: the DB edge is already consumed and
+    // the caller's delivery must still ack.
+    announcer
+        .announce_unclaimed(link, &reauth_outcome(true))
+        .await;
+
+    assert_eq!(notifier.notified.lock().unwrap().as_slice(), &[link]);
+}
+
+/// Returns a valid event before an invalid one on a second calendar, so the
+/// service must validate the whole calendar before accepting any of its rows.
+#[derive(Clone)]
+struct InvalidNormalizedGoogleProvider;
+
+impl GoogleCalendarProvider for InvalidNormalizedGoogleProvider {
+    async fn list_calendars(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+    ) -> Result<Vec<ProviderCalendar>, CalendarProviderError> {
+        Ok(two_calendars())
+    }
+
+    async fn sync_events(
+        &self,
+        _access_token: &str,
+        context: GoogleEventSyncContext,
+    ) -> Result<GoogleEventSyncBatch, CalendarProviderError> {
+        let mut valid = valid_upsert();
+        let source = valid.source.details_mut();
+        source.calendar_id = context.target.calendar_id;
+        let mut upserts = vec![valid.clone()];
+        if context.target.provider_calendar_id == "team" {
+            let start = Utc.with_ymd_and_hms(2026, 7, 24, 14, 0, 0).unwrap();
+            valid.occurrences[0].time = EventTime::Timed {
+                starts_at: start,
+                ends_at: start - Duration::seconds(1),
+                time_zone: None,
+            };
+            upserts.push(valid);
+        }
+        Ok(GoogleEventSyncBatch {
+            upserts,
+            observed_provider_event_ids: Some(vec!["provider-event".to_owned()]),
+            next_sync_token: format!("next-{}", context.target.provider_calendar_id),
+            materialized_range: Some(context.target.range),
+            cancelled_provider_event_ids: Vec::new(),
+        })
+    }
+
+    async fn watch_calendar(
+        &self,
+        _access_token: &str,
+        _email_link_id: Uuid,
+        _provider_calendar_id: &str,
+        _channel_id: Uuid,
+        _config: &GoogleWatchConfig,
+    ) -> Result<GoogleWatchChannel, CalendarProviderError> {
+        unreachable!("watch is disabled in these tests")
+    }
+}
+
+#[tokio::test]
+async fn invalid_normalized_calendar_never_commits_coverage_or_its_token() {
+    let lifecycle = FakeLifecycle::claimed();
+    let repository = FakeRepo::default();
+    let upserts = repository.upserts.clone();
+    let snapshots = repository.sync_snapshots.clone();
+    let errors = repository.recorded_sync_errors.clone();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        repository,
+        InvalidNormalizedGoogleProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+    let key = CalendarBackfillJobKey {
+        job_id: Uuid::now_v7(),
+        email_link_id: Uuid::now_v7(),
+    };
+    for _ in 0..2 {
+        let mut report = GoogleBackfillRunReport::default();
+        coordinator
+            .run(
+                key,
+                "macro|calendar@example.com",
+                "secret",
+                OccurrenceRange::maintenance_horizon(Utc::now()),
+                &mut report,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.events_upserted, 1, "only the healthy calendar lands");
+    }
+    assert_eq!(upserts.lock().unwrap().len(), 2);
+    let snapshots = snapshots.lock().unwrap();
+    assert_eq!(snapshots.len(), 2);
+    assert!(
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot.next_sync_token == "next-primary")
+    );
+    assert_eq!(
+        errors.lock().unwrap().len(),
+        2,
+        "a retry cannot erase the known coverage gap"
+    );
+    assert_eq!(lifecycle.completions.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn failure_to_persist_calendar_quarantine_fails_the_account_run() {
+    let lifecycle = FakeLifecycle::claimed();
+    let coordinator = GoogleCalendarBackfillCoordinator::new(
+        FakeRepo {
+            fail_sync_error_recording: true,
+            ..Default::default()
+        },
+        PartialFailureGoogleProvider,
+        lifecycle.clone(),
+        NoopMacroEventBroker,
+        None,
+    );
+    let mut report = GoogleBackfillRunReport::default();
+    assert!(
+        coordinator
+            .run(
+                CalendarBackfillJobKey {
+                    job_id: Uuid::now_v7(),
+                    email_link_id: Uuid::now_v7(),
+                },
+                "macro|calendar@example.com",
+                "secret",
+                OccurrenceRange::maintenance_horizon(Utc::now()),
+                &mut report,
+            )
+            .await
+            .is_err()
+    );
+    assert!(lifecycle.completions.lock().unwrap().is_empty());
+    assert_eq!(lifecycle.failures.lock().unwrap().len(), 1);
+}
+
+fn forward_export(
+    access: crate::domain::ics::CalendarEventExportAccess,
+) -> crate::domain::ics::CalendarEventExport {
+    crate::domain::ics::CalendarEventExport {
+        access,
+        owner_id: "macro|guest@example.com".to_string(),
+        event_type: EventType::Default,
+        ical_uid: "meeting@example.com".to_string(),
+        sequence: 2,
+        title: "Office tour".to_string(),
+        description: None,
+        location: Some("12th floor".to_string()),
+        time: EventTime::Timed {
+            starts_at: Utc.with_ymd_and_hms(2026, 10, 30, 18, 0, 0).unwrap(),
+            ends_at: Utc.with_ymd_and_hms(2026, 10, 30, 18, 30, 0).unwrap(),
+            time_zone: None,
+        },
+        recurrence_lines: Vec::new(),
+        organizer_email: Some("organizer@example.org".to_string()),
+        organizer_name: None,
+        updated_at: Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap(),
+    }
+}
+
+fn forward_copy(event_id: Uuid, inbox: &str) -> crate::domain::models::MeetingCopy {
+    crate::domain::models::MeetingCopy {
+        event_id,
+        inbox: inbox.to_string(),
+        organizes: false,
+        attends: true,
+    }
+}
+
+fn invitees() -> Vec<crate::domain::ics::IcsParticipant> {
+    vec![crate::domain::ics::IcsParticipant {
+        email: "friend@example.net".to_string(),
+        name: Some("A Friend".to_string()),
+    }]
+}
+
+/// Google's private copy of an invitation from an organizer outside Google.
+fn outside_invitation() -> crate::domain::ics::ForwardedCopy {
+    crate::domain::ics::ForwardedCopy {
+        google_private_copy: true,
+        is_snapshot: false,
+        join_link: Some(crate::domain::ics::JoinLink {
+            url: "https://teams.microsoft.com/l/meetup-join/abc".to_string(),
+            provider: Some(crate::domain::models::ConferenceProvider::MicrosoftTeams),
+        }),
+    }
+}
+
+fn forward_service(
+    export: crate::domain::ics::CalendarEventExport,
+    forwarded: crate::domain::ics::ForwardedCopy,
+    requested: Uuid,
+) -> CalendarService<FakeRepo> {
+    CalendarService::new(FakeRepo {
+        meeting_copies: vec![
+            forward_copy(Uuid::now_v7(), "work@example.com"),
+            forward_copy(requested, "guest@example.com"),
+        ],
+        export: Some(export),
+        forwarded: Some(forwarded),
+        ..FakeRepo::default()
+    })
+}
+
+#[tokio::test]
+async fn event_forward_publishes_a_google_organizers_event_from_the_requested_copys_inbox() {
+    let requested = Uuid::now_v7();
+    let export = crate::domain::ics::CalendarEventExport {
+        ical_uid: "abc123@google.com".to_string(),
+        ..forward_export(crate::domain::ics::CalendarEventExportAccess::OwnCopy)
+    };
+    let forwarded = crate::domain::ics::ForwardedCopy {
+        google_private_copy: false,
+        is_snapshot: false,
+        join_link: Some(crate::domain::ics::JoinLink {
+            url: "https://meet.google.com/abc-defg-hij".to_string(),
+            provider: Some(crate::domain::models::ConferenceProvider::GoogleMeet),
+        }),
+    };
+
+    let forward = forward_service(export, forwarded, requested)
+        .event_forward("macro|guest@example.com", requested, &invitees())
+        .await
+        .unwrap()
+        .expect("the requester's own copy can be forwarded");
+
+    assert_eq!(forward.inbox, "guest@example.com");
+    assert_eq!(forward.ics.title, "Office tour");
+    assert_eq!(
+        forward.kind,
+        crate::domain::ics::CalendarEventForwardKind::EventFile
+    );
+    let document = forward.ics.document.replace("\r\n ", "");
+    assert!(document.contains("METHOD:PUBLISH"));
+    assert!(document.contains("UID:abc123@google.com"));
+    assert!(!document.contains("ATTENDEE"));
+    assert!(document.contains("X-GOOGLE-CONFERENCE:https://meet.google.com/abc-defg-hij"));
+    assert!(document.contains("Join with Google Meet: https://meet.google.com/abc-defg-hij"));
+}
+
+#[tokio::test]
+async fn event_forward_invites_the_recipients_to_an_outside_organizers_meeting() {
+    let requested = Uuid::now_v7();
+    let export = crate::domain::ics::CalendarEventExport {
+        ical_uid: "040000008200E00074C5B7101A82E008000000001".to_string(),
+        organizer_name: Some("Outside Organizer".to_string()),
+        ..forward_export(crate::domain::ics::CalendarEventExportAccess::OwnCopy)
+    };
+
+    let forward = forward_service(export, outside_invitation(), requested)
+        .event_forward("macro|guest@example.com", requested, &invitees())
+        .await
+        .unwrap()
+        .expect("the requester's own copy can be forwarded");
+
+    assert_eq!(
+        forward.kind,
+        crate::domain::ics::CalendarEventForwardKind::Invitation {
+            organizer: crate::domain::ics::IcsParticipant {
+                email: "organizer@example.org".to_string(),
+                name: Some("Outside Organizer".to_string()),
+            },
+        }
+    );
+    let document = forward.ics.document.replace("\r\n ", "");
+    assert!(document.contains("METHOD:REQUEST"));
+    assert!(document.contains("ORGANIZER;CN=\"Outside Organizer\":mailto:organizer@example.org"));
+    assert!(document.contains(
+        "ATTENDEE;CN=\"A Friend\";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:friend@example.net"
+    ));
+    assert_eq!(document.matches("ATTENDEE").count(), 1);
+    assert!(!document.contains("guest@example.com"));
+    assert!(document.contains(
+        "CONFERENCE;VALUE=URI;FEATURE=VIDEO:https://teams.microsoft.com/l/meetup-join/abc"
+    ));
+    assert!(!document.contains("X-GOOGLE-CONFERENCE"));
+}
+
+#[tokio::test]
+async fn event_forward_falls_back_to_the_event_file_without_evidence_of_an_outside_organizer() {
+    let exchange = crate::domain::ics::CalendarEventExport {
+        ical_uid: "040000008200E00074C5B7101A82E008000000001".to_string(),
+        ..forward_export(crate::domain::ics::CalendarEventExportAccess::OwnCopy)
+    };
+    let cases = [
+        (
+            "a copy Google does not mark private",
+            exchange.clone(),
+            crate::domain::ics::ForwardedCopy {
+                google_private_copy: false,
+                ..outside_invitation()
+            },
+        ),
+        (
+            "a snapshot Macro imported",
+            exchange.clone(),
+            crate::domain::ics::ForwardedCopy {
+                is_snapshot: true,
+                ..outside_invitation()
+            },
+        ),
+        (
+            "an imported copy of a Google meeting",
+            crate::domain::ics::CalendarEventExport {
+                ical_uid: "abc123@GOOGLE.com".to_string(),
+                ..exchange.clone()
+            },
+            outside_invitation(),
+        ),
+        (
+            "a copy naming no organizer",
+            crate::domain::ics::CalendarEventExport {
+                organizer_email: None,
+                ..exchange.clone()
+            },
+            outside_invitation(),
+        ),
+    ];
+
+    for (case, export, forwarded) in cases {
+        let requested = Uuid::now_v7();
+        let forward = forward_service(export, forwarded, requested)
+            .event_forward("macro|guest@example.com", requested, &invitees())
+            .await
+            .unwrap()
+            .expect("the requester's own copy can be forwarded");
+
+        assert_eq!(
+            forward.kind,
+            crate::domain::ics::CalendarEventForwardKind::EventFile,
+            "{case}"
+        );
+        assert!(forward.ics.document.contains("METHOD:PUBLISH"), "{case}");
+        assert!(!forward.ics.document.contains("ATTENDEE"), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn event_forward_refuses_an_event_none_of_the_requesters_inboxes_holds() {
+    // A delegated inbox's copy or a channel share lists no copy of the
+    // requester's own for the requested event.
+    let service = CalendarService::new(FakeRepo {
+        meeting_copies: vec![forward_copy(Uuid::now_v7(), "work@example.com")],
+        export: Some(forward_export(
+            crate::domain::ics::CalendarEventExportAccess::OwnCopy,
+        )),
+        forwarded: Some(outside_invitation()),
+        ..FakeRepo::default()
+    });
+
+    let forward = service
+        .event_forward("macro|guest@example.com", Uuid::now_v7(), &invitees())
+        .await
+        .unwrap();
+
+    assert_eq!(forward, None);
+}
+
+#[tokio::test]
+async fn event_forward_refuses_a_copy_the_export_no_longer_resolves_as_owned() {
+    let requested = Uuid::now_v7();
+    let service = CalendarService::new(FakeRepo {
+        meeting_copies: vec![forward_copy(requested, "guest@example.com")],
+        export: Some(forward_export(
+            crate::domain::ics::CalendarEventExportAccess::ChannelShared,
+        )),
+        forwarded: Some(outside_invitation()),
+        ..FakeRepo::default()
+    });
+
+    let forward = service
+        .event_forward("macro|guest@example.com", requested, &invitees())
+        .await
+        .unwrap();
+
+    assert_eq!(forward, None);
+}

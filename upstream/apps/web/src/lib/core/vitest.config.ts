@@ -1,0 +1,68 @@
+import { fileURLToPath } from 'node:url';
+import solidPlugin from 'vite-plugin-solid';
+import solidSvg from 'vite-plugin-solid-svg';
+import wasm from 'vite-plugin-wasm';
+import tsconfigPaths from 'vite-tsconfig-paths';
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  plugins: [
+    tsconfigPaths(),
+    solidPlugin(),
+    solidSvg({ defaultAsComponent: true }),
+    wasm(),
+  ],
+  resolve: {
+    dedupe: ['solid-js'],
+    alias: {
+      '@solid-primitives/refs': fileURLToPath(
+        new URL(
+          '../../../../../node_modules/@solid-primitives/refs/dist/index.js',
+          import.meta.url
+        )
+      ),
+      '@solid-primitives/transition-group': fileURLToPath(
+        new URL(
+          '../../../../../node_modules/@solid-primitives/transition-group/dist/index.js',
+          import.meta.url
+        )
+      ),
+      'solid-transition-group': fileURLToPath(
+        new URL(
+          '../../../../../node_modules/solid-transition-group/dist/index.js',
+          import.meta.url
+        )
+      ),
+      'loro-crdt': 'loro-crdt/base64',
+    },
+  },
+  ssr: {
+    resolve: { conditions: ['browser', 'development'] },
+  },
+  test: {
+    // Prebundling transition dependencies creates a second Solid runtime.
+    deps: {
+      optimizer: {
+        client: {
+          enabled: false,
+        },
+      },
+    },
+    environment: 'jsdom',
+    globals: true,
+    server: {
+      deps: {
+        // One native solid-js per worker. Inlined, it loads a second copy
+        // through every library that imports it but is not inlined (such as
+        // @solid-primitives/trigger under @solid-primitives/map), and again
+        // after each vi.resetModules().
+        external: [/[\\/]node_modules[\\/]solid-js[\\/]/],
+        inline: [
+          'solid-transition-group',
+          '@solid-primitives/refs',
+          '@solid-primitives/transition-group',
+        ],
+      },
+    },
+  },
+} as any);

@@ -1,0 +1,475 @@
+import { ROUTER_BASE_CONCAT, toBaseRelative } from '@app/constants/routerBase';
+import { updateUserAuth } from '@core/auth';
+import {
+  createNativeAuthSession,
+  openDesktopAuthSession,
+} from '@core/auth/native-auth';
+import { toast } from '@core/component/Toast/Toast';
+import { PaywallKey, usePaywallState } from '@core/constant/PaywallState';
+import { isNativeMobilePlatform } from '@core/mobile/isNativeMobilePlatform';
+import { fireAndForget } from '@core/util/fireAndForget';
+import { isPlatform } from '@core/util/platform';
+import { Telemetry } from '@macro-inc/observability';
+import { useInitGmailLink } from '@queries/auth';
+import { useInitOutlookLink } from '@queries/auth/outlook-link';
+import { invalidateUserInfo } from '@queries/auth/user-info';
+import { invalidateEmailLinks, useEmailLinksQuery } from '@queries/email/link';
+import { queryReadyGate } from '@queries/gate';
+import type { ConsentScopes } from '@service-auth/client';
+import {
+  ALREADY_INITIALIZED_CODE,
+  emailClient,
+  NO_GMAIL_GRANT_CODE,
+  SHARED_INBOX_CONFLICT_CODE,
+} from '@service-email/client';
+import type {
+  ListLinksResponse,
+  ResyncResponse,
+} from '@service-email/generated/schemas';
+import type { UseQueryResult } from '@tanstack/solid-query';
+import { err, okAsync, ResultAsync } from 'neverthrow';
+import { createMemo, createSignal, getOwner } from 'solid-js';
+import { inboxAuthorizationUrl } from './consent';
+import {
+  announceAlreadyConnected,
+  announceConsentCancelled,
+  announceLinkedInbox,
+  type InboxAddition,
+} from './link-outcome';
+import { selectEmailProvider } from './ProviderDialog';
+import { rememberInboxLinkReturn } from './return-layout';
+import { requestShareInboxConfirmation } from './share-conflict';
+
+const [emailRefetchInterval, setEmailRefetchInterval] = createSignal<
+  number | undefined
+>();
+
+function hasEmailLinks(query: UseQueryResult<ListLinksResponse, Error>) {
+  if (!queryReadyGate(query)) {
+    return false;
+  }
+  return query.data.links.length > 0;
+}
+
+export function useEmailLinksStatus() {
+  const query = useEmailLinksQuery();
+  return createMemo(() => {
+    return hasEmailLinks(query);
+  });
+}
+
+type EmailInitError =
+  | { tag: 'PaymentRequired' }
+  /** The email link has already been initialized*/
+  | { tag: 'AlreadyInitialized' }
+  /** No Gmail grant to provision from — scope declined at consent or grant removed. */
+  | { tag: 'NoGmailGrant' }
+  /** The mailbox is already connected by another user; confirm to share it. */
+  | { tag: 'SharedInboxConflict'; emailAddress: string; ownerEmail: string }
+  | { tag: 'FailedToInitialize'; message: string };
+
+function parseSharedInboxConflict(message: string): {
+  emailAddress: string;
+  ownerEmail: string;
+} {
+  try {
+    const parsed = JSON.parse(message) as {
+      emailAddress?: string;
+      existingOwnerEmail?: string;
+    };
+    return {
+      emailAddress: parsed.emailAddress ?? '',
+      ownerEmail: parsed.existingOwnerEmail ?? '',
+    };
+  } catch {
+    return { emailAddress: '', ownerEmail: '' };
+  }
+}
+
+/**
+ * Calls email service to start syncing and initialize a new email link.
+ *
+ * Pass `linkId` to complete a multi-inbox add via the `/link/gmail` flow — init will
+ * read the `in_progress_user_link` row and provision a second `email_links` scoped to
+ * that linked email. Omit for the first-time signup path.
+ *
+ * Pass `forceShare` to confirm promoting a mailbox another user already connected into
+ * a shared inbox, after the user accepts the `SharedInboxConflict` prompt.
+ *
+ * @returns ok with the id of the inbox now accessible, err if syncing failed
+ */
+function initEmailLink(args?: {
+  linkId?: string;
+  forceShare?: boolean;
+}): ResultAsync<string, EmailInitError> {
+  return ResultAsync.fromSafePromise(
+    emailClient.init({ linkId: args?.linkId, forceShare: args?.forceShare })
+  ).andThen((initResult) => {
+    if (initResult.isErr()) {
+      if (isPaymentRequired(initResult.error))
+        return err<string, EmailInitError>({ tag: 'PaymentRequired' });
+      const conflict = initResult.error.find(
+        (e) => e.code === SHARED_INBOX_CONFLICT_CODE
+      );
+      if (conflict) {
+        const conflictError: EmailInitError = {
+          tag: 'SharedInboxConflict',
+          ...parseSharedInboxConflict(conflict.message),
+        };
+        return err<string, EmailInitError>(conflictError);
+      }
+      if (initResult.error.some((e) => e.code === NO_GMAIL_GRANT_CODE)) {
+        return err<string, EmailInitError>({ tag: 'NoGmailGrant' });
+      }
+      const error: EmailInitError = initResult.error.some(
+        (e) => e.code === ALREADY_INITIALIZED_CODE
+      )
+        ? { tag: 'AlreadyInitialized' }
+        : { tag: 'FailedToInitialize', message: 'Failed to initialize' };
+      return err<string, EmailInitError>(error);
+    }
+    return okAsync<string, EmailInitError>(initResult.value.link_id);
+  });
+}
+
+/**
+ * The time in ms between making a polling fetch for
+ * new emails during the sync process.
+ */
+const EMAIL_POLLING_INTERVAL = 1_000;
+
+/**
+ * How long in ms we should poll for emails during the sync process.
+ */
+const EMAIL_POLLING_TIMEOUT = 20_000;
+
+/**
+ * Starts a polling fetch for new emails during the sync process.
+ */
+function startEmailPolling() {
+  if (emailRefetchInterval()) return;
+  setEmailRefetchInterval(EMAIL_POLLING_INTERVAL);
+  setTimeout(() => {
+    stopEmailPolling();
+  }, EMAIL_POLLING_TIMEOUT);
+}
+
+/**
+ * Stops the polling fetch for new emails during the sync process.
+ */
+function stopEmailPolling() {
+  setEmailRefetchInterval(undefined);
+}
+
+/**
+ * Disconnects the email service and invalidates the email links query.
+ *
+ * NOTE: only to be used in development
+ *
+ * @returns ok if the email service was disconnected, err if it failed to disconnect
+ */
+function disconnectEmail(): ResultAsync<void, 'failed-to-disconnect'> {
+  return ResultAsync.fromSafePromise(emailClient.stopSync()).andThen(
+    (response) =>
+      response.isErr() ? err('failed-to-disconnect') : okAsync(void 0)
+  );
+}
+
+/**
+ * Enqueues a fresh backfill for a linked inbox. Idempotent on the backend: a
+ * no-op when a backfill is already in progress.
+ *
+ * @returns ok with the resync response, err if it failed
+ */
+function resyncInbox(
+  linkId: string
+): ResultAsync<ResyncResponse, 'failed-to-resync'> {
+  return ResultAsync.fromSafePromise(
+    emailClient.resyncLink({ linkId })
+  ).andThen((response) =>
+    response.isErr() ? err('failed-to-resync') : okAsync(response.value)
+  );
+}
+
+/**
+ * Initializes email syncing, starts polling, and invalidates relevant queries.
+ * Unlike useEmailLinks().initEmailLink, this does not require SolidJS context.
+ */
+export function initAndStartEmailSync() {
+  const invalidations = async () => {
+    invalidateEmailLinks();
+    await updateUserAuth();
+    await invalidateUserInfo();
+  };
+
+  return initEmailLink().map(startEmailPolling).map(invalidations);
+}
+
+/**
+ * The backend gates additional inboxes behind a paid subscription and answers
+ * `POST /link/gmail` with 402 when the user isn't entitled. The auth client maps
+ * that to a `PAYMENT_REQUIRED` error code; the add-inbox flow surfaces the
+ * paywall instead of a generic failure so the backend stays the source of truth
+ * on entitlement.
+ */
+function isPaymentRequired(errors: ReadonlyArray<{ code: string }>): boolean {
+  return errors.some((error) => error.code === 'PAYMENT_REQUIRED');
+}
+
+/**
+ * The backend answers `POST /link/gmail` with 429 when the user has too many
+ * incomplete link attempts in flight (each abandoned OAuth leaves a pending row
+ * that expires after 24h). The auth client maps that to `TOO_MANY_PENDING_LINKS`
+ * so the flow can explain the wait instead of a dead-end generic failure.
+ */
+function isTooManyPendingLinks(
+  errors: ReadonlyArray<{ code: string }>
+): boolean {
+  return errors.some((error) => error.code === 'TOO_MANY_PENDING_LINKS');
+}
+
+const TOO_MANY_PENDING_LINKS_MESSAGE =
+  'Too many inbox connections in progress.';
+
+type AddInboxOptions = {
+  scopes?: ConsentScopes;
+  provider?: 'GMAIL' | 'OUTLOOK';
+  reconnectLinkId?: string;
+  emailAddress?: string;
+};
+
+/**
+ * Starts the add-inbox flow: fetches the selected provider's authorization URL and
+ * navigates the browser to the OAuth consent page. The callback returns to
+ * `/inbox-link-callback`, which provisions the new link.
+ *
+ * `scopes` selects which permissions the consent screen asks for. Calendar
+ * entry points and reconnects of previously enabled calendars request calendar
+ * access. A healthy mailbox upgrade passes `calendar`; a revoked account needs
+ * `gmail_and_calendar` to restore both capabilities.
+ *
+ * On native mobile OAuth runs in a platform authentication browser via
+ * the Tauri auth plugin (the app never navigates away), and the link is
+ * provisioned here directly with the `link_id` from the init response. A
+ * shared-inbox conflict is surfaced through `requestShareInboxConfirmation`,
+ * rendered by the globally mounted dialog.
+ *
+ * Desktop opens consent in the system browser and returns through a macro:///
+ * deep link; web navigates the page. Both stash the current layout against the
+ * new link id so the callback restores it. Native mobile needs no stash: its
+ * layout never unmounts.
+ *
+ * A plain add (mailbox consent, no account named) also records the inboxes
+ * already connected, so a chooser that returns one of them is reported as
+ * already connected instead of as a new account.
+ */
+export function useAddInboxFlow() {
+  const owner = getOwner();
+  const initGmailLink = useInitGmailLink();
+  const initOutlookLink = useInitOutlookLink();
+  const { query, initEmailLink } = useEmailLinks();
+  const { showPaywall } = usePaywallState();
+
+  const completeNativeLink = async (
+    linkId: string,
+    forceShare: boolean,
+    addition: InboxAddition | undefined
+  ) => {
+    await initEmailLink({ linkId, forceShare }).match(
+      async (connectedLinkId) => {
+        await query.refetch();
+        announceLinkedInbox(connectedLinkId, addition);
+      },
+      async (error) => {
+        if (error.tag === 'PaymentRequired') {
+          showPaywall(PaywallKey.MULTI_INBOX);
+          return;
+        }
+        if (error.tag === 'AlreadyInitialized') {
+          await query.refetch();
+          announceAlreadyConnected(addition?.provider);
+          return;
+        }
+        if (error.tag === 'SharedInboxConflict' && !forceShare) {
+          requestShareInboxConfirmation({
+            emailAddress: error.emailAddress,
+            ownerEmail: error.ownerEmail,
+            onShare: () =>
+              fireAndForget(
+                completeNativeLink(linkId, true, addition),
+                'add-inbox'
+              ),
+          });
+          return;
+        }
+        toast.failure('Failed to add inbox');
+      }
+    );
+  };
+
+  const initialize = (
+    originalUrl: string,
+    scopes: ConsentScopes,
+    provider: 'GMAIL' | 'OUTLOOK',
+    reconnectLinkId?: string
+  ) =>
+    provider === 'OUTLOOK'
+      ? initOutlookLink.mutateAsync({
+          originalUrl,
+          calendar: scopes !== 'gmail',
+          reconnectLinkId,
+        })
+      : initGmailLink.mutateAsync({ originalUrl, scopes, reconnectLinkId });
+
+  const startNativeFlow = async (
+    scopes: ConsentScopes,
+    provider: 'GMAIL' | 'OUTLOOK',
+    addition: InboxAddition | undefined,
+    reconnectLinkId?: string,
+    emailAddress?: string
+  ) => {
+    const session = createNativeAuthSession('inbox-link-callback');
+    const result = await initialize(
+      session.callbackUrl,
+      scopes,
+      provider,
+      reconnectLinkId
+    );
+    if (result.isErr()) {
+      if (isPaymentRequired(result.error)) {
+        showPaywall(PaywallKey.MULTI_INBOX);
+        return;
+      }
+      if (isTooManyPendingLinks(result.error)) {
+        toast.failure(TOO_MANY_PENDING_LINKS_MESSAGE);
+        return;
+      }
+      toast.failure('Failed to start inbox connection');
+      return;
+    }
+
+    const auth = await session.authenticate(
+      inboxAuthorizationUrl(result.value.authorization_url, emailAddress)
+    );
+    if (!auth.success) {
+      if (auth.error === 'User canceled login') announceConsentCancelled();
+      else toast.failure('Failed to add inbox');
+      return;
+    }
+
+    await completeNativeLink(result.value.link_id, false, addition);
+  };
+
+  // Reconnects, account hints, and calendar consent may target an existing
+  // inbox on purpose, so only a plain add compares against connected ones.
+  const plainAddition = async (
+    provider: 'GMAIL' | 'OUTLOOK',
+    scopes: ConsentScopes,
+    options: AddInboxOptions | undefined
+  ): Promise<InboxAddition | undefined> => {
+    if (scopes !== 'gmail' || options?.reconnectLinkId || options?.emailAddress)
+      return undefined;
+    // Without the current list, an existing inbox would read as a new one.
+    const links = queryReadyGate(query)
+      ? query.data.links
+      : (await query.refetch()).data?.links;
+    if (!links) return undefined;
+    return {
+      provider,
+      connectedInboxes: links.map((link) => ({
+        id: link.id,
+        emailAddress: link.email_address,
+      })),
+    };
+  };
+
+  return async (options?: AddInboxOptions) => {
+    const scopes = options?.scopes ?? 'gmail';
+    const provider = options?.provider ?? (await selectEmailProvider(owner));
+    if (!provider) return;
+    const addition = await plainAddition(provider, scopes, options);
+    if (isNativeMobilePlatform()) {
+      await startNativeFlow(
+        scopes,
+        provider,
+        addition,
+        options?.reconnectLinkId,
+        options?.emailAddress
+      );
+      return;
+    }
+
+    const desktop = isPlatform('desktop');
+    const callbackUrl = desktop
+      ? 'macro:///inbox-link-callback'
+      : `${window.location.origin}${ROUTER_BASE_CONCAT}inbox-link-callback`;
+    const result = await initialize(
+      callbackUrl,
+      scopes,
+      provider,
+      options?.reconnectLinkId
+    );
+    if (result.isOk()) {
+      // Web consent unloads the app; the desktop deep link replaces its route.
+      // Preserve the layout so either callback can put it back.
+      rememberInboxLinkReturn(result.value.link_id, {
+        url: `${toBaseRelative(window.location.pathname)}${window.location.search}${window.location.hash}`,
+        scopes,
+        addition,
+      });
+      const authorizationUrl = inboxAuthorizationUrl(
+        result.value.authorization_url,
+        options?.emailAddress
+      );
+      if (desktop) {
+        await Telemetry.span('email.link.open_browser', async (span) => {
+          span.setAttr('email.link.id', result.value.link_id);
+          const opened = await openDesktopAuthSession(authorizationUrl);
+          if (!opened.success) {
+            span.error('Unable to open account connection browser');
+            toast.failure(
+              'Failed to open the browser to connect your account. Please try again.'
+            );
+          }
+        });
+        return;
+      }
+      window.location.href = authorizationUrl;
+    } else if (isPaymentRequired(result.error)) {
+      showPaywall(PaywallKey.MULTI_INBOX);
+    } else if (isTooManyPendingLinks(result.error)) {
+      toast.failure(TOO_MANY_PENDING_LINKS_MESSAGE);
+    } else {
+      toast.failure('Failed to start inbox connection');
+    }
+  };
+}
+
+/**
+ * Hooks for interacting with email links.
+ */
+export function useEmailLinks() {
+  const invalidations = async () => {
+    invalidateEmailLinks();
+    await updateUserAuth();
+    await invalidateUserInfo();
+  };
+
+  const query = useEmailLinksQuery();
+
+  return {
+    query: query,
+    isConnected: () => hasEmailLinks(query),
+    initEmailLink: (args?: { linkId?: string; forceShare?: boolean }) =>
+      initEmailLink(args).map(async (linkId) => {
+        startEmailPolling();
+        await invalidations();
+        return linkId;
+      }),
+    disconnect: () => disconnectEmail().andTee(invalidations),
+    resyncInbox: (linkId: string) =>
+      resyncInbox(linkId).andTee(() => invalidateEmailLinks()),
+    invalidate: () => invalidateEmailLinks(),
+    refetchInterval: emailRefetchInterval,
+  };
+}

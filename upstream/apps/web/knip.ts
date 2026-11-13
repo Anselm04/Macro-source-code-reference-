@@ -1,0 +1,77 @@
+import type { KnipConfig } from 'knip';
+
+const config: KnipConfig = {
+  entry: [
+    'src/index.tsx',
+    'src/index.css',
+    // Block definitions are discovered with import.meta.glob at runtime. Treat
+    // those discovery roots as entries; their imports make the rest of each
+    // block reachable without hiding dead block-local files from Knip.
+    'src/features/block-*/definition.ts',
+    'src/lib/workers/**/*.{js,ts,tsx}',
+    // Feature browser harnesses load from their own HTML and Playwright specs.
+    'src/features/*/browser-test/*.{ts,tsx}',
+    'src/lib/i18n/browser-test/*.{ts,tsx}',
+    'src/lib/core/component/LexicalMarkdown/component/decorator/browser-test/*.tsx',
+    'src/lib/core/component/LexicalMarkdown/component/menu/MentionsMenu/browser-test/*.{ts,tsx}',
+    'src/lib/core/component/LexicalMarkdown/fuzz/{fixture.tsx,*.browser.e2e.ts}',
+    'src/features/billing-lab/entry.tsx',
+    // Native test runners are invoked by scripts, not the application graph.
+    'tests/native/{runner,links-runner,notifications-runner}.ts',
+  ],
+  project: ['src/**/*.{js,ts,tsx}'],
+
+  // Generated files and vendored code should be ignored.
+  ignore: [
+    '**/generated/**',
+    'scripts/**',
+    '../../packages/loro-mirror/**',
+    '../../packages/sdk/**',
+    // Standalone browser harnesses are loaded from HTML and Playwright/Vite
+    // configs rather than imported by the application graph.
+    'src/lib/graphql-cache/worker/browser-test/**',
+    // Compile-only API assertions are checked by tsc, not imported at runtime.
+    '**/*.typecheck.ts',
+    '**/vite.config.ts',
+    '**/vite-ci.config.ts',
+    '**/vite.base.ts',
+    '**/vitest.config.ts',
+    '**/vitest.setup.ts',
+    '**/playwright.config.ts',
+    '**/orval.config.ts',
+    '**/*.d.ts',
+    '**/*.pw.ts',
+    '**/scripts/**',
+  ],
+
+  // Dependencies that are used but hard to detect statically.
+  ignoreDependencies: [
+    '@fontsource-variable/inter',
+    '@fontsource-variable/roboto-mono',
+    '@inkibra/tauri-plugins',
+    '@types/facebook-pixel',
+    '@types/gtag.js',
+    '@types/ws',
+    '@types/wicg-file-system-access',
+    'bebop-tools',
+    'orval',
+    'json-refs',
+    'json-schema-to-typescript',
+    'json-schema-to-zod',
+    'typedoc',
+    'lightningcss',
+    'concurrently',
+    '@biomejs/biome',
+    '@vitest/ui',
+    '@datadog/datadog-ci',
+    'libheif-js',
+    '@tailwindcss/vite',
+    'bebop',
+    // TypeScript 7's compiler, run by path from `type-check`.
+    'typescript-native',
+  ],
+
+  ignoreWorkspaces: ['../../packages/loro-mirror', '../../packages/sdk'],
+};
+
+export default config;

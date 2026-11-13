@@ -1,0 +1,92 @@
+//! Composition of the domain GraphQL adapter crates (`graphql_soup`,
+//! `graphql_channel`, `graphql_properties`, `graphql_notification`, `graphql_email`,
+//! `graphql_favorite`, `graphql_entity_mutation`, `graphql_work_feed`,
+//! `graphql_notification_inbox`, `graphql_registered_work`) into the
+//! complete schema served by
+//! `document_storage_service` and exported as SDL.
+#![deny(missing_docs)]
+#![deny(clippy::missing_docs_in_private_items)]
+
+/// Cross-domain fields composed onto Soup entities.
+mod edges;
+mod mail_cache_profile;
+mod realtime;
+mod saved_view;
+/// Complete schema types and construction helpers.
+mod schema;
+#[cfg(test)]
+mod sdl_test;
+
+pub use edges::{
+    AgentSessionBotDataLoader, AgentSessionBotLoader, GraphqlSessionBot, SoupAgentSessionEdges,
+    SoupEdges, SoupEmailThreadEdges, agent_session_bot_loader, agent_session_log_loader,
+};
+pub use graphql_activity::{
+    ActivityEdgeKey, ActivityEdgeLoad, ActivityFeedInput, ActivityFeedReader, ActivityFeedScope,
+    ActivityOverviewInput, ActivityPortReader, ActivityReader, EntityActivityLoader,
+    GraphqlActivityAction, GraphqlActivityDay, GraphqlActivityEntityRank, GraphqlActivityEvent,
+    GraphqlActivityOverview, GraphqlActivityPage, NoOpActivityReader, SoupActivityEdgeReader,
+    entity_activity_loader,
+};
+pub use graphql_channel::{
+    ChannelActivityAuthorizer, ChannelActivityMutationService, ChannelMutationRoot,
+    GraphqlChannelActivity, GraphqlChannelActivityType, NoOpChannelActivityMutationService,
+    RecordChannelActivityInput,
+};
+pub use graphql_common::GraphqlRequestParts;
+pub use graphql_email::{
+    DeleteEmailDraftInput, DeleteEmailDraftPayload, EmailContentKey, EmailContentLoad,
+    EmailContentLoader, EmailFocusContext, EmailFocusReader, EmailMutationService,
+    EmailServiceEmailContentReader, EmailThreadFocusLoader, EmailThreadMailProjectionLoad,
+    EmailThreadMailProjectionLoader, EmailThreadMetadataLoad, EmailThreadMetadataLoader,
+    EmailThreadUnavailable, GraphqlEmailLabel, GraphqlEmailLink, GraphqlEmailLinkSettings,
+    GraphqlEmailMutation, GraphqlEmailProvider, GraphqlEmailQuery, GraphqlEmailSyncStatus,
+    MarkEmailThreadSeenInput, NoOpSoupEmailContentEdgeReader, SaveEmailDraftContactInput,
+    SaveEmailDraftInput, SaveEmailDraftPayload, SoupEmailContentEdgeReader, SoupEmailEdgeReader,
+    SoupEmailThreadMailProjectionEdgeReader, SoupEmailThreadMetadataEdgeReader,
+    UpdateEmailThreadLabelInput, email_content_loader, email_thread_focus_loader,
+    email_thread_mail_projection_loader, email_thread_metadata_loader,
+};
+pub use graphql_entity_mutation::{
+    ChannelSharePolicyInput, DuplicateEntityInput, EntityMutationPayload, EntityMutationRoot,
+    EntityRefInput, EntitySharePolicyInput, GraphqlEntityMutationError,
+    GraphqlEntityMutationErrorCode, GraphqlEntityMutationResult, GraphqlLinkShare,
+    GraphqlMutationError, GraphqlMutationSuccess, GraphqlSharePolicyOperation, MoveEntityInput,
+    RenameEntityInput, UpdateEntitySharePolicyInput,
+};
+pub use graphql_favorite::{
+    EntityFavoriteEdgeReader, EntityFavoriteLoader, FavoriteMutationRoot, FavoriteQueryReader,
+    FavoritesFilterInput, GraphqlFavorite, NoOpFavoriteMutationService, ReorderFavoritesInput,
+    entity_favorite_loader, resolve_favorites,
+};
+pub use graphql_notification::{
+    EntityNotificationsLoader, GraphqlNotificationUpdateOperation, NoOpNotificationMutationService,
+    NotificationMutationRoot, NotificationMutationService, SoupNotificationEdgeReader,
+    UpdateNotificationsForEntityInput, UpdateNotificationsInput, entity_notifications_loader,
+};
+pub use graphql_notification_inbox::{
+    NotificationInboxGraphqlContext, NotificationInboxGraphqlService,
+};
+pub use graphql_permission::{
+    EntityPermissionEdgeReader, EntityPermissionLoader, GraphqlAccessLevelPermission,
+    GraphqlChannelParticipantRole, GraphqlChannelRolePermission, GraphqlChannelViewOnlyPermission,
+    GraphqlEntityAccessLevel, GraphqlEntityPermission, GraphqlTeamRole, GraphqlTeamRolePermission,
+    entity_permission_loader,
+};
+pub use graphql_properties::{
+    EntityPropertiesLoader, EntityPropertyReader, EntityPropertyWriter, NoOpEntityPropertyReader,
+    PropertiesEntityPropertyReader, PropertiesEntityPropertyWriter, PropertiesMutationRoot,
+    entity_properties_loader,
+};
+pub use graphql_registered_work::{RegisteredWorkGraphqlContext, RegisteredWorkGraphqlService};
+pub use graphql_work_feed::{WorkFeedGraphqlContext, WorkFeedGraphqlService};
+pub use mail_cache_profile::{MAIL_CACHE_PROFILE_HEADER, MailCacheProfile};
+pub use realtime::{
+    AgentSessionActivitySubscriptions, AgentSessionLogSubscriptions,
+    agent_session_activity_subscriptions, agent_session_log_subscriptions,
+};
+pub use schema::{
+    EmailThreadInput, SchemaOnlySoupSchema, SchemaOnlyState, SharedSoupSchema, SoupQueryRoot,
+    SoupSchema, SoupSubscriptionRoot, build_schema, build_schema_from_arc, build_schema_from_arcs,
+    build_schema_with_service, build_schema_with_services,
+};

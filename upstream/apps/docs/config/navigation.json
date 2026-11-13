@@ -1,0 +1,17 @@
+{
+  "groups": [
+    {
+      "group": "First Steps",
+      "pages": [
+        "index",
+        "changelog/introduction"
+      ]
+    },
+    {
+      "group": "MCP",
+      "pages": [
+        "AI/mcp/overview"
+      ]
+    }
+  ]
+}

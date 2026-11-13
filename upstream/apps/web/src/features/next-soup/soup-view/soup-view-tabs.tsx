@@ -1,0 +1,355 @@
+import { isListViewID, type ListView } from '@app/constants/list-views';
+import type { FilterID } from '@app/features/next-soup/filters';
+import type { FilterContext } from '@app/features/next-soup/filters/configs';
+import {
+  type Query,
+  queryStateFrom,
+} from '@app/features/next-soup/filters/filter-store';
+import { mergeQuery } from '@app/features/next-soup/filters/filter-store/query-store';
+import {
+  getViewPreset,
+  type PresetContext,
+  VIEW_TAB_PRESETS,
+} from '@app/features/next-soup/sidebar/soup-filter-presets';
+import { useSoup } from '@app/features/next-soup/soup-context';
+import { MobileFilterDrawer } from '@app/features/next-soup/soup-view/filters-bar/mobile-filter-drawer';
+import { MobileSearchFilterDrawer } from '@app/features/next-soup/soup-view/filters-bar/search/mobile-search-filter-drawer';
+import { useSoupView } from '@app/features/next-soup/soup-view/soup-view-context';
+import {
+  type TabbedListView,
+  VIEW_TAB_LISTS,
+} from '@app/features/next-soup/soup-view/tab-lists';
+import { PillTabs } from '@components/app/mobile/PillTabs';
+import { useSplitPanelOrThrow } from '@components/app/split-layout/layoutUtils';
+import { useUserContext } from '@core/context/user';
+import CaretDownIcon from '@icon/system/regular/caret-down.svg';
+import CheckIcon from '@icon/system/regular/check.svg';
+import { useIsTeamAdmin } from '@queries/team/teams';
+import { Dropdown, type TabOption, Tabs } from '@ui';
+import { batch, createMemo, For, Match, Show, Switch } from 'solid-js';
+
+const useCurrentListView = () => {
+  const panel = useSplitPanelOrThrow();
+  return createMemo<ListView | undefined>(() => {
+    const content = panel.handle.content();
+
+    if (content.type !== 'component') return;
+
+    return isListViewID(content.id) ? content.id : undefined;
+  });
+};
+
+/**
+ * Tabs actually shown for a view. `VIEW_TAB_LISTS` is the full superset (the
+ * tab/preset consistency tests key off it); flag-gated entries are dropped
+ * here so every tab surface — segmented control, collapsed dropdown, mobile
+ * pills, and the number/cycle hotkeys — agrees on which tabs exist.
+ */
+export const useVisibleViewTabs = () => {
+  return (view: TabbedListView): TabOption<string>[] => VIEW_TAB_LISTS[view];
+};
+
+const PRESERVE_FILTERS_ON_TAB_CHANGE: ListView[] = [
+  'documents',
+  'tasks',
+  'calls',
+];
+
+const VIEW_SCOPED_REFINEMENTS: ListView[] = ['calls'];
+
+export const shouldPreserveFiltersOnTabChange = (view: ListView) =>
+  PRESERVE_FILTERS_ON_TAB_CHANGE.includes(view);
+
+export const useApplyPreset = () => {
+  const soup = useSoup();
+  const {
+    queryFilters,
+    restorePersistedQueryFilters,
+    restorePersistedPredicates,
+    setActiveTab,
+    activeTab,
+    assigneeFilter,
+  } = useSoupView();
+  const user = useUserContext();
+  const isTeamAdmin = useIsTeamAdmin();
+
+  const getPresetContext = (): PresetContext => ({
+    userId: user.userId(),
+    isTeamAdmin: isTeamAdmin(),
+  });
+
+  const getFilterQuery = (id: string, ctx: FilterContext) => {
+    const filter = soup.predicates.getConfig(id);
+    if (!filter?.query) return undefined;
+
+    return typeof filter.query === 'function'
+      ? (filter.query as (ctx: FilterContext) => Query)(ctx)
+      : (filter.query as Query);
+  };
+
+  const applyTabPreset = (view: ListView, tabId: string) => {
+    const presetContext = getPresetContext();
+    const preset = getViewPreset(view, tabId, presetContext);
+    if (!preset) return false;
+
+    const filterContext: FilterContext = {
+      userId: presetContext.userId,
+      assignees: assigneeFilter(),
+    };
+
+    let nextFilters = preset.filters;
+    let nextClientFilters = preset.clientFilters;
+
+    if (shouldPreserveFiltersOnTabChange(view)) {
+      const currentPreset = getViewPreset(
+        view,
+        activeTab() ?? VIEW_TAB_PRESETS[view]?.default,
+        presetContext
+      );
+
+      const currentFilterIds: FilterID[] = [
+        ...(currentPreset?.clientFilters.and ?? []),
+        ...(currentPreset?.clientFilters.or ?? []),
+      ];
+
+      const nextAndIds = (soup.predicates.andIds() as FilterID[]).filter(
+        (id) => !currentFilterIds.includes(id)
+      );
+
+      const nextOrIds = (soup.predicates.orIds() as FilterID[]).filter(
+        (id) => !currentFilterIds.includes(id)
+      );
+
+      const refinementIds = [...nextAndIds, ...nextOrIds];
+
+      let mergedFilters = queryStateFrom(preset.filters);
+      for (const id of refinementIds) {
+        const query = getFilterQuery(id, filterContext);
+
+        if (!query) continue;
+
+        mergedFilters = mergeQuery(mergedFilters, query);
+      }
+
+      // Tags are a query-only refinement with no backing predicate, so the
+      // predicate-driven reconstruction above never carries them. Preserve the
+      // active selection (and its combine mode) explicitly like any other
+      // refinement.
+      const activeTagFilters = queryFilters.state.include.tagFilters;
+      if (activeTagFilters?.length) {
+        mergedFilters = mergeQuery(mergedFilters, {
+          include: {
+            tagFilters: activeTagFilters.map((t) => ({ ...t })),
+            tagFilterMode: queryFilters.state.include.tagFilterMode,
+          },
+        });
+      }
+
+      // Created by is a direct server-side document-owner refinement rather
+      // than a client predicate, so retain an explicit choice across the
+      // Tasks and Files tabs just as we do tags above. Do not carry a tab's
+      // own owner scope (e.g. Files → Owned) into another tab.
+      const currentCreatorIds =
+        queryFilters.state.include.documentOwnerId ?? [];
+      const presetCreatorIds =
+        currentPreset?.filters.include?.documentOwnerId ?? [];
+      const isExplicitCreatorFilter =
+        currentCreatorIds.length !== presetCreatorIds.length ||
+        currentCreatorIds.some((id) => !presetCreatorIds.includes(id));
+      if (isExplicitCreatorFilter) {
+        mergedFilters.include.documentOwnerId = currentCreatorIds.length
+          ? [...currentCreatorIds]
+          : undefined;
+      }
+
+      // A channel chosen in the Calls sidebar is a direct server refinement,
+      // and no tab scopes by channel, so it carries over unchanged.
+      const channelIds = queryFilters.state.include.callChannelId;
+      if (channelIds?.length) {
+        mergedFilters = mergeQuery(mergedFilters, {
+          include: { callChannelId: [...channelIds] },
+        });
+      }
+
+      nextFilters = mergedFilters;
+
+      nextClientFilters = {
+        and: [...new Set([...(preset.clientFilters.and ?? []), ...nextAndIds])],
+        or: [...new Set([...(preset.clientFilters.or ?? []), ...nextOrIds])],
+      };
+    }
+
+    // Calls sidebar refinements belong to the view, not to one tab, so a
+    // tab's persisted state must not replace them.
+    const restoreTab = !VIEW_SCOPED_REFINEMENTS.includes(view);
+    batch(() => {
+      setActiveTab(tabId);
+      if (!(restoreTab && restorePersistedQueryFilters(tabId))) {
+        queryFilters.replace(nextFilters);
+      }
+      if (!(restoreTab && restorePersistedPredicates(tabId))) {
+        soup.predicates.set(nextClientFilters);
+      }
+      soup.grouping.setActiveGroupId(preset.groupBy);
+    });
+
+    // The new tab replaces the dataset wholesale, and row focus only follows
+    const focusedRow = soup.focus.row();
+    if (
+      !focusedRow ||
+      focusedRow.getIsGrouped() ||
+      focusedRow.getIsLoadMore()
+    ) {
+    }
+    return true;
+  };
+
+  return { applyTabPreset };
+};
+
+export const SoupViewTabs = () => {
+  const listView = useCurrentListView();
+
+  return (
+    <Switch>
+      <For each={Object.keys(VIEW_TAB_LISTS) as TabbedListView[]}>
+        {(v) => (
+          <Match when={listView() === v}>
+            <ViewTabs view={v} />
+          </Match>
+        )}
+      </For>
+    </Switch>
+  );
+};
+
+const ViewTabs = (props: { view: TabbedListView }) => {
+  const { applyTabPreset } = useApplyPreset();
+  const { activeTab } = useSoupView();
+  const visibleViewTabs = useVisibleViewTabs();
+
+  return (
+    <Tabs
+      aria-label="View tabs"
+      class="shrink-0"
+      options={visibleViewTabs(props.view)}
+      value={activeTab() ?? VIEW_TAB_PRESETS[props.view].default}
+      onChange={(value) => applyTabPreset(props.view, value)}
+    />
+  );
+};
+
+/** The selected tab as a menu, for a header too narrow for every tab. */
+export const CollapsedSoupViewTabs = () => {
+  const listView = useCurrentListView();
+  const { applyTabPreset } = useApplyPreset();
+  const { activeTab } = useSoupView();
+  const visibleViewTabs = useVisibleViewTabs();
+
+  const view = createMemo(() => {
+    const v = listView();
+    return v && v in VIEW_TAB_LISTS ? (v as TabbedListView) : undefined;
+  });
+
+  const options = () => {
+    const v = view();
+    return v ? visibleViewTabs(v) : [];
+  };
+
+  const selected = () => {
+    const v = view();
+    const value = activeTab() ?? (v ? VIEW_TAB_PRESETS[v].default : undefined);
+    return options().find((option) => option.value === value) ?? options()[0];
+  };
+
+  return (
+    <Dropdown placement="bottom-start">
+      <Dropdown.Trigger variant="secondary" size="md">
+        {selected()?.label}
+        <CaretDownIcon class="size-3 text-ink-extra-muted" />
+      </Dropdown.Trigger>
+      <Dropdown.Content>
+        <Dropdown.Group>
+          <For each={options()}>
+            {(option) => (
+              <Dropdown.Item
+                onSelect={() => {
+                  const v = view();
+                  if (v) applyTabPreset(v, option.value);
+                }}
+              >
+                <span class="flex-1 truncate">{option.label}</span>
+                <Show when={selected()?.value === option.value}>
+                  <CheckIcon class="size-3.5 text-accent" />
+                </Show>
+              </Dropdown.Item>
+            )}
+          </For>
+        </Dropdown.Group>
+      </Dropdown.Content>
+    </Dropdown>
+  );
+};
+
+/**
+ * Filter-drawer button + per-view filter pills, rendered in the mobile split
+ * header. The strip is full-bleed: negative margins cancel the header row's
+ * gutter so pills scroll to the device edges, and the gutter travels inside
+ * the scroll content. The drawer button leads the strip and scrolls along
+ * with the pills.
+ */
+export const MobileSoupViewTabs = () => {
+  const listView = useCurrentListView();
+
+  return (
+    <Switch>
+      <Match when={listView() === 'search'}>
+        {/* The search view has no tab pills — its header hosts only the
+            facet-filter drawer button (the desktop SearchFiltersRow's
+            mobile counterpart). */}
+        <MobileSearchFilterDrawer />
+      </Match>
+      <For
+        each={Object.keys(VIEW_TAB_LISTS) as (keyof typeof VIEW_TAB_LISTS)[]}
+      >
+        {(v) => (
+          <Match when={listView() === v}>
+            <MobileViewTabs view={v} />
+          </Match>
+        )}
+      </For>
+    </Switch>
+  );
+};
+
+// Full-bleed breakout for header strips: the strip sits in the header row's
+// left flex slot, whose right edge stops short of the panel edge (row gap +
+// right-side column), so sizing it there leaves a sliver the pills can't
+// scroll over (right where the list's scrollbar sits). Instead, opt out of
+// flex sizing and span the header container itself (100cqw resolves against
+// @container/split-header = the panel width): -ml cancels the row gutter so
+// the strip runs device edge to device edge, over the scrollbar.
+const MOBILE_TAB_STRIP_CLASS =
+  '-ml-(--mobile-chrome-gutter) w-[100cqw] max-w-none flex-none';
+const MOBILE_TAB_CONTENT_CLASS = 'px-(--mobile-chrome-gutter)';
+
+const MobileViewTabs = (props: { view: TabbedListView }) => {
+  const { applyTabPreset } = useApplyPreset();
+  const { activeTab } = useSoupView();
+  const visibleViewTabs = useVisibleViewTabs();
+  const activeValue = () => activeTab() ?? VIEW_TAB_PRESETS[props.view].default;
+
+  return (
+    <PillTabs
+      scrollable
+      class={MOBILE_TAB_STRIP_CLASS}
+      contentClass={MOBILE_TAB_CONTENT_CLASS}
+      leading={<MobileFilterDrawer />}
+      items={visibleViewTabs(props.view)}
+      value={activeValue()}
+      onChange={(value) => applyTabPreset(props.view, value)}
+    />
+  );
+};
+
+export { type TabbedListView, VIEW_TAB_LISTS };

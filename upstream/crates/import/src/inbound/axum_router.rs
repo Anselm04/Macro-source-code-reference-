@@ -1,0 +1,305 @@
+//! HTTP surface for the import pipeline.
+
+use crate::domain::models::{ImportSource, ImportState, NotionImportReport};
+use crate::domain::ports::ImportError;
+use crate::domain::service::{
+    ImportService, ImportStager, NotionPageImporter, NotionWorkspaceImporter, RunImportOutcome,
+    WorkspaceImporter,
+};
+use axum::{
+    Json, Router,
+    extract::{FromRef, Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+};
+use macro_authorization::{
+    MacroAuthorizationExtractor, MacroAuthorizationService, MacroAuthorizationState, UserOrInternal,
+};
+use serde::Deserialize;
+use std::str::FromStr;
+use std::sync::Arc;
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+pub mod ledger;
+#[cfg(test)]
+mod test;
+
+/// Body for accepting/declining staged imports.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RunImportRequest {
+    /// Staged rows to import.
+    #[serde(default)]
+    pub import_ids: Vec<Uuid>,
+    /// Staged rows to discard.
+    #[serde(default)]
+    pub discard_ids: Vec<Uuid>,
+}
+
+/// Router state: the import service plus the authorization state the
+/// request extractors authenticate against (auth happens in the extractor,
+/// not in host-layered middleware).
+pub struct ImportRouterState<T, Auth> {
+    /// The import service implementation.
+    pub service: Arc<T>,
+    /// The authorization state used by the request extractors.
+    pub authorization_state: MacroAuthorizationState<Auth>,
+}
+
+// Manual Clone impl so T doesn't need to be Clone (it's behind Arc).
+impl<T, Auth> Clone for ImportRouterState<T, Auth> {
+    fn clone(&self) -> Self {
+        Self {
+            service: self.service.clone(),
+            authorization_state: self.authorization_state.clone(),
+        }
+    }
+}
+
+impl<T, Auth> FromRef<ImportRouterState<T, Auth>> for Arc<T> {
+    fn from_ref(state: &ImportRouterState<T, Auth>) -> Self {
+        state.service.clone()
+    }
+}
+
+impl<T, Auth> FromRef<ImportRouterState<T, Auth>> for MacroAuthorizationState<Auth> {
+    fn from_ref(state: &ImportRouterState<T, Auth>) -> Self {
+        state.authorization_state.clone()
+    }
+}
+
+/// Build the import router.
+pub fn import_router<T, Auth, S>(state: ImportRouterState<T, Auth>) -> Router<S>
+where
+    T: ImportService + WorkspaceImporter + ImportStager + NotionPageImporter,
+    Auth: MacroAuthorizationService,
+    S: Send + Sync + Clone + 'static,
+{
+    Router::new()
+        .route("/import/state", get(get_state_handler::<T, Auth>))
+        .route(
+            "/import/entities",
+            get(ledger::list_entities_handler::<T, Auth>)
+                .post(ledger::track_entity_handler::<T, Auth>),
+        )
+        .route(
+            "/import/entities/{id}",
+            delete(ledger::decline_entity_handler::<T, Auth>),
+        )
+        .route(
+            "/import/notion/pages",
+            post(ledger::import_notion_page_handler::<T, Auth>),
+        )
+        .route("/import/run", post(run_import_handler::<T, Auth>))
+        .route(
+            "/import/runs/{source}/discover",
+            post(discover_handler::<T, Auth>),
+        )
+        .route(
+            "/import/workspaces/{source}",
+            get(workspace_report_handler::<T, Auth>),
+        )
+        .route(
+            "/import/workspaces/{source}/cancel",
+            post(cancel_workspace_handler::<T, Auth>),
+        )
+        .route("/import/notion", get(notion_report_handler::<T, Auth>))
+        .route(
+            "/import/notion/cancel",
+            post(cancel_notion_handler::<T, Auth>),
+        )
+        .with_state(state)
+}
+
+/// Where the user's Notion workspace import stands.
+#[utoipa::path(
+    get,
+    path = "/import/notion",
+    responses(
+        (status = 200, body = NotionImportReport),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "import"
+)]
+#[tracing::instrument(skip(service, user), fields(user_id = %user.authorization.user.macro_user_id))]
+pub async fn notion_report_handler<T: NotionWorkspaceImporter, Auth: MacroAuthorizationService>(
+    State(service): State<Arc<T>>,
+    user: MacroAuthorizationExtractor<Auth, UserOrInternal>,
+) -> Response {
+    match service
+        .notion_import_report(&user.authorization.user.macro_user_id)
+        .await
+    {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// Stop planning or writing the user's Notion import. Objects already
+/// imported stay.
+#[utoipa::path(
+    post,
+    path = "/import/notion/cancel",
+    responses(
+        (status = 200, body = NotionImportReport, description = "Where the import stands after cancelling"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "import"
+)]
+#[tracing::instrument(skip(service, user), fields(user_id = %user.authorization.user.macro_user_id))]
+pub async fn cancel_notion_handler<T: NotionWorkspaceImporter, Auth: MacroAuthorizationService>(
+    State(service): State<Arc<T>>,
+    user: MacroAuthorizationExtractor<Auth, UserOrInternal>,
+) -> Response {
+    let user = user.authorization.user.macro_user_id;
+    if let Err(e) = service.cancel_notion_import(&user).await {
+        return error_response(e);
+    }
+    match service.notion_import_report(&user).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// Report progress for one reviewed workspace source.
+#[utoipa::path(get, path = "/import/workspaces/{source}", params(("source" = ImportSource, Path)), responses((status = 200, body = NotionImportReport)), tag = "import")]
+#[tracing::instrument(skip(service, user), fields(user_id = %user.authorization.user.macro_user_id))]
+pub async fn workspace_report_handler<T: WorkspaceImporter, Auth: MacroAuthorizationService>(
+    State(service): State<Arc<T>>,
+    user: MacroAuthorizationExtractor<Auth, UserOrInternal>,
+    Path(source): Path<String>,
+) -> Response {
+    let Ok(source) = ImportSource::from_str(&source) else {
+        return unknown_source_response(&source);
+    };
+    match service
+        .workspace_import_report(&user.authorization.user.macro_user_id, source)
+        .await
+    {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+/// Cancel this source's plan or write, keeping completed entities.
+#[utoipa::path(post, path = "/import/workspaces/{source}/cancel", params(("source" = ImportSource, Path)), responses((status = 200, body = NotionImportReport)), tag = "import")]
+#[tracing::instrument(skip(service, user), fields(user_id = %user.authorization.user.macro_user_id))]
+pub async fn cancel_workspace_handler<T: WorkspaceImporter, Auth: MacroAuthorizationService>(
+    State(service): State<Arc<T>>,
+    user: MacroAuthorizationExtractor<Auth, UserOrInternal>,
+    Path(source): Path<String>,
+) -> Response {
+    let Ok(source) = ImportSource::from_str(&source) else {
+        return unknown_source_response(&source);
+    };
+    let user = user.authorization.user.macro_user_id;
+    if let Err(error) = service.cancel_workspace_import(&user, source).await {
+        return error_response(error);
+    }
+    match service.workspace_import_report(&user, source).await {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+fn error_response(e: ImportError) -> Response {
+    if let ImportError::Admission(error) = e {
+        return error.into_response();
+    }
+    tracing::error!(error = ?e, "import request failed");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+fn unknown_source_response(source: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("unknown import source: {source}"),
+    )
+        .into_response()
+}
+
+/// Get the authenticated user's import state: discovery runs plus visible
+/// ledger rows.
+#[utoipa::path(
+    get,
+    path = "/import/state",
+    responses(
+        (status = 200, description = "Current import state", body = ImportState),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "import"
+)]
+#[tracing::instrument(skip(service, user), fields(user_id = %user.authorization.user.macro_user_id))]
+pub async fn get_state_handler<T: ImportService, Auth: MacroAuthorizationService>(
+    State(service): State<Arc<T>>,
+    user: MacroAuthorizationExtractor<Auth, UserOrInternal>,
+) -> Response {
+    match service.state(user.authorization.user.macro_user_id).await {
+        Ok(state) => Json(state).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// Accept staged imports (starts import jobs) and/or discard staged rows.
+#[utoipa::path(
+    post,
+    path = "/import/run",
+    request_body = RunImportRequest,
+    responses(
+        (status = 200, description = "Import run outcome", body = RunImportOutcome),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "import"
+)]
+#[tracing::instrument(skip(service, user, body), fields(user_id = %user.authorization.user.macro_user_id))]
+pub async fn run_import_handler<T: ImportService, Auth: MacroAuthorizationService>(
+    State(service): State<Arc<T>>,
+    user: MacroAuthorizationExtractor<Auth, UserOrInternal>,
+    Json(body): Json<RunImportRequest>,
+) -> Response {
+    match service
+        .run_import(
+            user.authorization.user.macro_user_id,
+            body.import_ids,
+            body.discard_ids,
+        )
+        .await
+    {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// Discover candidates for user selection. Only Slack supports discovery.
+#[utoipa::path(
+    post,
+    path = "/import/runs/{source}/discover",
+    params(("source" = String, Path, description = "Import source")),
+    responses(
+        (status = 204, description = "Discovery accepted (idempotent)"),
+        (status = 400, description = "Unknown import source or discovery not supported"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "import"
+)]
+#[tracing::instrument(skip(service, user), fields(user_id = %user.authorization.user.macro_user_id))]
+pub async fn discover_handler<T: ImportService, Auth: MacroAuthorizationService>(
+    State(service): State<Arc<T>>,
+    user: MacroAuthorizationExtractor<Auth, UserOrInternal>,
+    Path(source): Path<String>,
+) -> Response {
+    let Ok(source) = ImportSource::from_str(&source) else {
+        return unknown_source_response(&source);
+    };
+    match service
+        .start_discovery(user.authorization.user.macro_user_id, source)
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e @ ImportError::UnsupportedDiscovery(_)) => {
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
+        Err(e) => error_response(e),
+    }
+}

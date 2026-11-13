@@ -1,0 +1,483 @@
+//! UpdateCalendarEvent tool for editing existing calendar events.
+
+use ai_toolset::{
+    AsyncTool, RequestContext, ServiceContext, ToolAnnotated, ToolAnnotations, ToolCallError,
+    ToolResult,
+};
+use async_trait::async_trait;
+use rootcause::compat::boxed_error::IntoBoxedError;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+use super::{
+    AttendeeInput, CalendarLabels, CalendarToolContext, CopyChange, EventRemindersInput,
+    EventTimeInput, OutOfOfficeInput, ToolCalendarEvent, confirm_copy,
+    macro_call_update_tool_error, mutation_tool_error,
+};
+use crate::domain::{
+    meeting_links::first_macro_call_url,
+    models::{AttendeeResponseStatus, CalendarEventPatch, ConferenceChange, GuestPolicy},
+    ports::{
+        CalendarMacroCallService, CalendarMutationService, CalendarOccurrenceService,
+        CalendarRsvpScope, CalendarUpdateScope, MeetingLinkProvider,
+    },
+};
+
+/// A requested change to an event's video conference.
+#[derive(Debug, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConferenceChangeInput {
+    /// Attach the selected calendar's default conferencing provider.
+    ProviderDefault,
+    /// Attach Microsoft Teams on an eligible Outlook calendar.
+    MicrosoftTeams,
+    /// Generate a new Google Meet conference and attach it.
+    GoogleMeet,
+    /// Detach whatever conference is currently attached.
+    Remove,
+}
+
+impl From<ConferenceChangeInput> for ConferenceChange {
+    fn from(input: ConferenceChangeInput) -> Self {
+        match input {
+            ConferenceChangeInput::ProviderDefault => Self::ProviderDefault,
+            ConferenceChangeInput::MicrosoftTeams => Self::MicrosoftTeams,
+            ConferenceChangeInput::GoogleMeet => Self::GoogleMeet,
+            ConferenceChangeInput::Remove => Self::Removed,
+        }
+    }
+}
+
+/// The requester's own RSVP on an event they were invited to.
+#[derive(Debug, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RsvpResponseInput {
+    /// Attending.
+    Accepted,
+    /// Not attending.
+    Declined,
+    /// Might attend.
+    Tentative,
+}
+
+impl From<RsvpResponseInput> for AttendeeResponseStatus {
+    fn from(input: RsvpResponseInput) -> Self {
+        match input {
+            RsvpResponseInput::Accepted => Self::Accepted,
+            RsvpResponseInput::Declined => Self::Declined,
+            RsvpResponseInput::Tentative => Self::Tentative,
+        }
+    }
+}
+
+/// How much of a recurring series an update applies to.
+#[derive(Debug, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateScopeInput {
+    /// The entire event or series.
+    All,
+    /// One occurrence of a recurring series.
+    ThisEvent,
+}
+
+/// Update fields of a calendar event.
+#[derive(Debug, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+#[schemars(
+    title = "UpdateCalendarEvent",
+    description = "\
+Update an existing calendar event.\n\
+\n\
+A meeting on more than one of the user's inboxes is one ListCalendarEvents entry per inbox. \
+Before changing its details, guests or guest permissions, ask the user which inbox's copy to \
+change, then pass that copy's `inbox`. Never choose between the user's inboxes yourself, \
+whatever they look like: a test, secondary or unfamiliar address is still the user's own \
+inbox. Skip the question only when the user already named the inbox, when only one copy's \
+`viewerCan` allows the change (use it and say why), or when adding guests to a meeting the \
+user organizes from one of the inboxes (add them from that copy and say why). Reminders may \
+go to one copy and an `rsvp` to the copy where the user is a guest, naming the inbox in your \
+reply. Without `inbox` the tool refuses, lists each copy and gives the question to ask. One \
+call changes one copy, so an edit on one copy and an `rsvp` on another take two calls.\n\
+\n\
+Only the supplied fields change; omitted fields keep their current values. The change is written to the calendar provider immediately and attendees are \
+notified of it, so confirm details with the user first. Get the `eventId` from \
+ListCalendarEvents.\n\
+\n\
+`scope` picks how much of a recurring series changes and is always required: \
+\"this_event\" edits one occurrence (pass the occurrence's `recurrenceId` from \
+ListCalendarEvents) and leaves the rest of the series alone; \"all\" edits the series \
+itself — with `time` that MOVES EVERY OCCURRENCE, so never use \"all\" to reschedule a \
+single occurrence. Non-recurring events use \"all\". There is no this-and-following \
+update: end the series with DeleteCalendarEvent's \"this_and_following\" and create a new \
+event instead.\n\
+\n\
+Passing `attendees` replaces the full attendee list — include everyone who should remain, \
+not just additions. That holds when `viewerCan.removeGuests` from ListCalendarEvents is \
+true (the user organizes the event, or the organizer lets guests modify it). When it is \
+false, the list may only grow: pass the current attendees plus the additions; the additions \
+are invited without touching anyone else, and dropping any guest fails. Adding guests then \
+needs `viewerCan.inviteGuests`; otherwise the organizer doesn't let guests invite others \
+or hides the guest list, or the event is an Outlook meeting the user doesn't organize. \
+An empty string for `description` or `location` clears it. Fails on events from calendars \
+the user cannot edit.\n\
+\n\
+A guest without modify rights (`viewerCan.editDetails` false while `viewerCan.rsvp` is \
+true) may only change their own `reminders`, add guests where `viewerCan.inviteGuests` \
+allows it, and answer with `rsvp`; changing the title, time, description, location, \
+recurrence or conference fails because the organizer doesn't let guests change the \
+event.\n\
+\n\
+`addMacroCall` switches the event to a Macro call in place, so never delete and recreate an \
+event to change its meeting link. It creates the call, adds its join link to the description \
+(and to `location` when no physical location is set), and removes any Google Meet or other \
+conference, in the one update attendees are notified of. The returned event's `macroCallUrl` \
+holds the link. An Outlook event's Teams meeting cannot be removed this way, and the call \
+then fails.\n\
+\n\
+`rsvp` sets the user's own response to an invitation and is independent of the field \
+edits — it can be the only thing this call changes. It applies at the same `scope` as \
+the rest of the call and answers as the connected inbox the event's copy belongs to, so \
+it only works when that inbox is an attendee."
+)]
+pub struct UpdateCalendarEvent {
+    /// Event to update.
+    #[schemars(description = "The event's id, from ListCalendarEvents or CreateCalendarEvent.")]
+    pub event_id: uuid::Uuid,
+
+    /// Calendar whose copy of the event is updated.
+    #[schemars(
+        description = "The `calendarId` of the copy to update, from the `copies` of its \
+                       ListCalendarEvents entry, for an event synced from more than one \
+                       calendar. Omit to update the event's primary copy."
+    )]
+    #[serde(default)]
+    pub calendar_id: Option<uuid::Uuid>,
+
+    /// Inbox holding the copy this call changes.
+    #[schemars(
+        description = "The `inbox` of the copy this call changes, from its ListCalendarEvents \
+                       entry. Required when the meeting is on more than one of the user's \
+                       inboxes and the call changes anything but `reminders` or `rsvp`: the \
+                       tool refuses without it and lists each copy. It must be the inbox \
+                       holding the copy `eventId` names."
+    )]
+    #[serde(default)]
+    pub inbox: Option<String>,
+
+    /// Update scope.
+    #[schemars(
+        description = "How much of a recurring series to change: \"this_event\" edits one \
+                       occurrence (requires `recurrenceId`), \"all\" edits the whole event or \
+                       series. Non-recurring events use \"all\"."
+    )]
+    pub scope: UpdateScopeInput,
+
+    /// Occurrence key for occurrence-scoped updates.
+    #[schemars(
+        description = "The `recurrenceId` of the targeted occurrence, from its \
+                       ListCalendarEvents entry. Required for \"this_event\"; omit for \
+                       \"all\"."
+    )]
+    #[serde(default)]
+    pub recurrence_id: Option<String>,
+
+    /// Replacement title.
+    #[schemars(description = "Replacement title. Omit to keep the current title.")]
+    #[serde(default)]
+    pub title: Option<String>,
+
+    /// Replacement description.
+    #[schemars(
+        description = "Replacement event body/description. An empty string clears it; omit to \
+                       keep the current one."
+    )]
+    #[serde(default)]
+    pub description: Option<String>,
+
+    /// Replacement location.
+    #[schemars(
+        description = "Replacement location label. An empty string clears it; omit to keep \
+                       the current one."
+    )]
+    #[serde(default)]
+    pub location: Option<String>,
+
+    /// Replacement time.
+    #[schemars(
+        description = "Replacement time: a timed span with `kind` \"timed\" (startsAt, endsAt, \
+                       optional timeZone) or whole days with `kind` \"allDay\" (startDate, \
+                       exclusive endDate). Omit to keep the current time."
+    )]
+    #[serde(default)]
+    pub time: Option<EventTimeInput>,
+
+    /// Replacement attendee list.
+    #[schemars(
+        description = "Replacement attendee list — replaces all current attendees, so include \
+                       everyone who should remain. When `viewerCan.removeGuests` is false, it \
+                       may only add to the current list. Omit to leave attendees unchanged."
+    )]
+    #[serde(default)]
+    pub attendees: Option<Vec<AttendeeInput>>,
+
+    /// Replacement recurrence properties.
+    #[schemars(
+        description = "Replacement RFC 5545 recurrence lines. An empty list makes the event \
+                       one-off; omit to keep the current recurrence. Only valid with scope \
+                       \"all\"."
+    )]
+    #[serde(default)]
+    pub recurrence_lines: Option<Vec<String>>,
+
+    /// Conference change.
+    #[schemars(
+        description = "Change the event's video conference: \"provider_default\" uses the calendar's \
+                       supported provider; \"google_meet\" or \"microsoft_teams\" selects one explicitly. \
+                       \"remove\" detaches the conference only where supported. Check ListCalendars \
+                       capabilities first. Omit to preserve the current conference. To switch \
+                       to a Macro call use `addMacroCall` instead."
+    )]
+    #[serde(default)]
+    pub conference: Option<ConferenceChangeInput>,
+
+    /// Whether to switch the event to a Macro call.
+    #[schemars(
+        description = "Switch the event to a Macro call, replacing any Google Meet or other \
+                       conference. An event already holding a Macro call keeps it. Mutually \
+                       exclusive with `conference`."
+    )]
+    #[serde(default)]
+    pub add_macro_call: bool,
+
+    /// Replacement reminder configuration.
+    #[schemars(
+        description = "Replacement notification reminders. `useDefault: true` follows the \
+                       calendar's own defaults; otherwise `overrides` replaces the whole list \
+                       with entries of `method` \"popup\" (a Macro notification) or \"email\" \
+                       and `minutes` before the start — an empty list silences the event. \
+                       Omit to keep the current reminders."
+    )]
+    #[serde(default)]
+    pub reminders: Option<EventRemindersInput>,
+
+    /// The requester's own RSVP.
+    #[schemars(
+        description = "Set the user's own response to the invitation: \"accepted\", \
+                       \"declined\", or \"tentative\". Omit to leave their response alone."
+    )]
+    #[serde(default)]
+    pub rsvp: Option<RsvpResponseInput>,
+
+    /// Replacement out-of-office decline behavior.
+    #[schemars(
+        description = "Adjust out-of-office decline behavior; only valid on an event that is \
+                       already out of office (its event type cannot be changed). Replaces the \
+                       whole block: set `autoDeclineMode` (\"decline_none\", \"decline_all\", \
+                       or \"decline_new_only\") and optionally `declineMessage`. Omit to leave \
+                       it untouched."
+    )]
+    #[serde(default)]
+    pub out_of_office: Option<OutOfOfficeInput>,
+
+    /// Replacement guest policy.
+    #[schemars(
+        description = "Replace what guests may do: `canModify` (change the event; implies \
+                       `canInviteOthers`), `canInviteOthers` and `canSeeOtherGuests`, all three \
+                       required. Only the organizer of a Google event may set it \
+                       (`viewerCan.setGuestPolicy`), and only with scope \"all\": it belongs to \
+                       the whole series. Outlook events have none. Omit to leave it untouched."
+    )]
+    #[serde(default)]
+    pub guest_policy: Option<GuestPolicy>,
+}
+
+impl ToolAnnotated for UpdateCalendarEvent {
+    const ANNOTATIONS: ToolAnnotations = ToolAnnotations::destructive("Update calendar event");
+}
+
+#[async_trait]
+impl<M, O, L> AsyncTool<CalendarToolContext<M, O, L>> for UpdateCalendarEvent
+where
+    M: CalendarMutationService + CalendarMacroCallService,
+    O: CalendarOccurrenceService,
+    L: MeetingLinkProvider,
+{
+    type Output = ToolCalendarEvent;
+
+    #[tracing::instrument(skip_all, fields(user_id=?request_context.user_id), err)]
+    async fn call(
+        &self,
+        service_context: ServiceContext<CalendarToolContext<M, O, L>>,
+        request_context: RequestContext,
+    ) -> ToolResult<Self::Output> {
+        tracing::info!(
+            event_id=%self.event_id,
+            scope=?self.scope,
+            attendee_count=?self.attendees.as_ref().map(Vec::len),
+            rsvp=?self.rsvp,
+            inbox_confirmed=self.inbox.is_some(),
+            add_macro_call=self.add_macro_call,
+            "Update calendar event"
+        );
+
+        if self.add_macro_call && self.conference.is_some() {
+            return Err(ToolCallError {
+                description: "`addMacroCall` and `conference` are mutually exclusive; pick one."
+                    .to_string(),
+                internal_error: anyhow::Error::from_boxed(
+                    rootcause::report!("both Macro call and provider conference requested")
+                        .into_boxed_error(),
+                ),
+            });
+        }
+
+        let requester_id = request_context.user_id.to_string();
+        let scope = match (self.scope, self.recurrence_id.clone()) {
+            (UpdateScopeInput::All, None) => CalendarUpdateScope::All,
+            (UpdateScopeInput::ThisEvent, Some(recurrence_id)) => {
+                CalendarUpdateScope::ThisEvent { recurrence_id }
+            }
+            (UpdateScopeInput::ThisEvent, None) => {
+                return Err(ToolCallError {
+                    description: "A this_event update requires `recurrenceId` — use the \
+                                  occurrence's `recurrenceId` from ListCalendarEvents."
+                        .to_string(),
+                    internal_error: anyhow::Error::from_boxed(
+                        rootcause::report!("scoped update without recurrenceId").into_boxed_error(),
+                    ),
+                });
+            }
+            // Dropping the key would silently widen a one-occurrence intent
+            // to the whole series — exactly the mistake scoping exists to
+            // prevent — so make the caller restate what it wants.
+            (UpdateScopeInput::All, Some(_)) => {
+                return Err(ToolCallError {
+                    description: "`recurrenceId` only applies to scope \"this_event\". Pass \
+                                  scope \"this_event\" to change that occurrence, or drop \
+                                  `recurrenceId` to change the whole series."
+                        .to_string(),
+                    internal_error: anyhow::Error::from_boxed(
+                        rootcause::report!("series update with a recurrenceId").into_boxed_error(),
+                    ),
+                });
+            }
+        };
+        let patch = CalendarEventPatch {
+            title: self.title.clone(),
+            description: self.description.clone(),
+            location: self.location.clone(),
+            time: self.time.clone().map(Into::into),
+            attendees: self
+                .attendees
+                .clone()
+                .map(|attendees| attendees.into_iter().map(Into::into).collect()),
+            recurrence_lines: self.recurrence_lines.clone(),
+            visibility: None,
+            transparency: None,
+            reminders: self.reminders.clone().map(Into::into),
+            conference: self.conference.map(Into::into),
+            out_of_office: self.out_of_office.clone().map(Into::into),
+            guest_policy: self.guest_policy,
+        };
+
+        // Reminders and the user's own answer belong to one copy; anything
+        // else reaches the meeting, so the agent must have chosen the copy
+        // when the meeting is on several of the user's inboxes.
+        if patch.reaches_meeting() || self.add_macro_call || self.inbox.is_some() {
+            confirm_copy(
+                &*service_context.occurrences,
+                &requester_id,
+                self.event_id,
+                self.inbox.as_deref(),
+                CopyChange::Update {
+                    changes_guests: patch.attendees.is_some(),
+                },
+            )
+            .await?;
+        }
+
+        // An RSVP is its own provider call, so a call carrying only one runs
+        // only that half. Answering after the patch keeps a replaced attendee
+        // list from discarding the response that was just recorded.
+        let patched = if self.add_macro_call {
+            Some(
+                service_context
+                    .mutations
+                    .update_event_with_macro_call(
+                        &requester_id,
+                        self.event_id,
+                        self.calendar_id,
+                        patch,
+                        scope.clone(),
+                    )
+                    .await
+                    .map_err(macro_call_update_tool_error)?,
+            )
+        } else if patch.is_empty() {
+            None
+        } else {
+            Some(
+                service_context
+                    .mutations
+                    .update_event(
+                        &requester_id,
+                        self.event_id,
+                        self.calendar_id,
+                        patch,
+                        scope.clone(),
+                    )
+                    .await
+                    .map_err(|error| mutation_tool_error("update the calendar event", error))?,
+            )
+        };
+
+        let event = match self.rsvp {
+            Some(rsvp) => {
+                let rsvp_scope = match scope {
+                    CalendarUpdateScope::All => CalendarRsvpScope::All,
+                    CalendarUpdateScope::ThisEvent { recurrence_id } => {
+                        CalendarRsvpScope::ThisEvent { recurrence_id }
+                    }
+                };
+                service_context
+                    .mutations
+                    .respond_to_event(
+                        &requester_id,
+                        self.event_id,
+                        self.calendar_id,
+                        rsvp.into(),
+                        rsvp_scope,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| {
+                        let action = if patched.is_some() {
+                            "record the RSVP — the other changes were saved"
+                        } else {
+                            "record the RSVP"
+                        };
+                        mutation_tool_error(action, error)
+                    })?
+            }
+            None => patched.ok_or_else(|| ToolCallError {
+                description: "This call changes nothing — supply at least one field to update, \
+                              or an `rsvp`."
+                    .to_string(),
+                internal_error: anyhow::Error::from_boxed(
+                    rootcause::report!("update without any change").into_boxed_error(),
+                ),
+            })?,
+        };
+
+        let labels = CalendarLabels::load(&*service_context.mutations, &requester_id).await;
+        let macro_call_url = if self.add_macro_call {
+            first_macro_call_url(event.location.as_deref(), event.description.as_deref())
+        } else {
+            None
+        };
+        Ok(ToolCalendarEvent {
+            macro_call_url,
+            ..ToolCalendarEvent::from_event(&event, &labels)
+        })
+    }
+}

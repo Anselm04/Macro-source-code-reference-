@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Adopt the scene lifecycle without enabling additional iPad windows. -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>TaoScene</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+	<!-- The app only uses exempt encryption (HTTPS / OS-provided crypto), so
+	     App Store Connect's questionnaire resolves to "no documentation
+	     required". Declaring that here answers it for every uploaded build
+	     instead of by hand per build. Keep gen/apple/project.yml and
+	     gen/apple/app_iOS/Info.plist in sync. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+		<string>voip</string>
+	</array>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>macro</string>
+	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Macro uses the camera for video calls and for photos and videos you attach.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Macro uses the microphone for calls and for videos you record to attach.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>This app needs access to your photo library to upload attachments.</string>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>INSendMessageIntent</string>
+		<string>NSUserActivityTypeBrowsingWeb</string>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>macro</string>
+			</array>
+			<key>CFBundleURLName</key>
+			<string>macro</string>
+		</dict>
+	</array>
+</dict>
+</plist>

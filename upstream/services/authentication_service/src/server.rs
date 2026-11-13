@@ -1,0 +1,1021 @@
+//! The service's composition root: reads config and wires every adapter and
+//! domain service into the HTTP server.
+
+use analytics_client::{
+    AnalyticsClient, AnalyticsClientConfig, GoogleAnalyticsConfig, MetaConfig, PostHogConfig,
+};
+use anyhow::{Context, anyhow};
+use bots::outbound::pg_bots_repo::PgBotsRepo;
+use channels::{
+    domain::{
+        service::ChannelServiceImpl,
+        side_effects::{ChannelSideEffectService, SpawnedChannelEventDispatcher},
+    },
+    outbound::{
+        connection_gateway_realtime::ConnectionGatewayChannelRealtimePublisher,
+        contacts_dispatcher::ContactsChannelDispatcher,
+        notification_sender::NotificationChannelSender,
+        pg_channel_reference_share_permissions::PgChannelReferenceSharePermissions,
+        pg_channels_repo::PgChannelsRepo, pg_side_effect_context::PgChannelSideEffectContext,
+    },
+};
+use connection_gateway_client::ConnectionGatewayClient;
+use contacts::{domain::service::SqsContactsIngress, outbound::ingress::SqsContactsQueue};
+use document_storage_service_client::DocumentStorageServiceClient;
+use entity_access::{domain::service::EntityAccessServiceImpl, outbound::PgAccessRepository};
+use entity_registry::{EntityRegistryServiceImpl, PgEntityRegistryRepository};
+use foreign_entity::{
+    domain::service::ForeignEntityServiceImpl,
+    outbound::pg_foreign_entity_repo::PgForeignEntityRepo,
+};
+use github::{
+    domain::service::{GithubLinkConfig, GithubLinkServiceImpl},
+    outbound::{
+        github_auth_client::GithubAuthImpl, github_oauth_client::GithubOauthImpl,
+        pg_github_repo::PgGithubRepo,
+    },
+};
+use github_pull_requests::{
+    domain::service::GithubPullRequestServiceImpl,
+    outbound::pg_github_pull_request_repo::PgGithubPullRequestRepo,
+};
+use loops_client::LoopsClient;
+use macro_auth::middleware::decode_jwt::JwtValidationArgs;
+use macro_authorization::{
+    InternalAuthConfig, MacroAuthJwtValidator, MacroAuthorizationState,
+    PgUserApiKeyAuthorizationRepo, PgUserApiKeyAuthorizer,
+};
+use macro_event_broker::{KafkaEventPublisher, MacroEventBrokerService};
+use macro_service_urls::{
+    AppServiceUrl, ConnectionGatewayUrl, DocumentStorageServiceUrl, EmailServiceUrl,
+    GoogleOauthAuthorizationUrl, StaticFilePublicUrl, StaticFileServiceUrl,
+};
+use native_app_service::{
+    domain::{models::PlatformData, service::NativeAppServiceImpl},
+    outbound::DefaultBundleFetcher,
+};
+use notification::outbound::queue::SqsQueue;
+use notification::{
+    domain::service::SqsNotificationIngress, outbound::rate_limit::RedisRateLimitAdapter,
+};
+use rate_limit::domain::service::RateLimitServiceImpl;
+use roles_and_permissions::{
+    domain::service::UserRolesAndPermissionsServiceImpl, outbound::pgpool::MacroDB,
+};
+use secretsmanager_client::SecretManager;
+use sqlx::postgres::PgPoolOptions;
+use static_file_service_client::StaticFileServiceClient;
+use teams::{
+    domain::team_service::TeamServiceImpl,
+    outbound::{
+        contacts_enqueuer::ContactsIngressEnqueuer, customer_repo::CustomerRepositoryImpl,
+        team_analytics::AnalyticsClientTeamAnalytics, team_repo::TeamRepositoryImpl,
+    },
+};
+
+use gtm_invite::{
+    domain::service::GtmInviteServiceImpl, outbound::pg_gtm_invite_repo::PgGtmInviteRepo,
+};
+use referral::{domain::service::ReferralServiceImpl, outbound::pg_referral_repo::PgReferralRepo};
+use system_status::{
+    domain::service::SystemStatusServiceImpl,
+    outbound::{
+        connection_gateway_broadcaster::ConnectionGatewayStatusBroadcaster,
+        pg_system_status_repo::PgSystemStatusRepo,
+    },
+};
+use user_language::{
+    domain::service::UserLanguageServiceImpl, outbound::pg_user_language_repo::PgUserLanguageRepo,
+};
+
+use crate::{
+    api::{
+        self,
+        context::{
+            ApiContext, AuthorizationService, MacroApiTokenContext, MacroApiTokenExpirySeconds,
+            MacroApiTokenIssuer, MacroApiTokenPrivateSecretKey, StripeWebhookSecretKey,
+        },
+    },
+    config::{Config, Environment},
+    microsoft_token_cipher::{
+        EnvelopeMicrosoftTokenCipher, KmsDataKeyProvider, MicrosoftTokenCipher,
+    },
+    outbound::team_owned_entity_cleanup::{
+        TeamOwnedEntityCleanupAdapter, TeamOwnedEntityCleanupConfig,
+    },
+};
+use std::{sync::Arc, time::Duration};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+/// Build the service from the environment and serve until shutdown.
+// Not a `pub async fn`: see CS-73.
+pub fn run() -> impl Future<Output = anyhow::Result<()>> {
+    run_server()
+}
+
+async fn run_server() -> anyhow::Result<()> {
+    let env = Environment::new_or_prod();
+
+    // One SDK config is sufficient for every AWS client in this process.
+    let aws_config = macro_aws_config::get_macro_aws_config().await;
+    let secretsmanager_client = secretsmanager_client::SecretsManager::new(
+        aws_sdk_secretsmanager::Client::new(&aws_config),
+    );
+
+    // Parse our configuration from the environment.
+    let config = Config::from_env().context("expected to be able to generate config")?;
+    let account_link_state_key = config.account_link_state_key()?;
+    let signup_policy = Arc::new(
+        config
+            .signup_policy()
+            .context("invalid signup policy configuration")?,
+    );
+    let gtm_invite_config = config
+        .gtm_invite_config()
+        .context("invalid GTM invite link configuration")?;
+    let microsoft_credentials = config
+        .microsoft_credentials()
+        .context("invalid Microsoft OAuth configuration")?;
+    let microsoft_token_cipher = microsoft_credentials.as_ref().map(|credentials| {
+        Arc::new(EnvelopeMicrosoftTokenCipher::new(KmsDataKeyProvider::new(
+            aws_sdk_kms::Client::new(&aws_config),
+            credentials.token_kms_key_id.clone(),
+        ))) as Arc<dyn MicrosoftTokenCipher>
+    });
+
+    // A separate KMS key from the Microsoft one by design: sharing it would
+    // grant whatever decrypts Cursor keys access to the key protecting
+    // everyone's mailbox credentials.
+    // Agents' own API keys share it: they are read by the same agent harness
+    // and protected by the same IAM grants.
+    let cursor_kms = cursor_api_key::cipher::AwsKmsCiphertexts::new(
+        aws_sdk_kms::Client::new(&aws_config),
+        config.cursor_api_key_kms_key_id()?,
+    );
+    let cursor_api_key_cipher = Arc::new(cursor_api_key::cipher::KmsCursorApiKeyCipher::new(
+        cursor_kms.clone(),
+    )) as Arc<dyn cursor_api_key::cipher::CursorApiKeyCipher>;
+
+    let internal_api_key = config.internal_api_key.clone();
+
+    let stripe_webhook_secret = secretsmanager_client
+        .get_maybe_secret_value(env, StripeWebhookSecretKey::new()?)
+        .await?;
+
+    tracing::trace!("initialized config");
+
+    let (min_connections, max_connections): (u32, u32) = match config.environment {
+        Environment::Production => (5, 25),
+        Environment::Develop => (1, 25),
+        Environment::Local => (1, 10),
+    };
+
+    let db = PgPoolOptions::new()
+        .min_connections(min_connections)
+        .max_connections(max_connections)
+        .connect(&config.database_url)
+        .await
+        .context("could not connect to db")?;
+
+    tracing::trace!(
+        min_connections,
+        max_connections,
+        "initialized db connection"
+    );
+
+    // Macro API token
+    let macro_api_token_private_key = secretsmanager_client
+        .get_maybe_secret_value(config.environment, MacroApiTokenPrivateSecretKey::new()?)
+        .await?;
+
+    let fusionauth_api_key = match config.environment {
+        Environment::Local => config.fusionauth_api_key_secret_key.to_string().clone(),
+        _ => secretsmanager_client
+            .get_secret_value(&config.fusionauth_api_key_secret_key)
+            .await
+            .context("unable to get secret")?
+            .to_string(),
+    };
+
+    let fusionauth_client_secret = match config.environment {
+        Environment::Local => config.fusionauth_client_secret_key.to_string().clone(),
+        _ => secretsmanager_client
+            .get_secret_value(&config.fusionauth_client_secret_key)
+            .await
+            .context("unable to get secret")?
+            .to_string(),
+    };
+
+    let stripe_client_secret = match config.environment {
+        Environment::Local => config.stripe_secret_key.to_string().clone(),
+        _ => secretsmanager_client
+            .get_secret_value(&config.stripe_secret_key)
+            .await
+            .context("unable to get secret")?
+            .to_string(),
+    };
+
+    let google_client_secret = match config.environment {
+        Environment::Local => config.google_client_secret_key.to_string().clone(),
+        _ => secretsmanager_client
+            .get_secret_value(&config.google_client_secret_key)
+            .await
+            .context("unable to get google client secret")?
+            .to_string(),
+    };
+
+    let fusionauth_public_url = config
+        .fusionauth_public_url
+        .value()
+        .unwrap_or(config.fusionauth_base_url.as_ref())
+        .to_owned();
+    let auth_client = fusionauth::FusionAuthClient::new(
+        fusionauth_api_key,
+        config.fusionauth_client_id.to_string().clone(),
+        fusionauth_client_secret,
+        config.fusionauth_base_url.to_string().clone(),
+        config.fusionauth_oauth_redirect_uri.to_string().clone(),
+        config.google_client_id.to_string().clone(),
+        google_client_secret,
+    )
+    .with_public_url(fusionauth_public_url);
+    let auth_client = match microsoft_credentials {
+        Some(credentials) => auth_client.with_microsoft_credentials(
+            credentials.client_id,
+            credentials.client_secret,
+            credentials.tenant_id,
+        ),
+        None => auth_client,
+    };
+    tracing::trace!("initialized auth client");
+    // Gates new Outlook connections per user (`enable-outlook`). Without a
+    // PostHog key the deployment switch alone decides.
+    let feature_flags = config
+        .posthog_api_key()
+        .map(|key| {
+            feature_flags::outbound::posthog::PostHogFeatureFlags::new(
+                config.posthog_host.value().unwrap_or(DEFAULT_POSTHOG_HOST),
+                key.to_owned(),
+                Duration::from_secs(3),
+                config.environment,
+            )
+        })
+        .transpose()
+        .map_err(|error| anyhow!("invalid feature flag configuration: {error}"))?;
+    let microsoft_auth = microsoft_token_cipher.map(|cipher| {
+        use crate::{
+            domain::microsoft::{MicrosoftAuth, MicrosoftAuthService},
+            outbound::microsoft::{MicrosoftOAuthProvider, PgMicrosoftGrants},
+        };
+        Arc::new(
+            MicrosoftAuthService::new(
+                PgMicrosoftGrants::new(db.clone()),
+                MicrosoftOAuthProvider::new(
+                    Arc::new(auth_client.clone()),
+                    account_link_state_key.clone(),
+                ),
+                cipher,
+            )
+            .with_connections_enabled(config.outlook_connections_enabled)
+            .with_feature_flags(feature_flags.clone()),
+        ) as Arc<dyn MicrosoftAuth>
+    });
+
+    let static_file_service_client = Arc::new(StaticFileServiceClient::with_timeout(
+        config.service_internal_auth_key.to_string(),
+        StaticFileServiceUrl::new()?.to_string(),
+        std::time::Duration::from_secs(10),
+    ));
+    let static_file_public_url = StaticFilePublicUrl::new()?.to_string();
+    let google_authorization_url = url::Url::parse(GoogleOauthAuthorizationUrl::new()?.as_str())
+        .context("Google OAuth authorization URL is not a URL")?;
+    let document_storage_service_client = DocumentStorageServiceClient::new(
+        config.service_internal_auth_key.to_string().clone(),
+        DocumentStorageServiceUrl::new()?.to_string(),
+    );
+    tracing::trace!("initialized document storage service client");
+
+    let email_service_client =
+        email::outbound::EmailServiceHttpClient::new(EmailServiceUrl::new()?.to_string());
+    tracing::trace!("initialized email service client");
+
+    let macro_cache_client =
+        macro_cache_client::MacroCache::new(config.redis_uri.to_string().as_str());
+
+    tracing::trace!("initialized redis client");
+
+    let stripe_client = stripe::Client::new(stripe_client_secret);
+    tracing::trace!("initialized stripe client");
+
+    // `from_env` routes to local SMTP (Mailpit) when SMTP_HOST is set, else SES.
+    let ses_client = ses_client::Ses::from_env(
+        aws_sdk_sesv2::Client::new(&aws_config),
+        &config.environment.to_string(),
+    );
+
+    let jwt_args =
+        JwtValidationArgs::new_with_secret_manager(config.environment, &secretsmanager_client)
+            .await?;
+    let authorization_state = MacroAuthorizationState::new(Arc::new(AuthorizationService::new(
+        MacroAuthJwtValidator::new(jwt_args.clone()),
+        InternalAuthConfig {
+            api_key: internal_api_key.to_string(),
+            default_user_id: None,
+        },
+        macro_authorization::NoBotAuthorizer,
+        PgUserApiKeyAuthorizer::new(PgUserApiKeyAuthorizationRepo::new(db.clone())),
+    )));
+
+    let redis_client = redis::Client::open(config.redis_uri.to_string().as_str())
+        .context("failed to create redis client")?;
+    let redis_multiplexed_conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .context("failed to get multiplexed redis connection")?;
+
+    let notification_queue = macro_queues::NotificationIngressQueue::new();
+    let search_event_queue = macro_queues::SearchEventQueue::new();
+    let link_manager_queue = macro_queues::LinkManagerQueue::new();
+    let email_backfill_queue = macro_queues::EmailBackfillQueue::new();
+    let ingress_queue = SqsQueue::new(
+        aws_sdk_sqs::Client::new(&macro_aws_config::get_macro_aws_config().await),
+        notification_queue.to_string(),
+    );
+    let notification_ingress_service = SqsNotificationIngress {
+        queue: ingress_queue,
+    };
+    tracing::trace!("initialized notification ingress service");
+
+    let sqs_client = sqs_client::SQS::new(aws_sdk_sqs::Client::new(&aws_config))
+        .search_event_queue(&search_event_queue)
+        .email_link_manager_queue(&link_manager_queue)
+        .email_backfill_queue(&email_backfill_queue);
+    tracing::trace!("initialized sqs client");
+
+    // Initialize analytics client with configured providers
+    let analytics_client = Arc::new(AnalyticsClient::new(AnalyticsClientConfig {
+        google_analytics: config
+            .ga_measurement_id
+            .value()
+            .zip(config.ga_api_secret.value())
+            .map(|(measurement_id, api_secret)| {
+                tracing::info!("configuring Google Analytics");
+                GoogleAnalyticsConfig {
+                    measurement_id: measurement_id.to_string(),
+                    api_secret: api_secret.to_string(),
+                }
+            }),
+        meta: config
+            .meta_pixel_id
+            .value()
+            .zip(config.meta_access_token.value())
+            .map(|(pixel_id, access_token)| {
+                tracing::info!("configuring Meta Conversions API");
+                MetaConfig {
+                    pixel_id: pixel_id.to_string(),
+                    access_token: access_token.to_string(),
+                    test_event_code: config.meta_test_event_code.value().map(str::to_string),
+                }
+            }),
+        posthog: config.posthog_api_key().map(|api_key| {
+            tracing::info!("configuring PostHog");
+            PostHogConfig {
+                api_key: api_key.to_string(),
+                host: config
+                    .posthog_host
+                    .value()
+                    .unwrap_or(DEFAULT_POSTHOG_HOST)
+                    .to_string(),
+            }
+        }),
+    }));
+    tracing::trace!("initialized analytics client");
+
+    // Initialize Loops client. Production and develop sign-ups are added to
+    // Loops; on localhost, or wherever no API key is configured, this is a
+    // no-op. Note there is one Loops audience — a develop sign-up creates a
+    // real contact and can trigger live workflows, so leave the key unset in
+    // any environment that should not send.
+    let loops_client = match (config.environment, config.loops_api_key.value()) {
+        (Environment::Production | Environment::Develop, Some(api_key)) => {
+            tracing::info!("configuring Loops");
+            LoopsClient::new(api_key.to_string())
+        }
+        _ => LoopsClient::noop(),
+    };
+    tracing::trace!("initialized loops client");
+
+    let user_roles_and_permissions_macro_db = MacroDB::new(db.clone());
+
+    let user_roles_and_permissions_service = UserRolesAndPermissionsServiceImpl::new(
+        user_roles_and_permissions_macro_db.clone(),
+        user_roles_and_permissions_macro_db,
+    );
+
+    let stripe_prices = api::StripePrices {
+        premium: config.stripe_price_id.to_string(),
+        max: config
+            .stripe_max_price_id
+            .value()
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned),
+    };
+    if stripe_prices.max.is_none() {
+        tracing::warn!("STRIPE_MAX_PRICE_ID is not set; the Max plan cannot be sold");
+    }
+
+    let teams_repo_impl = TeamRepositoryImpl::new(db.clone());
+    let customer_repo_impl = CustomerRepositoryImpl::new(
+        stripe_client.clone(),
+        stripe_prices.seat_prices()?,
+        db.clone(),
+    );
+    let favorites_service = favorites::domain::service::FavoritesServiceImpl::new(
+        favorites::outbound::pg_favorites_repo::PgFavoritesRepo::new(db.clone()),
+    );
+    let team_crm_settings_repo_impl =
+        teams::outbound::team_crm_settings_repo::TeamCrmSettingsRepositoryImpl::new(db.clone());
+
+    let notification_ingress_service = Arc::new(notification_ingress_service);
+
+    let crm_enqueuer = teams::outbound::crm_enqueuer::SqsCrmEnqueuer::new(sqs_client.clone());
+    let sqs_client = Arc::new(sqs_client);
+    let contacts_ingress = Arc::new(SqsContactsIngress {
+        queue: SqsContactsQueue::new(
+            aws_sdk_sqs::Client::new(&aws_config),
+            macro_queues::ContactsQueue::new().to_string(),
+        ),
+    });
+    let contacts_enqueuer = ContactsIngressEnqueuer::new(contacts_ingress.clone());
+    let team_analytics = AnalyticsClientTeamAnalytics::new(analytics_client.clone());
+    let event_broker_tracker = TaskTracker::new();
+    let macro_event_broker = MacroEventBrokerService::new(
+        KafkaEventPublisher::new(config.kafka_brokers.as_ref())
+            .context("failed to create kafka event publisher")?,
+        event_broker_tracker.clone(),
+    );
+    let entity_access_service_impl = Arc::new(EntityAccessServiceImpl::new(
+        PgAccessRepository::new(db.clone()),
+    ));
+    let connection_gateway_client = Arc::new(ConnectionGatewayClient::new(
+        config.service_internal_auth_key.to_string(),
+        ConnectionGatewayUrl::new()?.to_string(),
+    ));
+    // Authentication creates channels and posts support welcome messages in-process, so its
+    // channel service must dispatch the same realtime, notification, contact, and broker side
+    // effects as the document-storage channel API. Channel broker events drive live search
+    // indexing.
+    let channel_side_effects = ChannelSideEffectService::new(
+        PgChannelSideEffectContext::new(db.clone()),
+        ConnectionGatewayChannelRealtimePublisher::new(connection_gateway_client.clone()),
+        NotificationChannelSender::new(notification_ingress_service.clone()),
+        ContactsChannelDispatcher::new(contacts_ingress),
+    )
+    .with_macro_event_broker(macro_event_broker.clone());
+    let channel_event_dispatcher = SpawnedChannelEventDispatcher::new(channel_side_effects);
+    let channel_service = ChannelServiceImpl::with_dependencies(
+        PgChannelsRepo::new(db.clone()),
+        channel_event_dispatcher.clone(),
+        PgChannelReferenceSharePermissions::new(db.clone(), entity_access_service_impl.clone()),
+    );
+    // The welcome message goes through the shared message service so it gets the
+    // same persistence and delivery as every other channel message.
+    let channel_messages: Arc<dyn messages::domain::api::MessageCommands> = Arc::new(
+        messages::domain::service::MessageService::new(
+            messages::outbound::pg_message_repo::PgMessageRepository::new(db.clone())
+                .with_initiatives(initiative::domain::lookup::InitiativeLookup::new(
+                    initiative::outbound::PgInitiativeRepo::new(db.clone()),
+                ))
+                .with_crm(crm::outbound::lookup::PgCrmParentReader::new(db.clone())),
+            messages::domain::effects::MessageEffects::new(
+                messages::outbound::broker::BrokerMessagePublisher::new(macro_event_broker.clone()),
+                messages::domain::ports::NoMessageEventPublisher,
+                channels::domain::message_delivery::ChannelMessageDelivery::new(
+                    PgChannelsRepo::new(db.clone()),
+                    channel_event_dispatcher,
+                    PgChannelReferenceSharePermissions::new(
+                        db.clone(),
+                        entity_access_service_impl.clone(),
+                    ),
+                    messages::outbound::connection_gateway::ConnectionGatewayMessages(
+                        connection_gateway_client.clone(),
+                    ),
+                    channels::outbound::pg_agent_creations::PgAgentCreations::new(db.clone()),
+                ),
+            ),
+        )
+        .with_group_recipients(channels::domain::group_mentions::ChannelGroupRecipients(
+            PgChannelsRepo::new(db.clone()),
+        ))
+        .with_references(
+            messages::outbound::entity_access_audience::EntityAccessMessageReferences(
+                (*entity_access_service_impl).clone(),
+            ),
+        ),
+    );
+
+    let foreign_entity_service =
+        ForeignEntityServiceImpl::new(PgForeignEntityRepo::new(db.clone()));
+
+    let github_link_service_impl = GithubLinkServiceImpl::new(
+        PgGithubRepo::new(db.clone()),
+        GithubOauthImpl::default(),
+        GithubAuthImpl::new(auth_client.clone(), redis_multiplexed_conn),
+        GithubPullRequestServiceImpl::new(
+            foreign_entity_service,
+            PgGithubPullRequestRepo::new(db.clone()),
+        )
+        .with_event_publisher(
+            github_pull_requests::broker::BrokerGithubPullRequestPublisher(
+                macro_event_broker.clone(),
+            ),
+        ),
+        GithubLinkConfig {
+            client_id: config.github_client_id.to_string(),
+            client_secret: config.github_client_secret.to_string(),
+            idp_id: config.github_idp_id.to_string(),
+        },
+    );
+
+    let rate_limit = RateLimitServiceImpl {
+        repo: RedisRateLimitAdapter {
+            redis: redis_client,
+        },
+    };
+    let user_language_service = Arc::new(UserLanguageServiceImpl::new(PgUserLanguageRepo::new(
+        db.clone(),
+    )));
+
+    // Invites that turn into teammates and referrals that sign up earn the
+    // inviter AI credit (or more free allowance).
+    let invite_rewards = crate::outbound::invite_rewards::BillingInviteRewards::new(
+        ai_billing::domain::InviteRewardService::new(
+            ai_billing::outbound::RolesTeamsEntitlementSource::new(
+                user_roles_and_permissions_service.clone(),
+                teams_repo_impl.clone(),
+            ),
+            ai_billing::outbound::PgCreditGrantRepo::new(db.clone()),
+            ai_billing::outbound::PgCreditGrantRepo::new(db.clone()),
+        ),
+    );
+    let referral_service = ReferralServiceImpl {
+        repo: PgReferralRepo::new(db.clone()),
+        rewarder: invite_rewards.clone(),
+        notification_ingress: notification_ingress_service.clone(),
+    };
+    let gtm_invite_service = GtmInviteServiceImpl {
+        repo: PgGtmInviteRepo::new(db.clone()),
+        config: gtm_invite_config,
+    };
+    let system_status_service = Arc::new(SystemStatusServiceImpl::new(
+        PgSystemStatusRepo::new(db.clone()),
+        ConnectionGatewayStatusBroadcaster::new(connection_gateway_client.clone()),
+    ));
+
+    let codex_connection = if let Some(key_id) = config.codex_oauth_kms_key_id() {
+        let cipher = Arc::new(codex_connection::outbound::cipher::EnvelopeCipher::new(
+            aws_sdk_kms::Client::new(&aws_config),
+            key_id,
+        )?);
+        let repository = Arc::new(
+            codex_connection::outbound::postgres::PostgresRepository::new(db.clone(), cipher),
+        );
+        let provider = codex_cloud_agents::outbound::openai::OpenAi::new()
+            .map_err(|_| anyhow::anyhow!("failed to initialize Codex OAuth client"))?;
+        Some(
+            Arc::new(codex_connection::domain::ConnectionServiceImpl::new(
+                repository, provider,
+            )) as Arc<dyn codex_connection::domain::ConnectionService>,
+        )
+    } else {
+        None
+    };
+
+    let computer_policy = config.computer_billing_policy()?;
+    let plan_customer = CustomerRepositoryImpl::new(
+        stripe_client.clone(),
+        stripe_prices.seat_prices()?,
+        db.clone(),
+    );
+    let stripe_client = Arc::new(stripe_client);
+    let plan_gateway = crate::outbound::subscription_plan::StripePlanGateway::new(
+        db.clone(),
+        stripe_client.clone(),
+        stripe_prices.seat_prices()?,
+        plan_customer,
+        crate::outbound::subscription_billing::StripeBillingReader::new(
+            teams_repo_impl.clone(),
+            hosted_runtimes::outbound::pg::PgComputerRepo::new(db.clone(), computer_policy),
+            stripe_prices.seat_prices()?,
+        ),
+    );
+    let subscription_plan = Arc::new(crate::service::subscription_plan::PlanService::new(
+        plan_gateway.clone(),
+    ));
+    let subscription_status = Arc::new(
+        crate::service::subscription_status::SubscriptionStatusService::new(
+            ai_billing::outbound::RolesTeamsEntitlementSource::new(
+                user_roles_and_permissions_service.clone(),
+                teams_repo_impl.clone(),
+            ),
+            plan_gateway,
+            feature_flags
+                .clone()
+                .map(hosted_runtimes::domain::rollout::ComputerRollout::new)
+                .unwrap_or_default(),
+        ),
+    );
+    let gtm_invite_service = Arc::new(gtm_invite_service);
+    let subscription_checkout =
+        Arc::new(crate::service::subscription_checkout::CheckoutService::new(
+            crate::outbound::subscription_checkout::StripeCheckoutGateway::new(
+                db.clone(),
+                stripe_client.clone(),
+                gtm_invite_service.clone(),
+                stripe_prices.seat_prices()?,
+            ),
+        ));
+    let ai_payment_gateway = ai_billing::outbound::StripePaymentGateway::new(stripe_client.clone());
+    let ai_pricing = config.ai_pricing();
+    let ai_billing_service = Arc::new(
+        ai_billing::domain::BillingServiceImpl::new(
+            ai_billing::outbound::RolesTeamsEntitlementSource::new(
+                user_roles_and_permissions_service.clone(),
+                teams_repo_impl.clone(),
+            ),
+            ai_billing::outbound::PgUsageReader::new(db.clone()),
+            ai_billing::outbound::PgBillingRepo::new(db.clone(), ai_pricing),
+            ai_payment_gateway.clone(),
+            ai_pricing,
+        )
+        .with_enforcement(config.enable_ai_usage_enforcement)
+        .with_billing(config.enable_ai_usage_billing),
+    );
+    // The floor under every settlement request: on a schedule, settle
+    // everyone who recorded counted usage recently, whose period just closed,
+    // or who holds a reload that was never collected. Settlement is
+    // idempotent and serialized per payer in the database, so replicas may
+    // sweep concurrently. Not started while billing is off: every settlement
+    // would return before reading anything.
+    let settlement_sweep = config.enable_ai_usage_billing.is_enabled().then(|| {
+        tokio::spawn(ai_billing::inbound::run_settlement_sweep(
+            ai_billing::domain::SettlementSweep::new(
+                ai_billing_service.clone(),
+                ai_billing::outbound::PgSettlementCandidates::new(db.clone()),
+                ai_billing::outbound::RolesTeamsEntitlementSource::new(
+                    user_roles_and_permissions_service.clone(),
+                    teams_repo_impl.clone(),
+                ),
+            ),
+            ai_billing::inbound::SETTLEMENT_SWEEP_INITIAL_DELAY,
+            ai_billing::inbound::SETTLEMENT_SWEEP_INTERVAL,
+        ))
+    });
+    if settlement_sweep.is_none() {
+        tracing::info!("ai billing settlement sweep not started: ENABLE_AI_USAGE_BILLING is off");
+    }
+    let document_storage_service_client = Arc::new(document_storage_service_client);
+    // The harness and scheduled-action services validate the fleet-wide
+    // internal key, not this service's own inbound key.
+    let internal_key = config.service_internal_auth_key.to_string();
+    let harness_url = macro_service_urls::AgentHarnessServiceUrl::new()?.to_string();
+    let scheduled_action_url = macro_service_urls::ScheduledActionServiceUrl::new()?.to_string();
+    let team_owned_entity_cleanup = TeamOwnedEntityCleanupAdapter::new(
+        Arc::new(
+            passwords::outbound::postgres::PgRepository::new(db.clone())
+                .map_err(|_| anyhow::anyhow!("invalid Passwords metadata pool capacity"))?,
+        ),
+        PgBotsRepo::new(db.clone()),
+        EntityRegistryServiceImpl::new(PgEntityRegistryRepository::new(db.clone())),
+        document_storage_service_client.clone(),
+        TeamOwnedEntityCleanupConfig {
+            internal_key: internal_key.clone(),
+            harness_url: harness_url.clone(),
+            scheduled_action_url: scheduled_action_url.clone(),
+        },
+        // Needs only the repository: the billing-backed computer service is
+        // built after the team service it bills through.
+        Arc::new(hosted_runtimes::domain::service::TeamComputerRelease::new(
+            hosted_runtimes::outbound::pg::PgComputerRepo::new(db.clone(), computer_policy),
+            hosted_runtimes::domain::service::SystemClock,
+        )),
+    )
+    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let teams_service_impl = TeamServiceImpl::new_with_analytics(
+        teams_repo_impl.clone(),
+        customer_repo_impl,
+        channel_service.clone(),
+        user_roles_and_permissions_service.clone(),
+        notification_ingress_service.clone(),
+        crm_enqueuer,
+        team_crm_settings_repo_impl,
+        team_analytics,
+    )
+    .with_contacts_enqueuer(contacts_enqueuer)
+    .with_event_broker(macro_event_broker.clone())
+    .with_open_seat_release((*ai_billing_service).clone())
+    .with_owned_entity_cleanup(team_owned_entity_cleanup)
+    .with_invite_rewarder(Arc::new(invite_rewards));
+    let computer_rollout = feature_flags
+        .clone()
+        .map(hosted_runtimes::domain::rollout::ComputerRollout::new)
+        .unwrap_or_default();
+    let computer_prices = config.computer_prices()?;
+    let computer_repo =
+        hosted_runtimes::outbound::pg::PgComputerRepo::new(db.clone(), computer_policy);
+    let teams_service = Arc::new(teams_service_impl);
+    let computer_service = Arc::new(
+        hosted_runtimes::domain::service::ComputerService::new(
+            computer_repo.clone(),
+            crate::outbound::computer_billing::TeamComputerBilling::new(
+                (*teams_service).clone(),
+                computer_prices.clone(),
+            ),
+            hosted_runtimes::domain::service::SystemClock,
+            computer_repo,
+        )
+        .with_rollout(computer_rollout),
+    );
+    // Agent teammates: off for every admin unless `enable-agent-teammates`
+    // is on for them in PostHog.
+    let team_agents_service = Arc::new(team_agents::domain::service::TeamAgentServiceImpl::new(
+        team_agents::outbound::pg_team_agents_repo::PgTeamAgentsRepo::new(db.clone()),
+        team_agents::outbound::team_membership::TeamsMembership::new(teams_service.clone()),
+        team_agents::outbound::agent_api_keys::UserApiKeys::new(Arc::new(
+            user_api_key::domain::service::UserApiKeyServiceImpl::new(
+                user_api_key::outbound::pg_user_api_keys_repo::PgUserApiKeysRepo::new(db.clone()),
+            ),
+        )),
+        team_agents::outbound::agent_git_repos::AgentGitRepos::new(
+            agent_git::client::AgentGitClient::new(
+                macro_service_urls::AgentGitServiceUrl::new()?.to_string(),
+                internal_key.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+        ),
+        team_agents::outbound::hosted_runtimes_computers::HostedRuntimesComputers::new(
+            computer_service.clone(),
+            hosted_runtimes::outbound::pg::PgComputerRepo::new(db.clone(), computer_policy),
+        ),
+        feature_flags.clone(),
+        crate::outbound::agent_addresses::AgentAddresses,
+    ));
+    let domain_notice_service =
+        Arc::new(teams::domain::domain_notice::DomainNoticeServiceImpl::new(
+            teams::outbound::colleague_directory::ContactsColleagueDirectory::new(
+                contacts::outbound::repository::DbContactsRepository::new(db.clone()),
+            ),
+            teams::domain::join_announcement::JoinAnnouncementServiceImpl::new(
+                teams::outbound::join_announcement_repo::JoinAnnouncementRepositoryImpl::new(
+                    db.clone(),
+                ),
+                SqsNotificationIngress {
+                    queue: SqsQueue::new(
+                        aws_sdk_sqs::Client::new(&aws_config),
+                        notification_queue.to_string(),
+                    ),
+                },
+            ),
+        ));
+    // Reminds people of team invites they have not answered. Replicas claim
+    // disjoint invites, so every replica sweeps.
+    let invite_reminders_stop = CancellationToken::new();
+    let invite_reminders = TaskTracker::new();
+    invite_reminders.spawn(
+        teams::inbound::invite_reminder_worker::run_invite_reminder_sweep(
+            teams_service.clone(),
+            teams::inbound::invite_reminder_worker::INVITE_REMINDER_SWEEP_INITIAL_DELAY,
+            teams::inbound::invite_reminder_worker::INVITE_REMINDER_SWEEP_INTERVAL,
+            invite_reminders_stop.clone().cancelled_owned(),
+        ),
+    );
+    invite_reminders.close();
+    // Carries out computers' billing effects (removing subscription items)
+    // and settles purchases whose charge is being confirmed. Rows are leased,
+    // so every replica runs it.
+    let computer_billing_stop = CancellationToken::new();
+    let computer_billing = TaskTracker::new();
+    computer_billing.spawn(run_computer_billing_effects(
+        computer_service.clone(),
+        computer_billing_stop.clone(),
+    ));
+    computer_billing.close();
+    let user_deletion = Arc::new(
+        crate::outbound::user_deletion::UserDeletionAdapter::new(
+            db.clone(),
+            document_storage_service_client.clone(),
+            teams_service.clone(),
+            onboarding::outbound::pg_onboarding_repo::PgOnboardingRepo::new(db.clone()),
+            stripe_client.clone(),
+            internal_key,
+            harness_url,
+            scheduled_action_url,
+        )
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+    );
+
+    // Cleanup continues while new connections are disabled or OAuth is unconfigured.
+    let grant_repository = crate::outbound::microsoft::PgMicrosoftGrants::new(db.clone());
+    let grant_cleanup = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(MICROSOFT_GRANT_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                crate::domain::microsoft::collect_expired_grants(&grant_repository).await
+            {
+                tracing::error!(?error, "Microsoft grant expiry cleanup failed");
+            }
+        }
+    });
+
+    let agent_api_keys = Arc::new(agent_api_keys::domain::AgentKeyService::new(
+        agent_api_keys::outbound::PgAgentKeyRepo::new(db.clone()),
+        agent_api_keys::outbound::KmsAgentKeyCipher::new(cursor_kms),
+        agent_api_keys::outbound::EntitlementKeyPlans::new(
+            ai_billing::outbound::RolesTeamsEntitlementSource::new(
+                user_roles_and_permissions_service.clone(),
+                teams_repo_impl.clone(),
+            ),
+        ),
+    ));
+    // Only to authorize changes to an agent's API key, with the agents' own
+    // rule; agents themselves are created and edited in document storage.
+    let bots = Arc::new(bots::domain::service::BotServiceImpl::new(
+        PgBotsRepo::new(db.clone()),
+        macro_event_broker.clone(),
+    ));
+
+    let server_result = api::setup_and_serve(
+        ApiContext {
+            inbox_connections: Arc::new(email::domain::inbox_entitlement::InboxConnectionService(
+                email::outbound::EmailPgRepo::new(db.clone()),
+            )),
+            db,
+            github_link_service: Arc::new(github_link_service_impl),
+            auth_client: Arc::new(auth_client),
+            microsoft_auth,
+            cursor_api_key_cipher,
+            agent_api_keys,
+            bots,
+            codex_connection,
+            macro_cache_client: Arc::new(macro_cache_client),
+            stripe_client,
+            subscription_checkout,
+            subscription_plan,
+            subscription_status,
+            document_storage_service_client,
+            static_file_service_client,
+            static_file_public_url,
+            user_deletion,
+            email_service_client: Arc::new(email_service_client),
+            ses_client: Arc::new(ses_client),
+            notification_ingress_service,
+            sqs_client,
+            environment: config.environment,
+            signup_policy,
+            rate_limit_service: rate_limit,
+            event_broker: macro_event_broker.clone(),
+            calendar_scope_enabled: config.calendar_scope_enabled,
+            google_authorization_url,
+            account_link_state_key,
+            jwt_args,
+            authorization_state,
+            token_context: MacroApiTokenContext {
+                issuer: MacroApiTokenIssuer::new()?,
+                macro_api_token_private_key,
+                expiry_seconds: MacroApiTokenExpirySeconds::new()?
+                    .as_ref()
+                    .parse()
+                    .context("failed to parse MACRO_API_TOKEN_EXPIRY_SECONDS as usize")?,
+            },
+            internal_api_key,
+            stripe_webhook_secret,
+            user_roles_and_permissions_service: Arc::new(user_roles_and_permissions_service),
+            teams_service,
+            computer_prices,
+            computer_billing_observer: computer_service.clone(),
+            computer_service,
+            team_agents_service,
+            domain_notice_service,
+            channel_service: Arc::new(channel_service),
+            channel_messages,
+            favorites_service: Arc::new(favorites_service),
+            entity_access_service: entity_access_service_impl,
+            referral_service: Arc::new(referral_service),
+            user_language_service,
+            gtm_invite_service,
+            system_status_service,
+            native_app_service: Arc::new(NativeAppServiceImpl {
+                bundle_fetcher: DefaultBundleFetcher::new(
+                    AppServiceUrl::new_for_environment(config.environment)
+                        .context("failed to resolve app service URL")?
+                        .parse_url()
+                        .context("failed to parse app service URL")?,
+                ),
+                bundle_policy: native_app_service::domain::models::BundleUpdatePolicy::from_env()
+                    .map_err(|err| {
+                    anyhow!("failed to load bundle update policy: {err}")
+                })?,
+                platform_data: PlatformData {
+                    ios_development_team_id: IOS_DEVELOPMENT_TEAM_ID.to_string(),
+                    ios_app_bundle_id: IOS_APP_BUNDLE_ID.to_string(),
+                },
+            }),
+            loops_client: Arc::new(loops_client),
+            analytics_client,
+            stripe_prices,
+            ai_billing_service,
+            ai_payment_gateway: Arc::new(ai_payment_gateway),
+        },
+        config.port,
+    )
+    .await;
+
+    grant_cleanup.abort();
+    let _ = grant_cleanup.await;
+    // A sweep interrupted here leaves nothing half done: each settlement
+    // step commits on its own and the next sweep, on any replica, resumes.
+    if let Some(sweep) = settlement_sweep {
+        sweep.abort();
+    }
+
+    // Lets a billing pass in progress finish its Stripe call and record it.
+    computer_billing_stop.cancel();
+    if tokio::time::timeout(COMPUTER_BILLING_DRAIN_TIMEOUT, computer_billing.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_seconds = COMPUTER_BILLING_DRAIN_TIMEOUT.as_secs(),
+            "timed out waiting for the computer billing pass to finish"
+        );
+    }
+
+    // Lets a sweep in progress finish: its reminders are already counted as
+    // sent, so abandoning the batch would drop them.
+    invite_reminders_stop.cancel();
+    if tokio::time::timeout(INVITE_REMINDER_DRAIN_TIMEOUT, invite_reminders.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_seconds = INVITE_REMINDER_DRAIN_TIMEOUT.as_secs(),
+            "timed out waiting for the team invite reminder sweep to finish"
+        );
+    }
+
+    tracing::info!("waiting for event broker publishes to drain");
+    event_broker_tracker.close();
+    match tokio::time::timeout(EVENT_BROKER_DRAIN_TIMEOUT, event_broker_tracker.wait()).await {
+        Ok(()) => tracing::info!("event broker publishes drained"),
+        Err(error) => {
+            tracing::warn!(
+                error=?error,
+                timeout_seconds = EVENT_BROKER_DRAIN_TIMEOUT.as_secs(),
+                "timed out waiting for event broker publishes to drain"
+            );
+        }
+    }
+
+    server_result
+}
+
+const EVENT_BROKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const INVITE_REMINDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const COMPUTER_BILLING_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const MICROSOFT_GRANT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// PostHog's US ingestion origin, used when `POSTHOG_HOST` is unset.
+const DEFAULT_POSTHOG_HOST: &str = "https://us.i.posthog.com";
+
+// SAFETY: this is not a secret value
+const IOS_DEVELOPMENT_TEAM_ID: &str = "TY74Q77JBD";
+// SAFETY: this is not a secret value
+const IOS_APP_BUNDLE_ID: &str = "com.macro.app.prod";
+
+/// How often due computer billing effects are carried out.
+const COMPUTER_BILLING_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn run_computer_billing_effects(
+    service: Arc<crate::api::context::ComputerServiceType>,
+    stop: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(COMPUTER_BILLING_TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = stop.cancelled() => return,
+            _ = interval.tick() => {}
+        }
+        match service.run_billing_effects().await {
+            Ok(_) => {}
+            // A busy pool is not a failure; the next tick tries again.
+            Err(error) if error.is_storage_unavailable() => {
+                tracing::warn!("computer storage unavailable; billing effects pass skipped");
+            }
+            Err(error) => {
+                tracing::error!(error = ?error, "computer billing effects pass failed");
+            }
+        }
+    }
+}

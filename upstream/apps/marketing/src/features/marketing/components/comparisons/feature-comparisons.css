@@ -1,0 +1,41 @@
+.feature-page .feature-comparisons {
+  --comparison-accent: var(--color-ink);
+  --comparison-value-size: 14px;
+  --comparison-partial-height: 1.5px;
+  position: relative;
+  width: min(640px, calc(100% - 64px));
+  min-width: 0;
+  margin: var(--feature-section-space, 96px) auto 72px;
+  padding: 0;
+  scroll-margin-top: 112px;
+}
+.feature-comparison-anchor { position: absolute; top: 0; scroll-margin-top: 112px; }
+.feature-comparison-scroll { width: 100%; overflow-x: auto; }
+.feature-comparison-scroll:focus-visible { outline: 2px solid var(--color-ink-muted); outline-offset: 4px; }
+.feature-comparison-table {
+  width: 100%;
+  border-collapse: collapse;
+  color: var(--color-ink);
+  font: 370 14px/20px var(--font-sans);
+}
+.feature-comparison-table :is(th, td) { padding: 8px; text-align: center; vertical-align: middle; }
+.feature-comparison-table thead th { font-weight: 600; white-space: nowrap; }
+.feature-comparison-table tbody th { font-weight: 370; }
+.feature-comparison-table tr { border-bottom: 1px solid color-mix(in srgb, var(--color-ink) 10%, transparent); }
+.feature-comparison-table tbody tr:last-child { border-bottom: 0; }
+.feature-comparison-table tr > :first-child { padding-left: 0; text-align: left; }
+.feature-comparison-table tr > :last-child { padding-right: 0; }
+.feature-comparison-table svg { width: 12px; height: 12px; }
+.feature-comparison-table svg path { stroke-width: 1.6; }
+.feature-comparison-key { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 20px; color: var(--color-ink-muted); font-size: 12px; line-height: 1.5; }
+.feature-comparison-key > span { display: inline-flex; gap: 6px; align-items: center; }
+.feature-comparison-key svg { width: 12px; height: 12px; flex: none; }
+.feature-comparison-key svg path { stroke-width: 1.6; }
+@media (max-width: 699px) {
+  .feature-page .feature-comparisons { width: calc(100% - 48px); margin-bottom: 48px; }
+  .feature-page .product-page .feature-comparisons { width: calc(100% - 16px); }
+  .feature-comparison-table { font-size: 12px; line-height: 18px; }
+  .feature-comparison-table :is(th, td) { padding: 8px 4px; }
+  .feature-comparison-table thead th { white-space: nowrap; }
+  .feature-comparison-table tbody th { min-width: 96px; }
+}

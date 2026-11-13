@@ -1,0 +1,130 @@
+import type { DateValue } from '@core/util/date';
+import { useChannelsActivityQuery } from '@queries/channel/activity';
+import { useListChannelsQuery } from '@queries/channel/channels';
+import { queryReadyGate } from '@queries/gate';
+import type { ApiChannelWithLatest } from '@service-storage/channel-list-types';
+import { ChannelTypeEnum } from '@service-storage/client';
+import type { ApiActivity as ChannelsActivity } from '@service-storage/generated/schemas/apiActivity';
+import { type Accessor, createMemo } from 'solid-js';
+import { unwrap } from 'solid-js/store';
+import { createAssertedContextProvider } from './createContext';
+import { useIsAuthenticated, useUserId } from './user';
+
+type ChannelsContextValue = {
+  channels: Accessor<ApiChannelWithLatest[]>;
+  activity: Accessor<ChannelsActivity[]>;
+  channelsById: Accessor<Record<string, ApiChannelWithLatest>>;
+  activityByChannelId: Accessor<Record<string, ChannelsActivity>>;
+  isLoading: Accessor<boolean>;
+  error: Accessor<Error | null>;
+};
+
+export const [ChannelsContextProvider, useChannelsContext] =
+  createAssertedContextProvider('ChannelsContext', (): ChannelsContextValue => {
+    const authenticated = useIsAuthenticated();
+    const enabled = () => authenticated() === true;
+    const channelsQuery = useListChannelsQuery(enabled);
+    const activityQuery = useChannelsActivityQuery(enabled);
+
+    // Raw rows: walking them through the store creates a signal per field.
+    const channels = () =>
+      enabled() && queryReadyGate(channelsQuery)
+        ? unwrap(channelsQuery.data)
+        : [];
+    const activity = () =>
+      enabled() && queryReadyGate(activityQuery) ? activityQuery.data : [];
+
+    const channelsById = createMemo(() =>
+      channels().reduce<Record<string, ApiChannelWithLatest>>((acc, ch) => {
+        acc[ch.id] = ch;
+        return acc;
+      }, {})
+    );
+
+    const activityByChannelId = createMemo(() => {
+      if (!enabled() || !queryReadyGate(activityQuery)) return {};
+      return activityQuery.data.reduce<Record<string, ChannelsActivity>>(
+        (acc, a) => {
+          acc[a.channel_id] = a;
+          return acc;
+        },
+        {}
+      );
+    });
+
+    return {
+      channels,
+      activity,
+      channelsById,
+      activityByChannelId,
+      isLoading: () => channelsQuery.isLoading || activityQuery.isLoading,
+      error: () => channelsQuery.error ?? activityQuery.error ?? null,
+    };
+  });
+
+export function useChannel(channelId: string) {
+  const ctx = useChannelsContext();
+  return createMemo(() => ctx.channelsById()[channelId]);
+}
+
+/**
+ * Whether a channel can host a call: unknown while the channel list first
+ * loads, and never in an agent DM. A channel the loaded list lacks is not
+ * one of the user's agent DMs, so it can, as before agent DMs existed.
+ */
+export function useChannelCanCall(
+  channelId: string
+): Accessor<boolean | undefined> {
+  const ctx = useChannelsContext();
+  return createMemo(() => {
+    const channel = ctx.channelsById()[channelId];
+    if (channel) return !channel.agent_dm;
+    return ctx.isLoading() ? undefined : true;
+  });
+}
+
+export function useChannelName(channelId: string, fallback?: string) {
+  const ctx = useChannelsContext();
+  return createMemo(() => ctx.channelsById()[channelId]?.name ?? fallback);
+}
+
+export function useChannelType(channelId: string) {
+  const ctx = useChannelsContext();
+  return createMemo(() => ctx.channelsById()[channelId]?.channel_type);
+}
+
+export function useChannelActivity(channelId: string) {
+  const ctx = useChannelsContext();
+  return createMemo(() => ctx.activityByChannelId()[channelId]);
+}
+
+/**
+ * Get a reactive map of userId -> Date for the most recent DM
+ * activity with that user. Useful for ranking/sorting users by recency of
+ * interaction.
+ */
+export function useDmActivityByUserId(): Accessor<Map<string, DateValue>> {
+  const { channels } = useChannelsContext();
+  const currentUserId = useUserId();
+
+  return createMemo(() => {
+    const currentUser = currentUserId();
+    if (!currentUser) return new Map();
+
+    const allChannels = channels();
+    const map = new Map<string, DateValue>();
+
+    for (const channel of allChannels) {
+      if (channel.channel_type !== ChannelTypeEnum.DirectMessage) continue;
+
+      const otherParticipant = channel.participants.find(
+        (p) => p.user_id !== currentUser
+      );
+      if (!otherParticipant) continue;
+
+      map.set(otherParticipant.user_id, channel.updated_at);
+    }
+
+    return map;
+  });
+}

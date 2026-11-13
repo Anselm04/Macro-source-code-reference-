@@ -1,0 +1,154 @@
+import { toast } from '@core/component/Toast/Toast';
+import { useIsAuthenticated } from '@core/context/user';
+import { throwOnErr } from '@core/util/result';
+import { queryOptions, useMutation, useQuery } from '@tanstack/solid-query';
+import type { Accessor } from 'solid-js';
+import { propertiesServiceClient } from '../../service-clients/service-properties/client';
+import type { CreatePropertyDefinitionRequest } from '../../service-clients/service-properties/generated/schemas/createPropertyDefinitionRequest';
+import type { EntityType } from '../../service-clients/service-properties/generated/schemas/entityType';
+import type { PropertyDefinition } from '../../service-clients/service-properties/generated/schemas/propertyDefinition';
+import type { PropertyDefinitionResponse } from '../../service-clients/service-properties/generated/schemas/propertyDefinitionResponse';
+import type { PropertyScope } from '../../service-clients/service-properties/generated/schemas/propertyScope';
+import { queryClient } from '../client';
+import { type MutationCallbacks, withCallbacks } from '../utils';
+import { propertiesKeys } from './keys';
+
+type ListPropertiesQueryParams = {
+  scope: PropertyScope;
+  includeOptions: boolean;
+  forEntityType?: EntityType;
+};
+
+// Cached callbacks outlive the caller; only plain request values enter here.
+function listPropertiesQueryOptions(
+  { scope, includeOptions, forEntityType }: ListPropertiesQueryParams,
+  enabled: boolean
+) {
+  return queryOptions({
+    queryKey: propertiesKeys.definitions({
+      scope,
+      includeOptions,
+      forEntityType,
+    }).queryKey,
+    queryFn: () =>
+      throwOnErr(() =>
+        propertiesServiceClient.listProperties({
+          scope,
+          include_options: includeOptions,
+          for_entity_type: forEntityType,
+        })
+      ),
+    enabled,
+    staleTime: 1000 * 60 * 5, // 5 minutes
+  });
+}
+
+export function useListPropertiesQuery(
+  params: Accessor<ListPropertiesQueryParams>,
+  enabled: Accessor<boolean> = () => true
+) {
+  const authenticated = useIsAuthenticated();
+  return useQuery(() =>
+    listPropertiesQueryOptions(params(), authenticated() === true && enabled())
+  );
+}
+
+export async function fetchPropertyDefinitionWithOptions(
+  definitionId: string
+): Promise<PropertyDefinitionResponse | undefined> {
+  const data = await queryClient.fetchQuery({
+    queryKey: propertiesKeys.definitions({
+      scope: 'all',
+      includeOptions: true,
+    }).queryKey,
+    queryFn: async () =>
+      await throwOnErr(
+        async () =>
+          await propertiesServiceClient.listProperties({
+            scope: 'all',
+            include_options: true,
+          })
+      ),
+    staleTime: 0,
+  });
+
+  return data.find((item) =>
+    'definition' in item
+      ? item.definition.id === definitionId
+      : item.id === definitionId
+  );
+}
+
+function invalidatePropertyDefinitions() {
+  queryClient.invalidateQueries({
+    predicate: ({ queryKey }) =>
+      queryKey.includes('properties') && queryKey.includes('definitions'),
+  });
+}
+
+type CreatePropertyDefinitionParams = {
+  body: CreatePropertyDefinitionRequest;
+};
+
+type DeletePropertyDefinitionParams = {
+  definitionId: string;
+};
+
+export function useDeletePropertyDefinitionMutation(
+  callbacks?: MutationCallbacks<unknown, Error, DeletePropertyDefinitionParams>
+) {
+  return useMutation(() => ({
+    mutationFn: async (vars: DeletePropertyDefinitionParams) => {
+      return await throwOnErr(
+        async () =>
+          await propertiesServiceClient.deletePropertyDefinition({
+            definition_id: vars.definitionId,
+          })
+      );
+    },
+    ...withCallbacks<unknown, Error, DeletePropertyDefinitionParams>(
+      {
+        onError(error) {
+          console.error('Failed to delete property definition', error);
+          toast.failure('Failed to delete property');
+        },
+        onSuccess: () => {
+          invalidatePropertyDefinitions();
+        },
+      },
+      callbacks
+    ),
+  }));
+}
+
+export function useCreatePropertyDefinitionMutation(
+  callbacks?: MutationCallbacks<
+    PropertyDefinition,
+    Error,
+    CreatePropertyDefinitionParams
+  >
+) {
+  return useMutation(() => ({
+    mutationFn: async (vars: CreatePropertyDefinitionParams) => {
+      const result = await throwOnErr(
+        async () =>
+          await propertiesServiceClient.createPropertyDefinition({
+            body: vars.body,
+          })
+      );
+      return result;
+    },
+    ...withCallbacks<PropertyDefinition, Error, CreatePropertyDefinitionParams>(
+      {
+        onError(error) {
+          console.error('Failed to create property definition', error);
+          toast.failure('Failed to create property');
+        },
+        onSuccess: () => {
+          invalidatePropertyDefinitions();
+        },
+      },
+      callbacks
+    ),
+  }));
+}

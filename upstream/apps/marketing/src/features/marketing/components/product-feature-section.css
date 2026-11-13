@@ -1,0 +1,67 @@
+/* Match the homepage: one reading column above each wider product demo. */
+.feature-page[data-product-spacing=true] .feature-page-section {
+  position: relative;
+  width: min(800px, calc(100% - 64px));
+  margin-block: 0;
+  margin-inline: auto;
+  padding-block: 64px 44px;
+}
+
+.feature-page-section::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto auto 50%;
+  width: 100vw;
+  transform: translateX(-50%);
+  border-top: 1px solid color-mix(in srgb, var(--color-ink) 5.4%, transparent);
+  pointer-events: none;
+}
+
+.product-feature-intro {
+  width: min(640px, 100%);
+  margin: 0 auto 28px;
+  text-align: left;
+}
+
+.product-feature-intro h2 {
+  margin: 0 0 24px;
+  font: calc(320 + var(--cream-slab-weight-increase, 0)) 40px/1.2 'Roboto Slab Variable', display, serif;
+  letter-spacing: -.035em;
+  white-space: nowrap;
+}
+
+.product-feature-intro h2 > span { display: inline-block; }
+
+.product-feature-intro p {
+  max-width: none;
+  color: var(--feature-copy-color, var(--color-ink-muted));
+  font: 370 17.5px/1.8 'Inter Variable', Inter, sans-serif;
+  letter-spacing: normal;
+  text-wrap: pretty;
+}
+
+.feature-page .feature-page-section > .feature-page-visual {
+  width: 100%;
+}
+
+/* Email's stages previously added a second inset and different top gaps. */
+.feature-page-section :is(.email-accounts-demo, .mail-sharing-stage, .email-keyboard-stage, .email-editing-stage) {
+  padding-top: 0;
+  padding-inline: 0;
+}
+.feature-page-section .mail-sharing-stage .mail-share-scrim {
+  inset-inline: 0;
+  top: 0;
+}
+
+@media (max-width: 699px) {
+  .feature-page[data-product-spacing=true] .feature-page-section {
+    width: calc(100% - 32px);
+    max-width: 540px;
+    padding-block: 52px 32px;
+  }
+  .feature-page[data-product-spacing=true] .product-page .feature-page-section { width: 100%; }
+  .product-feature-intro { width: calc(100% - 16px); margin-bottom: 20px; }
+  .product-feature-intro h2 { font-size: 28px; margin-bottom: 20px; white-space: normal; text-wrap: balance; }
+  .product-feature-intro p { line-height: 1.55; }
+}

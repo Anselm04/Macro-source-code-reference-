@@ -1,0 +1,277 @@
+use anyhow::Context;
+pub use dictation::outbound::OpenaiApiKey;
+use entity_registry::NonUserOwners;
+use macro_auth::InternalApiKey;
+pub use macro_env::Environment;
+use macro_env_var::{env_vars, maybe_env_vars};
+use secretsmanager_client::LocalOrRemoteSecret;
+
+#[cfg(test)]
+mod test;
+
+pub const DEFAULT_PRESIGNED_URL_EXPIRY_SECONDS: u64 = 900; // 15 minutes
+/// Allow long recordings to play and seek without the signed URL expiring mid-session.
+pub const CALL_RECORDING_PRESIGNED_URL_EXPIRY_SECONDS: u64 = 6 * 60 * 60;
+pub const DEFAULT_PRESIGNED_URL_BROWSER_CACHE_EXPIRY_SECONDS: u64 = 840; // remember that this is just a suggestion to the client browser 
+
+env_vars! {
+    /// PostHog project key for backend feature flags.
+    pub struct PosthogApiKey;
+    pub struct DatabaseUrl;
+    pub struct DatabaseUrlReadonly;
+    pub struct DocumentStorageBucket;
+    pub struct DocxDocumentUploadBucket;
+    /// S3 bucket holding pull request patches, shared with agent-harness-service.
+    pub struct GithubPullRequestPatchBucket;
+    /// Shared CloudFront distribution URL for document content and call recording GET URLs.
+    pub struct DocumentStorageServiceCloudfrontDistributionUrl;
+    /// Shared CloudFront signer public key ID for document content and call recordings.
+    pub struct DocumentStorageServiceCloudfrontSignerPublicKeyId;
+    pub struct RedisUri;
+    pub struct BulkUploadRequestsTable;
+    pub struct UploadStagingBucket;
+    pub struct SyncServiceAuthKey;
+    /// Existing authentication-service internal credential, also used by email-service.
+    pub struct AuthenticationServiceSecretKey;
+    pub struct OpensearchUrl;
+    pub struct OpensearchUsername;
+    pub struct OpensearchPassword;
+    pub struct GithubSyncAppUrl;
+    pub struct GithubSyncAppClientId;
+    pub struct GithubInstallationStateSecret;
+    pub struct GithubSyncAppClientSecret;
+    /// Comma-separated Kafka bootstrap servers for the macro event broker.
+    pub struct KafkaBrokers;
+    pub struct LivekitServerUrl;
+    pub struct LivekitApiKey;
+    pub struct LivekitApiSecret;
+    /// Cohere API key used by the task-dedup reranker. Required — injected
+    /// as `COHERE_API_KEY`, following the same pattern as `OPENAI_API_KEY`.
+    pub struct CohereApiKey;
+    pub struct DocumentLimit;
+    /// Signed URL lifetime for document content.
+    pub struct DocumentStorageServicePresignedUrlExpirySeconds;
+    pub struct DocumentStorageServicePresignedUrlBrowserCacheExpirySeconds;
+    /// Shared CloudFront signer private key for document content and call recordings.
+    pub struct DocumentStorageServiceCloudfrontSignerPrivateKey;
+    #[derive(Clone)]
+    pub struct DocumentPermissionJwt;
+    pub struct GithubWebhookSecretKey;
+    pub struct GithubSyncAppPemSecretKey;
+    pub struct CalWebhookSecretKey;
+    pub struct CalEventTypeContentNamesKey;
+    pub struct MetaPixelId;
+    pub struct MetaAccessToken;
+    #[derive(Clone)]
+    pub struct DocumentStorageServiceAuthKey;
+}
+
+maybe_env_vars! {
+    /// Passwords vault endpoint; provision together with issuer and signing key.
+    pub struct OpenbaoAddress;
+    /// Issuer accepted by the namespace-scoped OpenBao JWT role.
+    pub struct PasswordsJwtIssuer;
+    /// PEM RSA key minting short-lived team-bound OpenBao service JWTs.
+    pub struct PasswordsJwtSigningKey;
+    /// Rollout gate for entities owned by bots or teams.
+    pub struct EnableNonUserOwners;
+    /// Optional name of the LiveKit agent to dispatch for call transcription.
+    pub struct LivekitTranscriptionAgentName;
+    /// Shared secret for internal call endpoints (e.g. transcript ingestion from the agent).
+    pub struct InternalCallSecret;
+    /// Public base URL of this service (e.g. `https://gateway.macro.com/dss`),
+    /// used to build the ring-status URL included in VoIP push payloads.
+    /// When unset, payloads omit the URL and native ring-status polling is off.
+    pub struct CallRingStatusBaseUrl;
+    /// S3 bucket for call recording egress.
+    pub struct CallRecordingS3Bucket;
+    /// AWS region for the call recording S3 bucket.
+    pub struct CallRecordingS3Region;
+    /// AWS access key for call recording S3 uploads.
+    pub struct CallRecordingS3AccessKey;
+    /// AWS secret key for call recording S3 uploads.
+    pub struct CallRecordingS3Secret;
+    /// Optional Meta test event code — routes events to Meta's test events
+    /// view instead of production tracking.
+    pub struct MetaTestEventCode;
+    /// PostHog host; defaults to the project's US region.
+    pub struct PosthogHost;
+}
+
+/// The configuration parameters for the application.
+#[derive(macro_config::MacroConfig)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct Config {
+    pub openbao_address: OpenbaoAddress,
+    pub passwords_jwt_issuer: PasswordsJwtIssuer,
+    pub passwords_jwt_signing_key: PasswordsJwtSigningKey,
+    /// Required PostHog project key for backend feature flags.
+    pub posthog_api_key: PosthogApiKey,
+    /// PostHog host (optional)
+    pub posthog_host: PosthogHost,
+    /// Default-off quota admission and prospective usage counting.
+    #[macro_config_default(ai_usage::AiUsageEnforcement::Disabled)]
+    pub enable_ai_usage_enforcement: ai_usage::AiUsageEnforcement,
+    /// The free plan's hard monthly AI cap, in cents at provider cost.
+    /// Mandatory; set in Doppler.
+    pub ai_usage_free_included_allowance_cents: ai_billing::IncludedAllowanceCents,
+    /// In-plan AI allowance per Premium seat per period, in cents at provider
+    /// cost. Mandatory; set in Doppler.
+    pub ai_usage_included_allowance_cents: ai_billing::IncludedAllowanceCents,
+    /// In-plan AI allowance per Max seat per period, in cents at provider
+    /// cost. Mandatory; set in Doppler.
+    pub ai_usage_max_included_allowance_cents: ai_billing::IncludedAllowanceCents,
+    /// Markup on paid AI usage past the allowance, as a whole percent of
+    /// provider cost. Mandatory; set in Doppler.
+    pub ai_usage_overage_markup_percent: ai_billing::OverageMarkupPercent,
+    pub database_url: DatabaseUrl,
+    pub database_url_readonly: DatabaseUrlReadonly,
+    pub document_storage_bucket: DocumentStorageBucket,
+    pub docx_document_upload_bucket: DocxDocumentUploadBucket,
+    pub github_pull_request_patch_bucket: GithubPullRequestPatchBucket,
+    pub document_storage_service_cloudfront_distribution_url:
+        DocumentStorageServiceCloudfrontDistributionUrl,
+    pub document_storage_service_cloudfront_signer_public_key_id:
+        DocumentStorageServiceCloudfrontSignerPublicKeyId,
+    pub redis_uri: RedisUri,
+    pub bulk_upload_requests_table: BulkUploadRequestsTable,
+    pub upload_staging_bucket: UploadStagingBucket,
+    pub sync_service_auth_key: LocalOrRemoteSecret<SyncServiceAuthKey>,
+    /// Credential for resolving the selected inbox's Google grant.
+    pub authentication_service_secret_key: LocalOrRemoteSecret<AuthenticationServiceSecretKey>,
+    /// Match email-service's undo-send window for GraphQL delivery.
+    #[macro_config_default(10)]
+    pub sent_undo_delay_secs: u32,
+    pub opensearch_url: OpensearchUrl,
+    pub opensearch_username: OpensearchUsername,
+    pub opensearch_password: OpensearchPassword,
+    pub github_sync_app_url: GithubSyncAppUrl,
+    pub github_sync_app_client_id: GithubSyncAppClientId,
+    pub github_installation_state_secret: GithubInstallationStateSecret,
+    pub github_sync_app_client_secret: GithubSyncAppClientSecret,
+    pub kafka_brokers: KafkaBrokers,
+    pub livekit_server_url: LivekitServerUrl,
+    pub livekit_api_key: LivekitApiKey,
+    pub livekit_api_secret: LivekitApiSecret,
+    /// Shared server credential for task embeddings and Whisper, supplied by Doppler.
+    pub openai_api_key: OpenaiApiKey,
+    pub cohere_api_key: CohereApiKey,
+    pub github_webhook_secret_key: LocalOrRemoteSecret<GithubWebhookSecretKey>,
+    pub github_sync_app_pem_secret_key: LocalOrRemoteSecret<GithubSyncAppPemSecretKey>,
+    pub cal_webhook_secret_key: CalWebhookSecretKey,
+    pub cal_event_type_content_names_key: CalEventTypeContentNamesKey,
+    pub meta_pixel_id: MetaPixelId,
+    pub meta_access_token: MetaAccessToken,
+    pub document_storage_service_auth_key: DocumentStorageServiceAuthKey,
+    /// The internal api key
+    pub internal_api_key: InternalApiKey,
+
+    /// The port to listen for HTTP requests on.
+    #[macro_config_default(8080)]
+    pub port: usize,
+
+    /// The environment we are in
+    #[macro_config_default(Environment::new_or_prod())]
+    pub environment: Environment,
+
+    /// Whether calendar events participate in search. Off by default so a
+    /// deployed environment can carry the code before its calendar index has
+    /// been created and backfilled — with this false, calendar events are
+    /// dropped from the searched set no matter what a request asks for.
+    #[macro_config_default(false)]
+    pub calendar_search_enabled: bool,
+
+    /// Enable read-only calendar projections shared with current teammates.
+    #[macro_config_default(false)]
+    pub calendar_team_sharing_enabled: bool,
+
+    /// Enable Slack import creation and uploads. Existing receipts remain
+    /// readable, finalizable and cancellable when this switch is off.
+    #[macro_config_default(false)]
+    pub slack_import_enabled: bool,
+
+    /// Send Gmail label writes as `ModifyMessageLabelsBatch` queue messages.
+    /// Enable only after every email-service pubsub worker runs a release that
+    /// decodes them; older workers delete the batch form. Off, each message is
+    /// its own `ModifyMessageLabels`.
+    #[macro_config_default(false)]
+    pub gmail_label_write_batches_enabled: bool,
+
+    /// Maximum number of SQS messages to receive per poll for the delete document worker
+    #[macro_config_default(10)]
+    pub queue_max_messages: i32,
+    /// SQS long-poll wait time in seconds for the delete document worker
+    #[macro_config_default(4)]
+    pub queue_wait_time_seconds: i32,
+
+    /// Maximum number of SQS messages to receive per webhook worker poll
+    #[macro_config_default(10)]
+    pub webhook_queue_max_messages: i32,
+    /// SQS long-poll wait time in seconds for the webhook worker
+    #[macro_config_default(20)]
+    pub webhook_queue_wait_time_seconds: i32,
+
+    /// The document limit for free users
+    #[macro_config_default(20)]
+    pub document_limit: u64,
+
+    /// Master switch for calendar event reminder dispatch. When `false`
+    /// (the default) the worker drains its queue without delivering, so
+    /// synced reminder schedules produce no notifications until enabled.
+    #[macro_config_default(false)]
+    pub calendar_reminder_dispatch_enabled: bool,
+
+    /// Lets a team-scoped bot with no acting user own the documents it creates.
+    pub enable_non_user_owners: EnableNonUserOwners,
+
+    /// The number of seconds a signed document or call recording URL is valid for.
+    #[macro_config_default(DEFAULT_PRESIGNED_URL_EXPIRY_SECONDS)]
+    pub document_storage_service_presigned_url_expiry_seconds: u64,
+    /// The number of seconds a browser cache for a presigned url is valid for
+    #[macro_config_default(DEFAULT_PRESIGNED_URL_BROWSER_CACHE_EXPIRY_SECONDS)]
+    pub document_storage_service_presigned_url_browser_cache_expiry_seconds: u64,
+
+    /// The CloudFront private key shared by document content and call recording URL signing.
+    pub document_storage_service_cloudfront_signer_private_key:
+        LocalOrRemoteSecret<DocumentStorageServiceCloudfrontSignerPrivateKey>,
+
+    pub document_permission_jwt: DocumentPermissionJwt,
+
+    pub livekit_transcription_agent_name: LivekitTranscriptionAgentName,
+    pub internal_call_secret: InternalCallSecret,
+    pub call_ring_status_base_url: CallRingStatusBaseUrl,
+    pub call_recording_s3_bucket: CallRecordingS3Bucket,
+    pub call_recording_s3_region: CallRecordingS3Region,
+    pub call_recording_s3_access_key: CallRecordingS3AccessKey,
+    pub call_recording_s3_secret: CallRecordingS3Secret,
+    pub meta_test_event_code: MetaTestEventCode,
+}
+
+impl Config {
+    /// The AI pricing every billing component is composed with. Every value
+    /// is validated when the configuration loads.
+    pub fn ai_pricing(&self) -> ai_billing::AiPricing {
+        ai_billing::AiPricing::new(
+            ai_billing::PlanAllowances {
+                free: self.ai_usage_free_included_allowance_cents,
+                premium: self.ai_usage_included_allowance_cents,
+                max: self.ai_usage_max_included_allowance_cents,
+            },
+            self.ai_usage_overage_markup_percent,
+        )
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        let enforcement = ai_usage::config::load_ai_usage_enforcement()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut config =
+            macro_config::ConfigLoader::load::<Config>().context("failed to load config")?;
+        config.enable_ai_usage_enforcement = enforcement;
+        Ok(config)
+    }
+
+    pub fn non_user_owners(&self) -> anyhow::Result<NonUserOwners> {
+        NonUserOwners::from_config_value(self.enable_non_user_owners.value())
+            .context("ENABLE_NON_USER_OWNERS must be `true` or `false`")
+    }
+}

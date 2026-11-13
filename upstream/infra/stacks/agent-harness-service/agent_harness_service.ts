@@ -1,0 +1,866 @@
+import * as aws from '@pulumi/aws';
+import * as awsx from '@pulumi/awsx';
+import * as pulumi from '@pulumi/pulumi';
+import * as doppler from '@pulumiverse/doppler';
+import {
+  DATADOG_API_KEY,
+  DEFAULT_CONTINUE_BEFORE_STEADY_STATE,
+  EcsDeploymentFailureAlarm,
+  ServiceTargetGroup,
+  withTelemetry,
+} from '../../packages/resources';
+import { EcrImage } from '../../packages/service';
+import {
+  AGENT_PUBLIC_URLS,
+  CLOUD_TRAIL_SNS_TOPIC_ARN,
+  DopplerEcsEnvironment,
+  getGatewayAlb,
+  getKafkaClusterPolicy,
+  getServiceUrl,
+  GatewayService,
+  GATEWAY_PRIORITIES,
+  ServiceUrl,
+  stack,
+} from '../../packages/shared';
+
+const gatewayLoadBalancer = getGatewayAlb();
+
+const BASE_NAME = pulumi.getProject();
+/** Must match `ENCRYPTION_PURPOSE` in `mcp_auth_proxy::outbound::postgres`. */
+const MCP_OAUTH_KMS_PURPOSE = 'mcp-oauth-authorization-code';
+const MCP_OAUTH_KMS_ACTIONS = ['kms:Encrypt', 'kms:Decrypt'];
+const REPO_ROOT = '../../..';
+
+/** Where the service reads `REPO_STORAGE_ROOT`; set to this path in Doppler. */
+const REPO_STORAGE_PATH = '/data/agent-git';
+const REPO_VOLUME_NAME = 'agent-git-repos';
+
+type Args = {
+  vpc: {
+    vpcId: string;
+    // One EFS mount target per subnet, so the list must be known up front.
+    privateSubnetIds: string[];
+  };
+  tags: { [key: string]: string };
+  containerEnvVars: { name: string; value: pulumi.Output<string> | string }[];
+  platform: { family: string; architecture: 'amd64' | 'arm64' };
+  serviceContainerPort: number;
+  configurationSecrets: pulumi.Resource[];
+  /** Container port of the sandbox-facing egress proxy listener. */
+  egressContainerPort: number;
+  previewSecurityGroupId: pulumi.Input<string>;
+  previewControlTargetGroupArn: pulumi.Input<string>;
+  previewHttpTargetGroupArn: pulumi.Input<string>;
+  previewSshTargetGroupArn: pulumi.Input<string>;
+  healthCheckPath: string;
+  ecsClusterArn: pulumi.Output<string> | string;
+  cloudStorageClusterName: pulumi.Output<string> | string;
+  secretKeyArns: (pulumi.Output<string> | string)[];
+  /** SQS queues the service is allowed to send messages to. */
+  queueArns: pulumi.Input<string>[];
+  projectionQueueArn: pulumi.Input<string>;
+  /** S3 buckets the service needs access to. */
+  bucketArns: (pulumi.Output<string> | string)[];
+};
+
+/**
+ * The agent harness service. Replicated in every environment: each replica
+ * claims the sessions whose live actors it holds through Postgres ownership,
+ * and commands are broadcast through the shared Redis deployment so the
+ * responsible replica can execute them. The Kafka consumer group splits
+ * partitions across live tasks; ownership plus Redis routing is what makes
+ * that split correct.
+ *
+ */
+export class AgentHarnessService extends pulumi.ComponentResource {
+  public role: aws.iam.Role;
+  public ecr: awsx.ecr.Repository;
+  public serviceSg: aws.ec2.SecurityGroup;
+  public domain: string;
+  public egressDomain: string;
+  public targetGroup: aws.lb.TargetGroup;
+  public egressTargetGroup: aws.lb.TargetGroup;
+  public service: awsx.ecs.FargateService;
+  public cloudStorageClusterName: pulumi.Output<string> | string;
+  public tags: { [key: string]: string };
+
+  constructor(
+    name: string,
+    args: Args,
+    opts?: pulumi.ComponentResourceOptions
+  ) {
+    super('my:components:AgentHarnessService', name, {}, opts);
+    const {
+      vpc,
+      tags,
+      platform,
+      serviceContainerPort,
+      egressContainerPort,
+      healthCheckPath,
+      ecsClusterArn,
+      cloudStorageClusterName,
+      containerEnvVars,
+      secretKeyArns,
+      queueArns,
+      bucketArns,
+    } = args;
+
+    this.domain = getServiceUrl(ServiceUrl.AGENT_HARNESS_SERVICE_URL);
+    this.egressDomain = getServiceUrl(ServiceUrl.AGENT_HARNESS_EGRESS_URL);
+    this.cloudStorageClusterName = cloudStorageClusterName;
+    this.tags = tags;
+
+    const serviceSg = this.initializeSecurityGroups({ vpcId: vpc.vpcId });
+    this.serviceSg = serviceSg;
+
+    const repoStorage = this.initializeRepoStorage({
+      vpcId: vpc.vpcId,
+      privateSubnetIds: vpc.privateSubnetIds,
+    });
+
+    const efsPolicy = new aws.iam.Policy(
+      `${BASE_NAME}-efs-policy`,
+      {
+        name: `${BASE_NAME}-efs-policy-${stack}`,
+        policy: {
+          Version: '2012-10-17',
+          Statement: [
+            {
+              Action: [
+                'elasticfilesystem:ClientMount',
+                'elasticfilesystem:ClientWrite',
+                'elasticfilesystem:ClientRootAccess',
+              ],
+              Resource: [repoStorage.fileSystem.arn],
+              Effect: 'Allow',
+              Condition: {
+                StringEquals: {
+                  'elasticfilesystem:AccessPointArn':
+                    repoStorage.accessPoint.arn,
+                },
+              },
+            },
+          ],
+        },
+        tags,
+      },
+      { parent: this }
+    );
+
+    const secretsManagerPolicy = new aws.iam.Policy(
+      `${BASE_NAME}-secrets-manager-policy`,
+      {
+        name: `${BASE_NAME}-secrets-manager-policy-${stack}`,
+        policy: {
+          Version: '2012-10-17',
+          Statement: [
+            {
+              Action: [
+                'secretsmanager:GetSecretValue',
+                'secretsmanager:DescribeSecret',
+              ],
+              Resource: secretKeyArns,
+              Effect: 'Allow',
+            },
+          ],
+        },
+        tags,
+      },
+      { parent: this }
+    );
+
+    // The harness fans channel side effects and in-memory AI tool work out
+    // over the same queues as the other AI tool hosts.
+    const queuePolicy = new aws.iam.Policy(
+      `${BASE_NAME}-queue-policy`,
+      {
+        name: `${BASE_NAME}-queue-policy-${stack}`,
+        policy: {
+          Version: '2012-10-17',
+          Statement: [
+            {
+              Action: [
+                'sqs:SendMessage',
+                'sqs:GetQueueUrl',
+                'sqs:GetQueueAttributes',
+              ],
+              Resource: queueArns,
+              Effect: 'Allow',
+            },
+            {
+              Action: [
+                'sqs:ReceiveMessage',
+                'sqs:DeleteMessage',
+                'sqs:ChangeMessageVisibility',
+              ],
+              Resource: [args.projectionQueueArn],
+              Effect: 'Allow',
+            },
+          ],
+        },
+        tags,
+      },
+      { parent: this }
+    );
+
+    const s3Policy =
+      bucketArns.length > 0
+        ? new aws.iam.Policy(
+            `${BASE_NAME}-s3-policy`,
+            {
+              name: `${BASE_NAME}-s3-policy-${stack}`,
+              policy: pulumi.output({
+                Version: '2012-10-17',
+                Statement: [
+                  {
+                    Effect: 'Allow',
+                    Action: [
+                      's3:ListBucket',
+                      's3:GetObject',
+                      's3:PutObject',
+                      's3:DeleteObject',
+                    ],
+                    Resource: bucketArns.flatMap((arn) => [
+                      arn,
+                      pulumi.interpolate`${arn}/*`,
+                    ]),
+                  },
+                ],
+              }),
+              tags,
+            },
+            { parent: this }
+          )
+        : undefined;
+
+    this.role = new aws.iam.Role(
+      `${BASE_NAME}-role`,
+      {
+        name: `${BASE_NAME}-role-${stack}`,
+        assumeRolePolicy: {
+          Version: '2012-10-17',
+          Statement: [
+            {
+              Action: 'sts:AssumeRole',
+              Principal: {
+                Service: 'ecs-tasks.amazonaws.com',
+              },
+              Effect: 'Allow',
+            },
+          ],
+        },
+        managedPolicyArns: [
+          secretsManagerPolicy.arn,
+          queuePolicy.arn,
+          efsPolicy.arn,
+          ...(s3Policy ? [s3Policy.arn] : []),
+        ],
+        tags,
+      },
+      { parent: this }
+    );
+
+    // Producer/consumer access to the macro event Kafka cluster: the harness
+    // consumes `macro.channels` and `macro.agent_sessions`, publishes agent
+    // triggers, and publishes channel side effects.
+    new aws.iam.RolePolicyAttachment(
+      `${BASE_NAME}-role-kafka-client-att-${stack}`,
+      {
+        role: this.role,
+        policyArn: getKafkaClusterPolicy(),
+      },
+      { parent: this, dependsOn: [this.role] }
+    );
+
+    // Only the task role may mount, only through the access point, and only
+    // over TLS.
+    new aws.efs.FileSystemPolicy(
+      `${BASE_NAME}-efs-file-system-policy`,
+      {
+        fileSystemId: repoStorage.fileSystem.id,
+        policy: pulumi.jsonStringify({
+          Version: '2012-10-17',
+          Statement: [
+            {
+              Sid: 'AllowTaskRoleThroughAccessPoint',
+              Effect: 'Allow',
+              Principal: { AWS: this.role.arn },
+              Action: [
+                'elasticfilesystem:ClientMount',
+                'elasticfilesystem:ClientWrite',
+                'elasticfilesystem:ClientRootAccess',
+              ],
+              Resource: repoStorage.fileSystem.arn,
+              Condition: {
+                StringEquals: {
+                  'elasticfilesystem:AccessPointArn':
+                    repoStorage.accessPoint.arn,
+                },
+              },
+            },
+            {
+              Sid: 'DenyInsecureTransport',
+              Effect: 'Deny',
+              Principal: { AWS: '*' },
+              Action: '*',
+              Resource: repoStorage.fileSystem.arn,
+              Condition: { Bool: { 'aws:SecureTransport': 'false' } },
+            },
+          ],
+        }),
+      },
+      { parent: this }
+    );
+
+    const mcpOauthKms = this.createMcpOauthKmsKey(tags);
+
+    const image = new EcrImage(
+      `${BASE_NAME}-ecr-image-${stack}`,
+      {
+        repositoryId: `${BASE_NAME}-ecr-${stack}`,
+        repositoryName: `${BASE_NAME}-${stack}`,
+        imageId: `${BASE_NAME}-image-${stack}`,
+        imagePath: REPO_ROOT,
+        dockerfile: 'docker/Dockerfile',
+        platform,
+        buildArgs: {
+          SERVICE_NAME: 'agent_harness_service',
+        },
+        tags,
+      },
+      { parent: this }
+    );
+    this.ecr = image.ecr;
+
+    const gatewayTargetGroup = new ServiceTargetGroup(
+      `${stack}-${BASE_NAME}`,
+      {
+        tags: this.tags,
+        listenerArn: gatewayLoadBalancer.httpsListenerArn,
+        vpcId: vpc.vpcId,
+        containerPort: serviceContainerPort,
+        service: GatewayService.AGENT_HARNESS_SERVICE,
+        healthCheckPath,
+        pathPatterns: ['/agent-harness', '/agent-harness/*'],
+        serviceSecurityGroupId: serviceSg.id,
+        albSecurityGroupId: gatewayLoadBalancer.albSecurityGroupId,
+      },
+      { parent: this }
+    );
+
+    this.targetGroup = gatewayTargetGroup.target_group;
+    // Keep public OAuth identities and pinned clients on their original hosts.
+    // This shares the API target group, preserving ECS's five-target-group limit.
+    const publicHostRules = [
+      new aws.lb.ListenerRule(
+        `${BASE_NAME}-cognition-public-host-${stack}`,
+        {
+          listenerArn: gatewayLoadBalancer.httpsListenerArn,
+          priority:
+            GATEWAY_PRIORITIES[GatewayService.AGENT_COGNITION_PUBLIC_HOST],
+          conditions: [
+            {
+              hostHeader: {
+                values: [new URL(AGENT_PUBLIC_URLS.cognition).hostname],
+              },
+            },
+          ],
+          transforms: [
+            {
+              type: 'url-rewrite',
+              urlRewriteConfig: {
+                rewrite: {
+                  regex: '^/(cognition/)?(.*)$',
+                  replace: '/cognition/$2',
+                },
+              },
+            },
+          ],
+          actions: [{ type: 'forward', targetGroupArn: this.targetGroup.arn }],
+          tags,
+        },
+        { parent: this }
+      ),
+      new aws.lb.ListenerRule(
+        `${BASE_NAME}-mcp-public-host-${stack}`,
+        {
+          listenerArn: gatewayLoadBalancer.httpsListenerArn,
+          priority: GATEWAY_PRIORITIES[GatewayService.AGENT_MCP_PUBLIC_HOST],
+          conditions: [
+            {
+              hostHeader: { values: [new URL(AGENT_PUBLIC_URLS.mcp).hostname] },
+            },
+          ],
+          actions: [{ type: 'forward', targetGroupArn: this.targetGroup.arn }],
+          tags,
+        },
+        { parent: this }
+      ),
+    ];
+    const sharedApiRoutes: [GatewayService, string][] = [
+      [GatewayService.MCP_SERVER, '/mcp'],
+      [GatewayService.DOCUMENT_COGNITION_SERVICE, '/cognition'],
+      [GatewayService.AGENT_SCHEDULE_SERVICE, '/scheduled-action'],
+      [GatewayService.AGENT_GIT_SERVICE, '/agent-git'],
+    ];
+    const sharedApiRules = sharedApiRoutes.map(
+      ([service, prefix]) =>
+        new aws.lb.ListenerRule(
+          `${BASE_NAME}-${service}-${stack}`,
+          {
+            listenerArn: gatewayLoadBalancer.httpsListenerArn,
+            priority: GATEWAY_PRIORITIES[service],
+            actions: [
+              { type: 'forward', targetGroupArn: this.targetGroup.arn },
+            ],
+            conditions: [
+              {
+                pathPattern: {
+                  values: [prefix, `${prefix}/*`],
+                },
+              },
+            ],
+            tags,
+          },
+          { parent: this }
+        )
+    );
+
+    // Forward the egress prefix unchanged to its own listener. Session-token
+    // Authorization headers are handled by the egress router as before.
+    // Use a new target group: AWS cannot attach one to two ALBs during cutover.
+    // Keep the name (including the helper's -tg suffix) below 32 characters.
+    const egress = new ServiceTargetGroup(
+      `ah-egress-gateway-${stack}`,
+      {
+        listenerArn: gatewayLoadBalancer.httpsListenerArn,
+        vpcId: vpc.vpcId,
+        containerPort: egressContainerPort,
+        healthCheckPath,
+        pathPatterns: ['/agent-harness-egress', '/agent-harness-egress/*'],
+        service: GatewayService.AGENT_HARNESS_EGRESS,
+        serviceSecurityGroupId: serviceSg.id,
+        albSecurityGroupId: gatewayLoadBalancer.albSecurityGroupId,
+        tags,
+      },
+      { parent: this }
+    );
+    this.egressTargetGroup = egress.target_group;
+
+    const dopplerEcsEnvironment = new DopplerEcsEnvironment(
+      BASE_NAME,
+      { tags: this.tags },
+      { parent: this }
+    );
+
+    this.service = new awsx.ecs.FargateService(
+      `${BASE_NAME}`,
+      {
+        tags,
+        cluster: ecsClusterArn,
+        networkConfiguration: {
+          subnets: vpc.privateSubnetIds,
+          securityGroups: [serviceSg.id, args.previewSecurityGroupId],
+        },
+        continueBeforeSteadyState: DEFAULT_CONTINUE_BEFORE_STEADY_STATE,
+        deploymentCircuitBreaker: {
+          enable: true,
+          rollback: true,
+        },
+        deploymentMinimumHealthyPercent: 100,
+        deploymentMaximumPercent: 200,
+        // Keep dev and production replicated, including during rolling updates.
+        desiredCount: 2,
+        // ALB checks /health every 10s and fails the target after two
+        // misses (~20s). HTTP does not listen until after DB, AWS config,
+        // and JWT secrets, so a 0s grace period trips the circuit breaker
+        // before the replacement binds. Ignore those checks until then.
+        healthCheckGracePeriodSeconds: 120,
+        // Both listeners use the shared gateway, with separate target groups
+        // for the control API and sandbox egress proxy.
+        loadBalancers: [
+          {
+            targetGroupArn: args.previewControlTargetGroupArn,
+            containerName: 'service',
+            containerPort: serviceContainerPort,
+          },
+          {
+            targetGroupArn: args.previewHttpTargetGroupArn,
+            containerName: 'service',
+            containerPort: 8111,
+          },
+          {
+            targetGroupArn: args.previewSshTargetGroupArn,
+            containerName: 'service',
+            containerPort: 2222,
+          },
+          {
+            targetGroupArn: gatewayTargetGroup.target_group.arn,
+            containerName: 'service',
+            containerPort: serviceContainerPort,
+          },
+          {
+            targetGroupArn: this.egressTargetGroup.arn,
+            containerName: 'service',
+            containerPort: egressContainerPort,
+          },
+        ],
+        taskDefinitionArgs: {
+          taskRole: {
+            roleArn: this.role.arn,
+          },
+          executionRole: {
+            roleArn: dopplerEcsEnvironment.executionRole.arn,
+          },
+          volumes: [
+            {
+              name: REPO_VOLUME_NAME,
+              efsVolumeConfiguration: {
+                fileSystemId: repoStorage.fileSystem.id,
+                transitEncryption: 'ENABLED',
+                authorizationConfig: {
+                  accessPointId: repoStorage.accessPoint.id,
+                  iam: 'ENABLED',
+                },
+              },
+            },
+          ],
+          containers: withTelemetry(BASE_NAME, {
+            service: {
+              name: BASE_NAME,
+              image: image.image.imageUri,
+              // Daytona cleanup can make two 30-second stop attempts. Give the
+              // draining replica time to release capacity before ECS kills it.
+              stopTimeout: 120,
+              // Shared by the harness and up to eight restricted Deno children.
+              cpu: 4096,
+              memory: 8192,
+              environment: [
+                ...containerEnvVars,
+                {
+                  name: 'BASE_URL',
+                  value: this.domain,
+                },
+              ],
+              secrets: [...dopplerEcsEnvironment.containerSecrets],
+              mountPoints: [
+                {
+                  sourceVolume: REPO_VOLUME_NAME,
+                  containerPath: REPO_STORAGE_PATH,
+                  readOnly: false,
+                },
+              ],
+              logConfiguration: {
+                logDriver: 'awsfirelens',
+                options: {
+                  Name: 'datadog',
+                  Host: 'http-intake.logs.us5.datadoghq.com',
+                  apikey: DATADOG_API_KEY,
+                  dd_service: 'agent-harness-service',
+                  dd_source: 'fargate',
+                  dd_tags: `project:agent-harness-service, env:${stack}`,
+                  provider: 'ecs',
+                },
+              },
+              portMappings: [
+                { containerPort: 8111, hostPort: 8111, protocol: 'tcp' },
+                { containerPort: 2222, hostPort: 2222, protocol: 'tcp' },
+                {
+                  appProtocol: 'http',
+                  name: `${BASE_NAME}-tcp-${stack}`,
+                  hostPort: serviceContainerPort,
+                  containerPort: serviceContainerPort,
+                  targetGroup: this.targetGroup,
+                },
+                {
+                  appProtocol: 'http',
+                  name: `${BASE_NAME}-egress-tcp-${stack}`,
+                  hostPort: egressContainerPort,
+                  containerPort: egressContainerPort,
+                  targetGroup: this.egressTargetGroup,
+                },
+              ],
+            },
+          }),
+          runtimePlatform: {
+            operatingSystemFamily: platform.family.toUpperCase(),
+            cpuArchitecture:
+              platform.architecture === 'amd64'
+                ? 'X86_64'
+                : platform.architecture.toUpperCase(),
+          },
+        },
+      },
+      {
+        parent: this,
+        // ECS refuses a service whose target group is not yet associated
+        // with a load balancer; it is the listener rule that creates that
+        // association. Tasks also fail to start until a mount target exists
+        // in their subnet.
+        dependsOn: [
+          ...repoStorage.mountTargets,
+          ...args.configurationSecrets,
+          ...mcpOauthKms,
+          gatewayTargetGroup.listener_rule,
+          ...publicHostRules,
+          ...sharedApiRules,
+          egress.listener_rule,
+        ],
+      }
+    );
+
+    this.setupServiceAlarms();
+  }
+
+  /**
+   * The key the public MCP OAuth broker encrypts its authorization codes'
+   * upstream tokens with, and the Doppler value naming it. Returns what the
+   * ECS service must wait for, so no task starts unable to issue a code.
+   */
+  private createMcpOauthKmsKey(tags: { [key: string]: string }) {
+    const accountRootArn = pulumi.interpolate`arn:aws:iam::${aws.getCallerIdentityOutput().accountId}:root`;
+    const key = new aws.kms.Key(
+      `${BASE_NAME}-mcp-oauth-key`,
+      {
+        description: `Public MCP OAuth authorization code encryption key for ${stack}`,
+        deletionWindowInDays: 30,
+        enableKeyRotation: true,
+        policy: aws.iam.getPolicyDocumentOutput({
+          statements: [
+            {
+              sid: 'AllowAccountKeyAdministration',
+              effect: 'Allow',
+              principals: [{ type: 'AWS', identifiers: [accountRootArn] }],
+              actions: [
+                'kms:CancelKeyDeletion',
+                'kms:Create*',
+                'kms:Delete*',
+                'kms:Describe*',
+                'kms:Disable*',
+                'kms:Enable*',
+                'kms:Get*',
+                'kms:List*',
+                'kms:Put*',
+                'kms:Revoke*',
+                'kms:ScheduleKeyDeletion',
+                'kms:TagResource',
+                'kms:UntagResource',
+                'kms:Update*',
+              ],
+              resources: ['*'],
+            },
+            {
+              sid: 'AllowMcpOauthCodeEncryption',
+              effect: 'Allow',
+              principals: [{ type: 'AWS', identifiers: [this.role.arn] }],
+              actions: MCP_OAUTH_KMS_ACTIONS,
+              resources: ['*'],
+              conditions: [
+                {
+                  test: 'StringEquals',
+                  variable: 'kms:EncryptionContext:macro:purpose',
+                  values: [MCP_OAUTH_KMS_PURPOSE],
+                },
+              ],
+            },
+          ],
+        }).json,
+        tags,
+      },
+      { parent: this, protect: stack === 'prod' }
+    );
+    const alias = new aws.kms.Alias(
+      `${BASE_NAME}-mcp-oauth-key-alias`,
+      { name: `alias/${BASE_NAME}-mcp-oauth-${stack}`, targetKeyId: key.keyId },
+      { parent: this }
+    );
+    const rolePolicy = new aws.iam.RolePolicy(
+      `${BASE_NAME}-mcp-oauth-kms-policy`,
+      {
+        role: this.role.id,
+        policy: {
+          Version: '2012-10-17',
+          Statement: [
+            {
+              Action: MCP_OAUTH_KMS_ACTIONS,
+              Resource: key.arn,
+              Effect: 'Allow',
+              Condition: {
+                StringEquals: {
+                  'kms:EncryptionContext:macro:purpose': MCP_OAUTH_KMS_PURPOSE,
+                },
+              },
+            },
+          ],
+        },
+      },
+      { parent: this }
+    );
+    // MacroConfig reads only Doppler in ECS, so the key reaches the service
+    // through it rather than the container environment.
+    const dopplerKeyId = new doppler.Secret(
+      `harness-MCP_OAUTH_KMS_KEY_ID-${stack}`,
+      {
+        project: 'agent-harness-service',
+        config: stack === 'prod' ? 'prd' : 'dev',
+        name: 'MCP_OAUTH_KMS_KEY_ID',
+        value: alias.name,
+      },
+      { parent: this }
+    );
+    return [rolePolicy, dopplerKeyId];
+  }
+
+  private initializeSecurityGroups({
+    vpcId,
+  }: {
+    vpcId: pulumi.Output<string> | string;
+  }) {
+    const serviceSg = new aws.ec2.SecurityGroup(
+      `${BASE_NAME}-sg-${stack}`,
+      {
+        name: `${BASE_NAME}-sg-${stack}`,
+        vpcId,
+        description: `${BASE_NAME} service security group`,
+        tags: this.tags,
+      },
+      { parent: this }
+    );
+
+    new aws.vpc.SecurityGroupEgressRule(
+      `${BASE_NAME}-service-out`,
+      {
+        securityGroupId: serviceSg.id,
+        description: 'Allow all outbound traffic',
+        cidrIpv4: '0.0.0.0/0',
+        ipProtocol: '-1',
+        tags: this.tags,
+      },
+      { parent: this }
+    );
+
+    return serviceSg;
+  }
+
+  /**
+   * Encrypted EFS for the agent git service's bare repositories, shared by
+   * every replica and reachable on NFS only from the service security group.
+   *
+   * The access point maps every client to root (uid/gid 0), the user the
+   * container already runs as, so the repositories' owner matches the process
+   * and git's `safe.directory` ownership check passes without configuration.
+   * With IAM authorization EFS squashes root unless the task role also has
+   * `elasticfilesystem:ClientRootAccess`, so both policies grant it.
+   */
+  private initializeRepoStorage({
+    vpcId,
+    privateSubnetIds,
+  }: {
+    vpcId: string;
+    privateSubnetIds: string[];
+  }) {
+    const fileSystem = new aws.efs.FileSystem(
+      `${BASE_NAME}-repos`,
+      {
+        encrypted: true,
+        performanceMode: 'generalPurpose',
+        throughputMode: 'elastic',
+        tags: { ...this.tags, Name: `${BASE_NAME}-repos-${stack}` },
+      },
+      // The repositories are user data: never delete them with the stack.
+      { parent: this, retainOnDelete: true }
+    );
+
+    const efsSg = new aws.ec2.SecurityGroup(
+      `${BASE_NAME}-efs-sg-${stack}`,
+      {
+        name: `${BASE_NAME}-efs-sg-${stack}`,
+        vpcId,
+        description: `${BASE_NAME} repository EFS mount targets`,
+        tags: this.tags,
+      },
+      { parent: this }
+    );
+
+    new aws.vpc.SecurityGroupIngressRule(
+      `${BASE_NAME}-efs-nfs-in`,
+      {
+        securityGroupId: efsSg.id,
+        description: 'NFS from the agent-harness-service tasks',
+        referencedSecurityGroupId: this.serviceSg.id,
+        ipProtocol: 'tcp',
+        fromPort: 2049,
+        toPort: 2049,
+        tags: this.tags,
+      },
+      { parent: this }
+    );
+
+    const mountTargets = privateSubnetIds.map(
+      (subnetId, index) =>
+        new aws.efs.MountTarget(
+          `${BASE_NAME}-efs-mount-${index}`,
+          {
+            fileSystemId: fileSystem.id,
+            subnetId,
+            securityGroups: [efsSg.id],
+          },
+          { parent: this }
+        )
+    );
+
+    const accessPoint = new aws.efs.AccessPoint(
+      `${BASE_NAME}-repos-access-point`,
+      {
+        fileSystemId: fileSystem.id,
+        posixUser: { uid: 0, gid: 0 },
+        rootDirectory: {
+          path: '/agent-git',
+          creationInfo: {
+            ownerUid: 0,
+            ownerGid: 0,
+            permissions: '0755',
+          },
+        },
+        tags: this.tags,
+      },
+      { parent: this }
+    );
+
+    return { fileSystem, accessPoint, mountTargets };
+  }
+
+  private setupServiceAlarms() {
+    new EcsDeploymentFailureAlarm(
+      `${BASE_NAME}-deployment-failure-alarm`,
+      {
+        serviceName: BASE_NAME,
+        serviceArn: this.service.service.arn,
+        tags: this.tags,
+      },
+      { parent: this }
+    );
+
+    new aws.cloudwatch.MetricAlarm(
+      `${BASE_NAME}-service-cpu-alarm`,
+      {
+        name: `${BASE_NAME}-service-cpu-${stack}`,
+        alarmDescription: `Alarm when ${BASE_NAME} CPU stays elevated across its replicas`,
+        namespace: 'AWS/ECS',
+        metricName: 'CPUUtilization',
+        statistic: 'Average',
+        period: 300,
+        evaluationPeriods: 2,
+        threshold: 90,
+        comparisonOperator: 'GreaterThanOrEqualToThreshold',
+        dimensions: {
+          ClusterName: pulumi.interpolate`${this.cloudStorageClusterName}`,
+          ServiceName: this.service.service.name,
+        },
+        alarmActions: [CLOUD_TRAIL_SNS_TOPIC_ARN],
+        tags: this.tags,
+      },
+      { parent: this }
+    );
+  }
+}

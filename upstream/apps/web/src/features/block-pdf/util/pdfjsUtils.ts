@@ -1,0 +1,444 @@
+import type { Color, IColor } from '@block-pdf/model/Color';
+import {
+  Highlight,
+  HighlightRect,
+  HighlightType,
+  type WH,
+} from '@block-pdf/model/Highlight';
+import { PageModel } from '@block-pdf/model/Page';
+import type { PDFViewer } from '@block-pdf/PdfViewer';
+import type { ThreadPayload } from '@block-pdf/type/comments';
+import { v7 as uuid7 } from 'uuid';
+
+// Normalize rectangle rect=[x1, y1, x2, y2] so that (x1,y1) < (x2,y2)
+// For coordinate systems whose origin lies in the bottom-left, this
+// means normalization to (BL,TR) ordering. For systems with origin in the
+// top-left, this means (TL,BR) ordering.
+export function normalizeRect<
+  T extends [x1: number, y1: number, x2: number, y2: number],
+>(rect: T): T {
+  const r = rect.slice(0) as T; // clone rect
+  if (rect[0] > rect[2]) {
+    r[0] = rect[2];
+    r[2] = rect[0];
+  }
+  if (rect[1] > rect[3]) {
+    r[1] = rect[3];
+    r[3] = rect[1];
+  }
+  return r;
+}
+
+function domRectContains(container: DOMRect, target: DOMRect) {
+  return (
+    container.top <= target.top &&
+    container.bottom >= target.bottom &&
+    container.left <= target.left &&
+    container.right >= target.right
+  );
+}
+
+function seekParentWithClass(
+  childEl: HTMLElement | null,
+  className: string
+): HTMLElement | null {
+  let res = childEl;
+  while (!res?.classList?.contains(className) && res?.parentElement != null) {
+    res = res.parentElement;
+  }
+  return res;
+}
+
+function sortAndFilterDOMRects(rects: DOMRect[] | DOMRectList) {
+  return Array.from(rects)
+    .filter((x) => x.width && x.height)
+    .sort((a, b) => a.top - b.top + (a.height - b.height) + (a.width - b.width))
+    .filter((_, i, y) => y[i + 1] == null || !domRectContains(y[i + 1], y[i]));
+}
+
+function mergeHighlightRects(rects: HighlightRect[]): HighlightRect[] {
+  // Merge rects that are on the same line and right next to each other
+  const sortedRects = rects.sort(HighlightRect.sortedOrder);
+  const mergedRects: HighlightRect[] = [];
+  let lastRect: HighlightRect | null = null;
+  sortedRects.forEach((rect) => {
+    if (lastRect && HighlightRect.isAdjacent(lastRect, rect)) {
+      lastRect.width = HighlightRect.right(rect) - lastRect.left;
+    } else {
+      if (lastRect) {
+        mergedRects.push(lastRect);
+      }
+      lastRect = rect;
+    }
+  });
+  if (lastRect) {
+    mergedRects.push(lastRect);
+  }
+
+  return mergedRects;
+}
+
+function cleanupHighlightText(text: string): string {
+  return text
+    .replace(/[\r\n]/g, ' ')
+    .trim()
+    .replace(/[ ]{2,}/g, ' ');
+}
+
+/** assumes that padding is flush with the bounds of the text layer, it's highly unlikely they are exactly at the page boundary */
+function isPaddingBounds(container: DOMRect, target: DOMRect) {
+  const x1 = Math.floor(container.left);
+  const x2 = Math.floor(container.right);
+  const t_x1 = Math.floor(target.left);
+  const t_x2 = Math.floor(target.right);
+  return t_x1 <= x1 || t_x2 >= x2;
+}
+
+function mergedRectsFromDOMRects(textLayer: HTMLElement, rects: DOMRect[]) {
+  const textLayerRect = textLayer.getBoundingClientRect();
+  const domRects = sortAndFilterDOMRects(
+    rects.filter((target) => !isPaddingBounds(textLayerRect, target))
+  );
+  return mergeHighlightRects(
+    domRects.map((domRect) => highlightRectFromDOM(domRect, textLayerRect))
+  );
+}
+
+function highlightRectFromDOM(
+  selectionRect: DOMRect,
+  pageRect: DOMRect
+): HighlightRect {
+  const top = (selectionRect.top - pageRect.top) / pageRect.height;
+  const left = (selectionRect.left - pageRect.left) / pageRect.width;
+  const width = selectionRect.width / pageRect.width;
+  const height = selectionRect.height / pageRect.height;
+  return new HighlightRect(top, left, width, height);
+}
+
+function htmlCollectionToString(collection: HTMLCollection): string {
+  const result: string[] = [];
+  for (let node of collection) {
+    switch (node.nodeName) {
+      case 'BR':
+        result.push(' ');
+        break;
+      case 'SPAN':
+        if (node.textContent != null) result.push(node.textContent);
+        break;
+      default:
+        result.push(htmlCollectionToString(node.children));
+        break;
+    }
+  }
+
+  return result.join(' ');
+}
+
+function rangeToString(range: Range): string {
+  const contents = range.cloneContents();
+
+  if (contents.children.length > 0)
+    return htmlCollectionToString(contents.children);
+  else return contents.textContent ?? '';
+}
+
+function textNodeRects(inputRange: Range) {
+  const range = inputRange.cloneRange();
+  const iter = document.createNodeIterator(
+    range.commonAncestorContainer,
+    NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+    {
+      acceptNode: function () {
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    }
+  );
+
+  let atStart = false;
+  const result: DOMRect[] = [];
+  var nodeRange = document.createRange();
+  while (iter.nextNode()) {
+    const { referenceNode: node } = iter;
+    // skip until at the start of the range
+    if (!atStart && node !== range.startContainer) continue;
+    atStart = true;
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      nodeRange.selectNodeContents(node);
+      if (node === range.startContainer && node) {
+        nodeRange.setStart(node, range.startOffset);
+      }
+      if (node === range.endContainer) {
+        nodeRange.setEnd(node, range.endOffset);
+      }
+
+      if (!nodeRange.collapsed) result.push(nodeRange.getBoundingClientRect());
+    }
+
+    // Edge case handling for setting the end of triple-click selections
+    if (
+      node.nodeType === Node.ELEMENT_NODE &&
+      range.endContainer.nodeType === Node.ELEMENT_NODE &&
+      !document.getSelection()?.containsNode(node)
+    ) {
+      nodeRange.setEnd(node, 0);
+      break;
+    }
+
+    // stop at the end of the range
+    if (node === range.endContainer) break;
+  }
+
+  return result;
+}
+
+function textNodesOf(root: Node) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes: Text[] = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+  return nodes;
+}
+
+/** Narrows `range` to the part that falls inside `textLayer`, or null when they do not overlap. */
+function clipRangeToTextLayer(range: Range, textLayer: HTMLElement) {
+  const nodes = textNodesOf(textLayer).filter((node) =>
+    range.intersectsNode(node)
+  );
+  const first = nodes.at(0);
+  const last = nodes.at(-1);
+  if (!first || !last) return null;
+
+  const clipped = range.cloneRange();
+  if (!textLayer.contains(range.startContainer)) clipped.setStart(first, 0);
+  if (!textLayer.contains(range.endContainer))
+    clipped.setEnd(last, last.length);
+  return clipped;
+}
+
+/**
+ * Bounding rect of the selected glyphs on the page that owns `textLayer`. Text
+ * layer spans are padded out to the page edges to widen their selection hit
+ * area, so the span's own rect covers far more than the words it holds.
+ */
+export function selectedTextBounds(
+  range: Range,
+  textLayer: HTMLElement
+): DOMRect | null {
+  const pageRange = clipRangeToTextLayer(range, textLayer);
+  if (!pageRange) return null;
+
+  const textLayerRect = textLayer.getBoundingClientRect();
+  const rects = sortAndFilterDOMRects(
+    textNodeRects(pageRange).filter(
+      (rect) => !isPaddingBounds(textLayerRect, rect)
+    )
+  );
+  if (rects.length === 0) return null;
+
+  const left = Math.min(...rects.map((rect) => rect.left));
+  const top = Math.min(...rects.map((rect) => rect.top));
+  const right = Math.max(...rects.map((rect) => rect.right));
+  const bottom = Math.max(...rects.map((rect) => rect.bottom));
+  return new DOMRect(left, top, right - left, bottom - top);
+}
+
+function rangeToHighlightByPageIndex(
+  range: Range,
+  text: string,
+  selectionParams: {
+    color: Color | IColor | null;
+    thread: ThreadPayload | null;
+    redact: boolean;
+    pageViewport?: WH;
+  }
+): Map<number, Highlight> {
+  const startNode = range.startContainer as HTMLElement | null;
+  const endNode = range.endContainer as HTMLElement | null;
+  const pages = new Map<number, Highlight>();
+  if (startNode == null || endNode == null) return pages;
+
+  const startPage = PageModel.getPageNode(startNode);
+  const endPage = PageModel.getPageNode(endNode);
+  if (startPage == null || endPage == null) return pages;
+
+  const startIndex = PageModel.getPageIndex(startPage)!;
+  const endIndex = PageModel.getPageIndex(endPage)!;
+
+  // the difficult case is when the selection is across pages, the bounding rects include
+  // all of the elements in subsequent pages between the start and the end containers
+  const startTextLayer = seekParentWithClass(startNode, 'textLayer');
+  const endTextLayer = seekParentWithClass(endNode, 'textLayer');
+
+  if (startTextLayer == null || endTextLayer == null) return pages;
+
+  if (startNode === endNode || startPage === endPage) {
+    // the easy case is when the start and end containers belong to the same text layer
+    pages.set(
+      startIndex,
+      new Highlight({
+        uuid: uuid7(),
+        pageNum: startIndex,
+        rects: mergedRectsFromDOMRects(startTextLayer, textNodeRects(range)),
+        type: HighlightType.HIGHLIGHT,
+        text: cleanupHighlightText(text),
+        ...selectionParams,
+      })
+    );
+
+    return pages;
+  }
+
+  const startRangeTexts: string[] = [];
+  const rects: DOMRect[] = [];
+
+  const startRange = range.cloneRange();
+  const textLayer = startPage.querySelector('.textLayer');
+  if (
+    textLayer == null ||
+    textLayer.firstElementChild == null ||
+    textLayer.lastElementChild == null
+  )
+    return pages;
+  startRange.setEndAfter(textLayer.lastElementChild);
+
+  rects.push(...textNodeRects(startRange));
+  startRangeTexts.unshift(startRange.toString());
+  startRange.detach();
+
+  pages.set(
+    startIndex,
+    new Highlight({
+      uuid: uuid7(),
+      pageNum: startIndex,
+      rects: mergedRectsFromDOMRects(startTextLayer, rects),
+      type: HighlightType.HIGHLIGHT,
+      text: cleanupHighlightText(startRangeTexts.join(' ')),
+      ...selectionParams,
+    })
+  );
+
+  // Assume everything in the pages between the start and end are highlighted
+  const docView = seekParentWithClass(startNode, 'pdfViewer');
+  if (docView == null || startIndex == null || endIndex == null) {
+    console.error('the pdfViewer class is missing on the document container');
+  } else {
+    docView.querySelectorAll('.page[data-page-number]').forEach((page) => {
+      const pageIndex = PageModel.getPageIndex(page as HTMLElement);
+      if (pageIndex == null || pageIndex <= startIndex || pageIndex >= endIndex)
+        return;
+
+      const textLayer = page.querySelector('.textLayer');
+      if (
+        textLayer == null ||
+        textLayer.firstElementChild == null ||
+        textLayer.lastElementChild == null
+      )
+        return;
+      const pageRange = document.createRange();
+      pageRange.setStart(
+        textLayer.firstElementChild,
+        textLayer.firstElementChild.childNodes.length
+      );
+      pageRange.setEnd(
+        textLayer.lastElementChild,
+        textLayer.lastElementChild.childNodes.length
+      );
+      pages.set(
+        pageIndex,
+        new Highlight({
+          uuid: uuid7(),
+          pageNum: pageIndex,
+          rects: mergedRectsFromDOMRects(
+            textLayer as HTMLElement,
+            textNodeRects(pageRange)
+          ),
+          type: HighlightType.HIGHLIGHT,
+          text: cleanupHighlightText(rangeToString(pageRange)),
+          ...selectionParams,
+        })
+      );
+      pageRange.detach();
+    });
+  }
+
+  // Chromium correctly selects only the text contents at the end of ranges, but not the start
+  if (endTextLayer?.firstElementChild != null) {
+    const endRange = range.cloneRange();
+    endRange.setStart(endTextLayer?.firstElementChild, 0);
+    pages.set(
+      endIndex,
+      new Highlight({
+        uuid: uuid7(),
+        pageNum: endIndex,
+        rects: mergedRectsFromDOMRects(
+          endTextLayer as HTMLElement,
+          textNodeRects(endRange)
+        ),
+        type: HighlightType.HIGHLIGHT,
+        text: cleanupHighlightText(rangeToString(endRange)),
+        ...selectionParams,
+      })
+    );
+    endRange.detach();
+  }
+
+  return pages;
+}
+
+/** @returns Map of page index to highlights on that page */
+export function getHighlightsFromSelection(
+  selection: Selection,
+  color: Color | IColor | null = null,
+  type: (typeof HighlightType)[keyof typeof HighlightType] = HighlightType.HIGHLIGHT,
+  thread: ThreadPayload | null = null,
+  redact: boolean = false,
+  pageViewport?: WH
+): Map<number, Highlight> {
+  const range = selection.getRangeAt(0);
+  const text = selection.toString();
+  const startNode = selection.getRangeAt(0)
+    .startContainer as HTMLElement | null;
+  const startPage = PageModel.getPageNode(startNode);
+
+  // seek up to the pdfViewer, which is the top-level ancestor for all pages, so that picture-in-picture
+  //   // has a valid bounding rect not based on the top-level page
+  const docView = seekParentWithClass(startPage, 'pdfViewer');
+
+  if (docView == null) {
+    return new Map();
+  }
+
+  const selectionParams = {
+    color,
+    type,
+    thread,
+    redact,
+    pageViewport,
+  };
+
+  return rangeToHighlightByPageIndex(range, text, selectionParams);
+}
+
+/**
+ * Get the bounding rect of a page in the pdf viewer
+ * @param viewer
+ * @param pageNum 1-based index of the page
+ */
+export const getPdfPageRect = (
+  args: { pageNum: number } & (
+    | { viewer: PDFViewer }
+    | { viewerEl: HTMLElement }
+  )
+) => {
+  let viewerEl: HTMLElement;
+  if ('viewer' in args) {
+    viewerEl = args.viewer.viewerElement() as HTMLElement;
+  } else {
+    viewerEl = args.viewerEl;
+  }
+
+  const pdfPageRect = viewerEl
+    .querySelector(`[data-page-number="${args.pageNum}"] .pageOverlayContainer`)
+    ?.getBoundingClientRect();
+  return pdfPageRect;
+};

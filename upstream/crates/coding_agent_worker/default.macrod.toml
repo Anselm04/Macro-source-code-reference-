@@ -1,0 +1,16 @@
+# macrod configuration. Pairing adds a bearer token here; keep this file private.
+# Name, ownership, and permission bypass are set on the web at
+# Settings → Machines.
+
+# Development overrides; every key defaults to production.
+# [macro]
+# api_url = "https://gateway.macro.com/agent-harness"
+# storage_url = "https://gateway.macro.com/dss"
+# web_url = "https://macro.com/app"
+
+[harness]
+command = "hermes"
+args = ["acp"]
+
+[workspace]
+path = "."

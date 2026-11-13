@@ -1,0 +1,1113 @@
+import {
+  blockNameToDefaultFile,
+  itemToSafeName,
+} from '@core/constant/allBlocks';
+import { useChannelsContext } from '@core/context/channels';
+import { emailToId } from '@core/user';
+import {
+  extractSearchSnippet,
+  extractSearchTerms,
+  mergeAdjacentMacroEmTags,
+} from '@core/util/searchHighlight';
+import type {
+  AgentSessionEntity,
+  CalendarEventEntity,
+  CalendarEventEntityTime,
+  CallEntity,
+  ChannelEntity,
+  ChannelMessageEntity,
+  ChannelThreadEntity,
+  ChatEntity,
+  ContentHitData,
+  CrmCompanyEntity,
+  CrmContactEntity,
+  DocumentEntity,
+  EmailEntity,
+  EntityData,
+  ForeignEntity,
+  GithubPullRequestEntity,
+  HarnessEntity,
+  InitiativeEntity,
+  Notification,
+  ProjectEntity,
+  SearchData,
+  WithSearch,
+} from '@entity';
+import { type GithubPullRequestLabel, toSubType } from '@entity/types/entity';
+import { resolveNotifiedAt } from '@queries/soup/normalized-cache/notified-floor';
+import { resolveOwnTouch } from '@queries/soup/normalized-cache/own-touch';
+import type {
+  CallRecordSearchResult,
+  ChannelSearchResult,
+  ChatMessageSearchResult,
+  DocumentSearchResult,
+  EmailSearchResult,
+  ProjectSearchResult,
+  SoupProperty as SearchSoupProperty,
+  UnifiedSearchResponseItem,
+} from '@service-search/generated/models';
+import type {
+  GithubPullRequest,
+  SoupAttachment,
+  SoupCalendarEventTime,
+  SoupPage,
+  SoupProperty,
+} from '@service-storage/generated/schemas';
+import type { ChannelType } from '@service-storage/generated/schemas/channelType';
+import { formatDocumentName } from '@service-storage/util/filename';
+import { differenceInMilliseconds } from 'date-fns';
+import { match } from 'ts-pattern';
+import { mapAgentSessionSearchResult } from './agent-session-search';
+
+/** Search sends a property's entity type only when it has one. */
+function soupProperties(
+  properties: SearchSoupProperty[] | null | undefined
+): SoupProperty[] | undefined {
+  return properties?.map((property) => ({
+    ...property,
+    definition: {
+      ...property.definition,
+      specific_entity_type: property.definition.specific_entity_type ?? null,
+    },
+  }));
+}
+
+type InnerSearchResult =
+  | DocumentSearchResult
+  | EmailSearchResult
+  | ChatMessageSearchResult
+  | ChannelSearchResult
+  | ProjectSearchResult
+  | CallRecordSearchResult;
+
+type DisplayableSoupItem = SoupPage['items'][number];
+type SoupDocument = Extract<DisplayableSoupItem, { tag: 'document' }>['data'];
+
+type SoupEntity =
+  | AgentSessionEntity
+  | DocumentEntity
+  | ChatEntity
+  | ProjectEntity
+  | InitiativeEntity
+  | EmailEntity
+  | ChannelEntity
+  | ChannelThreadEntity
+  | CallEntity
+  | CrmCompanyEntity
+  | CrmContactEntity
+  | CalendarEventEntity
+  | ForeignEntity
+  | HarnessEntity;
+
+type SoupItemWithOptionalNotifications = DisplayableSoupItem & {
+  data: {
+    notifications?: Notification[] | null;
+    unreadNotifications?: ChannelEntity['unreadNotifications'];
+    unreadMentions?: ChannelEntity['unreadMentions'];
+  };
+};
+
+type TypedInnerSearchResult =
+  | { results: InnerSearchResult[]; type?: undefined }
+  | { results: DocumentSearchResult[]; type: 'pdf'; searchQuery: string }
+  | { results: DocumentSearchResult[]; type: 'md' }
+  | { results: ChannelSearchResult[]; type: 'channel' }
+  | { results: EmailSearchResult[]; type: 'email'; searchQuery?: string }
+  | {
+      results: CallRecordSearchResult[];
+      type: 'call_record';
+      callId: string;
+      callStartedAt: string;
+    };
+
+const getSearchData = (data: TypedInnerSearchResult): SearchData => {
+  let contentHitData: ContentHitData[] = [];
+
+  switch (data.type) {
+    case 'channel': {
+      contentHitData = data.results.flatMap((r) => {
+        const isContentHit = !!r.message_id;
+        if (!isContentHit) return [];
+
+        const contents = r.highlight.content ?? [];
+        return contents.map((content) => ({
+          type: 'channel' as const,
+          id: r.message_id!,
+          content: mergeAdjacentMacroEmTags(content),
+          senderId: r.sender_id!,
+          sentAt: r.created_at!,
+          location: {
+            type: 'channel' as const,
+            threadId: r.thread_id ?? undefined,
+            messageId: r.message_id!,
+          },
+        }));
+      });
+      break;
+    }
+    case 'pdf': {
+      contentHitData = data.results.flatMap((r) => {
+        const contents = r.highlight.content ?? [];
+        return contents.map((content) => {
+          const mergedContent = mergeAdjacentMacroEmTags(content);
+          return {
+            type: 'pdf' as const,
+            content: mergeAdjacentMacroEmTags(content),
+            location: {
+              type: 'pdf' as const,
+              searchPage: Number(r.node_id),
+              searchSnippet: extractSearchSnippet(mergedContent),
+              searchRawQuery: data.searchQuery,
+              highlightTerms: extractSearchTerms(mergedContent),
+            },
+          };
+        });
+      });
+      break;
+    }
+    case 'md': {
+      contentHitData = data.results.flatMap((r) => {
+        const isContentHit = !!r.node_id;
+        if (!isContentHit) return [];
+
+        const contents = r.highlight.content ?? [];
+        return contents.map((content) => ({
+          type: 'md' as const,
+          content: mergeAdjacentMacroEmTags(content),
+          location: { type: 'md' as const, nodeId: r.node_id! },
+        }));
+      });
+      break;
+    }
+    case 'email': {
+      contentHitData = data.results.flatMap((r) => {
+        const contents = r.highlight.content ?? [];
+        return contents.map((content) => ({
+          type: 'email' as const,
+          content: mergeAdjacentMacroEmTags(content),
+          sender: r.pretty_sender!,
+          senderId: emailToId(r.sender),
+          sentAt: r.sent_at!,
+          location: {
+            type: 'email' as const,
+            messageId: r.message_id!,
+          },
+        }));
+      });
+      break;
+    }
+    case 'call_record': {
+      contentHitData = data.results.flatMap((r) => {
+        // TODO: support name only hits for call records when we support rename
+        const isContentHit = !!r.transcript_id;
+        if (!isContentHit) return [];
+
+        const videoSeconds = Math.max(
+          0,
+          differenceInMilliseconds(r.started_at!, data.callStartedAt) / 1000
+        );
+
+        const contents = r.highlight.content ?? [];
+        return contents.map((content) => ({
+          type: 'call_record' as const,
+          id: r.transcript_id!,
+          content: mergeAdjacentMacroEmTags(content),
+          senderId: r.speaker_id!,
+          sentAt: r.started_at!,
+          videoSeconds,
+          location: {
+            type: 'call_record' as const,
+            callId: data.callId,
+            transcriptId: r.transcript_id!,
+          },
+        }));
+      });
+      break;
+    }
+    default: {
+      contentHitData = data.results.flatMap((r) => {
+        const contents = r.highlight.content ?? [];
+        return contents.map((content) => ({
+          content: mergeAdjacentMacroEmTags(content),
+          location: undefined,
+        }));
+      });
+    }
+  }
+
+  const nameHighlight =
+    data.results.find((r) => r.highlight.name)?.highlight.name ?? null;
+
+  let senderHighlightTerms: string[] | null = null;
+  if (data.type === 'email') {
+    const hasSenderMatch = data.results.some((r) => r.highlight.sender);
+    const terms = [
+      ...new Set(
+        data.results
+          .flatMap((r) => extractSearchTerms(r.highlight.sender ?? ''))
+          .map((t) => t.toLowerCase())
+      ),
+    ];
+    if (hasSenderMatch && data.searchQuery) {
+      const queryTerms = data.searchQuery
+        .toLowerCase()
+        .split(/\s+/)
+        .filter(Boolean);
+      for (const t of queryTerms) {
+        if (!terms.includes(t)) terms.push(t);
+      }
+    }
+    senderHighlightTerms = terms.length > 0 ? terms : null;
+  }
+
+  return {
+    nameHighlight: nameHighlight
+      ? mergeAdjacentMacroEmTags(nameHighlight)
+      : null,
+    senderHighlightTerms,
+    contentHitData: contentHitData.length > 0 ? contentHitData : null,
+    source: 'service' as const,
+  };
+};
+
+/**
+ * Maps a single channel search response item into `ChannelMessageEntity`s.
+ * Shared between the unified search transform and the channel-only endpoint,
+ * both of which return the same per-channel shape.
+ */
+export function mapChannelSearchResultItem(
+  result: {
+    channel_id: string;
+    channel_type: string;
+    owner_id?: string | null;
+    channel_message_search_results: ChannelSearchResult[];
+  },
+  channels: ReadonlyArray<{ id: string; name?: string | null }>
+): WithSearch<ChannelMessageEntity>[] {
+  const channelWithLatest = channels.find((c) => c.id === result.channel_id);
+  const channelName =
+    channelWithLatest?.name ?? blockNameToDefaultFile('channel');
+  const channelType = result.channel_type as ChannelType;
+  const ownerId = result.owner_id ?? '';
+
+  return result.channel_message_search_results
+    .filter((msg) => !!msg.message_id)
+    .map((msg): WithSearch<ChannelMessageEntity> => {
+      const search = getSearchData({
+        type: 'channel',
+        results: [msg],
+      });
+
+      const content = search.contentHitData?.[0]?.content ?? '';
+
+      return {
+        type: 'channel_message',
+        id: `${result.channel_id}:${msg.message_id}`,
+        channelId: result.channel_id,
+        channelName,
+        channelType,
+        messageId: msg.message_id!,
+        threadId: msg.thread_id ?? undefined,
+        target: {
+          messageId: msg.message_id!,
+          threadId: msg.thread_id ?? undefined,
+        },
+        senderId: msg.sender_id!,
+        content,
+        name: channelName,
+        ownerId,
+        createdAt: msg.created_at,
+        updatedAt: msg.updated_at ?? msg.created_at,
+        search,
+      };
+    });
+}
+
+const formatDisplayName = (text: string, fileType?: string | null) =>
+  formatDocumentName(text, fileType, { fullyQualifiedBlockName: true });
+
+export const useSearchResponseItemMapper = () => {
+  const { channels } = useChannelsContext();
+  return (result: UnifiedSearchResponseItem, searchQuery: string) =>
+    createSearchResponseItemMapper(channels())(result, searchQuery);
+};
+
+export const createSearchResponseItemMapper = (
+  channels: ReadonlyArray<{
+    id: string;
+    name?: string | null;
+    team_id?: string | null;
+  }>
+) => {
+  return (
+    result: UnifiedSearchResponseItem,
+    searchQuery: string
+  ): (WithSearch<EntityData> | undefined)[] => {
+    switch (result.type) {
+      case 'agentSession':
+        return [mapAgentSessionSearchResult(result)];
+      case 'company': {
+        const primaryDomain = result.domains[0]?.domain;
+        const nameHighlight = result.nameHighlighted
+          ? mergeAdjacentMacroEmTags(result.nameHighlighted)
+          : null;
+        return [
+          {
+            type: 'crm_company',
+            id: result.id,
+            teamId: result.teamId,
+            name: result.name || primaryDomain || 'Unknown Company',
+            ownerId: result.teamId,
+            description: result.description ?? undefined,
+            // Not returned by search — left undefined ("not loaded") so
+            // consumers don't mistake it for a real `false`.
+            emailSync: undefined,
+            hidden: result.hidden,
+            createdAt: result.createdAt,
+            updatedAt: result.updatedAt,
+            sortTs: result.updatedAt,
+            domains: result.domains.map((d) => ({
+              id: d.id,
+              companyId: d.companyId,
+              domain: d.domain,
+              createdAt: d.createdAt,
+            })),
+            search: {
+              nameHighlight,
+              senderHighlightTerms: null,
+              contentHitData: null,
+              source: 'service',
+            },
+          },
+        ];
+      }
+      case 'document': {
+        if (
+          !result.metadata ||
+          result.metadata.deleted_at ||
+          result.sub_type === 'initiative_description'
+        )
+          return [];
+        const searchFileType =
+          result.file_type === 'docx' ? 'pdf' : result.file_type;
+        let search: SearchData;
+        if (searchFileType === 'md') {
+          search = getSearchData({
+            results: result.document_search_results,
+            type: 'md',
+          });
+        } else if (searchFileType === 'pdf') {
+          search = getSearchData({
+            results: result.document_search_results,
+            type: 'pdf',
+            searchQuery,
+          });
+        } else {
+          search = getSearchData({
+            results: result.document_search_results,
+          });
+        }
+        // The index stores unformatted document names, so server name
+        // highlights lack the extension suffix the display name carries.
+        if (search.nameHighlight) {
+          search = {
+            ...search,
+            nameHighlight: formatDisplayName(
+              search.nameHighlight,
+              result.file_type
+            ),
+          };
+        }
+        const properties = soupProperties(result.properties);
+        return [
+          {
+            type: 'document',
+            subType:
+              result.sub_type === 'task'
+                ? { type: 'task' }
+                : result.sub_type === 'snippet'
+                  ? { type: 'snippet' }
+                  : result.sub_type === 'skill'
+                    ? { type: 'skill' }
+                    : null,
+            id: result.document_id,
+            name: formatDisplayName(
+              result.name || blockNameToDefaultFile(result.file_type),
+              result.file_type
+            ),
+            ownerId: result.owner_id,
+            createdAt: result.metadata?.created_at,
+            updatedAt: result.metadata?.updated_at,
+            fileType: result.file_type || undefined,
+            projectId: result.metadata?.project_id ?? undefined,
+            properties,
+            search,
+          },
+        ];
+      }
+      case 'email': {
+        const search = getSearchData({
+          results: result.email_message_search_results,
+          type: 'email',
+          searchQuery,
+        });
+
+        const name = result.name ?? blockNameToDefaultFile('email');
+
+        const participants = result.participants?.map((p) => ({
+          email: p.email,
+          name: p.name ?? undefined,
+        }));
+
+        return [
+          {
+            type: 'email',
+            id: result.thread_id,
+            name,
+            ownerId: result.owner_id,
+            linkId: result.link_id,
+            createdAt: result.created_at,
+            updatedAt: result.updated_at,
+            viewedAt: result.viewed_at,
+            isRead: result.is_read,
+            isImportant: result.is_important,
+            isDraft: result.is_draft,
+            done: !result.inbox_visible,
+            participants,
+            search,
+            snippet: result.snippet ?? undefined,
+            properties: soupProperties(result.properties),
+          },
+        ];
+      }
+      case 'chat': {
+        if (!result.metadata || result.metadata.deleted_at) return [];
+        const search = getSearchData({
+          results: result.chat_search_results,
+        });
+        return [
+          {
+            type: 'chat',
+            id: result.chat_id,
+            name: result.name,
+            ownerId: result.user_id,
+            createdAt: result.metadata?.created_at,
+            updatedAt: result.metadata?.updated_at,
+            projectId: result.metadata?.project_id ?? undefined,
+            properties: soupProperties(result.properties),
+            search,
+          },
+        ];
+      }
+      case 'channel': {
+        if (!result.metadata) return [];
+        const nameHighlight = result.highlight.name
+          ? mergeAdjacentMacroEmTags(result.highlight.name)
+          : null;
+        const search: SearchData = {
+          nameHighlight,
+          senderHighlightTerms: null,
+          contentHitData: null,
+          source: 'service',
+        };
+        const channel = channels.find(
+          (channel) => channel.id === result.channel_id
+        );
+        const channelName =
+          channel?.name ??
+          (search.nameHighlight
+            ? extractSearchSnippet(search.nameHighlight)
+            : blockNameToDefaultFile('channel'));
+        return [
+          {
+            type: 'channel',
+            id: result.channel_id,
+            name: channelName,
+            ownerId: result.owner_id ?? '',
+            channelType: result.channel_type as ChannelType,
+            teamId: channel?.team_id ?? undefined,
+            createdAt: result.metadata.created_at,
+            updatedAt: result.metadata.updated_at,
+            viewedAt: result.metadata.viewed_at,
+            interactedAt: result.metadata.interacted_at,
+            search,
+          },
+        ];
+      }
+      case 'channelMessage': {
+        const channelName =
+          channels.find((c) => c.id === result.channel_id)?.name ??
+          blockNameToDefaultFile('channel');
+        const search = getSearchData({ type: 'channel', results: [result] });
+        const content = search.contentHitData?.[0]?.content ?? '';
+        return [
+          {
+            type: 'channel_message',
+            id: `${result.channel_id}:${result.message_id}`,
+            channelId: result.channel_id,
+            channelName,
+            channelType: result.channel_type as ChannelType,
+            messageId: result.message_id,
+            threadId: result.thread_id ?? undefined,
+            target: {
+              messageId: result.message_id,
+              threadId: result.thread_id ?? undefined,
+            },
+            senderId: result.sender_id,
+            content,
+            name: channelName,
+            ownerId: result.owner_id ?? '',
+            createdAt: result.created_at,
+            updatedAt: result.updated_at,
+            search,
+          },
+        ];
+      }
+
+      case 'project': {
+        if (!result.metadata || result.metadata.deleted_at) return [];
+        const search = getSearchData({
+          results: result.project_search_results,
+        });
+
+        return [
+          {
+            type: 'project',
+            id: result.id,
+            name: result.name,
+            ownerId: result.owner_id,
+            createdAt: result.created_at,
+            updatedAt: result.updated_at,
+            projectId: result.metadata?.parent_project_id ?? undefined,
+            properties: soupProperties(result.properties),
+            search,
+          },
+        ];
+      }
+
+      case 'calendarEvent': {
+        if (!result.metadata) return [];
+        const search = getSearchData({
+          results: result.calendar_event_search_results,
+        });
+
+        // A recurring series is indexed once, as its master. The service
+        // resolves which instance this row means — next upcoming, else most
+        // recent past — so prefer that span over the master's, which for a
+        // long-running series is its original (stale) start.
+        const metadata = result.metadata;
+        const time = toCalendarEventTime(
+          metadata.occurrence?.time ?? metadata.time
+        );
+
+        return [
+          {
+            type: 'calendar_event',
+            id: result.id,
+            name: result.name,
+            ownerId: result.owner_id,
+            status: metadata.status,
+            time,
+            occurrenceKey: metadata.occurrence?.occurrenceKey,
+            isRecurring: metadata.isRecurring,
+            organizer: metadata.organizer
+              ? {
+                  name: metadata.organizer.name ?? undefined,
+                  email: metadata.organizer.email ?? undefined,
+                }
+              : undefined,
+            description: metadata.description ?? undefined,
+            conferenceUrl: metadata.conferenceUrl ?? undefined,
+            isReadOnly: metadata.isReadOnly,
+            createdAt: metadata.createdAt,
+            updatedAt: metadata.updatedAt,
+            properties: soupProperties(result.properties),
+            search,
+          },
+        ];
+      }
+
+      case 'call': {
+        if (!result.metadata) return [];
+        const search = getSearchData({
+          type: 'call_record',
+          results: result.call_search_results,
+          callId: result.call_id,
+          callStartedAt: result.metadata.started_at,
+        });
+
+        const channelName: string | undefined =
+          result.metadata.channel_name ??
+          channels.find((c) => c.id === result.channel_id)?.name ??
+          undefined;
+        const status = result.metadata.status;
+
+        return [
+          {
+            type: 'call',
+            id: result.call_id,
+            name: result.name ?? channelName ?? blockNameToDefaultFile('call'),
+            channelId: result.channel_id,
+            channelName,
+            ownerId: result.owner_id,
+            createdAt: result.metadata.started_at,
+            updatedAt: result.metadata.updated_at,
+            isActive: false,
+            status,
+            attended: status === 'ATTENDED',
+            durationMs: result.metadata.duration_ms,
+            participantIds: result.participant_ids,
+            properties: soupProperties(result.properties),
+            search,
+          },
+        ];
+      }
+    }
+  };
+};
+
+const resolveDocumentEntityName = (
+  entity: DocumentEntity | SoupDocument
+): string => {
+  return itemToSafeName({
+    type: 'document',
+    name: entity.name,
+    fileType: entity.fileType,
+    subType: toSubType(entity.subType),
+  });
+};
+
+export const isDisplayableSoupItem = (
+  item: SoupPage['items'][number]
+): item is DisplayableSoupItem =>
+  Boolean(item) &&
+  item.tag !== 'databaseRow' &&
+  (item.tag !== 'document' ||
+    item.data.subType?.type !== 'initiative_description');
+
+/**
+ * The email soup query encodes "no sort timestamp" — e.g. a never-viewed thread
+ * under the `viewed_at` sort — as the Unix epoch. Map it to `undefined` so each
+ * soup view's sort and the row date fall back to their own column
+ * (`updatedAt`/`createdAt`/`viewedAt`) instead of pinning the thread to 1970.
+ */
+function normalizeSentinelTs(
+  ts: string | null | undefined
+): string | undefined {
+  if (!ts) return undefined;
+  return Date.parse(ts) > 0 ? ts : undefined;
+}
+
+function isCalendarAttachment(attachment: SoupAttachment): boolean {
+  return (
+    attachment.mimeType === 'text/calendar' ||
+    attachment.filename?.toLowerCase().endsWith('.ics') === true
+  );
+}
+
+function withRawNotifications<T extends SoupEntity>(
+  entity: T,
+  item: DisplayableSoupItem
+): T {
+  const notifications = (item as SoupItemWithOptionalNotifications).data
+    .notifications;
+  if (!Array.isArray(notifications)) return entity;
+  return { ...entity, notifications } as T;
+}
+
+function calendarReminderTimestamp(
+  item: Extract<DisplayableSoupItem, { tag: 'calendarEvent' }>
+): string | undefined {
+  let latest: string | undefined;
+  let latestMs = -Infinity;
+  const include = (timestamp: string | null | undefined) => {
+    const ms = timestamp ? Date.parse(timestamp) : NaN;
+    if (ms > latestMs) {
+      latest = timestamp ?? undefined;
+      latestMs = ms;
+    }
+  };
+
+  include(item.data.lastReminderFiredAt);
+  const notifications = (item as SoupItemWithOptionalNotifications).data
+    .notifications;
+  for (const notification of notifications ?? []) {
+    if (
+      !notification.deleted_at &&
+      (notification.notification_metadata.tag === 'calendar_event_reminder' ||
+        notification.notification_metadata.tag ===
+          'calendar_event_join_request')
+    ) {
+      include(notification.created_at);
+    }
+  }
+  return latest;
+}
+
+export const mapApiSoupItemToEntity = (
+  item: DisplayableSoupItem
+): SoupEntity => {
+  const entity = match(item)
+    // Rows are read by the database SQL engine; isDisplayableSoupItem keeps
+    // them out of every list.
+    .with({ tag: 'databaseRow' }, () => {
+      throw new Error('Database rows are not rendered as Soup entities');
+    })
+    .with({ tag: 'agentSession' }, (item) => ({
+      ...item.data,
+      type: 'agent_session' as const,
+      name: item.data.name || 'Agent session',
+      frecencyScore: item.frecency_score,
+    }))
+    .with({ tag: 'chat' }, (item) => ({
+      ...item.data,
+      createdAt: item.data.createdAt,
+      updatedAt: item.data.updatedAt,
+      type: item.tag,
+      name: item.data.name || 'New Chat',
+      frecencyScore: item.frecency_score,
+      viewedAt: item.data.viewedAt,
+      projectId: item.data.projectId ?? undefined,
+    }))
+    .with({ tag: 'initiative' }, (item) => ({
+      ...item.data,
+      type: 'initiative' as const,
+      name: item.data.name || 'Untitled project',
+      frecencyScore: item.frecency_score,
+    }))
+    .with({ tag: 'project' }, (item) => ({
+      createdAt: item.data.createdAt,
+      updatedAt: item.data.updatedAt,
+      id: item.data.id,
+      ownerId: item.data.ownerId,
+      frecencyScore: item.frecency_score,
+      viewedAt: item.data.viewedAt,
+      projectId: item.data.parentId ?? undefined,
+      type: item.tag,
+      name: item.data.name || 'New Project',
+      properties: item.data.properties,
+    }))
+    .with({ tag: 'emailThread' }, (item) => {
+      const participants = item.data.participants?.map((p) => ({
+        email: p.emailAddress ?? '',
+        name: p.name ?? '',
+      }));
+
+      const hasIcsAttachment =
+        item.data.attachments?.some(isCalendarAttachment);
+
+      // Inline images (signature logos, pasted screenshots) carry a Content-ID.
+      const hasFileAttachment = item.data.attachments?.some(
+        (a) =>
+          !isCalendarAttachment(a) &&
+          !(a.contentId && a.mimeType?.startsWith('image/'))
+      );
+
+      const attachments = item.data.attachments?.map((a) => ({
+        id: a.id,
+        filename: a.filename,
+        mimeType: a.mimeType,
+        sizeBytes: a.sizeBytes,
+      }));
+
+      // The thread preview has no link id of its own; its participants and
+      // labels are scoped to the owning inbox, so they share its link id.
+      const linkId =
+        item.data.participants?.[0]?.linkId ?? item.data.labels?.[0]?.linkId;
+
+      return {
+        ...item.data,
+        createdAt: item.data.createdAt,
+        updatedAt: item.data.updatedAt,
+        sortTs: normalizeSentinelTs(item.data.sortTs),
+        senderEmail: item.data.senderEmail ?? undefined,
+        senderName: item.data.senderName ?? undefined,
+        snippet: item.data.snippet ?? undefined,
+        done: !item.data.inboxVisible,
+        type: 'email',
+        name: item.data.name || 'Email Thread',
+        frecencyScore: item.frecency_score,
+        viewedAt: item.data.viewedAt,
+        projectId: item.data.projectId ?? undefined,
+        linkId,
+        participants,
+        hasIcsAttachment,
+        hasFileAttachment,
+        attachments,
+      } satisfies EmailEntity;
+    })
+    .with({ tag: 'call' }, (item) => {
+      const status = item.data.status;
+
+      return {
+        type: 'call',
+        id: item.data.callId,
+        name:
+          item.data.customName ??
+          item.data.channelName ??
+          blockNameToDefaultFile('call'),
+        channelId: item.data.channelId,
+        channelName: item.data.channelName ?? undefined,
+        ownerId: item.data.createdBy,
+        createdAt: item.data.startedAt,
+        updatedAt: item.data.endedAt ?? item.data.startedAt,
+        sortTs: item.data.endedAt ?? item.data.startedAt,
+        isActive: item.data.isActive,
+        status,
+        attended: status === 'ATTENDED',
+        durationMs: item.data.durationMs ?? undefined,
+        participantIds: item.data.participants.map((p) => p.userId),
+        guests: item.data.guests,
+        summary: item.data.summary ?? undefined,
+        properties: item.data.properties,
+      } satisfies CallEntity;
+    })
+    .with({ tag: 'channelThread' }, (item) => {
+      const out: ChannelThreadEntity = {
+        type: 'channel_thread',
+        id: item.data.id,
+        name: 'Channel thread',
+        channelId: item.data.channel_id,
+        messageId: item.data.id,
+        threadId: item.data.id,
+        senderId: item.data.sender_id,
+        sender: item.data.sender,
+        content: item.data.content,
+        attachments: item.data.attachments,
+        reactions: item.data.reactions,
+        ownerId: item.data.sender_id,
+        createdAt: item.data.created_at,
+        updatedAt: item.data.thread.latest_reply_at ?? item.data.updated_at,
+        sortTs: item.data.thread.latest_reply_at ?? item.data.updated_at,
+        editedAt: item.data.edited_at,
+        deletedAt: item.data.deleted_at,
+        thread: {
+          replyCount: item.data.thread.reply_count,
+          latestReplyAt: item.data.thread.latest_reply_at,
+          preview: item.data.thread.preview,
+        },
+        replyCount: item.data.thread.reply_count,
+        latestReplyAt: item.data.thread.latest_reply_at,
+      };
+      return out;
+    })
+    .with({ tag: 'channel' }, (item) => {
+      const latestMessage = item.data.latest_message;
+      const latestRootMessage = item.data.latest_non_thread_message;
+
+      const out: ChannelEntity = {
+        type: 'channel',
+        unreadNotifications: (item as SoupItemWithOptionalNotifications).data
+          .unreadNotifications,
+        unreadMentions: (item as SoupItemWithOptionalNotifications).data
+          .unreadMentions,
+        id: item.data.channel.id,
+        name: item.data.channel.name || 'Unknown Channel',
+        channelType: item.data.channel.channel_type,
+        teamId: item.data.channel.team_id ?? undefined,
+        ownerId: item.data.channel.owner_id,
+        frecencyScore: item.frecency_score ?? 0,
+        updatedAt: item.data.channel.updated_at,
+        createdAt: item.data.channel.created_at,
+        participantIds: item.data.participants.map((p) => p.user_id),
+        isParticipant: item.data.is_participant ?? true,
+        viewedAt: item.data.viewed_at ?? item.data.interacted_at,
+        interactedAt: item.data.interacted_at,
+        latestMessage: latestMessage
+          ? {
+              messageId: latestMessage.message_id,
+              threadId: latestMessage.thread_id ?? undefined,
+              content: latestMessage.content,
+              mentions: latestMessage.mentions,
+              senderId: latestMessage.sender_id,
+              createdAt: latestMessage.created_at,
+            }
+          : undefined,
+        latestRootMessage: latestRootMessage
+          ? {
+              messageId: latestRootMessage.message_id,
+              threadId: latestRootMessage.thread_id ?? undefined,
+              content: latestRootMessage.content,
+              mentions: latestRootMessage.mentions,
+              senderId: latestRootMessage.sender_id,
+              createdAt: latestRootMessage.created_at,
+            }
+          : undefined,
+      };
+      return out;
+    })
+    .with({ tag: 'foreignEntity' }, (item) => {
+      // `authorLogin`/`authorId`/`labels` are enrichment-only fields the
+      // backend now returns but that aren't on the base generated schema yet.
+      const metadata = item.data.metadata as unknown as GithubPullRequest & {
+        authorLogin?: string | null;
+        authorId?: number | null;
+        labels?: GithubPullRequestLabel[] | null;
+        description?: string | null;
+        head?: { name?: string | null } | null;
+      };
+
+      let status: GithubPullRequestEntity['metadata']['status'] = 'open';
+
+      if (metadata.status === 'merged') {
+        status = 'merged';
+      } else if (metadata.status === 'closed') {
+        status = 'closed';
+      }
+
+      const out: GithubPullRequestEntity = {
+        type: 'foreign',
+        id: item.data.id,
+        name: metadata.name ?? metadata.displayName,
+        ownerId: item.data.storedForId,
+        createdAt: item.data.createdAt,
+        updatedAt: item.data.updatedAt,
+        foreignSource: 'github_pull_request',
+        foreignId: item.data.foreignEntityId,
+        storedForId: item.data.storedForId,
+        storedForAuthEntity: item.data.storedForAuthEntity,
+        metadata: {
+          number: metadata.number,
+          name: metadata.name ?? metadata.displayName,
+          owner: metadata.owner,
+          repo: metadata.repo,
+          url: metadata.url,
+          status: status,
+          additions: metadata.additions ?? 0,
+          deletions: metadata.deletions ?? 0,
+          comments: metadata.comments ?? [],
+          checks: metadata.checks?.filter(Boolean) ?? [],
+          labels: metadata.labels ?? [],
+          authorLogin: metadata.authorLogin ?? undefined,
+          authorId: metadata.authorId ?? undefined,
+          description: metadata.description ?? undefined,
+          headBranch: metadata.head?.name ?? undefined,
+        },
+      };
+
+      return out;
+    })
+    .with({ tag: 'harness' }, (item) => ({
+      id: item.data.id,
+      name: item.data.name,
+      ownerId: item.data.ownerId,
+      createdAt: item.data.createdAt,
+      updatedAt: item.data.updatedAt,
+      type: 'harness' as const,
+    }))
+    .with({ tag: 'document' }, (item) => ({
+      ...item.data,
+      createdAt: item.data.createdAt,
+      updatedAt: item.data.updatedAt,
+      type: item.tag,
+      frecencyScore: item.frecency_score,
+      viewedAt: item.data.viewedAt,
+      fileType: item.data.fileType ?? undefined,
+      projectId: item.data.projectId ?? undefined,
+      subType: toSubType(item.data.subType) ?? undefined,
+      name: resolveDocumentEntityName(item.data),
+    }))
+    .with({ tag: 'crmContact' }, (item) => ({
+      ...item.data,
+      type: 'crm_contact' as const,
+      name: item.data.name?.trim() || item.data.email || '',
+      ownerId: item.data.teamId,
+      sortTs: item.data.lastInteraction,
+      frecencyScore: item.frecency_score,
+    }))
+    .with({ tag: 'crmCompany' }, (item) => {
+      const primaryDomain = item.data.domains[0]?.domain;
+      return {
+        type: 'crm_company',
+        id: item.data.id,
+        teamId: item.data.teamId,
+        name: item.data.name || primaryDomain || 'Unknown Company',
+        ownerId: item.data.teamId,
+        description: item.data.description ?? undefined,
+        emailSync: item.data.emailSync,
+        hidden: item.data.hidden,
+        createdAt: item.data.createdAt,
+        updatedAt: item.data.updatedAt,
+        viewedAt: item.data.viewedAt,
+        sortTs: item.data.updatedAt,
+        frecencyScore: item.frecency_score,
+        domains: item.data.domains.map((d) => ({
+          id: d.id,
+          companyId: d.companyId,
+          domain: d.domain,
+          createdAt: d.createdAt,
+        })),
+        properties: item.data.properties,
+      } satisfies CrmCompanyEntity;
+    })
+    .with({ tag: 'calendarEvent' }, (item) => {
+      return {
+        type: 'calendar_event',
+        id: item.data.id,
+        name: item.data.title,
+        ownerId: item.data.ownerId,
+        status: item.data.status,
+        time: toCalendarEventTime(item.data.time),
+        conferenceUrl: item.data.conferenceUrl ?? undefined,
+        isReadOnly: item.data.isReadOnly,
+        createdAt: item.data.createdAt,
+        updatedAt: item.data.updatedAt,
+        properties: item.data.extra.properties,
+        frecencyScore: item.frecency_score,
+      } satisfies CalendarEventEntity;
+    })
+    .exhaustive(() => ({
+      type: 'document' as const,
+      id: 'id' in item.data ? item.data.id : '',
+      name: '',
+      ownerId: '',
+    }));
+
+  // Attached once for every tag: only touched_by_me pages carry the field,
+  // and the Recent feed's client sort reads it off the entity. Resolved
+  // through the own-touch floor so a touched refetch that outran the
+  // activity consumer can't move a freshly-touched row back down.
+  const touchedAt = resolveOwnTouch(entity.id, item.touched_at ?? null);
+  const touched = touchedAt ? { ...entity, touchedAt } : entity;
+  // Calendar sync can update old events long after their reminders fired.
+  // Without the server's notified_at sort, use the attached reminder's
+  // delivery time (or REST delivery stamp) rather than that metadata update.
+  // The explicit server stamp and newer websocket floor still take priority.
+  const notifiedAt = resolveNotifiedAt(
+    entity.id,
+    item.notified_at ??
+      (item.tag === 'calendarEvent' ? calendarReminderTimestamp(item) : null)
+  );
+  const notified = notifiedAt ? { ...touched, notifiedAt } : touched;
+
+  return withRawNotifications(
+    { ...notified, isFavorited: item.is_favorited },
+    item
+  );
+};
+
+const toCalendarEventTime = (
+  time: SoupCalendarEventTime
+): CalendarEventEntityTime =>
+  time.kind === 'timed'
+    ? { kind: 'timed', startsAt: time.startsAt, endsAt: time.endsAt }
+    : { kind: 'allDay', startDate: time.startDate, endDate: time.endDate };
+
+export const mapSoupPageToEntityList: (
+  data: SoupPage,
+  options: {
+    showSupportedForeignEntities?: boolean;
+  }
+) => SoupEntity[] = (data, options) => {
+  return data.items
+    .filter((item): item is DisplayableSoupItem => {
+      if (!isDisplayableSoupItem(item)) return false;
+
+      return (
+        item.tag !== 'foreignEntity' ||
+        (options.showSupportedForeignEntities === true &&
+          item.data.foreignEntitySource === 'github_pull_request')
+      );
+    })
+    .map(mapApiSoupItemToEntity);
+};

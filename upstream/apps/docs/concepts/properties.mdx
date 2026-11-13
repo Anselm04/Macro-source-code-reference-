@@ -1,0 +1,49 @@
+---
+title: "Properties"
+icon: "tags"
+description: "Attach structured fields to documents, tasks, emails, and CRM records with one shared system."
+---
+
+Macro uses properties to attach structured data to any *entity* (email, task, doc, CRM record, etc.). The properties system is unified across Blocks, so you can organize different content types using the same fields, or create different fields for different content types.
+
+<GuideGraphic kind="tasks" label="A task keeps status, assignee, and its source conversation together." />
+
+On tasks, the default properties of Status, Priority, and Assignees are visible in this card to the right of the task. To add additional properties click `Add property`.
+
+## Supported types
+
+**Add property** offers:
+
+- **Input**
+- **Input (Number)**
+- **Checkbox**
+- **Date**
+- **Time range**
+- **Link**
+- **Option**
+- **Option (Number)**
+- **User**, **Document**, **Channel**, **Project**, **Chat**, **Task**, or **Email**
+- **Any Entity**
+
+**Link**, **Option**, **Option (Number)**, and those entity types can be **Single** or **Multi**.
+
+## System vs. custom
+
+A property is either **system** (built in and non-removable, like a task's Status) or **custom** (something you add).
+
+## Pinned properties
+
+You can pin properties to show them in the card on the right, or in the unified list. If a property is more like hidden metadata that you don't need to see, leave it hidden. Otherwise, pin it. Each block type has its own defaults. For example, tasks pin **Status**, **Priority**, and **Assignees** out of the box.
+
+## Built-in fields by block
+
+Some blocks ship with their own system properties:
+
+- **Tasks**: Status, Priority, Assignees, Due Date, Parent Task / Subtasks, Depends On, Effort, Story Points, and Relevant Docs. See [Tasks](/product/tasks).
+- **Documents**: Owner, Folder, Created and Updated timestamps, plus assignable fields like a linked Task and urgency. See [Documents](/product/docs).
+- **CRM companies (Customers)**: Stage (Lead, Qualified, Demo, Trial, Negotiation, Customer, Churned), Owner (a person on your team), and Revenue, plus a Last Interaction timestamp that updates automatically from synced workspace emails.
+- **CRM contacts & companies**: Email, Name, Company, interaction timestamps, Domains, Email Sync, and more.
+
+## Agent access
+
+Agents read and write properties through the MCP entity tools: `GetEntityProperties` to read, `SetEntityProperty` to update (status, assignee, dates, custom fields), and `ListEntities` to browse. See [MCP setup](/AI/mcp/overview) to connect your agent.

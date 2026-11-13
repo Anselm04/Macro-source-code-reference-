@@ -1,0 +1,79 @@
+import { throwOnErr } from '@core/util/result';
+import { queryClient } from '@queries/client';
+import { authServiceClient } from '@service-auth/client';
+import type { UserName } from '@service-auth/generated/schemas/userName';
+import { queryOptions, useQuery } from '@tanstack/solid-query';
+import type { Accessor } from 'solid-js';
+import { assertQueryAccount, type QueryAccount } from './account-scope';
+import { authKeys } from './keys';
+import { useQueryAccount } from './use-query-account';
+
+const OWN_USER_NAME_STALE_TIME = 15_000;
+
+/**
+ * The current user's own editable first/last name — the fields Account
+ * settings reads and writes via getUserName/putUserName. Distinct from
+ * userInfo().name (the legacy identity-provider display name) and from
+ * useUserNames (viewer-scoped labels, batched by macro id).
+ */
+export function useOwnUserNameQuery() {
+  const account = useQueryAccount();
+  return useQuery(() => ownUserNameQueryOptions(account()));
+}
+
+export function ownUserNameQueryOptions(account: QueryAccount | undefined) {
+  return queryOptions({
+    queryKey: authKeys.userNameSelf(
+      account?.userId ?? '',
+      account?.session ?? -1
+    ).queryKey,
+    enabled: !!account,
+    queryFn: async ({ signal }) => {
+      signal.throwIfAborted();
+      assertQueryAccount(account);
+      const name = await throwOnErr(() => authServiceClient.getUserName());
+      signal.throwIfAborted();
+      assertQueryAccount(account);
+      return name;
+    },
+    staleTime: OWN_USER_NAME_STALE_TIME,
+    refetchOnWindowFocus: 'always',
+  });
+}
+
+/**
+ * The user's own name, or undefined until it loads. Prefer this over reading
+ * `useOwnUserNameQuery().data` directly: that read suspends the nearest
+ * boundary while the query is pending, and can re-suspend after an error
+ * (solid-query only takes its non-suspending `.latest` path once `data` is
+ * defined). Gating on `isSuccess` — not `isPending`, which is false in the
+ * error state — is what makes it safe to call during render.
+ *
+ * Use `useOwnUserNameQuery` directly only when you need status/error/refetch.
+ */
+export function useOwnUserName(): Accessor<UserName | undefined> {
+  const query = useOwnUserNameQuery();
+  return () => (query.isSuccess ? query.data : undefined);
+}
+
+/**
+ * Call after writing the name (putUserName). The write and every reader live
+ * in the same tab, so invalidating here is what flips dependent surfaces —
+ * e.g. the sidebar name beside a settings Viewer, which would otherwise have
+ * to poll.
+ */
+export function invalidateOwnUserName() {
+  return queryClient.invalidateQueries({
+    queryKey: authKeys.userNameSelf._def,
+  });
+}
+
+/**
+ * Whether a stored name part is a real value: non-empty and not the 'N/A'
+ * placeholder auth-service uses for unset names (the sidebar filters the
+ * same way).
+ */
+export function isRealNamePart(part: string | null | undefined): boolean {
+  const trimmed = part?.trim();
+  return Boolean(trimmed) && trimmed !== 'N/A';
+}

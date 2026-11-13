@@ -1,0 +1,257 @@
+import { useAnalytics } from '@app/lib/analytics/analytics-context';
+import { useFeatureFlag } from '@app/lib/analytics/posthog';
+import { t } from '@app/lib/i18n';
+import { TraceFlow } from '@app/observability/flow';
+import { useHasPaidAccess } from '@core/auth';
+import { toast } from '@core/component/Toast/Toast';
+import {
+  enableAiUsageBilling,
+  enableMacroComputers,
+  LOCAL_ONLY,
+} from '@core/constant/featureFlags';
+import { PERMISSION_IDS } from '@core/constant/permissions';
+import {
+  useLicenseStatus,
+  usePermissions,
+  useUserId,
+} from '@core/context/user';
+import { fireAndForget } from '@core/util/fireAndForget';
+import { lazyNamed } from '@core/util/lazyNamed';
+import {
+  useAiBillingSummaryQuery,
+  useChangePlanMutation,
+  useCreateBillingPortalMutation,
+  useCreateCheckoutSessionMutation,
+  useSubscriptionStatusQuery,
+  useTrialEligibilityQuery,
+} from '@queries/auth';
+import { queryReadyGate } from '@queries/gate';
+import { useCurrentTeamQuery } from '@queries/team/teams';
+import type { PaidPlan } from '@service-auth/ai-billing-types';
+import { createMemo, type JSX, Show, Suspense } from 'solid-js';
+import { BillingSettingsView } from './components/billing-settings-view';
+import { BillingComputers } from './computers/views/BillingComputers';
+import {
+  getBillingState,
+  getFreePlanCheckoutRequest,
+} from './core/billing-state';
+
+const ConnectedTeamBillingBreakdown = lazyNamed(
+  () => import('./views/team-billing-breakdown'),
+  'ConnectedTeamBillingBreakdown'
+);
+
+const BillingPreview =
+  import.meta.env.DEV && LOCAL_ONLY
+    ? lazyNamed(() => import('./views/billing-preview'), 'BillingPreview')
+    : undefined;
+
+export function Billing() {
+  if (BillingPreview) {
+    return (
+      <Suspense fallback={<p role="status">Loading billing…</p>}>
+        <BillingPreview
+          renderLive={(controls) => <LiveBilling controls={controls} />}
+        />
+      </Suspense>
+    );
+  }
+  return <LiveBilling />;
+}
+
+function LiveBilling(props: { controls?: JSX.Element }) {
+  const permissions = usePermissions();
+  const analytics = useAnalytics();
+  const hasPaid = useHasPaidAccess();
+  const licenseStatus = useLicenseStatus();
+  const userId = useUserId();
+  const team = useCurrentTeamQuery();
+  const summary = useAiBillingSummaryQuery();
+  const aiUsageBilling = useFeatureFlag(enableAiUsageBilling);
+  const macroComputers = useFeatureFlag(enableMacroComputers);
+  const changePlan = useChangePlanMutation();
+  const checkout = useCreateCheckoutSessionMutation();
+  const portal = useCreateBillingPortalMutation();
+  const effectiveHasPaid = () =>
+    hasPaid() || (summary.isSuccess && summary.data.tier !== 'free');
+  const trialEligibility = useTrialEligibilityQuery({
+    enabled: () => !effectiveHasPaid(),
+  });
+
+  const subscriptionStatus = useSubscriptionStatusQuery({
+    enabled: effectiveHasPaid,
+  });
+
+  const canManageSubscription = createMemo(() => {
+    return permissions()?.includes(PERMISSION_IDS.WRITE_STRIPE_SUBSCRIPTION);
+  });
+
+  const userTeam = createMemo(() => {
+    const currentTeam = queryReadyGate(team) ? team.data : undefined;
+    const uid = userId();
+    if (!currentTeam || !uid) return;
+
+    return currentTeam.team;
+  });
+
+  const teamRole = createMemo(() => {
+    const uid = userId();
+    const team = userTeam();
+
+    if (!team) return;
+
+    return team.owner_id === uid ? 'owner' : 'member';
+  });
+
+  const billingAttributes = () => {
+    const current = userTeam();
+    return current ? { 'team.id': current.id } : undefined;
+  };
+
+  const state = () =>
+    getBillingState({
+      hasPaid: effectiveHasPaid(),
+      canManageSubscription: canManageSubscription() === true,
+      teamReady: team.isSuccess,
+      teamRole: teamRole(),
+      teamPlans: team.isSuccess
+        ? team.data?.members.map((member) =>
+            (member as typeof member & { plan?: PaidPlan }).plan === 'max'
+              ? 'max'
+              : 'premium'
+          )
+        : undefined,
+      summary: summary.isSuccess
+        ? {
+            tier: summary.data.tier,
+            canManageBilling: summary.data.can_manage_billing,
+          }
+        : undefined,
+      aiUsageEnabled: aiUsageBilling().enabled,
+      pending: checkout.isPending || changePlan.isPending,
+      existingSubscription: queryReadyGate(trialEligibility)
+        ? trialEligibility.data.existingSubscription
+        : false,
+      trialEligible:
+        trialEligibility.isSuccess && queryReadyGate(trialEligibility)
+          ? trialEligibility.data.eligible
+          : undefined,
+      trialing: licenseStatus() === 'trialing',
+    });
+
+  const handleCheckout = async (plan: PaidPlan) => {
+    if (state().existingSubscription) return;
+    const eligible = state().trialEligible;
+    if (plan === 'premium' && eligible === undefined) return;
+    try {
+      const url = await checkout.mutateAsync(
+        getFreePlanCheckoutRequest(plan, eligible === true)
+      );
+      analytics.track('subscription_start', { type: plan });
+      window.location.href = url;
+    } catch (error) {
+      console.error(error);
+      toast.failure(
+        error instanceof Error
+          ? error.message.replace(/Premium/g, 'Pro')
+          : "Couldn't start checkout. Please try again."
+      );
+    }
+  };
+
+  const handleChangePlan = async (plan: PaidPlan) => {
+    try {
+      const previousTier = state().tier;
+      await changePlan.mutateAsync({ plan });
+      analytics.track('plan_changed', { plan });
+      toast.success(
+        plan === previousTier
+          ? `Keeping your ${plan === 'max' ? 'Max' : 'Pro'} plan. Your scheduled downgrade is canceled.`
+          : plan === 'max'
+            ? aiUsageBilling().enabled
+              ? 'Upgraded to Max. Your larger AI allowance applies right away.'
+              : 'Upgraded to Max.'
+            : 'Pro will start at your next renewal. You keep Max until then.'
+      );
+    } catch (error) {
+      console.error(error);
+      toast.failure("Couldn't change your plan. Please try again.");
+    }
+  };
+
+  const handleManage = async () => {
+    try {
+      const url = await portal.mutateAsync({
+        returnUrl: `${window.location.origin}/app`,
+      });
+      window.location.href = url;
+    } catch (error) {
+      console.error(error);
+      toast.failure("Couldn't open billing management. Please try again.");
+    }
+  };
+
+  return (
+    <BillingSettingsView
+      state={state()}
+      controls={props.controls}
+      renewalDate={
+        queryReadyGate(subscriptionStatus)
+          ? (subscriptionStatus.data.renewalDate ?? undefined)
+          : undefined
+      }
+      scheduledChange={
+        queryReadyGate(subscriptionStatus)
+          ? (subscriptionStatus.data.scheduledChange ?? undefined)
+          : undefined
+      }
+      computers={
+        // Flag off: nothing to wait for, so no loading line flashes by.
+        <Show when={macroComputers().enabled}>
+          <Suspense
+            fallback={<p role="status">{t('settingsBilling.loading')}</p>}
+          >
+            <Show
+              when={
+                queryReadyGate(subscriptionStatus)
+                  ? subscriptionStatus.data.billing
+                  : undefined
+              }
+              fallback={<BillingComputers />}
+            >
+              {(billing) => (
+                <TraceFlow
+                  name="team.billing.breakdown"
+                  attributes={billingAttributes()}
+                >
+                  <ConnectedTeamBillingBreakdown
+                    billing={billing()}
+                    teamId={userTeam()?.id}
+                  />
+                </TraceFlow>
+              )}
+            </Show>
+          </Suspense>
+        </Show>
+      }
+      subscriptionStatusFailed={subscriptionStatus.isError}
+      onRefreshStatus={() =>
+        fireAndForget(subscriptionStatus.refetch(), 'billing-settings')
+      }
+      trialEligibilityFailed={!effectiveHasPaid() && trialEligibility.isError}
+      onRefreshTrialEligibility={() =>
+        fireAndForget(trialEligibility.refetch(), 'billing-settings')
+      }
+      onKeepPlan={(plan) =>
+        fireAndForget(handleChangePlan(plan), 'billing-settings')
+      }
+      onManage={() => fireAndForget(handleManage(), 'billing-settings')}
+      onSelectPlan={(plan) =>
+        fireAndForget(
+          effectiveHasPaid() ? handleChangePlan(plan) : handleCheckout(plan),
+          'billing-settings'
+        )
+      }
+    />
+  );
+}

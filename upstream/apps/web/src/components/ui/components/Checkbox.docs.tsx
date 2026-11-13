@@ -1,0 +1,156 @@
+import { defineDoc } from '@app/features/ui-gallery/types';
+import { createSignal, For } from 'solid-js';
+import { Checkbox, InlineCheckbox, SingleSelectCheck } from './Checkbox';
+
+// #region demo:basic
+function BasicDemo() {
+  const [checked, setChecked] = createSignal(true);
+
+  return (
+    <div class="flex flex-col gap-3">
+      <Checkbox checked={checked()} onChange={setChecked}>
+        <Checkbox.Control />
+        <Checkbox.Label class="text-sm text-ink">
+          Notify me about replies
+        </Checkbox.Label>
+      </Checkbox>
+      <Checkbox defaultChecked={false}>
+        <Checkbox.Control />
+        <Checkbox.Label class="text-sm text-ink">Unchecked</Checkbox.Label>
+      </Checkbox>
+    </div>
+  );
+}
+// #endregion
+
+// #region demo:states
+function StatesDemo() {
+  return (
+    <div class="flex flex-col gap-3">
+      <Checkbox indeterminate>
+        <Checkbox.Control />
+        <Checkbox.Label class="text-sm text-ink">Indeterminate</Checkbox.Label>
+      </Checkbox>
+      <Checkbox disabled defaultChecked>
+        <Checkbox.Control />
+        <Checkbox.Label class="text-sm text-ink-disabled">
+          Disabled, checked
+        </Checkbox.Label>
+      </Checkbox>
+      <Checkbox disabled>
+        <Checkbox.Control />
+        <Checkbox.Label class="text-sm text-ink-disabled">
+          Disabled
+        </Checkbox.Label>
+      </Checkbox>
+      <Checkbox validationState="invalid">
+        <Checkbox.Control />
+        <Checkbox.Label>Accept the terms</Checkbox.Label>
+        <Checkbox.ErrorMessage class="text-xs text-failure">
+          Required to continue.
+        </Checkbox.ErrorMessage>
+      </Checkbox>
+    </div>
+  );
+}
+// #endregion
+
+// #region demo:sizes
+function SizesDemo() {
+  return (
+    <div class="flex flex-wrap items-center gap-6">
+      <For each={['sm', 'md', 'lg'] as const}>
+        {(size) => (
+          <Checkbox size={size} defaultChecked>
+            <Checkbox.Control />
+            <Checkbox.Label>{size}</Checkbox.Label>
+          </Checkbox>
+        )}
+      </For>
+    </div>
+  );
+}
+// #endregion
+
+// #region demo:list-affordances
+function ListAffordancesDemo() {
+  const [selected, setSelected] = createSignal('Inbox');
+  const rows = ['Inbox', 'Drafts', 'Sent'];
+
+  return (
+    <div class="flex w-full max-w-sm flex-col gap-4">
+      <div class="flex flex-col">
+        <span class="mb-1 font-mono text-xs text-ink-subtle">
+          SingleSelectCheck
+        </span>
+        <For each={rows}>
+          {(row) => (
+            <button
+              type="button"
+              class="flex items-center justify-between rounded-sm px-2 py-1.5 text-sm text-ink hover:bg-hover"
+              onClick={() => setSelected(row)}
+            >
+              {row}
+              <SingleSelectCheck active={selected() === row} />
+            </button>
+          )}
+        </For>
+      </div>
+
+      <div class="flex flex-col">
+        <span class="mb-1 font-mono text-xs text-ink-subtle">
+          InlineCheckbox
+        </span>
+        <For each={rows}>
+          {(row) => (
+            <div class="flex items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-ink">
+              <InlineCheckbox checked={row !== 'Sent'} />
+              {row}
+            </div>
+          )}
+        </For>
+      </div>
+    </div>
+  );
+}
+// #endregion
+
+export default defineDoc({
+  name: 'Checkbox',
+  category: 'Inputs',
+  description:
+    'A Kobalte checkbox with the app’s control styling. Composed from slots, so the label, description, and error message are yours to place.',
+  status: 'stable',
+  exports: ['Checkbox', 'InlineCheckbox', 'SingleSelectCheck'],
+  import: "import { Checkbox, InlineCheckbox, SingleSelectCheck } from '@ui';",
+  demos: [
+    {
+      id: 'basic',
+      title: 'Basic',
+      description:
+        'Pass `checked` and `onChange` for a controlled checkbox, or `defaultChecked` to let it manage itself. `Checkbox.Control` renders the hidden input as well as the box.',
+      render: BasicDemo,
+    },
+    {
+      id: 'states',
+      title: 'States',
+      description:
+        'Indeterminate, disabled, and invalid states share the same transparent empty face and accent-filled selection. Checkmarks animate in both directions and respect reduced motion.',
+      render: StatesDemo,
+    },
+    {
+      id: 'sizes',
+      title: 'Sizes',
+      description:
+        'Use sm for compact list affordances, md (the default) for ordinary fields, or lg for a larger box. The size prop scales the mark with its control.',
+      render: SizesDemo,
+    },
+    {
+      id: 'list-affordances',
+      title: 'List affordances',
+      description:
+        'Two visual-only helpers for rows that are themselves the hit target: `SingleSelectCheck` for pick-one menus, `InlineCheckbox` for multi-select lists. Pass `animate={false}` for rapid list selection; other uses animate by default. Neither handles input — the row does.',
+      render: ListAffordancesDemo,
+    },
+  ],
+});

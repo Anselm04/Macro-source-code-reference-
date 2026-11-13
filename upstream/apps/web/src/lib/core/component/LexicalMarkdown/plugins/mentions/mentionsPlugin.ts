@@ -1,0 +1,1175 @@
+import { verifyBlockName } from '@core/constant/allBlocks';
+import { untrackMention } from '@core/signal/mention';
+import { fireAndForget } from '@core/util/fireAndForget';
+import { $wrapNodeInElement, mergeRegister } from '@lexical/utils';
+import type { PeerIdValidator } from '@macro-inc/lexical-core';
+import {
+  $collapseInlineSearch,
+  $createAgentSessionMentionNode,
+  $createBookingLinkMentionNode,
+  $createContactMentionNode,
+  $createDateMentionNode,
+  $createDocumentMentionNode,
+  $createGroupMentionNode,
+  $createInlineSearchNode,
+  $createPullRequestMentionNode,
+  $createSnapshotNode,
+  $createThemeMentionNode,
+  $createUserMentionNode,
+  $handleInlineSearchNodeMutation,
+  $handleInlineSearchNodeTransform,
+  $isAgentSessionMentionNode,
+  $isContactMentionNode,
+  $isDateMentionNode,
+  $isDocumentMentionNode,
+  $isGroupMentionNode,
+  $isPullRequestMentionNode,
+  $isUserMentionNode,
+  $removeInlineSearch,
+  type AgentSessionMentionInfo,
+  AgentSessionMentionNode,
+  type BookingLinkMentionInfo,
+  BookingLinkMentionNode,
+  type ContactMentionInfo,
+  ContactMentionNode,
+  type DateMentionInfo,
+  DateMentionNode,
+  DocumentCardNode,
+  type DocumentMentionInfo,
+  DocumentMentionNode,
+  type GroupMentionInfo,
+  GroupMentionNode,
+  HISTORIC_TAG,
+  InlineSearchNode,
+  InlineSearchNodesType,
+  type PullRequestMentionInfo,
+  PullRequestMentionNode,
+  SKIP_DOM_SELECTION_TAG,
+  SKIP_SCROLL_INTO_VIEW_TAG,
+  type SnapshotNodeInfo,
+  type ThemeMentionInfo,
+  type UserMentionInfo,
+  UserMentionNode,
+  validTriggerPosition,
+} from '@macro-inc/lexical-core';
+import { $getId } from '@macro-inc/lexical-core/plugins/nodeIdPlugin';
+import type { MentionNode } from '@macro-inc/lexical-core/utils/mentions';
+import { blockNameToItemType, type ItemType } from '@service-storage/client';
+import {
+  $createParagraphNode,
+  $createTextNode,
+  $getRoot,
+  $getSelection,
+  $insertNodes,
+  $isNodeSelection,
+  $isRangeSelection,
+  $isRootOrShadowRoot,
+  COMMAND_PRIORITY_CRITICAL,
+  COMMAND_PRIORITY_HIGH,
+  COMMAND_PRIORITY_LOW,
+  COMMAND_PRIORITY_NORMAL,
+  createCommand,
+  KEY_BACKSPACE_COMMAND,
+  KEY_DELETE_COMMAND,
+  KEY_ENTER_COMMAND,
+  KEY_ESCAPE_COMMAND,
+  type LexicalCommand,
+  type LexicalEditor,
+  type LexicalNode,
+} from 'lexical';
+import type { Setter } from 'solid-js';
+import { match } from 'ts-pattern';
+import type { MenuOperations } from '../../shared/inlineMenu';
+import { registerInlineMenuTrigger } from '../../shared/registerInlineMenuTrigger';
+import { $collapseSelection, $traverseNodes, nodeByKey } from '../../utils';
+import { mapRegisterDelete } from '../shared';
+
+export const INSERT_DOCUMENT_MENTION_COMMAND: LexicalCommand<DocumentMentionInfo> =
+  createCommand('INSERT_DOCUMENT_MENTION_COMMAND');
+
+const INSERT_SNAPSHOT_NODE_COMMAND: LexicalCommand<SnapshotNodeInfo> =
+  createCommand('INSERT_SNAPSHOT_NODE_COMMAND');
+
+export const INSERT_CONTACT_MENTION_COMMAND: LexicalCommand<ContactMentionInfo> =
+  createCommand('INSERT_CONTACT_MENTION_COMMAND');
+
+export const INSERT_DATE_MENTION_COMMAND: LexicalCommand<DateMentionInfo> =
+  createCommand('INSERT_DATE_MENTION_COMMAND');
+
+const _OPEN_INLINE_SEARCH_COMMAND: LexicalCommand<void> = createCommand(
+  'OPEN_INLINE_SEARCH_COMMAND'
+);
+
+export const CLOSE_INLINE_SEARCH_COMMAND: LexicalCommand<void> = createCommand(
+  'CLOSE_INLINE_SEARCH_COMMAND'
+);
+
+/** Opens the mention typeahead at the caret, as typing `@` there does. */
+export const TYPE_AT_SYMBOL_COMMAND: LexicalCommand<void> = createCommand(
+  'TYPE_AT_SYMBOL_COMMAND'
+);
+
+export const REMOVE_INLINE_SEARCH_COMMAND: LexicalCommand<void> = createCommand(
+  'REMOVE_INLINE_SEARCH_COMMAND'
+);
+
+export const UPDATE_DOCUMENT_NAME_COMMAND: LexicalCommand<
+  Record<string, string>
+> = createCommand('UPDATE_DOCUMENT_NAME_COMMAND');
+
+export const UPDATE_USER_DISPLAY_NAME_COMMAND: LexicalCommand<
+  Record<string, string>
+> = createCommand('UPDATE_USER_DISPLAY_NAME_COMMAND');
+
+export const INSERT_USER_MENTION_COMMAND: LexicalCommand<UserMentionInfo> =
+  createCommand('INSERT_USER_MENTION_COMMAND');
+
+export const INSERT_GROUP_MENTION_COMMAND: LexicalCommand<GroupMentionInfo> =
+  createCommand('INSERT_GROUP_MENTION_COMMAND');
+
+export const INSERT_AGENT_SESSION_MENTION_COMMAND: LexicalCommand<AgentSessionMentionInfo> =
+  createCommand('INSERT_AGENT_SESSION_MENTION_COMMAND');
+
+export const INSERT_PR_MENTION_COMMAND: LexicalCommand<PullRequestMentionInfo> =
+  createCommand('INSERT_PR_MENTION_COMMAND');
+
+export const INSERT_THEME_MENTION_COMMAND: LexicalCommand<ThemeMentionInfo> =
+  createCommand('INSERT_THEME_MENTION_COMMAND');
+
+export const INSERT_BOOKING_LINK_MENTION_COMMAND: LexicalCommand<BookingLinkMentionInfo> =
+  createCommand('INSERT_BOOKING_LINK_MENTION_COMMAND');
+
+export type ItemMention = {
+  itemType:
+    | 'document'
+    | 'chat'
+    | 'user'
+    | 'channel'
+    | 'project'
+    | 'rss'
+    | 'contact'
+    | 'date'
+    | 'thread'
+    | 'unknown'
+    | 'color'
+    | 'call'
+    | 'calendar_event'
+    | 'database'
+    | 'form'
+    | 'agent_session'
+    | 'initiative'
+    | 'foreign'
+    | 'group'
+    | 'routine'
+    | 'crm_company'
+    | 'crm_contact'
+    | 'crm_pipeline'
+    | 'skill'
+    | 'external_chat';
+  itemId: string;
+  fileType?: string;
+  documentName?: string;
+  channelType?: string;
+  groupAlias?: string;
+};
+
+function $isMentionNode(
+  node: LexicalNode
+): node is
+  | UserMentionNode
+  | DocumentMentionNode
+  | ContactMentionNode
+  | DateMentionNode
+  | AgentSessionMentionNode
+  | PullRequestMentionNode
+  | GroupMentionNode {
+  return (
+    $isUserMentionNode(node) ||
+    $isDocumentMentionNode(node) ||
+    $isContactMentionNode(node) ||
+    $isDateMentionNode(node) ||
+    $isAgentSessionMentionNode(node) ||
+    $isPullRequestMentionNode(node) ||
+    $isGroupMentionNode(node)
+  );
+}
+
+/** A PR mention authored from a GitHub URL alone has no entity to track. */
+function $isUntrackedPullRequestMention(node: LexicalNode): boolean {
+  return $isPullRequestMentionNode(node) && !node.getId();
+}
+
+function $mentionItemFromNode(node: MentionNode): ItemMention {
+  if ($isDocumentMentionNode(node)) {
+    let fileType = '';
+    let itemType: ItemMention['itemType'] = 'document';
+    const documentName = node.getDocumentName();
+    const blockName = node.getBlockName();
+    if (blockName === 'pdf') fileType = 'pdf';
+    else if (blockName === 'write') fileType = 'docx';
+    else if (blockName === 'md') fileType = 'md';
+    // task/snippet aliases are markdown documents
+    else if (blockName === 'task') fileType = 'md';
+    else if (blockName === 'snippet') fileType = 'md';
+    // skills are their own attachment type: either a markdown skill
+    // document or a built-in system skill
+    else if (blockName === 'skill') {
+      fileType = 'md';
+      itemType = 'skill';
+    } else if (blockName === 'csv') fileType = 'csv';
+    else if (blockName === 'canvas') fileType = 'canvas';
+    else if (blockName === 'code') {
+      const blockParams = node.getBlockParams();
+      fileType = blockParams?.fileType || 'txt';
+    } else if (blockName === 'image') {
+      fileType = 'png'; // Default to png
+    } else if (blockName === 'channel') {
+      fileType = 'channel';
+      itemType = 'channel';
+    } else if (blockName === 'project') {
+      fileType = 'project';
+      itemType = 'project';
+    } else if (blockName === 'form') {
+      // A form reference: posting it grants the channel View on the form.
+      fileType = 'form';
+      itemType = 'form';
+    } else if (blockName === 'database') {
+      fileType = 'database';
+      itemType = 'database';
+    } else if (blockName === 'initiative') {
+      // A task project, never a document id.
+      fileType = 'initiative';
+      itemType = 'initiative';
+    } else if (blockName === 'chat') {
+      fileType = 'chat';
+      itemType = 'chat';
+    } else if (blockName === 'rss') {
+      fileType = 'rss';
+    } else if (blockName === 'email') {
+      fileType = 'email';
+      itemType = 'thread';
+    } else if (blockName === 'call') {
+      fileType = 'call';
+      itemType = 'call';
+    } else if (blockName === 'calendar') {
+      fileType = 'calendar_event';
+      itemType = 'calendar_event';
+    } else if (blockName === 'company') {
+      fileType = 'company';
+      itemType = 'crm_company';
+    } else if (blockName === 'contact') {
+      fileType = 'contact';
+      itemType = 'crm_contact';
+    } else if (blockName === 'pipeline') {
+      fileType = 'pipeline';
+      itemType = 'crm_pipeline';
+    } else if (blockName === 'external_chat') {
+      // Posting it shares the group with the channel's members.
+      fileType = 'external_chat';
+      itemType = 'external_chat';
+    } else if (blockName === 'unknown') {
+      fileType = 'unknown';
+    }
+    return {
+      itemType: itemType,
+      itemId: node.getDocumentId(),
+      fileType,
+      documentName,
+      channelType: node.getChannelType(),
+    };
+  } else if ($isUserMentionNode(node)) {
+    return {
+      itemType: 'user',
+      itemId: node.getUserId(),
+    };
+  } else if ($isContactMentionNode(node)) {
+    return {
+      itemType: 'contact',
+      itemId: node.getContactId(),
+    };
+  } else if ($isGroupMentionNode(node)) {
+    return {
+      itemType: 'group',
+      itemId: node.getGroupAlias(),
+      groupAlias: node.getGroupAlias(),
+    };
+  } else if ($isAgentSessionMentionNode(node)) {
+    return {
+      itemType: 'agent_session',
+      itemId: node.getId(),
+      documentName: node.getLabel(),
+    };
+  } else if ($isPullRequestMentionNode(node)) {
+    return {
+      itemType: 'foreign',
+      itemId: node.getId(),
+      fileType: 'github_pull_request',
+      documentName: node.getLabel(),
+    };
+  } else {
+    return {
+      itemType: 'date',
+      itemId: node.getDate(),
+    };
+  }
+}
+
+// Validator for the position of the @ trigger. Only the text before the caret
+// constrains it, so `@` stays literal mid-word but opens the menu in front of a
+// word — the word itself is left out of the search.
+const beforeRegex = /[(['\"\`\s]$/;
+
+/**
+ * When mentions nodes are selected by using the arrow keys, we want to be able to delete them.
+ * @return true if any nodes to delete were found.
+ */
+function $deleteSelectedMentions(sourceDocumentId?: string) {
+  let foundNodesToBeDeleted = false;
+
+  const sel = $getSelection();
+  if (!$isNodeSelection(sel)) return false;
+  const nodes = sel.getNodes();
+  for (const node of nodes) {
+    if ($isMentionNode(node) && node.isKeyboardSelectable()) {
+      if (!$isGroupMentionNode(node)) {
+        const mentionUuid = node.getMentionUuid();
+        if (mentionUuid && sourceDocumentId) {
+          fireAndForget(
+            untrackMention(
+              sourceDocumentId,
+              mentionUuid,
+              $mentionItemFromNode(node).itemType
+            ),
+            'mention-tracking'
+          );
+        }
+      }
+      node.remove();
+      foundNodesToBeDeleted = true;
+    }
+  }
+  return foundNodesToBeDeleted;
+}
+
+const getDocumentMentionItemType = (
+  node: DocumentMentionNode
+): ItemMention['itemType'] => blockItemType(node.__blockName);
+
+/** The item a document mention or card of `blockName` references. */
+const blockItemType = (blockName: string): ItemMention['itemType'] => {
+  const itemType = blockNameToItemType(verifyBlockName(blockName));
+  return match<ItemType, ItemMention['itemType']>(itemType)
+    .with('email', () => 'thread')
+    .with('document', () => 'document')
+    .with('agent_session', () => 'agent_session')
+    .with('database', () => 'database')
+    .with('form', () => 'form')
+    .with('chat', () => 'chat')
+    .with('channel', () => 'channel')
+    .with('project', () => 'project')
+    .with('initiative', () => 'initiative')
+    .with('channel_message', () => 'channel')
+    .with('channel_thread', () => 'channel')
+    .with('routine', () => 'routine')
+    .with('call', () => 'call')
+    .with('calendar_event', () => 'calendar_event')
+    .with('foreign', () => {
+      throw new Error('foreign entities cannot be document mentions');
+    })
+    .with('harness', () => {
+      throw new Error('runtimes cannot be document mentions');
+    })
+    .with('crm_company', () => 'crm_company')
+    .with('crm_contact', () => 'crm_contact')
+    .with('crm_pipeline', () => 'crm_pipeline')
+    .exhaustive();
+};
+
+type MentionsPluginProps = {
+  menu?: MenuOperations;
+  onCreateMention?: (mention: ItemMention) => void;
+  onRemoveMention?: (mention: ItemMention) => void;
+  setMentions?: Setter<ItemMention[]>;
+  peerIdValidator?: PeerIdValidator;
+  sourceDocumentId?: string;
+  disableMentionTracking?: boolean;
+};
+
+/**
+ * The documentMentionPlugin registers the listeners for the mentions.
+ * @param editor the Lexical editor to register the plugin with.
+ * @param setDecorators The store setter for decorators.
+ * @param openMenu The function to trigger when the @-menu is opened.
+ */
+function registerMentionsPlugin(
+  editor: LexicalEditor,
+  props: MentionsPluginProps
+) {
+  if (
+    !editor.hasNodes([
+      DocumentMentionNode,
+      UserMentionNode,
+      GroupMentionNode,
+      ContactMentionNode,
+      DateMentionNode,
+      PullRequestMentionNode,
+      AgentSessionMentionNode,
+      InlineSearchNode,
+    ])
+  ) {
+    throw new Error('MentionsPlugin: Editor config is missing required nodes.');
+  }
+
+  const { menu, onCreateMention, onRemoveMention, sourceDocumentId } = props;
+
+  /**
+   * There is a Lexical bug(?) where keyboard deleting a node selection does not prevent the delete
+   * from bubbling to the regular delete commands. This flag gets set to true when we
+   * delete a mention viq a node selection.
+   */
+  let consumeDelete = false;
+
+  function updateMentionsSignal() {
+    if (props.setMentions === undefined) return;
+    const mentions: ItemMention[] = [];
+    editor.read(() => {
+      $traverseNodes($getRoot(), (node) => {
+        if ($isMentionNode(node) && !$isUntrackedPullRequestMention(node)) {
+          mentions.push($mentionItemFromNode(node));
+        } else if (
+          node instanceof DocumentCardNode &&
+          node.getBlockName() === 'database'
+        ) {
+          mentions.push({
+            itemType: 'database',
+            itemId: node.getDocumentId(),
+            documentName: node.getDocumentName(),
+          });
+        }
+      });
+    });
+    props.setMentions(mentions);
+  }
+
+  // Expansion/collapse replaces the node but preserves its tracked reference UUID.
+  // Untrack only when neither representation remains in the committed editor state.
+  function databaseReferenceRemains(mentionUuid: string) {
+    return editor.read(() => {
+      let remains = false;
+      $traverseNodes($getRoot(), (node) => {
+        if (
+          (node instanceof DocumentCardNode || $isDocumentMentionNode(node)) &&
+          node.getBlockName() === 'database' &&
+          node.getMentionUuid() === mentionUuid
+        )
+          remains = true;
+      });
+      return remains;
+    });
+  }
+
+  return mergeRegister(
+    // A form or database card references its entity exactly as its mention did;
+    // converting one to the other removes one reference and creates the other.
+    editor.registerMutationListener(
+      DocumentCardNode,
+      (mutatedNodes, { prevEditorState }) => {
+        for (const [nodeKey, mutation] of mutatedNodes) {
+          if (mutation === 'updated') continue;
+          const node = nodeByKey(
+            mutation === 'destroyed'
+              ? prevEditorState
+              : editor.getEditorState(),
+            nodeKey
+          );
+          // Form and database cards are references; other cards'
+          // sharing stays as it was.
+          if (!(node instanceof DocumentCardNode)) continue;
+          if (
+            node.getBlockName() !== 'form' &&
+            node.getBlockName() !== 'database'
+          )
+            continue;
+          const card = {
+            itemType: blockItemType(node.getBlockName()),
+            itemId: node.getDocumentId(),
+            documentName: node.getDocumentName(),
+          };
+          if (mutation === 'created') onCreateMention?.(card);
+          else {
+            const uuid = node.getMentionUuid();
+            if (
+              node.getBlockName() === 'database' &&
+              uuid &&
+              sourceDocumentId &&
+              !databaseReferenceRemains(uuid)
+            )
+              fireAndForget(
+                untrackMention(sourceDocumentId, uuid, 'database'),
+                'mention-tracking'
+              );
+            onRemoveMention?.({ itemType: card.itemType, itemId: card.itemId });
+          }
+        }
+        updateMentionsSignal();
+      }
+    ),
+    editor.registerCommand(
+      INSERT_DOCUMENT_MENTION_COMMAND,
+      (payload) => {
+        editor.update(() => {
+          const selection = $getSelection();
+          const mentionNode =
+            payload.blockName === 'agent'
+              ? $createAgentSessionMentionNode({
+                  id: payload.documentId,
+                  label: payload.documentName,
+                })
+              : $createDocumentMentionNode({
+                  ...payload,
+                  createdAt: payload.createdAt ?? Date.now(),
+                });
+
+          if (payload.mentionUuid) {
+            mentionNode.setMentionUuid(payload.mentionUuid);
+          }
+
+          // Do not paste mentions over range-selected text -- append after.
+          if ($isRangeSelection(selection) && !selection.isCollapsed()) {
+            $collapseSelection(selection);
+            $insertNodes([$createTextNode(' '), mentionNode]);
+          } else {
+            $insertNodes([mentionNode]);
+          }
+          if ($isRootOrShadowRoot(mentionNode.getParentOrThrow())) {
+            $wrapNodeInElement(mentionNode, $createParagraphNode);
+          }
+          mentionNode.selectEnd();
+        });
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      INSERT_SNAPSHOT_NODE_COMMAND,
+      (payload) => {
+        editor.update(() => {
+          const selection = $getSelection();
+          const snapshotNode = $createSnapshotNode(payload);
+
+          // Do not paste snapshot nodes over range-selected text -- append after.
+          if ($isRangeSelection(selection) && !selection.isCollapsed()) {
+            $collapseSelection(selection);
+            $insertNodes([$createTextNode(' '), snapshotNode]);
+            snapshotNode.selectEnd();
+            return true;
+          }
+          $insertNodes([snapshotNode]);
+          if ($isRootOrShadowRoot(snapshotNode.getParentOrThrow())) {
+            $wrapNodeInElement(snapshotNode, $createParagraphNode);
+          }
+          snapshotNode.selectEnd();
+        });
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      INSERT_USER_MENTION_COMMAND,
+      (payload) => {
+        editor.update(() => {
+          const mentionNode = $createUserMentionNode(payload);
+
+          if (payload.mentionUuid) {
+            mentionNode.setMentionUuid(payload.mentionUuid);
+          }
+
+          $insertNodes([mentionNode]);
+          if ($isRootOrShadowRoot(mentionNode.getParentOrThrow())) {
+            $wrapNodeInElement(mentionNode, $createParagraphNode);
+          }
+          mentionNode.selectEnd();
+        });
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      INSERT_CONTACT_MENTION_COMMAND,
+      (payload) => {
+        editor.update(() => {
+          const mentionNode = $createContactMentionNode(payload);
+
+          if (payload.mentionUuid) {
+            mentionNode.setMentionUuid(payload.mentionUuid);
+          }
+
+          $insertNodes([mentionNode]);
+          if ($isRootOrShadowRoot(mentionNode.getParentOrThrow())) {
+            $wrapNodeInElement(mentionNode, $createParagraphNode);
+          }
+          mentionNode.selectEnd();
+        });
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      INSERT_DATE_MENTION_COMMAND,
+      (payload) => {
+        editor.update(() => {
+          const mentionNode = $createDateMentionNode(payload);
+
+          if (payload.mentionUuid) {
+            mentionNode.setMentionUuid(payload.mentionUuid);
+          }
+
+          $insertNodes([mentionNode]);
+          if ($isRootOrShadowRoot(mentionNode.getParentOrThrow())) {
+            $wrapNodeInElement(mentionNode, $createParagraphNode);
+          }
+          mentionNode.selectEnd();
+        });
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      INSERT_GROUP_MENTION_COMMAND,
+      (payload) => {
+        editor.update(() => {
+          const mentionNode = $createGroupMentionNode(payload);
+
+          $insertNodes([mentionNode]);
+          if ($isRootOrShadowRoot(mentionNode.getParentOrThrow())) {
+            $wrapNodeInElement(mentionNode, $createParagraphNode);
+          }
+          mentionNode.selectEnd();
+        });
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      INSERT_AGENT_SESSION_MENTION_COMMAND,
+      (payload) => {
+        const node = $createAgentSessionMentionNode(payload);
+        $insertNodes([node]);
+        if ($isRootOrShadowRoot(node.getParentOrThrow()))
+          $wrapNodeInElement(node, $createParagraphNode);
+        node.selectEnd();
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerMutationListener(
+      AgentSessionMentionNode,
+      (mutations, { prevEditorState }) => {
+        for (const [key, mutation] of mutations) {
+          const node = nodeByKey(
+            mutation === 'destroyed'
+              ? prevEditorState
+              : editor.getEditorState(),
+            key
+          );
+          if (!$isAgentSessionMentionNode(node)) continue;
+          if (mutation === 'created')
+            onCreateMention?.($mentionItemFromNode(node));
+          if (mutation === 'destroyed') {
+            const mentionUuid = node.getMentionUuid();
+            if (mentionUuid && sourceDocumentId) {
+              fireAndForget(
+                untrackMention(sourceDocumentId, mentionUuid, 'agent_session'),
+                'mention-tracking'
+              );
+            }
+            onRemoveMention?.($mentionItemFromNode(node));
+          }
+        }
+        updateMentionsSignal();
+      }
+    ),
+
+    editor.registerCommand(
+      INSERT_PR_MENTION_COMMAND,
+      (payload) => {
+        editor.update(() => {
+          const mentionNode = $createPullRequestMentionNode(payload);
+
+          if (payload.mentionUuid) {
+            mentionNode.setMentionUuid(payload.mentionUuid);
+          }
+
+          $insertNodes([mentionNode]);
+          if ($isRootOrShadowRoot(mentionNode.getParentOrThrow())) {
+            $wrapNodeInElement(mentionNode, $createParagraphNode);
+          }
+          mentionNode.selectEnd();
+        });
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      INSERT_THEME_MENTION_COMMAND,
+      (payload) => {
+        editor.update(() => {
+          const selection = $getSelection();
+          const mentionNode = $createThemeMentionNode(
+            payload.name,
+            payload.data
+          );
+
+          if ($isRangeSelection(selection) && !selection.isCollapsed()) {
+            $collapseSelection(selection);
+            $insertNodes([$createTextNode(' '), mentionNode]);
+            mentionNode.selectEnd();
+            return true;
+          }
+          $insertNodes([mentionNode]);
+          if ($isRootOrShadowRoot(mentionNode.getParentOrThrow())) {
+            $wrapNodeInElement(mentionNode, $createParagraphNode);
+          }
+          mentionNode.selectEnd();
+        });
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      INSERT_BOOKING_LINK_MENTION_COMMAND,
+      (payload) => {
+        if (!editor.hasNode(BookingLinkMentionNode)) return false;
+        editor.update(() => {
+          const mentionNode = $createBookingLinkMentionNode(payload);
+          $insertNodes([mentionNode]);
+          if ($isRootOrShadowRoot(mentionNode.getParentOrThrow())) {
+            $wrapNodeInElement(mentionNode, $createParagraphNode);
+          }
+          mentionNode.selectEnd();
+        });
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    registerInlineMenuTrigger(editor, '@', () => {
+      editor.dispatchCommand(TYPE_AT_SYMBOL_COMMAND, undefined);
+    }),
+
+    editor.registerCommand(
+      TYPE_AT_SYMBOL_COMMAND,
+      () => {
+        const shouldTrigger = validTriggerPosition(editor, beforeRegex, null);
+        if (shouldTrigger) {
+          editor.update(() => {
+            $insertNodes([$createInlineSearchNode('@')]);
+          });
+          return true;
+        }
+        return false;
+      },
+      COMMAND_PRIORITY_LOW
+    ),
+
+    editor.registerNodeTransform(InlineSearchNode, (node: InlineSearchNode) =>
+      $handleInlineSearchNodeTransform(node, InlineSearchNodesType.Mentions)
+    ),
+
+    editor.registerCommand(
+      CLOSE_INLINE_SEARCH_COMMAND,
+      () => $collapseInlineSearch(props.peerIdValidator),
+      COMMAND_PRIORITY_LOW
+    ),
+    editor.registerCommand(
+      KEY_ESCAPE_COMMAND,
+      () => $collapseInlineSearch(props.peerIdValidator),
+      COMMAND_PRIORITY_HIGH
+    ),
+
+    editor.registerCommand(
+      REMOVE_INLINE_SEARCH_COMMAND,
+      () => $removeInlineSearch(props.peerIdValidator),
+      COMMAND_PRIORITY_HIGH
+    ),
+
+    // Menu ENTERS should not propagate to the editor.
+    editor.registerCommand(
+      KEY_ENTER_COMMAND,
+      () => menu?.isOpen() ?? false,
+      COMMAND_PRIORITY_CRITICAL
+    ),
+
+    editor.registerCommand(
+      KEY_BACKSPACE_COMMAND,
+      () => {
+        consumeDelete = $deleteSelectedMentions(sourceDocumentId);
+        return consumeDelete;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      KEY_DELETE_COMMAND,
+      () => {
+        consumeDelete = $deleteSelectedMentions(sourceDocumentId);
+        return consumeDelete;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    mapRegisterDelete(
+      editor,
+      () => {
+        if (consumeDelete) {
+          consumeDelete = false;
+          return true;
+        }
+        return false;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      UPDATE_DOCUMENT_NAME_COMMAND,
+      (payload) => {
+        editor.update(
+          () => {
+            const nodesToUpdate: Array<DocumentMentionNode | DocumentCardNode> =
+              [];
+            $traverseNodes($getRoot(), (node) => {
+              if (
+                (node instanceof DocumentMentionNode ||
+                  node instanceof DocumentCardNode) &&
+                payload[node.getDocumentId()] &&
+                node.getDocumentName() !== payload[node.getDocumentId()]
+              ) {
+                nodesToUpdate.push(node);
+              }
+            });
+
+            nodesToUpdate.forEach((node) => {
+              const newName = payload[node.getDocumentId()];
+              node.setDocumentName(newName);
+            });
+          },
+          {
+            // Because these changes come the the "air" (ie the network) we want to make sure
+            // they don't get recorded into the undo stack. This was breaking the predictability
+            // of undo with document mentions. This hacks around that by using the an undocumented
+            // "historic" tag from the LexicalHistoryPlugin.
+            tag: [
+              HISTORIC_TAG,
+              SKIP_DOM_SELECTION_TAG,
+              SKIP_SCROLL_INTO_VIEW_TAG,
+            ],
+            discrete: true,
+          }
+        );
+
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerCommand(
+      UPDATE_USER_DISPLAY_NAME_COMMAND,
+      (payload) => {
+        editor.update(
+          () => {
+            const nodesToUpdate: UserMentionNode[] = [];
+            $traverseNodes($getRoot(), (node) => {
+              const newName =
+                node instanceof UserMentionNode
+                  ? payload[node.getUserId()]
+                  : undefined;
+              if (
+                node instanceof UserMentionNode &&
+                newName &&
+                node.getDisplayName() !== newName
+              ) {
+                nodesToUpdate.push(node);
+              }
+            });
+
+            nodesToUpdate.forEach((node) => {
+              const newName = payload[node.getUserId()];
+              if (newName) node.setDisplayName(newName);
+            });
+          },
+          {
+            tag: [
+              HISTORIC_TAG,
+              SKIP_DOM_SELECTION_TAG,
+              SKIP_SCROLL_INTO_VIEW_TAG,
+            ],
+            discrete: true,
+          }
+        );
+
+        return true;
+      },
+      COMMAND_PRIORITY_NORMAL
+    ),
+
+    editor.registerMutationListener(
+      InlineSearchNode,
+      (mutatedNodes, { prevEditorState }) =>
+        $handleInlineSearchNodeMutation(
+          editor,
+          prevEditorState,
+          mutatedNodes,
+          InlineSearchNodesType.Mentions,
+          {
+            onDestroy: () => menu?.closeMenu(),
+            onCreate: () => menu?.openMenu(),
+            onUpdate: (search) => menu?.setSearchTerm(search),
+          },
+          props.peerIdValidator
+        )
+    ),
+
+    editor.registerMutationListener(
+      DocumentMentionNode,
+      (mutatedNodes, { prevEditorState }) => {
+        for (const [nodeKey, mutation] of mutatedNodes) {
+          const node = nodeByKey(
+            mutation === 'destroyed'
+              ? prevEditorState
+              : editor.getEditorState(),
+            nodeKey
+          ) as DocumentMentionNode | null;
+
+          if (!node) {
+            continue;
+          }
+
+          const itemType = getDocumentMentionItemType(node);
+          if (mutation === 'destroyed') {
+            const nodeId = prevEditorState.read(() => $getId(node));
+            if (nodeId) {
+              // unsetDocumenentionPreviewCache(nodeId);
+            }
+            const mentionUuid = node.getMentionUuid();
+            if (
+              mentionUuid &&
+              sourceDocumentId &&
+              (node.getBlockName() !== 'database' ||
+                !databaseReferenceRemains(mentionUuid))
+            ) {
+              fireAndForget(
+                untrackMention(sourceDocumentId, mentionUuid, itemType),
+                'mention-tracking'
+              );
+            }
+            if (onRemoveMention) {
+              onRemoveMention({
+                itemType,
+                itemId: node.getDocumentId(),
+              });
+            }
+          } else if (mutation === 'created') {
+            if (onCreateMention) {
+              onCreateMention($mentionItemFromNode(node));
+            }
+          }
+        }
+        updateMentionsSignal();
+      }
+    ),
+
+    editor.registerMutationListener(
+      UserMentionNode,
+      (mutatedNodes, { prevEditorState }) => {
+        for (const [nodeKey, mutation] of mutatedNodes) {
+          if (mutation === 'created') {
+            const node = nodeByKey(
+              editor.getEditorState(),
+              nodeKey
+            ) as UserMentionNode;
+            if (node && onCreateMention) {
+              onCreateMention({
+                itemType: 'user',
+                itemId: node.getUserId(),
+              });
+            }
+          } else if (mutation === 'destroyed') {
+            const node = nodeByKey(prevEditorState, nodeKey) as UserMentionNode;
+            if (node) {
+              const mentionUuid = node.getMentionUuid();
+              if (mentionUuid && sourceDocumentId) {
+                fireAndForget(
+                  untrackMention(sourceDocumentId, mentionUuid, 'user'),
+                  'mention-tracking'
+                );
+              }
+              if (onRemoveMention) {
+                onRemoveMention({
+                  itemType: 'user',
+                  itemId: node.getUserId(),
+                });
+              }
+            }
+          }
+        }
+        updateMentionsSignal();
+      }
+    ),
+
+    editor.registerMutationListener(
+      ContactMentionNode,
+      (mutatedNodes, { prevEditorState }) => {
+        for (const [nodeKey, mutation] of mutatedNodes) {
+          if (mutation === 'created') {
+            const node = nodeByKey(
+              editor.getEditorState(),
+              nodeKey
+            ) as ContactMentionNode;
+            if (node && onCreateMention) {
+              onCreateMention({
+                itemType: 'contact',
+                itemId: node.getContactId(),
+              });
+            }
+          } else if (mutation === 'destroyed') {
+            const node = nodeByKey(
+              prevEditorState,
+              nodeKey
+            ) as ContactMentionNode;
+            if (node) {
+              const mentionUuid = node.getMentionUuid();
+              if (mentionUuid && sourceDocumentId) {
+                fireAndForget(
+                  untrackMention(sourceDocumentId, mentionUuid, 'contact'),
+                  'mention-tracking'
+                );
+              }
+              if (onRemoveMention) {
+                onRemoveMention({
+                  itemType: 'contact',
+                  itemId: node.getContactId(),
+                });
+              }
+            }
+          }
+        }
+        updateMentionsSignal();
+      }
+    ),
+
+    editor.registerMutationListener(
+      DateMentionNode,
+      (mutatedNodes, { prevEditorState }) => {
+        for (const [nodeKey, mutation] of mutatedNodes) {
+          if (mutation === 'created') {
+            const node = nodeByKey(
+              editor.getEditorState(),
+              nodeKey
+            ) as DateMentionNode;
+            if (node && onCreateMention) {
+              onCreateMention({
+                itemType: 'date',
+                itemId: node.getDate(),
+              });
+            }
+          } else if (mutation === 'destroyed') {
+            const node = nodeByKey(prevEditorState, nodeKey) as DateMentionNode;
+            if (node) {
+              const mentionUuid = node.getMentionUuid();
+              if (mentionUuid && sourceDocumentId) {
+                fireAndForget(
+                  untrackMention(sourceDocumentId, mentionUuid, 'date'),
+                  'mention-tracking'
+                );
+              }
+              if (onRemoveMention) {
+                onRemoveMention({
+                  itemType: 'date',
+                  itemId: node.getDate(),
+                });
+              }
+            }
+          }
+        }
+        updateMentionsSignal();
+      }
+    ),
+
+    editor.registerMutationListener(
+      GroupMentionNode,
+      (mutatedNodes, { prevEditorState }) => {
+        for (const [nodeKey, mutation] of mutatedNodes) {
+          if (mutation === 'created') {
+            const node = nodeByKey(
+              editor.getEditorState(),
+              nodeKey
+            ) as GroupMentionNode;
+            if (node && onCreateMention) {
+              onCreateMention({
+                itemType: 'group',
+                itemId: node.getGroupAlias(),
+                groupAlias: node.getGroupAlias(),
+              });
+            }
+          } else if (mutation === 'destroyed') {
+            const node = nodeByKey(
+              prevEditorState,
+              nodeKey
+            ) as GroupMentionNode;
+            if (node && onRemoveMention) {
+              onRemoveMention({
+                itemType: 'group',
+                itemId: node.getGroupAlias(),
+                groupAlias: node.getGroupAlias(),
+              });
+            }
+          }
+        }
+        updateMentionsSignal();
+      }
+    ),
+
+    editor.registerMutationListener(
+      PullRequestMentionNode,
+      (mutatedNodes, { prevEditorState }) => {
+        for (const [nodeKey, mutation] of mutatedNodes) {
+          const node = nodeByKey(
+            mutation === 'destroyed'
+              ? prevEditorState
+              : editor.getEditorState(),
+            nodeKey
+          ) as PullRequestMentionNode | null;
+
+          if (!node || $isUntrackedPullRequestMention(node)) continue;
+
+          if (mutation === 'destroyed') {
+            const mentionUuid = node.getMentionUuid();
+            if (mentionUuid && sourceDocumentId) {
+              fireAndForget(
+                untrackMention(sourceDocumentId, mentionUuid, 'foreign'),
+                'mention-tracking'
+              );
+            }
+            onRemoveMention?.($mentionItemFromNode(node));
+          } else if (mutation === 'created') {
+            onCreateMention?.($mentionItemFromNode(node));
+          }
+        }
+        updateMentionsSignal();
+      }
+    )
+  );
+}
+
+export function mentionsPlugin(props: MentionsPluginProps) {
+  return (editor: LexicalEditor) => registerMentionsPlugin(editor, props);
+}

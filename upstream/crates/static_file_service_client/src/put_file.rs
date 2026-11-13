@@ -1,0 +1,235 @@
+use super::StaticFileServiceClient;
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use reqwest::header::CONTENT_TYPE;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+// HACK: duplicate logic. put into model crate later
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PutFileRequest {
+    /// file name
+    pub file_name: String,
+    /// optional mime type if type cannot be infered from file_name
+    pub content_type: Option<String>,
+    /// extra metadata to store with file
+    /// don't put anything private in here it is public
+    pub extension_data: Option<Value>,
+    /// Exact upload size in bytes, signed into the upload URL when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_length: Option<u64>,
+}
+
+// HACK: duplicate logic. put into model crate later
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PutFileResponse {
+    /// expiring url to upload file blob to
+    pub upload_url: String,
+    /// permalink
+    pub file_location: String,
+    /// key to retrieve metadata
+    pub id: String,
+}
+
+impl StaticFileServiceClient {
+    pub async fn put_file(&self, file_url: &str) -> Result<PutFileResponse> {
+        let response = self.client.get(file_url).send().await?;
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .map(String::from)
+            .context("content-type header not found")?;
+
+        let file_bytes = response.bytes().await?;
+
+        self.put_file_with_bytes(file_url, file_bytes, content_type)
+            .await
+    }
+
+    pub async fn put_file_with_bytes(
+        &self,
+        file_url: &str,
+        file_bytes: Bytes,
+        content_type: String,
+    ) -> Result<PutFileResponse> {
+        self.upload(
+            None,
+            PutFileRequest {
+                file_name: file_url.to_string(),
+                content_type: Some(content_type.clone()),
+                extension_data: None,
+                content_length: None,
+            },
+            file_bytes,
+            &content_type,
+        )
+        .await
+    }
+
+    /// Store `bytes` under a name of the caller's choosing.
+    ///
+    /// [`Self::put_file_with_bytes`] passes the source URL as the file name,
+    /// which is right for a file mirrored from somewhere else and wrong for
+    /// bytes that were never at a URL — an artifact downloaded from a
+    /// presigned link, whose name is `screenshot.png` and whose link must not
+    /// end up in the stored metadata.
+    pub async fn put_named_bytes(
+        &self,
+        file_name: &str,
+        bytes: Bytes,
+        content_type: &str,
+    ) -> Result<PutFileResponse> {
+        self.upload(
+            None,
+            PutFileRequest {
+                file_name: file_name.to_string(),
+                content_type: Some(content_type.to_string()),
+                extension_data: None,
+                content_length: None,
+            },
+            bytes,
+            content_type,
+        )
+        .await
+    }
+
+    /// [`Self::put_named_bytes`] for a file owned by `owner_id`.
+    pub async fn put_named_bytes_for_user(
+        &self,
+        owner_id: &str,
+        file_name: &str,
+        bytes: Bytes,
+        content_type: &str,
+    ) -> Result<PutFileResponse> {
+        self.upload(
+            Some(owner_id),
+            PutFileRequest {
+                file_name: file_name.to_string(),
+                content_type: Some(content_type.to_string()),
+                extension_data: None,
+                content_length: None,
+            },
+            bytes,
+            content_type,
+        )
+        .await
+    }
+
+    /// Reserve a file owned by `owner_id` without uploading it. The caller
+    /// PUTs the bytes to the returned `upload_url`, declaring `content_type`,
+    /// before the URL expires.
+    #[tracing::instrument(skip(self), err)]
+    pub async fn reserve_for_user(
+        &self,
+        owner_id: &str,
+        file_name: &str,
+        content_type: &str,
+    ) -> Result<PutFileResponse> {
+        self.reserve(owner_id, file_name, content_type, None).await
+    }
+
+    /// Like [`Self::reserve_for_user`], but storage rejects an upload of any
+    /// size other than `content_length`.
+    #[tracing::instrument(skip(self), err)]
+    pub async fn reserve_sized_for_user(
+        &self,
+        owner_id: &str,
+        file_name: &str,
+        content_type: &str,
+        content_length: u64,
+    ) -> Result<PutFileResponse> {
+        self.reserve(owner_id, file_name, content_type, Some(content_length))
+            .await
+    }
+
+    async fn reserve(
+        &self,
+        owner_id: &str,
+        file_name: &str,
+        content_type: &str,
+        content_length: Option<u64>,
+    ) -> Result<PutFileResponse> {
+        let full_url = format!("{}/internal/file", self.url);
+        let res = self
+            .client
+            .put(&full_url)
+            .header(crate::INTERNAL_MACRO_USER_ID_HEADER, owner_id)
+            .json(&PutFileRequest {
+                file_name: file_name.to_string(),
+                content_type: Some(content_type.to_string()),
+                extension_data: None,
+                content_length,
+            })
+            .send()
+            .await?;
+
+        let status_code = res.status();
+        if status_code != reqwest::StatusCode::OK {
+            let body: String = res.text().await?;
+            tracing::error!(
+                body=%body,
+                status=%status_code,
+                "unexpected response from static file service"
+            );
+            anyhow::bail!("HTTP {}: {}", status_code, body);
+        }
+
+        Ok(res.json().await?)
+    }
+
+    /// Reserve a file (owned by `owner_id`, when given) and PUT its bytes to
+    /// the upload URL that comes back.
+    async fn upload(
+        &self,
+        owner_id: Option<&str>,
+        body: PutFileRequest,
+        bytes: Bytes,
+        content_type: &str,
+    ) -> Result<PutFileResponse> {
+        let full_url = format!("{}/internal/file", self.url);
+        let mut request = self.client.put(&full_url).json(&body);
+        if let Some(owner_id) = owner_id {
+            request = request.header(crate::INTERNAL_MACRO_USER_ID_HEADER, owner_id);
+        }
+        let res = request.send().await?;
+
+        let status_code = res.status();
+
+        if status_code != reqwest::StatusCode::OK {
+            let body: String = res.text().await?;
+            tracing::error!(
+                body=%body,
+                status=%status_code,
+                "unexpected response from document storage service"
+            );
+            anyhow::bail!(body);
+        }
+
+        let res = res.json().await?;
+
+        let put_file_data: PutFileResponse = serde_json::from_value(res)?;
+
+        // The service mints the presigned URL for a browser on the host
+        // (`localhost:4566`); an uploader inside the Docker network has to
+        // use LocalStack's own hostname to reach the same object. No-op
+        // outside local AWS.
+        let presigned_url =
+            macro_aws_config::transform_aws_url_for_internal_fetch(&put_file_data.upload_url);
+
+        let upload_response = self
+            .client
+            .put(&presigned_url)
+            .header(CONTENT_TYPE, content_type)
+            .body(bytes.to_vec())
+            .send()
+            .await?;
+
+        if !upload_response.status().is_success() {
+            anyhow::bail!("Upload failed: {}", upload_response.status());
+        }
+
+        Ok(put_file_data)
+    }
+}

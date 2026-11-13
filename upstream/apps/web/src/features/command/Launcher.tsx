@@ -1,0 +1,1511 @@
+import { openAgentComposer } from '@app/features/agents-view/primitives/open-composer';
+import { createAiDocument } from '@app/features/block-ai/queries/create-ai';
+import { createFigDocument } from '@app/features/block-fig/queries/create-fig';
+import { createPsdDocument } from '@app/features/block-psd/queries/create-psd';
+import { useSpreadsheetAccess } from '@app/features/block-spreadsheet/primitives/use-spreadsheet-access';
+import { createSpreadsheetDocument } from '@app/features/block-spreadsheet/queries/create-spreadsheet';
+import { isSpreadsheetEnabledForCurrentUser } from '@app/features/block-spreadsheet/queries/spreadsheet-access';
+import { EMAIL_COMPOSE_TO_INPUT_ID } from '@app/features/email-compose/core/constants';
+import { useQuickCallsFlag } from '@app/features/meetings/use-quick-calls-flag';
+import { raiseKeyboardForNewTaskTitle } from '@app/features/task-composer/new-task-title-focus';
+import { useFeatureFlag } from '@app/lib/analytics/posthog';
+import { t } from '@app/lib/i18n';
+import { openNewChannelModal } from '@channel/CreateChannelModal';
+import { useSplitLayout } from '@components/app/split-layout/layout';
+import type { BlockAlias, BlockName } from '@core/block';
+import { getIconConfig } from '@core/component/EntityIcon';
+import { toast } from '@core/component/Toast/Toast';
+import {
+  enableAiEditor,
+  enableCarouselCreateMenu,
+  enableDatabases,
+  enableFigViewer,
+  enableForms,
+  enableProjects,
+  enablePsdEditor,
+  enableSnippets,
+  isFeatureEnabled,
+} from '@core/constant/featureFlags';
+import { triggerFocusInput } from '@core/directive/focusInput';
+import {
+  createHotkeyGroup,
+  registerHotkey,
+  useHotkeyDOMScope,
+} from '@core/hotkey/hotkeys';
+import { pressedKeys } from '@core/hotkey/state';
+import { TOKENS } from '@core/hotkey/tokens';
+import type { ValidHotkey } from '@core/hotkey/types';
+import { isMobile } from '@core/mobile/isMobile';
+import {
+  createCanvasFile,
+  createCodeFileFromText,
+  createMarkdownFile,
+  createSnippet,
+} from '@core/util/create';
+import { createControlledOpenSignal } from '@core/util/createControlledOpenSignal';
+import { fireAndForget } from '@core/util/fireAndForget';
+import ChatIcon from '@icon/system/regular/chat.svg';
+import MagnifyingGlassIcon from '@icon/system/regular/magnifying-glass.svg';
+import PlusIcon from '@icon/system/regular/plus.svg';
+import { Dialog } from '@kobalte/core/dialog';
+import { getMarkdownGoldenBytes } from '@macro-inc/lexical-core/markdown-golden';
+import { type Span, Telemetry } from '@macro-inc/observability';
+import { createDatabase } from '@queries/storage/databases';
+import { createForm } from '@queries/storage/forms';
+import { makePersisted } from '@solid-primitives/storage';
+import { useNavigate } from '@solidjs/router';
+import {
+  CommandMenuSearchInput,
+  CommandMenuShell,
+  cn,
+  createCommandListController,
+  Hotkey,
+  ToggleSwitch,
+} from '@ui';
+import { getNormalizedKeyString } from '@ui/components/Hotkey';
+import {
+  type Accessor,
+  createMemo,
+  createSignal,
+  type JSX,
+  lazy,
+  onCleanup,
+  onMount,
+  Show,
+  Suspense,
+} from 'solid-js';
+import { createStore } from 'solid-js/store';
+import { Dynamic } from 'solid-js/web';
+import {
+  type PaneCreateContext,
+  useCreateContext,
+} from './context/create-context';
+import { creatableDescription, creatableId } from './core/creatable';
+import type { CreateMenuSection } from './core/create-menu-details';
+import {
+  launcherItemKey,
+  recentLauncherBlocks,
+  sortLauncherBlocks,
+} from './core/launcher-history';
+import { createCallCommand } from './create-call-command';
+import { MobileCreateSheet } from './mobile/MobileCreateSheet';
+import type { CreatableBlock, CreatableName, OpenCreatedItem } from './types';
+
+const LAUNCHER_FRECENCY_STORE = 'launcher-frecency-v1';
+const LAUNCHER_SEARCH_MODE_STORE = 'launcher-search-mode-v1';
+
+type LauncherFrecencyEntry = {
+  count: number;
+  lastUsedAt: number;
+};
+
+type LauncherFrecencyStore = Record<string, LauncherFrecencyEntry>;
+
+const [launcherFrecencyStore, setLauncherFrecencyStore] = makePersisted(
+  createStore<LauncherFrecencyStore>({}),
+  { name: LAUNCHER_FRECENCY_STORE }
+);
+const [launcherSearchMode, setLauncherSearchModePreference] = makePersisted(
+  createSignal(true),
+  { name: LAUNCHER_SEARCH_MODE_STORE }
+);
+
+export function useRecentCreateMenuBlocks(items: Accessor<CreatableBlock[]>) {
+  return createMemo(() => recentLauncherBlocks(items(), launcherFrecencyStore));
+}
+
+function trackLauncherItemUsage(item: CreatableBlock) {
+  const key = launcherItemKey(item);
+  const previous = launcherFrecencyStore[key];
+
+  setLauncherFrecencyStore(key, {
+    count: (previous?.count ?? 0) + 1,
+    lastUsedAt: Date.now(),
+  });
+}
+
+function matchesLauncherSearch(item: CreatableBlock, query: string) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+
+  if (terms.length === 0) return true;
+
+  // Translated text plus the English id and keywords, so English terms keep
+  // matching in every interface language.
+  const searchableText = [
+    item.label,
+    creatableId(item),
+    creatableDescription(item),
+    item.launcherHint,
+    item.blockName,
+    ...(item.keywords ?? []),
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return terms.every((term) => searchableText.includes(term));
+}
+
+const createBlock = async (spec: {
+  blockName: BlockName | BlockAlias;
+  createFn: () => Promise<string | undefined>;
+  loading?: boolean;
+  shouldInsert?: boolean;
+  openCreated?: OpenCreatedItem;
+  /** Active creation span, owned by the creation operation. */
+  span?: Span;
+}) => {
+  const { openWithSplit } = useSplitLayout();
+  const { blockName, createFn, loading, openCreated, span } = spec;
+
+  setCreateMenuOpen(false, false);
+
+  // On mobile, navigate directly after creation instead of showing an
+  // intermediate loading pane during the swipe transition. The loading pane
+  // would also unmount a surface that opens the document itself.
+  const showLoadingFirst = loading && !isMobile() && !openCreated;
+
+  const split = showLoadingFirst
+    ? openWithSplit(
+        { type: 'component', id: 'loading' },
+        { referredFrom: 'launcher', preferNewSplit: spec.shouldInsert }
+      ).split
+    : undefined;
+
+  const id = await createFn();
+  if (!id) {
+    span?.setAttr('error', true);
+    split?.goBack();
+    return;
+  }
+
+  span?.setAttr('document.id', id);
+
+  if (openCreated?.({ blockName, id })) {
+    span?.event('doc.navigated');
+    return;
+  }
+
+  // If we are creating a new markdown document "from scratch" then we can let
+  // them instantly start editing
+  const createMdParams =
+    blockName === 'md' || blockName === 'snippet'
+      ? { optimisticSnapshot: await getMarkdownGoldenBytes() }
+      : undefined;
+
+  if (split) {
+    split.replace({
+      next: {
+        type: blockName,
+        id,
+        params: createMdParams,
+      },
+      mergeHistory: true,
+      referredFrom: 'launcher',
+    });
+  } else {
+    openWithSplit(
+      {
+        type: blockName,
+        id,
+        ...(createMdParams ? { params: createMdParams } : {}),
+      },
+      {
+        referredFrom: 'launcher',
+        preferNewSplit: spec.shouldInsert,
+      }
+    );
+  }
+
+  span?.event('doc.navigated');
+};
+
+const reportCreateBlockError = (error: unknown) =>
+  Telemetry.error(error, { surface: 'launcher' });
+const createComponent = (spec: {
+  componentId: string;
+  shouldInsert?: boolean;
+  asPopover?: boolean;
+  params?: Record<string, unknown>;
+}) => {
+  const { openWithSplit, popoverSplit } = useSplitLayout();
+
+  // For popovers, create the popover BEFORE closing launcher
+  // so the popover can acquire the focus lock while launcher still owns rootFocusElement
+  if (spec.asPopover) {
+    popoverSplit({
+      type: 'component',
+      id: spec.componentId,
+      params: spec.params,
+    });
+    setCreateMenuOpen(false, false);
+    return;
+  }
+
+  setCreateMenuOpen(false, false);
+
+  openWithSplit(
+    { type: 'component', id: spec.componentId },
+    {
+      referredFrom: 'launcher',
+      preferNewSplit: spec.shouldInsert,
+    }
+  );
+};
+
+export function runCreateAction(
+  blockName: CreatableName,
+  options: {
+    shouldInsert?: boolean;
+    source?: string;
+    projectId?: string;
+    destination?: string;
+    /** Creatables that open a composer instead ignore it. */
+    openCreated?: OpenCreatedItem;
+    /** Plain defaults supplied by the caller, never resolved from global state. */
+    context?: PaneCreateContext;
+  } = {}
+) {
+  const shouldInsert = options.shouldInsert ?? false;
+  const openCreated = options.openCreated;
+  // Creation analytics fire at the data-layer chokepoints (create.ts /
+  // projects.ts); `source` just attributes which surface initiated it.
+  const source = options.source ?? 'create_menu';
+
+  switch (blockName) {
+    case 'md': {
+      const span = Telemetry.span('doc.create');
+      span.setAttr('doc.type', 'md');
+      span.setAttr('doc.source', source);
+      span
+        .run(() =>
+          createBlock({
+            blockName: 'md',
+            loading: true,
+            span,
+            createFn: () =>
+              createMarkdownFile({
+                title: '',
+                content: '',
+                projectId: options.projectId,
+                source,
+              }),
+            shouldInsert,
+            openCreated,
+          })
+        )
+        .catch((error) => {
+          span.error(error);
+          reportCreateBlockError(error);
+        })
+        .finally(() => span.end());
+      return;
+    }
+    case 'spreadsheet':
+      if (!isSpreadsheetEnabledForCurrentUser()) return;
+      fireAndForget(
+        createBlock({
+          blockName: 'spreadsheet',
+          loading: true,
+          createFn: () =>
+            createSpreadsheetDocument({
+              projectId: options.projectId,
+              source,
+            }),
+          shouldInsert,
+          openCreated,
+        }),
+        'launcher'
+      );
+      return;
+    case 'psd':
+      if (!isFeatureEnabled(enablePsdEditor)) return;
+      createBlock({
+        blockName: 'psd',
+        loading: true,
+        createFn: () =>
+          createPsdDocument({ projectId: options.projectId, source }),
+        shouldInsert,
+        openCreated,
+      }).catch(reportCreateBlockError);
+      return;
+    case 'fig':
+      if (!isFeatureEnabled(enableFigViewer)) return;
+      createBlock({
+        blockName: 'fig',
+        loading: true,
+        createFn: () =>
+          createFigDocument({ projectId: options.projectId, source }),
+        shouldInsert,
+        openCreated,
+      }).catch(reportCreateBlockError);
+      return;
+    case 'ai':
+      if (!isFeatureEnabled(enableAiEditor)) return;
+      createBlock({
+        blockName: 'ai',
+        loading: true,
+        createFn: () =>
+          createAiDocument({ projectId: options.projectId, source }),
+        shouldInsert,
+        openCreated,
+      }).catch(reportCreateBlockError);
+      return;
+    case 'canvas':
+      createBlock({
+        blockName: 'canvas',
+        loading: true,
+        createFn: async () => {
+          const result = await createCanvasFile({
+            title: 'New Canvas',
+            projectId: options.projectId,
+            source,
+          });
+          if ('error' in result) return;
+          return result.documentId ?? undefined;
+        },
+        shouldInsert,
+        openCreated,
+      }).catch(reportCreateBlockError);
+      return;
+    case 'task':
+      // Raise the keyboard within this gesture; the composer mounts later.
+      raiseKeyboardForNewTaskTitle();
+      createComponent({
+        componentId: 'task-compose',
+        asPopover: true,
+        params: { composerContext: options.context?.task ?? undefined },
+      });
+      return;
+    case 'initiative':
+      if (!isFeatureEnabled(enableProjects)) return;
+      createComponent({
+        componentId: 'project-compose',
+        asPopover: true,
+      });
+      return;
+    case 'snippet':
+      createBlock({
+        blockName: 'snippet',
+        loading: true,
+        createFn: () =>
+          createSnippet({
+            projectId: options.projectId,
+            title: '',
+            content: '',
+            source,
+          }),
+        shouldInsert,
+        openCreated,
+      }).catch(reportCreateBlockError);
+      return;
+    case 'email':
+      // Focus the "To" field within this gesture so the iOS keyboard opens;
+      // the compose mounts asynchronously, so this waits for the input.
+      triggerFocusInput(() =>
+        document.getElementById(EMAIL_COMPOSE_TO_INPUT_ID)
+      );
+      createComponent({
+        componentId: 'email-compose',
+        shouldInsert,
+      });
+      return;
+    case 'channel':
+      createComponent({
+        componentId: 'channel-compose',
+        shouldInsert,
+      });
+      return;
+    case 'project':
+      createComponent({
+        componentId: 'folder-compose',
+        asPopover: true,
+        params: {
+          parentId: options.projectId,
+          destination: options.destination,
+          source,
+        },
+      });
+      return;
+    case 'database':
+      if (!isFeatureEnabled(enableDatabases)) return;
+      createBlock({
+        blockName: 'database',
+        loading: true,
+        createFn: async () => {
+          const created = await createDatabase({
+            name: 'Untitled database',
+            source,
+          });
+          if (created.isErr()) {
+            toast.failure(t('create.couldNotCreateDatabase'));
+            return;
+          }
+          return created.value;
+        },
+        shouldInsert,
+        openCreated,
+      }).catch(reportCreateBlockError);
+      return;
+    case 'form':
+      if (!isFeatureEnabled(enableForms)) return;
+      createBlock({
+        blockName: 'form',
+        loading: true,
+        createFn: async () => {
+          const created = await createForm(
+            { name: 'Untitled form', source: { kind: 'new' } },
+            source
+          );
+          if (created.isErr()) {
+            toast.failure(t('create.couldNotCreateForm'));
+            return;
+          }
+          return created.value.form.id;
+        },
+        shouldInsert,
+        openCreated,
+      }).catch(reportCreateBlockError);
+      return;
+    case 'code':
+      createBlock({
+        blockName: 'code',
+        loading: true,
+        createFn: async () => {
+          const result = await createCodeFileFromText({
+            code: 'print("Hello, World!")',
+            extension: 'py',
+            title: 'New Code File',
+            projectId: options.projectId,
+            source,
+          });
+          if (result.isErr()) return;
+          return result.value.documentId ?? undefined;
+        },
+        shouldInsert,
+        openCreated,
+      }).catch(reportCreateBlockError);
+      return;
+    case 'routine':
+      createComponent({ componentId: 'routine-compose', asPopover: true });
+      return;
+    case 'skill':
+      createComponent({
+        componentId: 'skill-compose',
+        asPopover: true,
+      });
+      return;
+    case 'chat':
+    case 'agent':
+      setCreateMenuOpen(false, false);
+      openAgentComposer(useSplitLayout(), shouldInsert);
+      return;
+  }
+}
+
+/** Capture the provider during setup; snapshot only when the action runs. */
+export function useCreateAction(): typeof runCreateAction {
+  const context = useCreateContext();
+  return (name, options = {}) =>
+    runCreateAction(name, {
+      ...options,
+      context:
+        options.context ??
+        (name === 'task' ? { task: context.snapshot('task') } : undefined),
+    });
+}
+export type { CreatableBlock, CreatableName } from './types';
+
+const createBlocks = (
+  createAction: typeof runCreateAction
+): CreatableBlock[] => [
+  {
+    id: 'Email',
+    get label() {
+      return t('create.emailLabel');
+    },
+    icon: getIconConfig('email').icon,
+    description: () => t('create.emailDescription'),
+    keywords: ['new', 'make', 'add', 'compose'],
+    blockName: 'email',
+    hotkeyToken: TOKENS.create.email,
+    altHotkeyToken: TOKENS.create.emailNewSplit,
+    hotkey: 'e',
+    keyDownHandler: () => {
+      createAction('email', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Routine',
+    get label() {
+      return t('create.routineLabel');
+    },
+    icon: getIconConfig('routine').icon,
+    description: () => t('create.routineDescription'),
+    get launcherHint() {
+      return t('create.routineHint');
+    },
+    keywords: ['new', 'make', 'add', 'schedule', 'agent', 'event', 'trigger'],
+    blockName: 'routine',
+    hotkeyToken: TOKENS.create.routine,
+    hotkey: 'u',
+    keyDownHandler: () => {
+      createAction('routine');
+      return true;
+    },
+  },
+  {
+    id: 'Agent',
+    get label() {
+      return t('create.agentLabel');
+    },
+    icon: getIconConfig('agent').icon,
+    description: () => t('create.agentDescription'),
+    get launcherHint() {
+      return t('create.agentHint');
+    },
+    keywords: ['new', 'make', 'add', 'agent', 'code', 'coder', 'session'],
+    blockName: 'agent',
+    hotkeyToken: TOKENS.create.agent,
+    altHotkeyToken: TOKENS.create.agentNewSplit,
+    hotkey: 'a',
+    keyDownHandler: () => {
+      createAction('agent', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Database',
+    get label() {
+      return t('create.databaseLabel');
+    },
+    icon: getIconConfig('database').icon,
+    description: () => t('create.databaseDescription'),
+    get launcherHint() {
+      return t('create.databaseHint');
+    },
+    keywords: ['new', 'make', 'add', 'database', 'table', 'db'],
+    blockName: 'database',
+    enabled: () => isFeatureEnabled(enableDatabases),
+    hotkeyToken: TOKENS.create.database,
+    altHotkeyToken: TOKENS.create.databaseNewSplit,
+    hotkey: 'l',
+    keyDownHandler: () => {
+      createAction('database', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Form',
+    get label() {
+      return t('create.formLabel');
+    },
+    icon: getIconConfig('form').icon,
+    description: () => t('create.formDescription'),
+    get launcherHint() {
+      return t('create.formHint');
+    },
+    keywords: ['new', 'make', 'add', 'form', 'survey', 'questionnaire', 'poll'],
+    blockName: 'form',
+    enabled: () => isFeatureEnabled(enableForms),
+    hotkeyToken: TOKENS.create.form,
+    altHotkeyToken: TOKENS.create.formNewSplit,
+    hotkey: 'q',
+    keyDownHandler: () => {
+      createAction('form', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Skill',
+    get label() {
+      return t('create.skillLabel');
+    },
+    icon: getIconConfig('skill').icon,
+    description: () => t('create.skillDescription'),
+    get launcherHint() {
+      return t('create.skillHint');
+    },
+    keywords: ['new', 'make', 'add', 'instruction', 'prompt'],
+    blockName: 'skill',
+    hotkeyToken: TOKENS.create.skill,
+    hotkey: 'k',
+    keyDownHandler: () => {
+      createAction('skill');
+      return true;
+    },
+  },
+  {
+    id: 'Document',
+    get label() {
+      return t('create.documentLabel');
+    },
+    icon: getIconConfig('md').icon,
+    description: () => t('create.documentDescription'),
+    keywords: ['new', 'make', 'add', 'document', 'note'],
+    blockName: 'md',
+    hotkeyToken: TOKENS.create.note,
+    altHotkeyToken: TOKENS.create.noteNewSplit,
+    hotkey: 'd',
+    keyDownHandler: () => {
+      createAction('md', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Task',
+    get label() {
+      return t('create.taskLabel');
+    },
+    icon: getIconConfig('task').icon,
+    description: () => t('create.taskDescription'),
+    keywords: ['new', 'make', 'add', 'todo'],
+    blockName: 'task',
+    hotkeyToken: TOKENS.create.task,
+    altHotkeyToken: TOKENS.create.taskNewSplit,
+    hotkey: 't' as const,
+    keyDownHandler: () => {
+      createAction('task');
+      return true;
+    },
+  },
+  {
+    id: 'Project',
+    get label() {
+      return t('create.projectLabel');
+    },
+    icon: getIconConfig('initiative').icon,
+    description: () => t('create.projectDescription'),
+    keywords: ['new', 'make', 'add', 'project'],
+    blockName: 'initiative',
+    enabled: () => isFeatureEnabled(enableProjects),
+    hotkeyToken: TOKENS.create.initiative,
+    hotkey: 'p',
+    keyDownHandler: () => {
+      createAction('initiative');
+      return true;
+    },
+  },
+  {
+    id: 'Snippet',
+    get label() {
+      return t('create.snippetLabel');
+    },
+    icon: getIconConfig('snippet').icon,
+    description: () => t('create.snippetDescription'),
+    get launcherHint() {
+      return t('create.snippetHint');
+    },
+    keywords: ['new', 'make', 'add'],
+    blockName: 'snippet',
+    hotkeyToken: TOKENS.create.snippet,
+    altHotkeyToken: TOKENS.create.snippetNewSplit,
+    hotkey: 's' as const,
+    keyDownHandler: () => {
+      createAction('snippet', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Message',
+    get label() {
+      return t('create.messageLabel');
+    },
+    icon: ChatIcon,
+    description: () => t('create.messageDescription'),
+    get launcherHint() {
+      return t('create.messageHint');
+    },
+    keywords: ['new', 'make', 'add', 'channel'],
+    blockName: 'channel',
+    hotkeyToken: TOKENS.create.message,
+    altHotkeyToken: TOKENS.create.messageNewSplit,
+    hotkey: 'm',
+    keyDownHandler: () => {
+      createAction('channel', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Channel',
+    get label() {
+      return t('create.channelLabel');
+    },
+    icon: getIconConfig('channel').icon,
+    description: () => t('create.channelDescription'),
+    get launcherHint() {
+      return t('create.channelHint');
+    },
+    keywords: ['new', 'make', 'add', 'channel', 'group', 'conversation'],
+    blockName: 'channel',
+    hotkeyToken: TOKENS.create.channel,
+    hotkey: 'g',
+    keyDownHandler: () => {
+      openNewChannelModal();
+      setCreateMenuOpen(false, false);
+      return true;
+    },
+  },
+  {
+    id: 'Canvas',
+    get label() {
+      return t('create.canvasLabel');
+    },
+    icon: getIconConfig('canvas').icon,
+    description: () => t('create.canvasDescription'),
+    keywords: ['new', 'make', 'add', 'diagram'],
+    blockName: 'canvas',
+    hotkeyToken: TOKENS.create.canvas,
+    altHotkeyToken: TOKENS.create.canvasNewSplit,
+    hotkey: 'n',
+    keyDownHandler: () => {
+      createAction('canvas', {
+        shouldInsert: pressedKeys().has('shift'),
+      });
+      return true;
+    },
+  },
+  {
+    id: 'Photoshop file',
+    get label() {
+      return t('create.photoshopLabel');
+    },
+    enabled: () => isFeatureEnabled(enablePsdEditor),
+    icon: getIconConfig('psd').icon,
+    description: () => t('create.photoshopDescription'),
+    get launcherHint() {
+      return t('create.photoshopHint');
+    },
+    keywords: ['new', 'make', 'add', 'photoshop', 'psd', 'image', 'photo'],
+    blockName: 'psd',
+    hotkeyToken: TOKENS.create.photoshop,
+    altHotkeyToken: TOKENS.create.photoshopNewSplit,
+    hotkey: 'h',
+    keyDownHandler: () => {
+      createAction('psd', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Design',
+    get label() {
+      return t('create.designLabel');
+    },
+    enabled: () => isFeatureEnabled(enableFigViewer),
+    icon: getIconConfig('fig').icon,
+    description: () => t('create.designDescription'),
+    get launcherHint() {
+      return t('create.designHint');
+    },
+    keywords: ['new', 'make', 'add', 'design', 'figma', 'mockup', 'ui'],
+    blockName: 'fig',
+    hotkeyToken: TOKENS.create.design,
+    altHotkeyToken: TOKENS.create.designNewSplit,
+    hotkey: 'i',
+    keyDownHandler: () => {
+      createAction('fig', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Illustrator file',
+    get label() {
+      return t('create.illustratorLabel');
+    },
+    enabled: () => isFeatureEnabled(enableAiEditor),
+    icon: getIconConfig('ai').icon,
+    description: () => t('create.illustratorDescription'),
+    get launcherHint() {
+      return t('create.illustratorHint');
+    },
+    keywords: [
+      'new',
+      'make',
+      'add',
+      'illustrator',
+      'illustration',
+      'vector',
+      'artboard',
+    ],
+    blockName: 'ai',
+    hotkeyToken: TOKENS.create.illustration,
+    altHotkeyToken: TOKENS.create.illustrationNewSplit,
+    hotkey: 'v',
+    keyDownHandler: () => {
+      createAction('ai', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Spreadsheet',
+    get label() {
+      return t('create.spreadsheetLabel');
+    },
+    enabled: isSpreadsheetEnabledForCurrentUser,
+    icon: getIconConfig('spreadsheet').icon,
+    description: () => t('create.spreadsheetDescription'),
+    get launcherHint() {
+      return t('create.spreadsheetHint');
+    },
+    keywords: ['new', 'make', 'add', 'sheet', 'table', 'formula'],
+    blockName: 'spreadsheet',
+    hotkeyToken: TOKENS.create.spreadsheet,
+    altHotkeyToken: TOKENS.create.spreadsheetNewSplit,
+    hotkey: 'b',
+    keyDownHandler: () => {
+      createAction('spreadsheet', {
+        shouldInsert: pressedKeys().has('shift'),
+      });
+      return true;
+    },
+  },
+  {
+    id: 'Folder',
+    get label() {
+      return t('create.folderLabel');
+    },
+    icon: getIconConfig('project').icon,
+    description: () => t('create.folderDescription'),
+    keywords: ['new', 'make', 'add', 'project'],
+    blockName: 'project',
+    hotkeyToken: TOKENS.create.project,
+    altHotkeyToken: TOKENS.create.projectNewSplit,
+    hotkey: 'f',
+    keyDownHandler: () => {
+      createAction('project', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+  {
+    id: 'Code',
+    get label() {
+      return t('create.codeLabel');
+    },
+    icon: getIconConfig('code').icon,
+    description: () => t('create.codeDescription'),
+    keywords: ['new', 'make', 'add'],
+    blockName: 'code',
+    hotkeyToken: TOKENS.create.code,
+    altHotkeyToken: TOKENS.create.codeNewSplit,
+    hotkey: 'o',
+    keyDownHandler: () => {
+      createAction('code', { shouldInsert: pressedKeys().has('shift') });
+      return true;
+    },
+  },
+];
+
+export const CREATABLE_BLOCKS = createBlocks(runCreateAction);
+
+/** Router-backed commands are bound once in each host's component owner. */
+export function useCreateCommands(): CreatableBlock[] {
+  const navigate = useNavigate();
+  const quickCalls = useQuickCallsFlag();
+  return [
+    ...createBlocks(useCreateAction()),
+    createCallCommand({
+      navigate,
+      close: () => setCreateMenuOpen(false, false),
+      enabled: () => quickCalls().enabled,
+    }),
+  ];
+}
+
+/**
+ * The creatable-block entries a create menu renders, with feature gating
+ * applied — the single source of truth shared by the desktop menus and the
+ * mobile page create actions, so they cannot drift. Callers with a custom
+ * block list (e.g. the onboarding sandbox launcher) pass it as `source` to
+ * run it through the same gating.
+ */
+export function useCreateMenuBlocks(
+  source: () => CreatableBlock[] | undefined = () => undefined
+): Accessor<CreatableBlock[]> {
+  const commands = useCreateCommands();
+  const spreadsheets = useSpreadsheetAccess();
+  const snippetsFlag = useFeatureFlag(enableSnippets);
+  const projectsFlag = useFeatureFlag(enableProjects);
+  // Subscribed to rather than left to the block's own `enabled`, which reads
+  // PostHog without tracking it: this memo has no other reason to re-run, so a
+  // flag that resolves after mount would leave the menu as it was until reload.
+  const databasesFlag = useFeatureFlag(enableDatabases);
+  const psdFlag = useFeatureFlag(enablePsdEditor);
+  const figFlag = useFeatureFlag(enableFigViewer);
+  const aiFlag = useFeatureFlag(enableAiEditor);
+  const formsFlag = useFeatureFlag(enableForms);
+  return createMemo(() => {
+    databasesFlag();
+    psdFlag();
+    figFlag();
+    aiFlag();
+    formsFlag();
+    return (source() ?? commands).filter((block) => {
+      if (block.blockName === 'spreadsheet') return spreadsheets();
+      if (block.blockName === 'snippet') return snippetsFlag().enabled;
+      if (block.blockName === 'initiative') return projectsFlag().enabled;
+      return block.enabled?.() ?? true;
+    });
+  });
+}
+
+/**
+ * Whether one creatable is on offer right now, tracked reactively.
+ *
+ * For the surfaces that offer a single creatable by name rather than rendering
+ * the whole list — an empty state's button, a list view's `+`. Answered from
+ * {@link useCreateMenuBlocks} so there is one gate rather than a copy of it per
+ * surface, and so a flag that resolves after mount reaches these too: a gated
+ * entry left to its own `enabled` reads PostHog without tracking it, which
+ * strands the answer the surface first happened to get.
+ *
+ * A name that is not a creatable-block entry at all is not "disabled" — it is
+ * not this gate's business, and callers reaching for a view-only label handle
+ * it themselves.
+ */
+export function useCreatableEnabled(): (name: CreatableName) => boolean {
+  const blocks = useCreateMenuBlocks();
+  return (name) => blocks().some((block) => block.blockName === name);
+}
+
+export const [createMenuOpen, setCreateMenuOpen] = createControlledOpenSignal(
+  false,
+  { id: 'launcher' }
+);
+
+type LauncherMenuItemProps = {
+  creatableBlock: CreatableBlock;
+  selected?: boolean;
+  showHotkey?: boolean;
+};
+
+export const LauncherMenuItem = (props: LauncherMenuItemProps) => {
+  const launcherHint = () => props.creatableBlock.launcherHint;
+
+  return (
+    <>
+      <div
+        class={cn(
+          'size-4 shrink-0 text-ink-extra-muted transition-colors',
+          props.selected && 'text-ink'
+        )}
+      >
+        <Dynamic component={props.creatableBlock.icon} />
+      </div>
+
+      <div class="min-w-0 flex-1 flex items-baseline gap-2">
+        <span class="truncate text-sm font-medium text-ink">
+          {props.creatableBlock.label}
+        </span>
+        <Show when={launcherHint()}>
+          {(hint) => (
+            <span class="min-w-0 truncate font-medium text-ink-extra-muted/70">
+              {hint()}
+            </span>
+          )}
+        </Show>
+      </div>
+
+      <Show when={props.showHotkey}>
+        <div class="flex border border-ink/12 text-xxs rounded-md items-center px-1.5 py-px font-normal text-ink-muted">
+          <Hotkey token={props.creatableBlock.hotkeyToken} />
+        </div>
+      </Show>
+    </>
+  );
+};
+
+export type LauncherInnerProps = {
+  onClose: (shouldReturnFocus?: boolean) => void;
+  blocks?: CreatableBlock[];
+};
+
+type LauncherBodyState = {
+  sections: Accessor<CreateMenuSection[]>;
+  blocks: Accessor<CreatableBlock[]>;
+  selectedIndex: Accessor<number>;
+  searchMode: Accessor<boolean>;
+  shiftHeld: Accessor<boolean>;
+  itemId: (item: CreatableBlock) => string;
+  select: (index: number) => void;
+  step: (direction: number) => void;
+  choose: (item: CreatableBlock) => void;
+  scrollSelectedIntoView: Accessor<boolean>;
+};
+
+/** Shared launcher behavior and chrome; each layout supplies its own body. */
+export const LauncherShell = (
+  props: LauncherInnerProps & {
+    children: (state: LauncherBodyState) => JSX.Element;
+    footerAction?: (state: LauncherBodyState) => JSX.Element;
+    class?: string;
+    horizontalNavigation?: boolean;
+    groupItems?: (
+      items: CreatableBlock[],
+      recentItems: CreatableBlock[]
+    ) => CreateMenuSection[];
+  }
+) => {
+  const hkGroup = createHotkeyGroup();
+  const commands = useCreateCommands();
+  const candidates = () => props.blocks ?? commands;
+  const availableBlocks = useCreateMenuBlocks(candidates);
+  const sortedBlocks = createMemo(() =>
+    sortLauncherBlocks(availableBlocks(), launcherFrecencyStore)
+  );
+  const [searchQuery, setSearchQuery] = createSignal('');
+  const searchMode = launcherSearchMode;
+  const recentBlocks = useRecentCreateMenuBlocks(availableBlocks);
+  const filteredBlocks = createMemo(() => {
+    if (!searchMode()) return sortedBlocks();
+
+    return sortedBlocks().filter((item) =>
+      matchesLauncherSearch(item, searchQuery())
+    );
+  });
+  const sections = createMemo<CreateMenuSection[]>(
+    () =>
+      props.groupItems?.(filteredBlocks(), recentBlocks()) ?? [
+        {
+          group: { id: 'other', label: t('create.results'), tagline: '' },
+          items: filteredBlocks(),
+        },
+      ]
+  );
+  const blocks = createMemo(() =>
+    sections().flatMap((section) => section.items)
+  );
+  const [attachHotkeys, launcherScope] = useHotkeyDOMScope('create-menu', true);
+
+  let ref!: HTMLDivElement;
+  let searchInputRef: HTMLInputElement | undefined;
+  let shiftRippleRef: HTMLSpanElement | undefined;
+
+  const shiftHeld = () => pressedKeys().has('shift');
+
+  const [focusedIndex, setFocusedIndex] = createSignal(0);
+  const listController = createCommandListController({
+    items: blocks,
+    selectedIndex: focusedIndex,
+    setSelectedIndex: setFocusedIndex,
+  });
+
+  const runLauncherItem = (
+    item: CreatableBlock | undefined,
+    shouldReturnFocus?: boolean
+  ) => {
+    if (!item || !availableBlocks().includes(item)) return false;
+
+    trackLauncherItemUsage(item);
+    item.keyDownHandler();
+    props.onClose(shouldReturnFocus);
+
+    return true;
+  };
+
+  const setLauncherSearchMode = (next: boolean) => {
+    const selectedItem = blocks()[focusedIndex()];
+    setLauncherSearchModePreference(next);
+
+    if (!next) {
+      setSearchQuery('');
+    }
+    setFocusedIndex(
+      selectedItem ? Math.max(0, blocks().indexOf(selectedItem)) : 0
+    );
+
+    queueMicrotask(() => {
+      if (next) {
+        searchInputRef?.focus({ preventScroll: true });
+      } else {
+        ref?.focus({ preventScroll: true });
+      }
+    });
+  };
+
+  candidates().forEach((item) => {
+    registerHotkey({
+      hotkeyToken: item.hotkeyToken,
+      hotkey: item.hotkey,
+      scopeId: launcherScope,
+      description: item.description,
+      condition: () => !searchMode() && availableBlocks().includes(item),
+      registrationType: item.registrationType,
+      runWithInputFocused: item.runWithInputFocused,
+      keyDownHandler: () => {
+        return runLauncherItem(item, false);
+      },
+    }).withGroup(hkGroup);
+
+    if (item.altHotkeyToken) {
+      registerHotkey({
+        hotkeyToken: item.altHotkeyToken,
+        hotkey: `shift+${item.hotkey}` as ValidHotkey,
+        scopeId: launcherScope,
+        description: () =>
+          t('create.descriptionInNewSplit', {
+            description: creatableDescription(item),
+          }),
+        condition: () => !searchMode() && availableBlocks().includes(item),
+        registrationType: item.registrationType,
+        runWithInputFocused: item.runWithInputFocused,
+        keyDownHandler: () => {
+          return runLauncherItem(item);
+        },
+      }).withGroup(hkGroup);
+    }
+  });
+
+  registerHotkey({
+    hotkey: 'c',
+    scopeId: launcherScope,
+    description: () => t('create.closeLauncher'),
+    condition: () =>
+      createMenuOpen() &&
+      !searchMode() &&
+      !availableBlocks().some((item) => item.hotkey === 'c'),
+    registrationType: 'add',
+    keyDownHandler: () => {
+      setCreateMenuOpen(false);
+      return true;
+    },
+  }).withGroup(hkGroup);
+
+  const navUpHotkey = registerHotkey({
+    hotkey: props.horizontalNavigation
+      ? ['arrowleft', 'arrowup', 'ctrl+k', 'shift+tab']
+      : ['arrowup', 'ctrl+k', 'shift+tab'],
+    scopeId: launcherScope,
+    description: () => t('create.navigateUp'),
+    keyDownHandler: (event) => {
+      if (
+        event?.key === 'ArrowLeft' &&
+        event.target instanceof HTMLInputElement
+      )
+        return false;
+      event?.preventDefault();
+      return listController.selectPrevious();
+    },
+    runWithInputFocused: true,
+  }).withGroup(hkGroup);
+
+  const navDownHotkey = registerHotkey({
+    hotkey: props.horizontalNavigation
+      ? ['arrowright', 'arrowdown', 'ctrl+j', 'tab']
+      : ['arrowdown', 'ctrl+j', 'tab'],
+    scopeId: launcherScope,
+    description: () => t('create.navigateDown'),
+    keyDownHandler: (event) => {
+      if (
+        event?.key === 'ArrowRight' &&
+        event.target instanceof HTMLInputElement
+      )
+        return false;
+      event?.preventDefault();
+      return listController.selectNext();
+    },
+    runWithInputFocused: true,
+  }).withGroup(hkGroup);
+
+  const searchModeHotkey = registerHotkey({
+    hotkey: '/',
+    scopeId: launcherScope,
+    description: () => t('create.toggleSearchMode'),
+    keyDownHandler: () => {
+      setLauncherSearchMode(!searchMode());
+      return true;
+    },
+    runWithInputFocused: true,
+    displayPriority: 6,
+  }).withGroup(hkGroup);
+
+  registerHotkey({
+    hotkey: 'escape',
+    scopeId: launcherScope,
+    description: () => t('create.exit'),
+    runWithInputFocused: true,
+    keyDownHandler: () => {
+      props.onClose();
+      return true;
+    },
+  }).withGroup(hkGroup);
+
+  registerHotkey({
+    hotkey: 'shift+enter',
+    scopeId: launcherScope,
+    description: () => t('create.openInNewSplit'),
+    keyDownHandler: () => {
+      return runLauncherItem(blocks()[focusedIndex()]);
+    },
+    runWithInputFocused: true,
+    displayPriority: 7,
+  }).withGroup(hkGroup);
+
+  const confirmHotkey = registerHotkey({
+    hotkey: 'enter' as ValidHotkey,
+    scopeId: launcherScope,
+    description: () => t('create.openInCurrentSplit'),
+    keyDownHandler: () => {
+      return runLauncherItem(blocks()[focusedIndex()]);
+    },
+    runWithInputFocused: true,
+    displayPriority: 8,
+  }).withGroup(hkGroup);
+
+  onMount(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift' && !e.repeat && shiftRippleRef) {
+        shiftRippleRef.classList.remove('rippling');
+        void shiftRippleRef.offsetWidth; // reflow to restart animation
+        shiftRippleRef.classList.add('rippling');
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    onCleanup(() => window.removeEventListener('keydown', onKeyDown));
+  });
+
+  onMount(() => {
+    if (!ref) return;
+    attachHotkeys(ref);
+    queueMicrotask(() => {
+      if (searchMode()) {
+        searchInputRef?.focus({ preventScroll: true });
+      } else {
+        ref.focus({ preventScroll: true });
+      }
+    });
+  });
+
+  onCleanup(hkGroup.dispose);
+
+  const bodyState: LauncherBodyState = {
+    sections,
+    blocks,
+    selectedIndex: focusedIndex,
+    searchMode,
+    shiftHeld,
+    itemId: (item) => `create-menu-${launcherItemKey(item)}`,
+    select: listController.setSelectedIndexFromPointer,
+    step: (direction) => {
+      const count = blocks().length;
+      if (count)
+        listController.setSelectedIndex(
+          (((focusedIndex() + direction) % count) + count) % count
+        );
+    },
+    choose: runLauncherItem,
+    scrollSelectedIntoView: listController.shouldScrollSelectedIntoView,
+  };
+
+  return (
+    // The shared shell stopped painting its own pane (cmd+k gets one from the
+    // app Dialog wrapper); this raw-Kobalte dialog carries it here.
+    <div
+      class={cn(
+        'elevated-surface create-menu-pane w-200 max-w-[calc(100vw-16px)] touch:mobile-sheet touch:overflow-hidden touch:pb-[var(--mobile-sheet-safe-padding,0px)]',
+        props.class
+      )}
+    >
+      <div
+        aria-hidden="true"
+        class="hidden touch:flex h-5 shrink-0 items-center justify-center"
+      >
+        <div class="h-1 w-9 rounded-full bg-ink/15" />
+      </div>
+      <CommandMenuShell
+        depth={2}
+        hideBorder
+        class="h-auto w-full max-h-[75vh] outline-none touch:rounded-none"
+        ref={ref}
+        tabindex={-1}
+      >
+        <CommandMenuShell.Header>
+          <Show
+            when={searchMode()}
+            fallback={
+              <div class="min-w-0 flex h-7 flex-1 items-center gap-2 text-ink-muted">
+                <PlusIcon class="size-4 shrink-0 text-ink-extra-muted" />
+                <h1 class="truncate text-base font-normal">
+                  {t('create.createNew')}
+                </h1>
+              </div>
+            }
+          >
+            <div class="min-w-0 flex h-7 flex-1 items-center gap-2">
+              <MagnifyingGlassIcon class="size-4 shrink-0 text-ink-extra-muted" />
+              <CommandMenuSearchInput
+                ref={searchInputRef}
+                type="text"
+                placeholder={t('create.searchCreateOptions')}
+                value={searchQuery()}
+                onInput={(event) => {
+                  setSearchQuery(event.currentTarget.value);
+                  setFocusedIndex(0);
+                }}
+              />
+            </div>
+          </Show>
+          <ToggleSwitch
+            checked={searchMode()}
+            onChange={setLauncherSearchMode}
+            size="xs"
+            label={
+              <span class="flex items-center gap-1 text-[11px] font-medium leading-none text-ink-extra-muted/70">
+                {t('create.searchMode')}{' '}
+                <Hotkey
+                  shortcut={searchModeHotkey.hotkey()}
+                  theme="subtle"
+                  class="border-ink/12 px-2 py-0.5"
+                />
+              </span>
+            }
+            labelClass="flex items-center"
+            controlClass="bg-ink-extra-muted/25 data-checked:bg-accent"
+            class="ml-auto flex-row-reverse gap-1.5 px-2 py-1"
+          />
+        </CommandMenuShell.Header>
+        <CommandMenuShell.Body class="touch:flex touch:flex-col">
+          {props.children(bodyState)}
+        </CommandMenuShell.Body>
+        <CommandMenuShell.Footer
+          class={cn(
+            'relative touch:px-6 touch:py-4',
+            props.footerAction && 'min-h-12 gap-3 border-t border-edge-divider'
+          )}
+        >
+          <style>{`
+              @keyframes shift-ripple {
+                0%   { transform: scale(1); opacity: 0.6; }
+                100% { transform: scale(2.2); opacity: 0; }
+              }
+              .shift-ripple.rippling {
+                animation: shift-ripple 0.35s cubic-bezier(0.2, 0.8, 0.4, 1) forwards;
+              }
+            `}</style>
+          <span
+            class={cn(
+              'flex items-center gap-1.5',
+              props.footerAction && 'hidden sm:flex'
+            )}
+          >
+            <span class="flex gap-0.5">
+              <Hotkey
+                shortcut={searchMode() ? 'arrowup' : navUpHotkey.hotkey()}
+                class="min-w-3 justify-center"
+              />
+              <Hotkey
+                shortcut={searchMode() ? 'arrowdown' : navDownHotkey.hotkey()}
+                class="min-w-3 justify-center"
+              />
+            </span>
+            {t('create.navigate')}
+          </span>
+          <Show when={!props.footerAction}>
+            <span class="flex items-center gap-1.5">
+              <Hotkey
+                shortcut={confirmHotkey.hotkey()}
+                class="min-w-3 justify-center"
+              />
+              {t('create.create')}
+            </span>
+          </Show>
+          <span class="hidden touch:hidden md:flex items-center gap-1.5">
+            {t('create.hold')}
+            <span class="relative inline-flex place-items-center">
+              <span
+                ref={shiftRippleRef}
+                class="shift-ripple absolute inset-0 rounded-sm bg-ink/10 pointer-events-none opacity-0"
+              />
+              <span
+                class={cn(
+                  'min-w-3 text-xxs px-0.5 py-px rounded-sm text-center transition-colors duration-150',
+                  shiftHeld() ? 'bg-ink/10 text-ink' : 'text-ink-extra-muted'
+                )}
+              >
+                {getNormalizedKeyString({ shortcut: 'shift' })}
+              </span>
+            </span>
+            {t('create.newSplit')}
+          </span>
+          <Show when={props.footerAction}>
+            {(action) => (
+              <div class="absolute right-2 bottom-2">{action()(bodyState)}</div>
+            )}
+          </Show>
+        </CommandMenuShell.Footer>
+      </CommandMenuShell>
+    </div>
+  );
+};
+
+const DetailsLauncher = lazy(() => import('./DetailsLauncher'));
+const CarouselLauncher = lazy(() => import('./CarouselLauncher'));
+
+export const LauncherInner = (props: LauncherInnerProps) => {
+  const carouselFlag = useFeatureFlag(enableCarouselCreateMenu);
+  return (
+    <Suspense>
+      <Show
+        when={carouselFlag().enabled}
+        fallback={<DetailsLauncher {...props} />}
+      >
+        <CarouselLauncher {...props} />
+      </Show>
+    </Suspense>
+  );
+};
+
+type LauncherProps = {
+  open: boolean;
+  onOpenChange: (open: boolean, shouldReturnFocus?: boolean) => void;
+};
+
+function MobileLauncher(props: LauncherProps) {
+  const availableBlocks = useCreateMenuBlocks();
+  const items = createMemo(() =>
+    sortLauncherBlocks(availableBlocks(), launcherFrecencyStore)
+  );
+  return (
+    <MobileCreateSheet
+      open={props.open}
+      onOpenChange={props.onOpenChange}
+      items={items()}
+      onSelect={(item) => {
+        trackLauncherItemUsage(item);
+        item.keyDownHandler();
+        props.onOpenChange(false);
+      }}
+    />
+  );
+}
+
+export const Launcher = (props: LauncherProps) => (
+  <Show when={isMobile()} fallback={<DesktopLauncher {...props} />}>
+    <MobileLauncher {...props} />
+  </Show>
+);
+
+const DesktopLauncher = (props: LauncherProps) => {
+  return (
+    <Dialog open={props.open} onOpenChange={props.onOpenChange} modal={true}>
+      <Dialog.Portal>
+        <Dialog.Overlay class="fixed inset-0 z-modal scrim-glass dialog-overlay-open-animation" />
+        <Dialog.Content
+          aria-label={t('create.createNew')}
+          class="fixed inset-x-0 top-0 bottom-(--virtual-keyboard-height,0) z-modal flex items-start justify-center px-2 pt-[10vh] outline-none [--color-surface:var(--color-dialog)]"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              props.onOpenChange(false);
+            }
+          }}
+        >
+          <LauncherInner
+            onClose={(shouldReturnFocus) =>
+              props.onOpenChange(false, shouldReturnFocus)
+            }
+          />
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog>
+  );
+};

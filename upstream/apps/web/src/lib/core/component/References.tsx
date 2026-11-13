@@ -1,0 +1,462 @@
+import { documentCommentLocation } from '@app/features/notifications/document-comment-location';
+import { openProject } from '@app/features/projects/open-project';
+import {
+  callDetailSearch,
+  callDetailSearchCodec,
+} from '@block-call/call-route';
+import { navigateToChannelMessage } from '@block-channel/utils/link';
+import { useGlobalBlockOrchestrator } from '@components/app/GlobalAppState';
+import { useSplitLayout } from '@components/app/split-layout/layout';
+import type { BlockAlias, BlockName } from '@core/block';
+import { toast } from '@core/component/Toast/Toast';
+import { itemToBlockName } from '@core/constant/allBlocks';
+import { COMMENT_LINK_PARAM } from '@core/messages/comment-link';
+import { getDisplayNameParts, tryMacroId } from '@core/user';
+import { compareDateDesc, type DateValue } from '@core/util/date';
+import { useSplitNavigationHandler } from '@core/util/useSplitNavigationHandler';
+import { formatRelativeTimestamp } from '@entity';
+import { Telemetry } from '@macro-inc/observability';
+import {
+  isAccessiblePreviewItem,
+  type PreviewItem,
+  useItemPreview,
+} from '@queries/preview';
+import { useAttachmentReferencesQuery } from '@queries/storage/attachment-references';
+import type { ItemType } from '@service-storage/client';
+import type { ApiAttachmentCommentReference as CommentReference } from '@service-storage/generated/schemas/apiAttachmentCommentReference';
+import type { ApiAttachmentEntityReference as EntityReference } from '@service-storage/generated/schemas/apiAttachmentEntityReference';
+import type { ApiAttachmentGenericReference as GenericReference } from '@service-storage/generated/schemas/apiAttachmentGenericReference';
+import { stringToItemType } from '@service-storage/itemType';
+import { createCallback } from '@solid-primitives/rootless';
+import { createMemo, For, type JSX, Show } from 'solid-js';
+import { match } from 'ts-pattern';
+import { InlineItemPreview } from './ItemPreview';
+import { openDocument } from './LexicalMarkdown/component/core/BlockLink';
+import { StaticMarkdown } from './LexicalMarkdown/component/core/StaticMarkdown';
+import { twoLineClampMarkdownTheme } from './LexicalMarkdown/theme';
+import { UserIcon } from './UserIcon';
+
+type ReferenceProps = {
+  documentId: string;
+  entityType?: ItemType;
+};
+
+type ChannelRef = EntityReference & {
+  channel_id: string;
+  message_id: string;
+  thread_id?: string;
+  sender_id: string;
+  attachment_created_at: string;
+  message_content?: string;
+};
+
+type CommentRef = EntityReference &
+  CommentReference & { reference_type: 'comment' };
+
+type GenericRef = EntityReference &
+  GenericReference & { reference_type: 'generic' };
+
+function isChannelReference(ref: EntityReference): ref is ChannelRef {
+  return (
+    'channel_id' in ref &&
+    'message_id' in ref &&
+    'sender_id' in ref &&
+    'attachment_created_at' in ref
+  );
+}
+
+function isCommentReference(ref: EntityReference): ref is CommentRef {
+  return (
+    'parent_entity_type' in ref &&
+    'parent_entity_id' in ref &&
+    'message_id' in ref &&
+    'sender_id' in ref &&
+    'attachment_created_at' in ref
+  );
+}
+
+function isGenericReference(ref: EntityReference): ref is GenericRef {
+  return (
+    'reference_type' in ref &&
+    (ref as any).reference_type === 'generic' &&
+    'source_entity_type' in ref &&
+    'entity_type' in ref &&
+    'created_at' in ref
+  );
+}
+
+const getReferenceCreatedAt = (ref: EntityReference) => {
+  if (isChannelReference(ref) || isCommentReference(ref)) {
+    return ref.attachment_created_at;
+  } else if (isGenericReference(ref)) {
+    return ref.created_at;
+  }
+};
+
+interface ReferenceRowProps {
+  source: JSX.Element;
+  senderAvatar?: JSX.Element;
+  senderName?: string;
+  timestamp: DateValue;
+  body?: JSX.Element;
+  onClick?: (e: KeyboardEvent | MouseEvent) => void;
+}
+
+function ReferenceRow(props: ReferenceRowProps) {
+  const navHandlers = useSplitNavigationHandler<HTMLDivElement>((e) => {
+    props.onClick?.(e);
+  });
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      class="group/ref-row flex min-w-0 flex-col overflow-hidden rounded-lg py-1 hover:bg-hover/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+      onMouseDown={navHandlers.onMouseDown}
+      onClick={navHandlers.onClick}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          props.onClick?.(e);
+        }
+      }}
+    >
+      <div class="flex min-h-6 min-w-0 items-center gap-1.5 text-xs leading-5">
+        <Show when={props.senderAvatar}>{props.senderAvatar}</Show>
+        <div class="min-w-0 flex max-w-max flex-1 items-center gap-1.5 overflow-hidden">
+          <Show when={props.senderName}>
+            <span class="ph-no-capture shrink-0 font-medium text-ink truncate max-w-[8rem]">
+              {props.senderName}
+            </span>
+            <span class="shrink-0 text-ink-muted/70">in</span>
+          </Show>
+          <div class="min-w-0 flex flex-1 items-center overflow-hidden text-ink-muted">
+            {props.source}
+          </div>
+        </div>
+        <span aria-hidden class="shrink-0 text-ink-extra-muted">
+          ·
+        </span>
+        <span class="shrink-0 text-ink-extra-muted tabular-nums">
+          {formatRelativeTimestamp(props.timestamp)}
+        </span>
+      </div>
+
+      <Show when={props.body}>
+        <div class="ph-no-capture min-w-0 mt-1.5 ml-1 pl-2.5 border-l-2 border-ink-muted/12 text-xs text-ink-muted/65">
+          {props.body}
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+// A message that is only mention tags adds no info — the row's source chip
+// already links to the same target.
+const MENTION_TAG_RE = /<m-\w+-mention>[\s\S]*?<\/m-\w+-mention>/g;
+function isOnlyMentions(markdown: string): boolean {
+  return markdown.replace(MENTION_TAG_RE, '').trim().length === 0;
+}
+
+/** A channel message or a comment: the sender, where it was said, and its text. */
+function MessageReferenceRow(props: {
+  source: JSX.Element;
+  senderId: string;
+  createdAt: string;
+  content?: string;
+  onOpen: (e: KeyboardEvent | MouseEvent) => void;
+}) {
+  const senderName = () => {
+    const parts = getDisplayNameParts(tryMacroId(props.senderId), {
+      emailFallback: 'local-part',
+    });
+    return parts.firstName || parts.fullName;
+  };
+  const hasContent = () => {
+    const content = props.content?.trim();
+    if (!content) return false;
+    return !isOnlyMentions(content);
+  };
+
+  return (
+    <ReferenceRow
+      source={props.source}
+      senderAvatar={
+        <UserIcon
+          id={props.senderId}
+          size="sm"
+          isDeleted={false}
+          suppressClick
+          showTooltip={false}
+        />
+      }
+      senderName={senderName()}
+      timestamp={props.createdAt}
+      onClick={props.onOpen}
+      body={
+        hasContent() ? (
+          <StaticMarkdown
+            markdown={props.content || ''}
+            theme={twoLineClampMarkdownTheme}
+          />
+        ) : undefined
+      }
+    />
+  );
+}
+
+function ChannelReferenceRow(props: {
+  reference: ChannelRef;
+  onOpen: (e: KeyboardEvent | MouseEvent) => void;
+}) {
+  return (
+    <MessageReferenceRow
+      source={
+        <InlineItemPreview id={props.reference.channel_id} type="channel" />
+      }
+      senderId={props.reference.sender_id}
+      createdAt={props.reference.attachment_created_at}
+      content={props.reference.message_content}
+      onOpen={props.onOpen}
+    />
+  );
+}
+
+function CommentReferenceRow(props: {
+  reference: CommentRef;
+  onOpen: (parent: PreviewItem, e: KeyboardEvent | MouseEvent) => void;
+}) {
+  const parentType = () => stringToItemType(props.reference.parent_entity_type);
+  const [parent] = useItemPreview(() => ({
+    id: props.reference.parent_entity_id,
+    type: parentType(),
+  }));
+
+  return (
+    <MessageReferenceRow
+      source={
+        <InlineItemPreview
+          id={props.reference.parent_entity_id}
+          type={parentType()}
+        />
+      }
+      senderId={props.reference.sender_id}
+      createdAt={props.reference.attachment_created_at}
+      content={props.reference.message_content}
+      onOpen={(e) => props.onOpen(parent(), e)}
+    />
+  );
+}
+
+function GenericReferenceRow(props: {
+  reference: GenericRef;
+  onOpen: (item: PreviewItem, e?: KeyboardEvent | MouseEvent) => void;
+}) {
+  const userId = props.reference.user_id!;
+  const senderName = () => {
+    const parts = getDisplayNameParts(tryMacroId(userId), {
+      emailFallback: 'local-part',
+    });
+    return parts.firstName || parts.fullName;
+  };
+  const sourceItemType = () =>
+    stringToItemType(props.reference.source_entity_type);
+  const [item] = useItemPreview(() => ({
+    id: props.reference.source_entity_id,
+    type: sourceItemType(),
+  }));
+
+  return (
+    <ReferenceRow
+      source={
+        <InlineItemPreview
+          id={props.reference.source_entity_id}
+          type={sourceItemType()}
+        />
+      }
+      senderAvatar={
+        <UserIcon
+          id={userId}
+          size="sm"
+          isDeleted={false}
+          suppressClick
+          showTooltip={false}
+        />
+      }
+      senderName={senderName()}
+      timestamp={props.reference.created_at}
+      onClick={(e) => props.onOpen(item(), e)}
+    />
+  );
+}
+
+export function References(props: ReferenceProps) {
+  const references = useAttachmentReferencesQuery(
+    () => props.documentId,
+    () => props.entityType ?? 'document'
+  );
+  const layout = useSplitLayout();
+  const blockOrchestrator = useGlobalBlockOrchestrator();
+
+  const navigateToItem = ({
+    blockId,
+    blockName,
+  }: {
+    event?: KeyboardEvent | MouseEvent;
+    blockName: BlockName | BlockAlias;
+    blockId: string;
+  }) => {
+    layout.openWithSplit(
+      { type: blockName, id: blockId },
+      { preferNewSplit: true }
+    );
+  };
+
+  // Opens the commented entity at the comment, the same way a reply target or
+  // a comment notification does for each parent kind.
+  const navigateToComment = createCallback(
+    (reference: CommentRef, parent: PreviewItem) => {
+      const parentId = reference.parent_entity_id;
+      const messageId = reference.message_id;
+      match(reference.parent_entity_type)
+        .with('initiative', () =>
+          openProject(layout, parentId, {
+            discussionId: messageId,
+            newSplit: true,
+          })
+        )
+        .with('document', () => {
+          if (!isAccessiblePreviewItem(parent) || parent.type !== 'document') {
+            toast.failure('Failed to open reference');
+            return;
+          }
+          const location = documentCommentLocation(messageId, {
+            fileType: parent.fileType,
+            subType: parent.subType,
+          });
+          openDocument(location.blockName, parentId, location.params, true);
+        })
+        .with('crm_company', 'crm_contact', (type) =>
+          openDocument(
+            type === 'crm_company' ? 'company' : 'contact',
+            parentId,
+            { [COMMENT_LINK_PARAM]: messageId },
+            true
+          )
+        )
+        .with('call', () =>
+          layout.openWithSplit(
+            { type: 'call', id: parentId },
+            {
+              preferNewSplit: true,
+              search: {
+                [callDetailSearch.namespace]: callDetailSearchCodec.serialize({
+                  ...callDetailSearch.defaults,
+                  messageId,
+                  seek: crypto.randomUUID(),
+                }),
+              },
+            }
+          )
+        )
+        .otherwise(() => toast.failure('Failed to open reference'));
+    }
+  );
+
+  const navigateToMessage = ({
+    channelId,
+    messageId,
+    threadId,
+  }: {
+    event?: KeyboardEvent | MouseEvent;
+    channelId: string;
+    messageId: string;
+    threadId?: string;
+  }) => {
+    navigateToChannelMessage(
+      blockOrchestrator,
+      channelId,
+      messageId,
+      threadId,
+      {
+        preferNewSplit: true,
+      }
+    ).catch((error) => Telemetry.error(error, { surface: 'references' }));
+  };
+
+  const navigateToGenericReference = (
+    item: PreviewItem,
+    event?: KeyboardEvent | MouseEvent
+  ) => {
+    if (isAccessiblePreviewItem(item) && item.type === 'document') {
+      navigateToItem({
+        event,
+        blockName: itemToBlockName(item),
+        blockId: item.id,
+      });
+    } else {
+      toast.failure('Failed to open reference');
+    }
+  };
+
+  const sortedReferences = createMemo(() => {
+    const refs = references.data ?? [];
+    return [...refs].sort((a, b) =>
+      compareDateDesc(getReferenceCreatedAt(a), getReferenceCreatedAt(b))
+    );
+  });
+
+  return (
+    <Show
+      when={sortedReferences().length > 0}
+      fallback={
+        <div class="py-8 text-ink-muted text-sm text-center">
+          No references found
+        </div>
+      }
+    >
+      <div class="flex flex-col">
+        <For each={sortedReferences()}>
+          {(ref) => {
+            if (isChannelReference(ref)) {
+              return (
+                <ChannelReferenceRow
+                  reference={ref}
+                  onOpen={(e) =>
+                    navigateToMessage({
+                      event: e,
+                      channelId: ref.channel_id,
+                      messageId: ref.message_id,
+                      threadId: ref.thread_id,
+                    })
+                  }
+                />
+              );
+            }
+            if (isCommentReference(ref)) {
+              return (
+                <CommentReferenceRow
+                  reference={ref}
+                  onOpen={(parent) => navigateToComment(ref, parent)}
+                />
+              );
+            }
+            if (isGenericReference(ref)) {
+              return (
+                <GenericReferenceRow
+                  reference={ref}
+                  onOpen={navigateToGenericReference}
+                />
+              );
+            }
+            return (
+              <div class="px-3 py-2 text-xs text-failure">
+                Unknown reference type
+              </div>
+            );
+          }}
+        </For>
+      </div>
+    </Show>
+  );
+}

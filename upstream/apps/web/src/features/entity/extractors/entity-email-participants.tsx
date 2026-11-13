@@ -1,0 +1,252 @@
+import { isViewerAddress } from '@app/features/email-message/core/email-user';
+import { HoverCard } from '@core/component/HoverCard';
+import { StaticMarkdown } from '@core/component/LexicalMarkdown/component/core/StaticMarkdown';
+import { unifiedListMarkdownTheme } from '@core/component/LexicalMarkdown/theme';
+import { toast } from '@core/component/Toast/Toast';
+import { UserTooltip } from '@core/component/UserTooltip';
+import { emailToMacroId, getDisplayName } from '@core/user';
+import {
+  highlightTermsInText,
+  mergeAdjacentMacroEmTags,
+} from '@core/util/searchHighlight';
+import CopyIcon from '@icon/system/regular/copy.svg';
+import { Telemetry } from '@macro-inc/observability';
+import { useInboxEmail } from '@queries/email/inbox-email';
+import { Surface } from '@ui';
+import { createSignal, For, Show } from 'solid-js';
+import type { EmailEntity, EmailThreadParticipants } from '../types/entity';
+import { isSearchEntity } from '../types/search';
+
+/** Checks if a value is likely an email address */
+function isLikelyEmail(value?: string): boolean {
+  return typeof value === 'string' && value.includes('@');
+}
+
+/** Extracts the local part of an email address (before @) */
+function getEmailLocalPart(email: string): string {
+  return email.split('@')[0];
+}
+
+/**
+ * Resolves the best display name for a participant
+ * Priority: participant.name > macroDisplayName > email local part
+ *
+ * `participant.name` is the From display name of that sender's message in
+ * this thread, so it comes first: the Macro lookup is keyed by address alone
+ * and falls back to the viewer's address book, which pins one person's name
+ * onto every message from a shared sender such as notifications@cal.com.
+ */
+function resolveParticipantName(
+  participant: EmailThreadParticipants[number],
+  macroDisplayName?: string
+): string {
+  const participantFullName = participant.name ?? '';
+  if (participantFullName && !isLikelyEmail(participantFullName)) {
+    return participantFullName;
+  }
+  if (macroDisplayName && !isLikelyEmail(macroDisplayName)) {
+    return macroDisplayName;
+  }
+  return getEmailLocalPart(participant.email);
+}
+
+type ResolvedParticipant = {
+  participant: EmailThreadParticipants[number];
+  displayName: string;
+};
+
+function ParticipantWithTooltip(props: {
+  participant: EmailThreadParticipants[number];
+  displayName: string;
+  highlighted?: string;
+}) {
+  const macroId = () => emailToMacroId(props.participant.email);
+  const macroDisplayName = () => getDisplayName(macroId());
+  const tooltipName = () =>
+    resolveParticipantName(props.participant, macroDisplayName());
+  const [open, setOpen] = createSignal(false);
+
+  return (
+    <HoverCard
+      open={open()}
+      onOpenChange={setOpen}
+      isolateClicks
+      triggerAs="span"
+      trigger={
+        <Show
+          when={props.highlighted}
+          fallback={<span>{props.displayName}</span>}
+        >
+          {(md) => (
+            <StaticMarkdown
+              markdown={md()}
+              theme={unifiedListMarkdownTheme}
+              singleLine
+            />
+          )}
+        </Show>
+      }
+      content={
+        <UserTooltip
+          displayName={tooltipName()}
+          email={props.participant.email}
+          id={macroId()}
+          onClose={() => setOpen(false)}
+        />
+      }
+    />
+  );
+}
+
+/**
+ * Resolves participants into display-ready objects, handling the "me" case
+ * and filtering out the viewer.
+ */
+function resolveParticipants(
+  participants: EmailThreadParticipants | undefined,
+  viewerEmail: string | undefined,
+  getMacroDisplayName: (email: string) => string | undefined
+): ResolvedParticipant[] {
+  if (!participants || participants.length === 0) return [];
+
+  const seen = new Set<string>();
+  const result: ResolvedParticipant[] = [];
+
+  for (const participant of participants) {
+    if (!participant.email) continue;
+    if (isViewerAddress(participant.email, viewerEmail)) continue;
+
+    const macroDisplayName = getMacroDisplayName(participant.email);
+    const displayName = resolveParticipantName(participant, macroDisplayName);
+
+    if (seen.has(displayName)) continue;
+    seen.add(displayName);
+
+    result.push({ participant, displayName });
+  }
+
+  // Every participant was the viewer (self-to-self threads, or
+  // duplicate own-address rows from multi-inbox accounts) — show "me".
+  if (result.length === 0) {
+    const self = participants.find((p) =>
+      isViewerAddress(p.email, viewerEmail)
+    );
+    if (self) return [{ participant: self, displayName: 'me' }];
+  }
+
+  return result;
+}
+
+function abbreviateParticipants(
+  resolved: ResolvedParticipant[]
+): ResolvedParticipant[] {
+  if (resolved.length <= 1) return resolved;
+
+  const abbreviated = resolved.map((r) => ({
+    ...r,
+    displayName: r.displayName.split(' ')[0],
+  }));
+
+  if (abbreviated.length <= 3) return abbreviated;
+
+  return [abbreviated[0], abbreviated[1]];
+}
+
+async function writeEmailToClipboard(email: string) {
+  await navigator.clipboard.writeText(email);
+  toast.success('Email copied');
+}
+
+function copyEmail(email: string, e: MouseEvent) {
+  e.stopPropagation();
+  writeEmailToClipboard(email).catch((error) => {
+    Telemetry.error(error, { surface: 'email-participants' });
+    toast.failure('Failed to copy email');
+  });
+}
+
+function HiddenParticipantsTooltip(props: { hidden: ResolvedParticipant[] }) {
+  return (
+    <HoverCard
+      isolateClicks
+      triggerAs="span"
+      trigger={<span class="opacity-60">+{props.hidden.length}</span>}
+      content={
+        <Surface depth={3} class="py-1 text-ink">
+          <For each={props.hidden}>
+            {(r) => (
+              <div
+                class="flex items-center gap-2 px-2 py-1 text-xs hover:bg-hover"
+                onClick={[copyEmail, r.participant.email]}
+              >
+                <span class="truncate">{r.participant.email}</span>
+                <CopyIcon class="size-3 shrink-0 opacity-60" />
+              </div>
+            )}
+          </For>
+        </Surface>
+      }
+    />
+  );
+}
+
+/** Get a nicely formatted list of participants from an email entity. */
+export function EntityEmailParticipants(props: { entity: EmailEntity }) {
+  const viewerEmail = useInboxEmail(() => props.entity.linkId);
+  const fetchDisplayName = (email: string) =>
+    getDisplayName(emailToMacroId(email));
+
+  const participants = () =>
+    abbreviateParticipants(
+      resolveParticipants(
+        props.entity.participants,
+        viewerEmail(),
+        fetchDisplayName
+      )
+    );
+
+  const allResolved = () =>
+    resolveParticipants(
+      props.entity.participants,
+      viewerEmail(),
+      fetchDisplayName
+    );
+
+  const hiddenParticipants = () => {
+    const all = allResolved();
+    return all.length > 3 ? all.slice(2) : [];
+  };
+
+  const searchTerms = () => {
+    if (!isSearchEntity(props.entity)) return undefined;
+    return props.entity.search.senderHighlightTerms;
+  };
+
+  const highlightName = (name: string) => {
+    const terms = searchTerms();
+    if (!terms?.length) return undefined;
+    const result = mergeAdjacentMacroEmTags(highlightTermsInText(name, terms));
+    return result !== name ? result : undefined;
+  };
+
+  return (
+    <>
+      <For each={participants()}>
+        {(resolved, index) => (
+          <>
+            <Show when={index() > 0}>, </Show>
+            <ParticipantWithTooltip
+              participant={resolved.participant}
+              displayName={resolved.displayName}
+              highlighted={highlightName(resolved.displayName)}
+            />
+          </>
+        )}
+      </For>
+      <Show when={hiddenParticipants().length > 0}>
+        {''}
+        <HiddenParticipantsTooltip hidden={hiddenParticipants()} />
+      </Show>
+    </>
+  );
+}

@@ -1,0 +1,105 @@
+import type { MessageEditor } from '@channel/Channel/create-message-editor';
+import type { NewMessageCheckable } from '@channel/Channel/util';
+import type { InputHandle, InputSnapshot } from '@channel/Input';
+import type {
+  Message,
+  MessageListItem,
+  MessageParent,
+} from '@service-storage/messages';
+import type { Accessor, JSX, Setter } from 'solid-js';
+import type {
+  ChannelMessageListMeta,
+  MessageActions,
+  MessageData,
+} from '../Message';
+import type { FocusRequest } from './focus-request';
+import type { MessageElementMount } from './message-element-lifecycle';
+
+export type ThreadActions = {
+  onDismissNewMessages?: () => void;
+};
+
+export type ThreadState = {
+  isExpanded: Accessor<boolean>;
+  setIsExpanded: Setter<boolean>;
+  isReplying: Accessor<boolean>;
+  setIsReplying: Setter<boolean>;
+  replyInputState: Accessor<InputSnapshot | undefined>;
+  setReplyInputState: Setter<InputSnapshot | undefined>;
+  replyInputEl?: Accessor<HTMLElement | undefined>;
+  setReplyInputEl?: Setter<HTMLElement | undefined>;
+  replyInputHandle?: Accessor<InputHandle | undefined>;
+  setReplyInputHandle?: Setter<InputHandle | undefined>;
+  replyInputFocusRequest: FocusRequest;
+};
+
+export type MessageEditState = {
+  messageId: string;
+  /** The message as it was when the edit started. */
+  message: MessageData;
+  snapshot: InputSnapshot;
+};
+
+/** Reactive contract for positioning and releasing a channel navigation target. */
+export type ThreadTargetNavigation = {
+  /** A new request can revisit the same message without remounting the thread. */
+  requestKey?: Accessor<string | number | undefined>;
+  targetThreadId: Accessor<string | undefined>;
+  targetMessageId: Accessor<string | undefined>;
+  targetReplyId: Accessor<string | undefined>;
+  activeTargetReplyId: Accessor<string | undefined>;
+  positionTarget: (
+    threadRow: HTMLElement,
+    targetElement: HTMLElement
+  ) => boolean;
+  onTargetMessageScrolled: (messageId: string) => void;
+  onTargetReplyScrolled: (replyId: string) => void;
+  onClearTarget: (threadId: string) => void;
+};
+
+export type ThreadProps = {
+  /** Optional host-specific timeline decorations and live content. */
+  beforeMessage?: JSX.Element;
+  afterMessage?: JSX.Element;
+  renderMessageContent?: (content: JSX.Element) => JSX.Element;
+  /** See `hideTriggeredBy` on the channel message. */
+  hideTriggeredBy?: boolean;
+  data: Accessor<MessageListItem>;
+  /** Complete replies supplied by a host that already loaded the thread. */
+  replies?: Accessor<Message[]>;
+  parent: Accessor<MessageParent>;
+  /** The enclosing view owns a floating input only in unified mode. */
+  inputMode?: 'inline' | 'unified';
+  getMessageActions?: (message: MessageData) => MessageActions | undefined;
+  listMeta?: ChannelMessageListMeta;
+  threadActions?: ThreadActions;
+  messageEditor?: MessageEditor;
+  targetNavigation?: ThreadTargetNavigation;
+  /** Whether the channel's Cmd+F find bar is currently open. */
+  isFindBarOpen: Accessor<boolean>;
+  /** The unified input's reply binding */
+  unifiedReplyTarget?: { threadId: string; replyId?: string };
+  /** Exact unread notification targets, including replies not yet loaded. */
+  unreadMessageIds?: readonly string[];
+  onMessageMount?: MessageElementMount;
+  onDisclosureMount?: MessageElementMount;
+  isNewMessage?: (reply: NewMessageCheckable) => boolean;
+  selectedMessageId?: Accessor<string | undefined>;
+  onSelectMessage?: (messageId: string) => void;
+  onClearSelection?: () => void;
+  messageListScopeId?: string;
+  isNewestThread?: boolean;
+  /**
+   * A single-root thread (a document's floating comment) stacks replies under
+   * the root on one straight rail instead of indenting and branching them.
+   */
+  monorail?: boolean;
+  /** Flat chat surfaces do not draw thread connector rails. */
+  hideRail?: boolean;
+  /** Render replies with root-message headers, without changing thread ownership. */
+  repliesAsRoots?: boolean;
+  /** Draws the root as something other than a message, such as a call's row. */
+  rootSlot?: () => JSX.Element;
+  /** Collapse to the indicator alone rather than previewing replies. */
+  hideCollapsedPreview?: boolean;
+} & ThreadState;

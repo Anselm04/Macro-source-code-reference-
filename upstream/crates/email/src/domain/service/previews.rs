@@ -1,0 +1,397 @@
+use entity_access::domain::models::EntityAccessReceipt;
+use entity_access::domain::models::MemberTeamRole;
+use entity_access::domain::models::ViewAccessLevel;
+
+use crate::domain::{
+    models::{
+        EmailErr, EnrichedEmailThreadPreview, GetEmailsRequest, PreviewCursorQuery, PreviewView,
+        PreviewViewStandardLabel, UserProvider,
+    },
+    ports::EmailRepo,
+};
+use filter_ast::Expr;
+use frecency::domain::{
+    models::{AggregateId, FrecencyByIdsRequest, FrecencyData},
+    ports::FrecencyQueryService,
+};
+use item_filters::ast::email::EmailLiteral;
+use macro_user_id::cowlike::CowLike;
+use macro_user_id::user_id::MacroUserIdStr;
+use model_entity::EntityType;
+use models_pagination::{CollectBy, PaginateOn, PaginatedCursor, Query, SimpleSortMethod};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use uuid::Uuid;
+
+use super::EmailServiceImpl;
+use super::thread::email_thread_ids_from_receipts;
+
+#[cfg(test)]
+mod test;
+
+/// Threads outside All Mail that one by-id read looks up in Spam and Trash.
+/// Each costs up to two sequential folder reads; a batch past the cap leaves
+/// the rest absent, as every thread outside All Mail was before the fallback.
+const MAX_FOLDER_LOOKUPS: usize = 20;
+
+const DEFAULT_PAGE: u32 = 20;
+const MIN_PAGE: u32 = 1;
+const MAX_PAGE: u32 = 500;
+
+/// The page size for a preview request: the documented default when the
+/// caller names none, and never outside the allowed range.
+fn page_limit(requested: Option<u32>) -> u32 {
+    requested.unwrap_or(DEFAULT_PAGE).clamp(MIN_PAGE, MAX_PAGE)
+}
+
+async fn get_frecency_scores<U: FrecencyQueryService>(
+    service: &U,
+    include_frecency: bool,
+    user_id: macro_user_id::user_id::MacroUserIdStr<'_>,
+    ids: &[model_entity::Entity<'_>],
+) -> Result<HashMap<AggregateId<'static>, FrecencyData>, frecency::domain::models::FrecencyQueryErr>
+{
+    if include_frecency {
+        service
+            .get_frecencies_by_ids(FrecencyByIdsRequest { user_id, ids })
+            .await
+            .map(|response| response.into_inner())
+    } else {
+        Ok(HashMap::new())
+    }
+}
+
+impl<T, U, E, CS, Eam, B> EmailServiceImpl<T, U, E, CS, Eam, B>
+where
+    T: EmailRepo,
+    U: FrecencyQueryService,
+    E: crate::domain::ports::EmailMessageEnqueuer,
+    CS: crm::domain::service::CrmService,
+    anyhow::Error: From<T::Err>,
+{
+    #[tracing::instrument(err, skip(self, req))]
+    pub(crate) async fn get_email_thread_previews_impl(
+        &self,
+        req: GetEmailsRequest,
+    ) -> Result<PaginatedCursor<EnrichedEmailThreadPreview, Uuid, SimpleSortMethod, ()>, EmailErr>
+    {
+        let GetEmailsRequest {
+            view,
+            link_ids,
+            macro_id,
+            limit,
+            query,
+            include_frecency,
+            team_receipt,
+            crm_scope,
+        } = req;
+
+        let team_id = self
+            .validate_crm_scope(team_receipt.as_ref(), crm_scope.as_ref())
+            .await?;
+
+        let sort_method = *query.sort_method();
+
+        let limit = page_limit(limit);
+
+        let query = PreviewCursorQuery {
+            view,
+            link_ids,
+            limit,
+            query,
+            team_id,
+        };
+
+        let previews = self
+            .email_repo
+            .previews_for_view_cursor(query, macro_id.copied().into_owned())
+            .await
+            .map_err(anyhow::Error::from)?;
+
+        let thread_ids: Vec<Uuid> = previews.iter().map(|p| p.id).collect();
+
+        let ids: Vec<_> = thread_ids
+            .iter()
+            .map(|id| EntityType::EmailThread.with_entity_string(id.to_string()))
+            .collect();
+
+        let frecency_scores = get_frecency_scores(
+            &self.frecency_service,
+            include_frecency,
+            macro_id,
+            ids.as_slice(),
+        );
+
+        let (attachment_map_result, participant_result, labels_result, frecency_scores) = tokio::join!(
+            self.email_repo.attachments_by_thread_ids(&thread_ids),
+            self.email_repo.contacts_by_thread_ids(&thread_ids),
+            self.email_repo.labels_by_thread_ids(&thread_ids),
+            frecency_scores,
+        );
+
+        let mut attachment_map = attachment_map_result
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .group_by(|v| v.thread_id);
+        let mut participant_map = participant_result
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .group_by(|v| v.thread_id);
+        let mut labels_map = labels_result
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .group_by(|v| v.thread_id);
+
+        let mut frecency_scores_map: HashMap<AggregateId<'static>, FrecencyData> = frecency_scores?;
+
+        Ok(previews
+            .into_iter()
+            .map(|thread| {
+                let id = AggregateId {
+                    user_id: thread.owner_id.clone(),
+                    entity: EntityType::EmailThread.with_entity_string(thread.id.to_string()),
+                };
+
+                EnrichedEmailThreadPreview {
+                    attachments: attachment_map.remove(&thread.id).unwrap_or_default(),
+                    labels: labels_map.remove(&thread.id).unwrap_or_default(),
+                    participants: participant_map.remove(&thread.id).unwrap_or_default(),
+                    frecency_score: frecency_scores_map
+                        .remove(&id)
+                        .map(|data| id.into_aggregate(data)),
+                    thread,
+                }
+            })
+            .paginate_on(limit as usize, sort_method)
+            .into_page())
+    }
+
+    /// Hydrate the Soup preview of each receipt-authorized thread. The
+    /// receipts settled who may read the threads; the preview query only
+    /// renders them, scoped to the inboxes that own them.
+    #[tracing::instrument(err, skip(self, receipts), fields(thread_count = receipts.len()))]
+    pub(crate) async fn get_email_thread_previews_by_receipts_impl(
+        &self,
+        viewer: MacroUserIdStr<'static>,
+        receipts: Vec<EntityAccessReceipt<ViewAccessLevel>>,
+    ) -> Result<Vec<EnrichedEmailThreadPreview>, EmailErr> {
+        let thread_ids = email_thread_ids_from_receipts(receipts)?;
+        if thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let threads: Vec<(Uuid, Uuid)> = self
+            .email_repo
+            .thread_metadata_by_ids(&thread_ids)
+            .await
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .map(|metadata| (metadata.thread_id, metadata.link_id))
+            .collect();
+        self.thread_previews_by_id(viewer, threads).await
+    }
+
+    /// The preview of one thread in the caller's own or delegated inboxes,
+    /// fresh from this service's pool. Ownership is checked here, never by
+    /// the caller.
+    #[tracing::instrument(err, skip(self), fields(user_id = %macro_id, %thread_id))]
+    pub(crate) async fn get_owned_email_thread_preview_impl(
+        &self,
+        macro_id: MacroUserIdStr<'static>,
+        thread_id: Uuid,
+    ) -> Result<Option<EnrichedEmailThreadPreview>, EmailErr> {
+        let Some(link) = self
+            .email_repo
+            .owned_link_for_thread(thread_id, macro_id.clone())
+            .await
+            .map_err(anyhow::Error::from)?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .thread_previews_by_id(macro_id, vec![(thread_id, link.id)])
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Render already-authorized `(thread, inbox)` pairs, each in the view of
+    /// the inbox that owns it. A thread renders as All Mail shows it; one that
+    /// All Mail leaves out because every message is in spam or trash renders
+    /// as its Spam or Trash row does, so a thread opened from those folders,
+    /// or reloaded after a write moved it there, is still found. All Mail
+    /// lists themselves keep excluding both folders.
+    #[tracing::instrument(
+        err,
+        skip_all,
+        fields(thread_count = threads.len(), outside_all_mail = tracing::field::Empty)
+    )]
+    async fn thread_previews_by_id(
+        &self,
+        viewer: MacroUserIdStr<'static>,
+        threads: Vec<(Uuid, Uuid)>,
+    ) -> Result<Vec<EnrichedEmailThreadPreview>, EmailErr> {
+        if threads.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut link_ids: Vec<Uuid> = threads.iter().map(|(_, link_id)| *link_id).collect();
+        link_ids.sort_unstable();
+        link_ids.dedup();
+        let thread_ids = threads.iter().map(|(thread_id, _)| *thread_id).collect();
+        let mut previews = self
+            .get_email_thread_previews_impl(authorized_threads_request(
+                viewer.clone(),
+                PreviewViewStandardLabel::All,
+                thread_ids,
+                link_ids,
+            ))
+            .await?
+            .items;
+
+        // One thread per folder read: the folder scan narrows to a thread's
+        // own messages only through an equality on its id, so a batch would
+        // read every message in the inbox's folder.
+        let found: HashSet<Uuid> = previews.iter().map(|preview| preview.thread.id).collect();
+        let outside_all_mail: Vec<(Uuid, Uuid)> = threads
+            .into_iter()
+            .filter(|(thread_id, _)| !found.contains(thread_id))
+            .collect();
+        tracing::Span::current().record("outside_all_mail", outside_all_mail.len());
+        if outside_all_mail.len() > MAX_FOLDER_LOOKUPS {
+            tracing::warn!(
+                outside_all_mail = outside_all_mail.len(),
+                looked_up = MAX_FOLDER_LOOKUPS,
+                "too many threads outside All Mail to look up in Spam and Trash"
+            );
+        }
+        for (thread_id, link_id) in outside_all_mail.into_iter().take(MAX_FOLDER_LOOKUPS) {
+            for folder in [
+                PreviewViewStandardLabel::Spam,
+                PreviewViewStandardLabel::Trash,
+            ] {
+                let preview = self
+                    .get_email_thread_previews_impl(authorized_threads_request(
+                        viewer.clone(),
+                        folder,
+                        vec![thread_id],
+                        vec![link_id],
+                    ))
+                    .await?
+                    .items
+                    .into_iter()
+                    .next();
+                if let Some(preview) = preview {
+                    previews.push(preview);
+                    break;
+                }
+            }
+        }
+        Ok(previews)
+    }
+
+    pub(crate) async fn get_link_by_auth_id_and_macro_id_impl(
+        &self,
+        auth_id: &str,
+        macro_id: macro_user_id::user_id::MacroUserIdStr<'_>,
+    ) -> Result<Option<crate::domain::models::Link>, EmailErr> {
+        Ok(self
+            .email_repo
+            .link_by_fusionauth_and_macro_id(auth_id, macro_id, UserProvider::Gmail)
+            .await
+            .map_err(anyhow::Error::from)?)
+    }
+
+    /// CRM-scope validation for the new `crm_domains` / `crm_addresses`
+    /// filter attributes. Returns `Ok(Some(team_id))` when the scope is
+    /// present and every requested domain/address passes the per-team CRM
+    /// pre-check; `Ok(None)` when no scope was requested.
+    ///
+    /// Errors:
+    ///   * `Unauthorized` — caller has no qualifying team membership but
+    ///     the filter requested CRM scope.
+    ///   * `CrmDisabledForTeam` — `team_crm_settings.crm_enabled = false`.
+    ///   * `CrmDomainNotFound` / `CrmDomainNotPermitted` —
+    ///     per-domain failure (no row / hidden company / email_sync off).
+    ///   * `CrmAddressNotFound` / `CrmAddressNotPermitted` —
+    ///     per-address failure (no row / hidden contact / hidden company / email_sync off).
+    async fn validate_crm_scope(
+        &self,
+        team_receipt: Option<&EntityAccessReceipt<MemberTeamRole>>,
+        crm_scope: Option<&item_filters::ast::CrmScope>,
+    ) -> Result<Option<Uuid>, EmailErr> {
+        let Some(scope) = crm_scope else {
+            return Ok(None);
+        };
+
+        let receipt = team_receipt.ok_or(EmailErr::Unauthorized)?;
+        let team_id = Uuid::parse_str(&receipt.entity().entity_id).map_err(|e| {
+            EmailErr::RepoErr(anyhow::anyhow!(
+                "team_receipt entity_id is not a valid uuid: {e}"
+            ))
+        })?;
+
+        let (domains, addresses): (&[String], &[String]) = match scope {
+            item_filters::ast::CrmScope::Domains(d) => (d.as_slice(), &[]),
+            item_filters::ast::CrmScope::Addresses(a) => (&[], a.as_slice()),
+        };
+
+        let precheck = self
+            .crm_service
+            .crm_scope_precheck(&team_id, domains, addresses)
+            .await
+            .map_err(|e| EmailErr::RepoErr(anyhow::anyhow!("crm precheck failed: {e}")))?;
+
+        if !precheck.crm_enabled {
+            return Err(EmailErr::CrmDisabledForTeam);
+        }
+
+        for status in &precheck.domains {
+            if !status.exists {
+                return Err(EmailErr::CrmDomainNotFound(status.domain.clone()));
+            }
+            if status.company_hidden || !status.email_sync {
+                return Err(EmailErr::CrmDomainNotPermitted(status.domain.clone()));
+            }
+        }
+
+        for status in &precheck.addresses {
+            if !status.exists {
+                return Err(EmailErr::CrmAddressNotFound(status.address.clone()));
+            }
+            if status.contact_hidden || status.company_hidden || !status.email_sync {
+                return Err(EmailErr::CrmAddressNotPermitted(status.address.clone()));
+            }
+        }
+
+        Ok(Some(team_id))
+    }
+}
+
+/// The preview request for threads whose access was already authorized,
+/// rendered in `view`. Each thread renders in the view of the inbox that owns
+/// it, as the CRM list renders teammates' threads, and the exact id filter
+/// keeps the widened inbox scope from admitting any other thread.
+fn authorized_threads_request(
+    viewer: MacroUserIdStr<'static>,
+    view: PreviewViewStandardLabel,
+    thread_ids: Vec<Uuid>,
+    link_ids: Vec<Uuid>,
+) -> GetEmailsRequest {
+    let limit = u32::try_from(thread_ids.len()).unwrap_or(u32::MAX);
+    let thread_filter = thread_ids
+        .into_iter()
+        .map(|id| Expr::val(EmailLiteral::ThreadId(id)))
+        .reduce(Expr::or)
+        .map(Arc::new);
+    GetEmailsRequest {
+        view: PreviewView::StandardLabel(view),
+        link_ids,
+        macro_id: viewer,
+        limit: Some(limit),
+        query: Query::Sort(SimpleSortMethod::UpdatedAt, thread_filter),
+        include_frecency: false,
+        team_receipt: None,
+        crm_scope: None,
+    }
+}

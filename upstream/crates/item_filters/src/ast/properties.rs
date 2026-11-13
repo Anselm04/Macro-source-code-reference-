@@ -1,0 +1,303 @@
+use std::fmt;
+use std::str::FromStr;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::PropertyFilter;
+use crate::ast::ExpandErr;
+use filter_ast::{ExpandFrame, Expr, FoldTree, TryExpandNode};
+
+/// The entity type for property lookups in the `entity_properties` table.
+///
+/// Using a closed enum prevents SQL injection through the `entity_type` field,
+/// which is interpolated into dynamic SQL queries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PropertyEntityType {
+    /// Native, archived, or imported call record.
+    CallRecord,
+    /// Calendar event entity
+    CalendarEvent,
+    /// Channel entity
+    Channel,
+    /// Chat entity
+    Chat,
+    /// Company entity
+    Company,
+    /// Database row entity
+    DatabaseRow,
+    /// Document entity
+    Document,
+    /// Initiative entity
+    Initiative,
+    /// Project entity
+    Project,
+    /// Task entity
+    Task,
+    /// Thread entity
+    Thread,
+    /// User entity
+    User,
+}
+
+/// Error returned when parsing an invalid entity type string.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("invalid property entity type: {0}")]
+pub struct PropertyEntityTypeError(pub String);
+
+impl FromStr for PropertyEntityType {
+    type Err = PropertyEntityTypeError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "CALENDAR_EVENT" => Ok(Self::CalendarEvent),
+            "CALL_RECORD" => Ok(Self::CallRecord),
+            "CHANNEL" => Ok(Self::Channel),
+            "CHAT" => Ok(Self::Chat),
+            "COMPANY" => Ok(Self::Company),
+            "DATABASE_ROW" => Ok(Self::DatabaseRow),
+            "DOCUMENT" => Ok(Self::Document),
+            "INITIATIVE" => Ok(Self::Initiative),
+            "PROJECT" => Ok(Self::Project),
+            "TASK" => Ok(Self::Task),
+            "THREAD" => Ok(Self::Thread),
+            "USER" => Ok(Self::User),
+            _ => Err(PropertyEntityTypeError(s.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for PropertyEntityType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CalendarEvent => write!(f, "CALENDAR_EVENT"),
+            Self::CallRecord => write!(f, "CALL_RECORD"),
+            Self::Channel => write!(f, "CHANNEL"),
+            Self::Chat => write!(f, "CHAT"),
+            Self::Company => write!(f, "COMPANY"),
+            Self::DatabaseRow => write!(f, "DATABASE_ROW"),
+            Self::Document => write!(f, "DOCUMENT"),
+            Self::Initiative => write!(f, "INITIATIVE"),
+            Self::Project => write!(f, "PROJECT"),
+            Self::Task => write!(f, "TASK"),
+            Self::Thread => write!(f, "THREAD"),
+            Self::User => write!(f, "USER"),
+        }
+    }
+}
+
+/// A validated entity reference ID that is safe for SQL interpolation.
+///
+/// Rejects strings containing single quotes, backslashes, or null bytes,
+/// which could enable SQL injection when interpolated into dynamic queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityRefId(String);
+
+/// Error returned when an entity reference ID contains unsafe characters.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("entity reference ID contains unsafe characters: {0}")]
+pub struct EntityRefIdError(pub String);
+
+impl EntityRefId {
+    /// Create a new validated entity reference ID.
+    pub fn new(s: String) -> Result<Self, EntityRefIdError> {
+        if s.contains('\'') || s.contains('\\') || s.contains('\0') {
+            return Err(EntityRefIdError(s));
+        }
+        Ok(Self(s))
+    }
+}
+
+impl fmt::Display for EntityRefId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for EntityRefId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EntityRefId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// UTC timestamp interval. Lower bounds are inclusive; upper bounds are exclusive.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema, schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schema(as = PropertyDateFilterRange))]
+#[cfg_attr(feature = "schema", schemars(rename = "PropertyDateFilterRange"))]
+pub struct DateRange {
+    /// Inclusive UTC lower bound, omitted for an open start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<DateTime<Utc>>,
+    /// Exclusive UTC upper bound, omitted for an open end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<DateTime<Utc>>,
+}
+
+/// Describes how to match against a property value in the entity_properties table.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum PropertyMatchValue {
+    /// Match a select option by its UUID. Uses the `?` jsonb operator on `values->'value'`.
+    #[serde(rename = "so")]
+    SelectOption(Uuid),
+    /// Match an entity reference by entity_id. Uses the `@>` jsonb operator on `values->'value'`.
+    #[serde(rename = "er")]
+    EntityRef(EntityRefId),
+    /// Match a DATE property within a UTC interval; open bounds match any present date.
+    #[serde(rename = "dr")]
+    DateRange(DateRange),
+}
+
+/// A single property-based filter condition for the AST.
+///
+/// When converted to SQL, this generates an EXISTS subquery against the
+/// `entity_properties` table, checking that the given property has a matching value.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct PropertiesLiteral {
+    /// The property definition UUID to filter on.
+    #[serde(rename = "pd")]
+    pub property_definition_id: Uuid,
+    /// The entity type for the property lookup (e.g., Task, Document, Project).
+    /// When None, matches across all entity types.
+    #[serde(default, rename = "et", skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<PropertyEntityType>,
+    /// The value to match against.
+    #[serde(rename = "v")]
+    pub value: PropertyMatchValue,
+}
+
+impl ExpandFrame<PropertiesLiteral> for Vec<PropertyFilter> {
+    type Err = ExpandErr;
+    fn expand_ast(
+        filters: Vec<PropertyFilter>,
+    ) -> Result<Option<Expr<PropertiesLiteral>>, ExpandErr> {
+        let nodes: Vec<Option<Expr<PropertiesLiteral>>> = filters
+            .into_iter()
+            .map(|pf| {
+                let prop_def_id = Uuid::parse_str(&pf.property_definition_id)?;
+                let entity_type = pf
+                    .entity_type
+                    .map(|et| et.parse::<PropertyEntityType>())
+                    .transpose()?;
+
+                let option_nodes = pf
+                    .option_ids
+                    .iter()
+                    .map(|s| Uuid::parse_str(s))
+                    .try_expand(
+                        |r| {
+                            r.map(|uuid| PropertiesLiteral {
+                                property_definition_id: prop_def_id,
+                                entity_type,
+                                value: PropertyMatchValue::SelectOption(uuid),
+                            })
+                        },
+                        Expr::or,
+                    )?;
+
+                let entity_ref_nodes = pf
+                    .entity_ids
+                    .iter()
+                    .map(|id| EntityRefId::new(id.clone()))
+                    .try_expand(
+                        |r| {
+                            r.map(|id| PropertiesLiteral {
+                                property_definition_id: prop_def_id,
+                                entity_type,
+                                value: PropertyMatchValue::EntityRef(id),
+                            })
+                        },
+                        Expr::or,
+                    )?;
+
+                let date_range_node = pf.date_range.map(|range| {
+                    Expr::val(PropertiesLiteral {
+                        property_definition_id: prop_def_id,
+                        entity_type,
+                        value: PropertyMatchValue::DateRange(range),
+                    })
+                });
+                let date_present_node = pf.has_date.map(|has_date| {
+                    let literal = Expr::val(PropertiesLiteral {
+                        property_definition_id: prop_def_id,
+                        entity_type,
+                        value: PropertyMatchValue::DateRange(DateRange {
+                            start: None,
+                            end: None,
+                        }),
+                    });
+                    if has_date {
+                        literal
+                    } else {
+                        Expr::is_not(literal)
+                    }
+                });
+                Ok([
+                    [option_nodes, entity_ref_nodes]
+                        .into_iter()
+                        .fold_with(Expr::or),
+                    date_range_node,
+                    date_present_node,
+                ]
+                .into_iter()
+                .fold_with(Expr::and))
+            })
+            .collect::<Result<_, ExpandErr>>()?;
+
+        Ok(nodes.into_iter().fold_with(Expr::and))
+    }
+}
+
+/// True when the filter could match an entity of one of the given types.
+/// Untyped literals match any type. Conservative under NOT, since a negated
+/// predicate can match anything.
+pub fn properties_filter_can_apply_to(
+    expr: &Expr<PropertiesLiteral>,
+    entity_types: &[PropertyEntityType],
+) -> bool {
+    match expr {
+        Expr::And(a, b) => {
+            properties_filter_can_apply_to(a, entity_types)
+                && properties_filter_can_apply_to(b, entity_types)
+        }
+        Expr::Or(a, b) => {
+            properties_filter_can_apply_to(a, entity_types)
+                || properties_filter_can_apply_to(b, entity_types)
+        }
+        Expr::Not(_) => true,
+        Expr::Literal(PropertiesLiteral { entity_type, .. }) => {
+            entity_type.is_none_or(|entity_type| entity_types.contains(&entity_type))
+        }
+    }
+}
+
+/// True when the filter can match an entity that has no property rows at all,
+/// i.e. the expression evaluated with every literal false. When this returns
+/// false, property-less entity types (channels, calls, CRM companies, foreign
+/// entities) can never satisfy the filter.
+pub fn properties_filter_matches_propertyless(expr: &Expr<PropertiesLiteral>) -> bool {
+    match expr {
+        Expr::And(a, b) => {
+            properties_filter_matches_propertyless(a) && properties_filter_matches_propertyless(b)
+        }
+        Expr::Or(a, b) => {
+            properties_filter_matches_propertyless(a) || properties_filter_matches_propertyless(b)
+        }
+        Expr::Not(a) => !properties_filter_matches_propertyless(a),
+        Expr::Literal(_) => false,
+    }
+}

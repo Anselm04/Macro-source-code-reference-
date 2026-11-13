@@ -1,0 +1,117 @@
+# Calendar scheduling
+
+Personal and Macro-team booking pages, event types, weekly schedules/date overrides,
+collective and round-robin hosts, booking limits/buffers, custom questions, host
+legacy approval management, cancellation, rescheduling, and recorded attendance. `domain::Service` owns
+authorization and booking policy. HTTP adapters expose public presentation types and authenticate
+management requests; PostgreSQL and the existing calendar/team domain ports supply
+storage and provider operations.
+
+## Integration
+
+Apply MacroDB migrations `20260918164303_calendar_scheduling.sql` and
+`20260918175703_scheduling_recovery.sql`, then deploy the
+updated calendar service with its existing `CALENDAR_SYNC_ENABLED` setting enabled.
+The migration uses PostgreSQL multiranges (PostgreSQL 14+) and `btree_gist` for
+atomic host conflict exclusion. Each host needs a connected, writable primary
+calendar whose grant works, and every calendar that counts toward their busy time
+must be current (`macro_services/sync_health.rs`, over
+`CalendarSyncHealthReader`): a calendar failing transiently still offers time
+around its stored events for 45 minutes after its next sync was due (its last
+successful sync; for a Google system calendar such as holidays, which Macro
+syncs daily, a day after it), while a
+permanent or reauthorization failure, a calendar or inbox still on its first
+sync, or a failure past that window refuses availability. A calendar with Busy
+off never blocks booking, whatever its sync state. Busy time comes from every connected calendar
+the host has not turned off (the Busy switch in Settings → Calendar, stored in
+`calendar_availability_preferences` and read in process, never through the
+calendar service's HTTP listing), plus meetings the host is in on any calendar
+(`calendar_events::domain::labels::attends_meeting`). Invitations and Google Meet links use the existing calendar mutation service.
+Deployed invitations include the private cancellation/rescheduling URL.
+
+The web entry points are Settings → Calendar, the calendar header shortcuts,
+`/app/book/:profile/:slug?`, and `/app/booking/:id#token`. Existing Macro team
+owners/admins can manage team scheduling; members have read access. Current
+membership is checked again when booking or approving. Booking capabilities travel
+in request headers/bodies, and scheduling responses disable caching.
+
+Event types start paused. Public pages show enabled types only. Team availability
+uses the selected shared weekly schedule plus every selected host's busy calendar
+and personal default availability (including that host's time zone and date overrides).
+Personal profiles without an explicit default use their first schedule; hosts who have
+not configured personal availability use the team schedule.
+Round robin assigns one available host, favoring the least assigned host. Public
+slots are displayed on the visitor's local date. Existing bookings retain their
+original event/schedule snapshots for management after a link is edited or removed.
+Replacement-slot requests accept `timeZone` with `date` to return starts on the
+visitor's local day, across host dates and daylight-saving boundaries. Requests
+without `timeZone` retain schedule-date semantics for existing clients and host
+administration. The booking's own reservation and calendar event remain excluded.
+
+Booking queries accept a half-open `from`/`to` range of start times, up to 733 days
+(room for two full comparison years across daylight-saving changes). They return the
+complete range or a clear error when more than 5,000 records match. The management UI starts with a 61-day range and exposes date controls so large profiles can narrow it; round-robin balancing uses aggregate host counts and is independent of this list limit. Insights must not
+interpret failures as an empty dataset. Reschedule counts increase only after a
+successful move; old records default to zero, without reconstructing unknown history.
+Attendance defaults to unknown and may be recorded only after a confirmed meeting has
+ended, by a current assigned host or profile administrator. Elapsed confirmed meetings
+can be counted as completed, but this alone is not evidence of attendance.
+
+## Verification
+
+- `cargo test -p calendar_scheduling --features postgres,inbound` with `DATABASE_URL` pointing
+  to a disposable PostgreSQL server and `SQLX_OFFLINE` unset. The SQLx integration
+  tests create isolated test databases and apply the actual scheduling migration.
+- `SQLX_OFFLINE=true cargo check -p calendar_service` checks production composition.
+- In `apps/web`, `bun --bun x vitest run --config src/features/scheduling/vitest.config.ts`
+  checks client validation and request races/retries.
+- `/src/features/scheduling/browser-test/index.html` on the Vite dev server mounts
+  the real scheduling components with injected sample data. It never sends invitations
+  or writes hosted data; it is separate from production routes.
+
+## Operational behavior
+
+A booking holds its host reservations before calling the provider. An uncertain
+provider write leaves the booking `failed` (or `processing` after a process crash),
+with reservations retained to avoid duplicate meetings. Durable operation intents, stable
+provider creation IDs, pinned calendars, and version-fenced retries recover these states after
+five minutes. The calendar-service worker runs every 15 seconds; repeated failures back off and
+emit operator-attention errors. Keyed deletion works even after local calendar projection
+retirement. Completion-persistence failures still return the durable private receipt. Rescheduling reserves the old and new intervals until the provider
+accepts the update, then releases the old interval. Calendar projections without a
+source time zone for all-day events conservatively block all possible UTC offsets.
+
+This change does not include payments, workflow automation, routing forms, advanced
+analytics, or webhooks. Core booking insights are derived from authorized booking records.
+New approval-only configurations and bookings are disabled until standalone host/guest
+notifications exist. Existing pending records remain manageable. Confirmed meetings receive
+provider calendar invitations. Shared PostgreSQL budgets cap public availability and booking
+requests per profile; all booking changes use a monotonic revision to prevent stale edits.
+See `docs/design/calendar-scheduling-v1.md` for rollout, rollback and monitoring queries.
+It does not deploy the backend or apply migrations to shared databases.
+
+## AI booking-link workflows
+
+`ListBookingLinks` discovers personal links, current team IDs, reusable schedules and
+full editable drafts. Pass a returned team ID to discover that team's links. Both
+active and paused links include their shareable URL and profile revision.
+`CreateBookingLink` and `EditBookingLink` execute directly in every host after
+conversational confirmation. The agent explains the complete proposal, waits for
+the user's approval, then passes that reply verbatim in required `userConfirmation`.
+Missing or blank confirmation is rejected before calling the scheduling service.
+As with confirmed email/calendar tools, the quote is not verified against conversation
+history. There is no booking review card, elicitation, or deferred user-tool result.
+The agent discovers internal identities through tools instead of asking users for IDs.
+Code mode reaches the same workflows through `macro.calendar.booking` in the SDK, over
+`GET/POST /scheduling/links` and `PUT /scheduling/links/{id}`; the HTTP writes take the
+same required `userConfirmation`.
+
+The scheduling service owns authorization and validates the complete draft. Edits
+replace only the chosen event type; changed hours use a separate schedule to
+preserve other links and personal default availability. All writes retain the
+profile's compare-and-swap fence. An identical create at an existing slug or an
+identical edit is a no-op; a conflicting slug or stale edited revision fails and
+requires reading and reviewing the current state. Creation returns actual saved
+identities and URLs. Paused links cannot accept bookings, and creating a link never
+sends invitations. Guest booking still uses the normal calendar-readiness and
+availability checks. This workflow has no Forms dependencies.

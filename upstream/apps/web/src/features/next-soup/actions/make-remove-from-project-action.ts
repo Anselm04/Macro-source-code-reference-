@@ -1,0 +1,57 @@
+import { t } from '@app/lib/i18n';
+import { toast } from '@core/component/Toast/Toast';
+import { fireAndForget } from '@core/util/fireAndForget';
+import type { EntityData } from '@entity';
+import { createBulkRemoveFromProjectDssEntityMutation } from '@entity';
+import { restoreSoupFocus } from '../utils';
+import type { EntityActionListState } from './entity-action-context';
+
+/** Clear the entities' folder (set their project to none). */
+export const makeRemoveFromProjectAction = () => {
+  const removeMutation = createBulkRemoveFromProjectDssEntityMutation();
+
+  const canExecute = (entity: EntityData): boolean =>
+    entity.type === 'document' ||
+    entity.type === 'chat' ||
+    entity.type === 'project' ||
+    entity.type === 'email' ||
+    entity.type === 'database' ||
+    entity.type === 'form';
+
+  const execute = async (entities: EntityData[]): Promise<boolean> => {
+    // Failure toast is shown by the mutation
+    const result = await removeMutation
+      .mutateAsync({ entities })
+      .catch(() => null);
+    if (!result) return false;
+    toast.success(
+      entities.length > 1
+        ? t('entityActions.toastRemovedCountFromFolder', {
+            count: entities.length,
+          })
+        : t('entityActions.toastRemovedFromFolder')
+    );
+    return true;
+  };
+
+  const executeWithSoup = async (
+    entities: EntityData[],
+    soup: EntityActionListState
+  ) => {
+    // Entities leave the viewed folder's list; move focus to a neighbor
+    const currentIndex = soup.focus.index();
+    const nextRow =
+      soup.items.at(currentIndex + 1) ?? soup.items.at(currentIndex - 1);
+    const success = await execute(entities);
+    // Rolled back on failure; keep selection and focus for a retry
+    if (!success) return;
+
+    soup.selection.clear();
+    if (nextRow) {
+      soup.focus.set(nextRow.id);
+    }
+    fireAndForget(restoreSoupFocus(nextRow?.id), 'entity-actions');
+  };
+
+  return { canExecute, execute, executeWithSoup };
+};

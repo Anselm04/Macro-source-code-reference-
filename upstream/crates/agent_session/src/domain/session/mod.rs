@@ -1,0 +1,19 @@
+//! Protocol state and actor shell for one agent-runtime connection.
+
+pub(crate) mod actors;
+// The file layout (session/session.rs) is a deliberate organizational
+// choice: logic in `session`, vocabulary in `types`.
+#[allow(clippy::module_inception)]
+mod session;
+pub(crate) mod telemetry;
+mod types;
+
+#[cfg(test)]
+mod tests;
+
+pub use session::SessionMachine;
+pub(crate) use session::initialize_request;
+pub use types::{
+    CloseReason, Effect, HandshakeStatus, InitializationContext, Input, PermissionPolicy,
+    RuntimeStatus, SessionRestoreSupport, StopReason,
+};

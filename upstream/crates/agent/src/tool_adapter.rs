@@ -1,0 +1,302 @@
+/// Adapts `ai_toolset` tool types into RIG [`DynamicTool`] objects.
+use ai_toolset::telemetry::ToolCallSpan;
+use ai_toolset::tool_object::ToolSetCallable;
+use ai_toolset::{
+    AsyncToolCollection, RequestContext, ToolResult, ToolSet as AiToolSet, ToolSetError,
+};
+use rig_agent::tool::{DynamicTool, ToolExecutionError};
+use std::sync::{Arc, RwLock};
+use tracing::Instrument as _;
+
+/// Ensure every object schema carries an explicit `properties` map.
+///
+/// Zero-argument tools serialize to `{"type": "object"}` with no
+/// `properties` key, which OpenAI's strict function validation rejects
+/// ("object schema missing properties"). Adding an empty map is a
+/// semantic no-op accepted by every provider. Recurses through the
+/// standard schema-bearing keywords.
+pub fn normalize_request_schema(schema: &mut serde_json::Value) {
+    let serde_json::Value::Object(map) = schema else {
+        return;
+    };
+
+    if map.get("type").and_then(|t| t.as_str()) == Some("object") && !map.contains_key("properties")
+    {
+        map.insert(
+            "properties".to_owned(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+    }
+
+    for key in ["properties", "$defs", "definitions"] {
+        if let Some(serde_json::Value::Object(children)) = map.get_mut(key) {
+            for child in children.values_mut() {
+                normalize_request_schema(child);
+            }
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(serde_json::Value::Array(children)) = map.get_mut(key) {
+            for child in children.iter_mut() {
+                normalize_request_schema(child);
+            }
+        }
+    }
+    for key in ["items", "additionalProperties", "not", "if", "then", "else"] {
+        if let Some(child) = map.get_mut(key) {
+            normalize_request_schema(child);
+        }
+    }
+}
+
+/// The provider-facing description of a tool, lifted out of its schema.
+///
+/// Providers take the description on the tool definition, so the schema's root
+/// `description` moves there rather than being sent twice. It is never empty:
+/// rig omits an empty description, OpenAI echoes the tool back with
+/// `"description": null`, and rig then fails to parse `response.completed`,
+/// dropping the call's token usage from its span.
+pub(crate) fn take_description(
+    name: &str,
+    description: String,
+    schema: &mut serde_json::Value,
+) -> String {
+    let in_schema = schema
+        .as_object_mut()
+        .and_then(|map| map.remove("description"))
+        .and_then(|value| value.as_str().map(str::to_owned));
+    [Some(description), in_schema]
+        .into_iter()
+        .flatten()
+        .find(|description| !description.trim().is_empty())
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// A tool's definition as providers receive it, from its schema.
+pub(crate) fn provider_definition(
+    name: String,
+    description: String,
+    schema: &schemars::Schema,
+) -> rig_core::completion::ToolDefinition {
+    let mut parameters =
+        serde_json::to_value(schema).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    normalize_request_schema(&mut parameters);
+    let description = take_description(&name, description, &mut parameters);
+    rig_core::completion::ToolDefinition {
+        name,
+        description,
+        parameters,
+    }
+}
+
+type Deserializer<Context> = Arc<
+    dyn Fn(
+            &serde_json::Value,
+        ) -> Result<Box<dyn ToolSetCallable<Context> + Send + Sync>, serde_json::Error>
+        + Send
+        + Sync,
+>;
+
+/// Builds RIG [`DynamicTool`]s from the tools of an [`AsyncToolCollection`].
+///
+/// The produced tools capture the shared service context and a mutable request
+/// context (user ID) so that `ai_toolset` tools can be called through RIG's
+/// agentic loop without modification.
+pub struct ToolsetToolAdapter;
+
+impl ToolsetToolAdapter {
+    /// Consume an [`AsyncToolCollection`] and produce one [`DynamicTool`] per
+    /// registered tool.
+    ///
+    /// `context` is the shared service context (e.g. `ToolServiceContext`).
+    /// `request_context` is shared across all adapters and should be set before
+    /// each session.
+    pub fn from_collection<Context>(
+        collection: AsyncToolCollection<Context>,
+        context: Arc<Context>,
+        request_context: Arc<RwLock<RequestContext>>,
+    ) -> Vec<DynamicTool>
+    where
+        Context: Clone + Send + Sync + 'static,
+    {
+        collection
+            .tools
+            .into_iter()
+            .map(|(name, tool_object)| {
+                let mut input_schema = serde_json::Value::Object(tool_object.input_schema.clone());
+                normalize_request_schema(&mut input_schema);
+                let description =
+                    take_description(&name, tool_object.description.clone(), &mut input_schema);
+                let deserializer: Deserializer<Context> = Arc::new(
+                    move |json: &serde_json::Value| -> Result<
+                        Box<dyn ToolSetCallable<Context> + Send + Sync>,
+                        serde_json::Error,
+                    > { tool_object.try_deserialize(json) },
+                );
+                let context = context.clone();
+                let request_context = request_context.clone();
+                let tool_name = name.clone();
+
+                DynamicTool::new(
+                    name,
+                    description,
+                    input_schema,
+                    move |_tool_ctx, args: serde_json::Value| {
+                        let deserializer = deserializer.clone();
+                        let context = context.clone();
+                        let request_context = request_context.clone();
+                        let tool_name = tool_name.clone();
+                        Box::pin(async move {
+                            let req_ctx = request_context
+                                .read()
+                                .expect("request_context lock poisoned")
+                                .clone();
+                            // Bypasses `ToolSet::try_tool_call`, so it carries
+                            // the same `execute_tool` telemetry itself - under
+                            // the same request-level opt-out.
+                            let telemetry = req_ctx
+                                .genai_telemetry
+                                .then(|| ToolCallSpan::begin(&tool_name, &args));
+                            let span = telemetry.as_ref().map_or_else(tracing::Span::none, |t| {
+                                t.span().clone()
+                            });
+                            let result: Result<ToolResult<serde_json::Value>, ToolSetError> =
+                                async {
+                                    let callable = (deserializer)(&args)
+                                        .map_err(ToolSetError::Deserialization)?;
+                                    let ctx = (*context).clone();
+                                    Ok(callable.call(ctx, req_ctx).await)
+                                }
+                                .instrument(span)
+                                .await;
+                            if let Some(telemetry) = &telemetry {
+                                telemetry.finish(&result);
+                            }
+                            match result {
+                                Ok(Ok(value)) => crate::tool_media::model_output(value),
+                                Ok(Err(e)) => {
+                                    tracing::error!(error = ?e.internal_error, "toolset tool error");
+                                    Err(ToolExecutionError::other(e.description))
+                                }
+                                Err(ToolSetError::Deserialization(e)) => Err(invalid_args(e)),
+                                Err(e) => Err(ToolExecutionError::other(e.to_string())),
+                            }
+                        })
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// Builds RIG [`DynamicTool`]s that delegate through a shared
+/// [`dyn AiToolSet`](AiToolSet).
+///
+/// Unlike [`ToolsetToolAdapter`] which takes ownership of tools from an
+/// `AsyncToolCollection`, these tools dispatch every call through the shared
+/// [`AiToolSet`] trait object. This supports `CombinedToolSet` (static tools +
+/// MCP tools) without decomposing it.
+pub struct DynToolSetAdapter;
+
+impl DynToolSetAdapter {
+    /// Create one [`DynamicTool`] per provider definition in `definitions`,
+    /// built with [`provider_definition`] from `toolset`'s
+    /// [`AiToolSet::request_schemas`]. Calls are dispatched through the shared
+    /// `toolset`.
+    pub(crate) fn from_definitions<Context>(
+        definitions: Vec<rig_core::completion::ToolDefinition>,
+        toolset: Arc<dyn AiToolSet<Context> + Send + Sync>,
+        context: Arc<Context>,
+        request_context: Arc<RwLock<RequestContext>>,
+    ) -> Vec<DynamicTool>
+    where
+        Context: Clone + Send + Sync + 'static,
+    {
+        definitions
+            .into_iter()
+            .map(|definition| {
+                Self::build(
+                    definition.name,
+                    definition.description,
+                    definition.parameters,
+                    toolset.clone(),
+                    context.clone(),
+                    request_context.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Build a single tool for one loaded on demand via tool search.
+    ///
+    /// Used to register a `SearchTools`-discovered tool with the live tool
+    /// server mid-session so it becomes advertised and callable on the next
+    /// turn. Calls dispatch through the shared `toolset` by name, exactly like
+    /// [`Self::from_definitions`].
+    pub fn loaded<Context>(
+        name: String,
+        description: String,
+        schema: schemars::Schema,
+        toolset: Arc<dyn AiToolSet<Context> + Send + Sync>,
+        context: Arc<Context>,
+        request_context: Arc<RwLock<RequestContext>>,
+    ) -> DynamicTool
+    where
+        Context: Clone + Send + Sync + 'static,
+    {
+        let definition = provider_definition(name, description, &schema);
+        Self::build(
+            definition.name,
+            definition.description,
+            definition.parameters,
+            toolset,
+            context,
+            request_context,
+        )
+    }
+
+    fn build<Context>(
+        name: String,
+        description: String,
+        schema: serde_json::Value,
+        toolset: Arc<dyn AiToolSet<Context> + Send + Sync>,
+        context: Arc<Context>,
+        request_context: Arc<RwLock<RequestContext>>,
+    ) -> DynamicTool
+    where
+        Context: Clone + Send + Sync + 'static,
+    {
+        let tool_name = name.clone();
+        DynamicTool::new(
+            name,
+            description,
+            schema,
+            move |_tool_ctx, args: serde_json::Value| {
+                let toolset = toolset.clone();
+                let context = context.clone();
+                let request_context = request_context.clone();
+                let tool_name = tool_name.clone();
+                Box::pin(async move {
+                    let ctx = (*context).clone();
+                    let req_ctx = request_context
+                        .read()
+                        .expect("request_context lock poisoned")
+                        .clone();
+                    match toolset.try_tool_call(ctx, req_ctx, &tool_name, &args).await {
+                        Ok(Ok(value)) => crate::tool_media::model_output(value),
+                        Ok(Err(e)) => {
+                            tracing::error!(error = ?e.internal_error, "tool error");
+                            Err(ToolExecutionError::other(e.description))
+                        }
+                        Err(e) => Err(ToolExecutionError::other(e.to_string())),
+                    }
+                })
+            },
+        )
+    }
+}
+
+/// Deserialization failures are invalid model-supplied arguments.
+fn invalid_args(e: serde_json::Error) -> ToolExecutionError {
+    ToolExecutionError::invalid_args(e.to_string())
+}

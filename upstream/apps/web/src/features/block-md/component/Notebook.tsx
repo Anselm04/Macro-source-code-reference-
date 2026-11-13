@@ -1,0 +1,517 @@
+import { useChangeEntityIcon } from '@app/features/entity-appearance/entity-appearance';
+import { useDocumentAppearance } from '@app/features/entity-appearance/queries/document-appearance';
+import { useFeatureFlag } from '@app/lib/analytics/posthog';
+import { t } from '@app/lib/i18n';
+import { createSizeBreakpoints } from '@app/util/create-size-breakpoints';
+import { CommentMargin } from '@block-md/comments/CommentMargin';
+import { useSplitPanel } from '@components/app/split-layout/layoutUtils';
+import { useMacroMentionLinkResolver } from '@components/app/split-layout/split-router/mention-links';
+import { editorFocusSignal } from '@core/component/LexicalMarkdown/utils';
+import { ParamsProvider } from '@core/component/ParamsProvider';
+import {
+  DEV_MODE_ENV,
+  ENABLE_MARKDOWN_COMMENTS,
+  enableEntityAppearance,
+  LOCAL_ONLY,
+} from '@core/constant/featureFlags';
+import { useIsMacroTeam } from '@core/context/team';
+import { useUserId } from '@core/context/user';
+import { registerHotkey } from '@core/hotkey/hotkeys';
+import { TOKENS } from '@core/hotkey/tokens';
+import { isMobile } from '@core/mobile/isMobile';
+import { isTouchDevice } from '@core/mobile/isTouchDevice';
+import {
+  captureScrollAnchor,
+  keepScrollAnchorOnResize,
+  restoreScrollAnchor,
+  type ScrollAnchor,
+} from '@core/util/scrollAnchor';
+import type { DocumentEntity } from '@entity';
+import Smiley from '@icon/system/regular/smiley.svg';
+import type { LoroManager } from '@macro-inc/collaboration/collab/manager';
+import { makeResizeObserver } from '@solid-primitives/resize-observer';
+import { makePersisted } from '@solid-primitives/storage';
+import { badgeTriggerClasses } from '@ui';
+import type { DialogHandle } from '@ui/components/ImperativeDialog';
+import {
+  createComputed,
+  createEffect,
+  createMemo,
+  createSignal,
+  on,
+  onCleanup,
+  onMount,
+  Show,
+  untrack,
+} from 'solid-js';
+import { useMarkdownDocument } from '../context/markdown-document-context';
+import { createEnterOwningControl } from '../util/createEnterOwningControl';
+import { markdownWideMode } from '../wide-mode';
+import { DocumentDiscussion } from './DocumentDiscussion';
+import { InlineTaskGithubPullRequests } from './InlineTaskGithubPullRequests';
+import { InlineTaskProperties } from './InlineTaskProperties';
+import { MarkdownEditor } from './MarkdownEditor';
+import { useMarkdownName } from './MarkdownNameProvider';
+import {
+  MARKDOWN_OUTLINE_INSET,
+  MARKDOWN_OUTLINE_WIDTH,
+  MarkdownOutline,
+  outlineFitsGutter,
+  useMarkdownOutline,
+} from './MarkdownOutline';
+import { SkillDescriptionField } from './SkillDescriptionField';
+import { shouldAutofocusDocument } from './should-autofocus-document';
+import { TaskDuplicateMatchPill } from './TaskDuplicateMatches';
+import { TitleEditor } from './TitleEditor';
+import { registerMarkdownCommands } from './useMarkdownCommands';
+
+/**
+ * Whether the Lexical state debugger panel is open, persisted across reloads so
+ * the debug panel stays where the user left it. Shared by every notebook so the
+ * toggle is consistent regardless of which editor surfaced it.
+ */
+const [showLexicalStateDebugger, setShowLexicalStateDebugger] = makePersisted(
+  createSignal(false),
+  { name: 'lexical-state-debugger-open' }
+);
+
+const NoteTargetWidth = 768;
+const CommentTargetWidth = 320;
+const GapTargetWidth = 24;
+const MinimizedCommentTargetWidth = 48;
+
+enum CommentLayoutMode {
+  lg = 'lg',
+  md = 'md',
+  xs = 'xs',
+  none = 'none',
+}
+
+const CommentBreakpoints = {
+  lg: {
+    min: NoteTargetWidth + 2 * CommentTargetWidth + 3 * GapTargetWidth,
+  },
+  md: {
+    min: (3 / 4) * NoteTargetWidth + CommentTargetWidth + GapTargetWidth,
+  },
+} as const;
+
+function useCanUseLexicalStateDebugger() {
+  const isMacroTeam = useIsMacroTeam();
+  return createMemo(() => {
+    if (LOCAL_ONLY || DEV_MODE_ENV) return true;
+    return isMacroTeam();
+  });
+}
+
+export function Notebook(props: {
+  loroManager: LoroManager;
+  documentId: string;
+  hotkeyScope: string | undefined;
+  autoFocus: boolean;
+}) {
+  const {
+    element: blockElement,
+    state,
+    entity: documentEntity,
+    permissions,
+  } = useMarkdownDocument();
+  const panel = useSplitPanel();
+  const { comments: commentState, params } = state;
+  const { md, setMd } = state.editor;
+  const { displayName: documentName } = useMarkdownName();
+  const userId = useUserId();
+  const changeIcon = useChangeEntityIcon();
+  const appearanceFlag = useFeatureFlag(enableEntityAppearance);
+  const [appearanceDialog, setAppearanceDialog] = createSignal<DialogHandle>();
+  const openIconEditor = (entity: DocumentEntity, anchor: HTMLElement) => {
+    setAppearanceDialog(changeIcon(entity, anchor));
+  };
+  const appearance = useDocumentAppearance(
+    () => documentEntity?.(),
+    () => Boolean(userId())
+  );
+  const titleEntity = () => {
+    const entity = documentEntity?.();
+    return entity && { ...entity, appearance: appearance() };
+  };
+  const scopeId = () => props.hotkeyScope;
+  const ownsEnter = createEnterOwningControl();
+  const resolveAppLink = useMacroMentionLinkResolver();
+
+  let notebookRef!: HTMLDivElement;
+  let commentMarginRef: HTMLDivElement | undefined;
+  let contentRef!: HTMLDivElement;
+  // Escape the notebook's isolated stacking context so the menu covers editor
+  // handles, while remaining inside the block so app chrome still covers it.
+  const outlinePortalMount = () =>
+    notebookRef.closest<HTMLElement>('.portal-scope') ?? notebookRef;
+
+  const [width, setWidth] = createSignal<number>();
+  const [leftFloatX, setLeftFloatX] = createSignal(0);
+  const [contentInset, setContentInset] = createSignal(0);
+  const commentBreakpoints = createSizeBreakpoints(width, CommentBreakpoints);
+  const canUseLexicalStateDebugger = useCanUseLexicalStateDebugger();
+  const outline = useMarkdownOutline({
+    editor: () => md.editor,
+    enabled: () => outlineFitsGutter(contentInset()) && !isMobile(),
+  });
+
+  const hasComment = createMemo(() => {
+    if (!ENABLE_MARKDOWN_COMMENTS) return false;
+    return Object.keys(commentState.comments).length > 0;
+  });
+  // On phones the margin is hidden entirely (no minimized rail); the touch
+  // comment drawer is the only comment surface. CommentMargin stays mounted
+  // inside the hidden wrapper — it hosts the drawer.
+  const showComments = () => hasComment() && !isMobile();
+  const layoutMode = createMemo((): CommentLayoutMode => {
+    if (!showComments() || width() === undefined) {
+      return CommentLayoutMode.none;
+    }
+    // The lg layout floats the comments beside a centered fixed-width column;
+    // a column that fills the pane leaves no room there, so wide mode keeps
+    // the comments in their own flex column.
+    if (commentBreakpoints.lg() && !markdownWideMode())
+      return CommentLayoutMode.lg;
+    if (commentBreakpoints.md()) return CommentLayoutMode.md;
+    return CommentLayoutMode.xs;
+  });
+
+  const isWide = () => markdownWideMode() && !isMobile();
+  const columnLayout = () => `${layoutMode()}:${isWide()}`;
+
+  // Switching layout mode or wide mode resizes the text column and reflows the
+  // document under an unchanged scrollTop; the first comment on a document
+  // would otherwise scroll its own anchor text out of view, and toggling wide
+  // mode would lose the reader's place. Browser scroll anchoring is suppressed
+  // because the switch changes the column's padding and margins. The computed
+  // captures the anchor before the new classes are applied, the effect
+  // restores it after.
+  let scrollAnchor: ScrollAnchor | undefined;
+  createComputed(
+    on(
+      columnLayout,
+      () => {
+        const scroller = md.scrollContainer;
+        const editorRoot = md.editor?.getRootElement();
+        scrollAnchor =
+          scroller && editorRoot
+            ? captureScrollAnchor(scroller, editorRoot)
+            : undefined;
+      },
+      { defer: true }
+    )
+  );
+  createEffect(
+    on(
+      columnLayout,
+      () => {
+        const anchor = scrollAnchor;
+        const scroller = md.scrollContainer;
+        scrollAnchor = undefined;
+        if (anchor && scroller) restoreScrollAnchor(scroller, anchor);
+      },
+      { defer: true }
+    )
+  );
+
+  // Closing or opening a neighbouring split changes the document's width and
+  // rewraps its text under an unchanged scrollTop. WebKit has no CSS scroll
+  // anchoring, so without this the reader lands somewhere else in the document.
+  createEffect(() => {
+    const scroller = md.scrollContainer;
+    const editor = md.editor;
+    if (!scroller || !editor) return;
+    onCleanup(
+      keepScrollAnchorOnResize(scroller, () => {
+        const editorRoot = editor.getRootElement();
+        return editorRoot
+          ? captureScrollAnchor(scroller, editorRoot)
+          : undefined;
+      })
+    );
+  });
+
+  // Set the refs on the block store.
+  onMount(() => {
+    setMd({
+      notebook: notebookRef,
+      commentMargin: commentMarginRef,
+      contentRef: contentRef,
+    });
+    onCleanup(() => {
+      setMd({ notebook: undefined, commentMargin: undefined });
+    });
+
+    const observeCallback = () => {
+      const { width, left } = notebookRef.getBoundingClientRect();
+      setWidth(width);
+      const content = contentRef.getBoundingClientRect();
+      setContentInset(content.left - left);
+      setLeftFloatX(content.right - left + GapTargetWidth);
+    };
+    const { observe } = makeResizeObserver(observeCallback);
+    observeCallback();
+    observe(notebookRef);
+    // A comment layout change resizes the text column without resizing the
+    // notebook, and it is the column's own geometry the outline is placed
+    // against.
+    observe(contentRef);
+  });
+
+  createEffect(() => {
+    const currentScopeId = scopeId();
+    if (!currentScopeId) return;
+    untrack(() =>
+      registerHotkey({
+        hotkey: 'enter',
+        scopeId: currentScopeId,
+        hotkeyToken: TOKENS.block.focus,
+        description: 'Focus Title or Markdown Editor',
+        keyDownHandler: (event) => {
+          if (ownsEnter(event?.target)) return false;
+          const titleEditor = md.titleEditor;
+          const markdownEditor = md.editor;
+          const docName = untrack(documentName);
+
+          if (titleEditor && docName === '') {
+            titleEditor.focus();
+            return true;
+          } else if (markdownEditor) {
+            markdownEditor.focus(undefined, { defaultSelection: 'rootStart' });
+            return true;
+          }
+          return false;
+        },
+        hide: true,
+      })
+    );
+  });
+
+  // The document shares its split scope with the view hosting it, and views
+  // like Drive bind Tab there to cycle their tabs, which closes the document.
+  // This override eclipses those commands while the document is mounted:
+  // Tab is left to the editors (title to body, list indent) and to native
+  // focus order.
+  createEffect(() => {
+    const currentScopeId = scopeId();
+    if (!currentScopeId) return;
+    untrack(() =>
+      registerHotkey({
+        hotkey: ['tab', 'shift+tab'],
+        scopeId: currentScopeId,
+        description: 'Move focus within document',
+        keyDownHandler: () => false,
+        hide: true,
+      })
+    );
+  });
+
+  // Register markdown formatting commands on the block scope so they appear in
+  // Cmd+K, but only when the editor has focus (not just the block container).
+  const [editorHasFocus, setEditorHasFocus] = createSignal(false);
+  createEffect(() => {
+    const editor = md.editor;
+    if (!editor) return;
+    const cleanup = editorFocusSignal(editor, setEditorHasFocus);
+    onCleanup(cleanup);
+  });
+  createEffect(() => {
+    const currentScopeId = scopeId();
+    if (!currentScopeId) return;
+    const group = untrack(() =>
+      registerMarkdownCommands(
+        currentScopeId,
+        () => md.editor,
+        editorHasFocus,
+        {
+          canUseStateDebugger: canUseLexicalStateDebugger,
+          toggleStateDebugger: () =>
+            setShowLexicalStateDebugger((prev) => !prev),
+        }
+      )
+    );
+    onCleanup(() => group.dispose());
+  });
+  createEffect(() => {
+    if (!canUseLexicalStateDebugger() && showLexicalStateDebugger()) {
+      setShowLexicalStateDebugger(false);
+    }
+  });
+
+  // Wait for the block element before claiming focus on initial mount.
+  let hasRun = false;
+  createEffect(() => {
+    if (hasRun) return;
+    if (!props.autoFocus) return;
+    const element = blockElement();
+    if (!element) return;
+    if (shouldAutofocusDocument(element, panel?.panelRef() ?? null))
+      element.focus();
+    hasRun = true;
+  });
+
+  const containerClasses = createMemo(() => {
+    const mode = layoutMode();
+    const shared = 'flex relative text-ink min-h-full min-w-0 isolate';
+    if (mode === CommentLayoutMode.lg) return shared;
+
+    const gap = mode === CommentLayoutMode.none ? '' : 'gap-6 justify-center';
+    if (mode === CommentLayoutMode.md) return `${shared} px-8 ${gap}`;
+    // Beside margin comments (or their rail) the margin below assumes a pane
+    // holding only the text, so it would take width from the text instead.
+    if (!isWide() || mode === CommentLayoutMode.xs)
+      return `${shared} px-6 ${gap}`;
+    // Wide mode's margin grows with the pane up to 64px, room for the outline
+    // in the left gutter. It never drops below the standard padding, and while
+    // the pane is narrower than the standard column plus that margin the text
+    // keeps the standard width, so the column only widens as the pane does.
+    return `${shared} px-[clamp(1.5rem,calc((100%_-_48rem)/2),4rem)] ${gap}`;
+  });
+
+  const contentDivClasses = createMemo(() => {
+    const mode = layoutMode();
+    // A zero basis keeps WebKit from sizing the column by the max-content width
+    // of its text, which it recomputes slowly for long unbroken runs.
+    // Wide mode lifts the reading column's cap so it fills the pane.
+    const maxWidth = isWide() ? '' : 'max-w-3xl';
+    const shared = `grow basis-0 ${maxWidth} pt-12 touch:pt-6 min-w-0`;
+    switch (mode) {
+      case CommentLayoutMode.lg:
+        return `${shared} mx-auto`;
+      case CommentLayoutMode.md:
+        return `${shared} flex-3`;
+      case CommentLayoutMode.xs:
+        return `${shared} flex-3`;
+      default:
+        return `${shared} mx-auto`;
+    }
+  });
+
+  const commentPositioning = createMemo(() => {
+    const mode = layoutMode();
+    const leftFloat = leftFloatX();
+    switch (mode) {
+      case CommentLayoutMode.lg:
+        return {
+          classes: 'absolute top-0 h-full w-xs pointer-events-none',
+          style: { left: `${leftFloat}px` },
+        };
+      case CommentLayoutMode.md:
+        return {
+          classes: 'flex-2 max-w-xs min-w-0 pointer-events-none',
+          style: {},
+        };
+      case CommentLayoutMode.xs:
+        return {
+          classes: 'flex-1 min-w-0 shrink-0 pointer-events-none',
+          style: { left: `${leftFloat}px` },
+        };
+      default:
+        return {
+          classes: 'hidden',
+          style: {},
+        };
+    }
+  });
+
+  return (
+    <div class={containerClasses()} ref={notebookRef}>
+      <Show when={outline.show()}>
+        <div
+          class="pointer-events-none absolute inset-y-0 z-1"
+          style={{
+            left: `${MARKDOWN_OUTLINE_INSET}px`,
+            width: `${MARKDOWN_OUTLINE_WIDTH}px`,
+          }}
+        >
+          <MarkdownOutline
+            editor={() => md.editor}
+            outline={outline}
+            portalMount={outlinePortalMount}
+            scrollContainer={() => md.scrollContainer}
+          />
+        </div>
+      </Show>
+      <div
+        class={contentDivClasses()}
+        ref={contentRef}
+        classList={{ relative: true }}
+      >
+        <TitleEditor autoFocusOnMount={props.autoFocus} />
+        <div class="spacer h-3" />
+        <SkillDescriptionField />
+        <div class="mb-6 flex flex-row flex-wrap items-center gap-2 text-sm empty:hidden">
+          <Show
+            when={
+              appearanceFlag().enabled &&
+              titleEntity() &&
+              !titleEntity()?.appearance?.icon &&
+              permissions.canEdit()
+            }
+          >
+            <button
+              type="button"
+              aria-haspopup="dialog"
+              aria-expanded={appearanceDialog()?.isOpen() ?? false}
+              class={badgeTriggerClasses({
+                variant: 'secondary',
+                size: 'xs',
+                class: 'gap-1.5',
+              })}
+              onClick={(event) => {
+                const entity = titleEntity();
+                if (entity) openIconEditor(entity, event.currentTarget);
+              }}
+            >
+              <Smiley class="size-3.5" />
+              {t('appearance.addIcon')}
+            </button>
+          </Show>
+          <InlineTaskProperties />
+          <InlineTaskGithubPullRequests />
+          <TaskDuplicateMatchPill />
+        </div>
+        <ParamsProvider state={params}>
+          <MarkdownEditor
+            autoFocusOnMount={props.autoFocus && !isTouchDevice()}
+            resolveAppLink={resolveAppLink}
+            loroManager={props.loroManager}
+            showLexicalStateDebugger={
+              canUseLexicalStateDebugger() && showLexicalStateDebugger()
+            }
+            onLexicalStateDebuggerClose={() =>
+              setShowLexicalStateDebugger(false)
+            }
+          />
+          {/* Wide mode widens only the document body: the discussion keeps the
+              standard column, centered under the text. Without wide mode the
+              column is already this width, so the box changes nothing. */}
+          <div class="mx-auto max-w-3xl">
+            <DocumentDiscussion editorHasFocus={editorHasFocus()} />
+          </div>
+        </ParamsProvider>
+      </div>
+      <div
+        class={commentPositioning().classes}
+        style={{
+          ...commentPositioning().style,
+          ...(layoutMode() === CommentLayoutMode.xs
+            ? {
+                width: `${MinimizedCommentTargetWidth}px`,
+                'max-width': `${MinimizedCommentTargetWidth}px`,
+              }
+            : {}),
+        }}
+        ref={commentMarginRef}
+        classList={{
+          block: showComments(),
+          hidden: !showComments(),
+        }}
+      >
+        <CommentMargin wideEnough={showComments() && commentBreakpoints.md()} />
+      </div>
+    </div>
+  );
+}

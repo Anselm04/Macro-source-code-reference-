@@ -1,0 +1,116 @@
+use anyhow::Context;
+use axum::Router;
+use calendar_events::inbound::mutation_router::{
+    CalendarMutationRouterState, calendar_mutation_router,
+};
+use calendar_events::inbound::replacement_router::{
+    CalendarReplacementRouterState, calendar_replacement_router,
+};
+use context::ApiContext;
+use macro_tower_layers::MacroRequestIdAndTracingLayer;
+use std::time::Duration;
+use tower::ServiceBuilder;
+use tower_http::compression::CompressionLayer;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+
+pub mod context;
+
+mod calendar_watch;
+pub mod swagger;
+#[cfg(test)]
+mod test;
+
+/// Path prefix the shared gateway ALB forwards unmodified. Dual-mounted
+/// alongside `/`, where the target group's `/health` check probes.
+const GATEWAY_PATH_PREFIX: &str = "/calendar";
+
+/// Build the application and serve it until a shutdown signal arrives.
+pub async fn setup_and_serve(state: ApiContext) -> anyhow::Result<()> {
+    let env = state.config.environment;
+    let port = state.config.port;
+    let correlation = state.correlation.clone();
+    let traced_api = traced(api_router(state.clone()).with_state(state).layer(
+        axum::middleware::from_fn_with_state(correlation, agent_correlation::inbound::propagate),
+    ));
+    let health = crate::health::router();
+    let app = mount_at_root_and_prefix(traced_api.merge(health)).merge(swagger_ui());
+
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
+        .unwrap();
+    tracing::info!(
+        "calendar service is up and running with environment {:?} on port {}",
+        env,
+        port
+    );
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(macro_entrypoint::shutdown_signal())
+        .await
+        .context("error starting service")
+}
+
+/// Wraps the API in the request id, server span, CORS and compression layers.
+/// The server span is the shared INFO-level `http.request` span that adopts an
+/// incoming `traceparent`; tower-http's default span is DEBUG, below the
+/// exporter's filter, so the API would send no server spans.
+fn traced(api: Router) -> Router {
+    api.layer(
+        ServiceBuilder::new()
+            .layer(MacroRequestIdAndTracingLayer::new(Duration::from_millis(200)).into_inner())
+            .layer(macro_cors::cors_layer())
+            .layer(CompressionLayer::new().gzip(true)),
+    )
+}
+
+fn mount_at_root_and_prefix(inner: Router) -> Router {
+    Router::new()
+        .merge(inner.clone())
+        .nest(GATEWAY_PATH_PREFIX, inner)
+}
+
+fn swagger_ui() -> Router {
+    Router::new()
+        .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", swagger::ApiDoc::openapi()))
+        .merge(
+            SwaggerUi::new("/calendar/docs")
+                .url("/calendar/api-doc/openapi.json", swagger::ApiDoc::openapi()),
+        )
+}
+
+fn api_router(state: ApiContext) -> Router<ApiContext> {
+    let team_settings = calendar_events::inbound::team_router::team_calendar_settings_router(
+        calendar_events::inbound::team_router::CalendarTeamRouterState::new(
+            state.calendar_team_service.clone(),
+            state.authorization_state.clone(),
+        ),
+    );
+    // Calendar mutations follow the calendar sync kill switch: without sync a
+    // provider write would never be reflected locally.
+    if state.config.calendar_sync_enabled {
+        calendar_watch::router()
+            .merge(team_settings)
+            .nest(
+                "/scheduling",
+                calendar_scheduling::inbound::router::router(
+                    calendar_scheduling::inbound::router::RouterState::new(
+                        state.scheduling_service.clone(),
+                        state.authorization_state.clone(),
+                    ),
+                ),
+            )
+            .merge(calendar_replacement_router(
+                CalendarReplacementRouterState::new(
+                    state.calendar_mutation_service.clone(),
+                    state.authorization_state.clone(),
+                ),
+            ))
+            .merge(calendar_mutation_router(CalendarMutationRouterState::new(
+                state.calendar_mutation_service.clone(),
+                state.meeting_links.clone(),
+                state.authorization_state.clone(),
+            )))
+    } else {
+        calendar_watch::router().merge(team_settings)
+    }
+}

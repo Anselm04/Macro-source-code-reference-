@@ -1,0 +1,370 @@
+//! Macro meeting links carried by calendar events.
+//!
+//! A Macro call is not provider conferencing: Google knows nothing about it,
+//! so the link travels in the event's ordinary location and description
+//! fields, in the exact shape the calendar UI recognizes and can later
+//! strip or replace. This module owns that shape, finding and stripping it
+//! again, and the flows that mint a meeting and write the event carrying it.
+
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
+
+use super::{
+    models::{CalendarEvent, CalendarEventDraft, CalendarEventPatch, ConferenceChange, EventTime},
+    ports::{
+        CalendarEventDetailsReader, CalendarMutationError, CalendarMutationService,
+        CalendarUpdateScope, MeetingLinkProvider,
+    },
+};
+
+/// Inputs for minting a Macro meeting to accompany a calendar event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeetingLinkRequest {
+    /// Display title, normally the event title. Adapters trim it to the
+    /// meeting provider's limits and fall back to its default when blank.
+    pub title: String,
+    /// Scheduled start, or `None` for an event without clock times.
+    pub scheduled_start: Option<DateTime<Utc>>,
+    /// Scheduled end, or `None` for an event without clock times.
+    pub scheduled_end: Option<DateTime<Utc>>,
+}
+
+impl MeetingLinkRequest {
+    /// The meeting a draft event should carry: same title, and the same
+    /// clock times when the event has them. All-day events leave the
+    /// meeting unscheduled, exactly as the calendar UI does.
+    pub fn for_draft(draft: &CalendarEventDraft) -> Self {
+        Self::for_event(&draft.title, Some(&draft.time))
+    }
+
+    /// The meeting an event with this title and time should carry. An
+    /// occurrence whose time is not stored leaves the meeting unscheduled.
+    fn for_event(title: &str, time: Option<&EventTime>) -> Self {
+        let (scheduled_start, scheduled_end) = match time {
+            Some(EventTime::Timed {
+                starts_at, ends_at, ..
+            }) => (Some(*starts_at), Some(*ends_at)),
+            Some(EventTime::AllDay { .. }) | None => (None, None),
+        };
+        Self {
+            title: title.to_string(),
+            scheduled_start,
+            scheduled_end,
+        }
+    }
+}
+
+/// A minted Macro meeting invitation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeetingLink {
+    /// Persistent meeting identifier, used to cancel the meeting again.
+    pub id: Uuid,
+    /// Browser URL anyone invited can open to join the call.
+    pub url: String,
+}
+
+/// Failures minting or cancelling a Macro meeting link.
+#[derive(Debug, thiserror::Error)]
+pub enum MeetingLinkError {
+    /// The meeting provider rejected the request as malformed.
+    #[error("invalid meeting link request: {0}")]
+    InvalidInput(String),
+    /// The host cannot mint meeting links at all.
+    #[error("Macro meeting links are not available in this host")]
+    Unavailable,
+    /// The meeting provider failed; the calendar event was not written.
+    #[error("meeting link provider failed: {0}")]
+    Failed(String),
+}
+
+/// A created event together with the Macro call it carries.
+#[derive(Clone, Debug)]
+pub struct EventWithMacroCall {
+    /// The event as the provider echoed it back.
+    pub event: CalendarEvent,
+    /// The meeting written into the event's description and location.
+    pub meeting_link: MeetingLink,
+}
+
+/// Failures writing an event that carries a Macro call.
+#[derive(Debug, thiserror::Error)]
+pub enum MacroCallEventError {
+    /// The calendar write failed. A meeting minted for it was cancelled on a
+    /// best-effort basis unless the event may have reached the provider.
+    #[error(transparent)]
+    Calendar(#[from] CalendarMutationError),
+    /// The meeting link could not be minted; nothing was written to the
+    /// calendar.
+    #[error("could not create the Macro call for the event: {0}")]
+    MeetingLink(#[from] MeetingLinkError),
+}
+
+/// Text prefixing the generated join line. The calendar UI matches on it
+/// to recognize the paragraph as generated rather than user-written.
+const JOIN_LINE_LABEL: &str = "Join Macro call";
+
+/// Write a meeting link into an event's location and description.
+///
+/// The description gains a trailing paragraph naming the call; the location
+/// becomes the link only when the user supplied no physical location, so a
+/// room is never overwritten. Both mirror the calendar UI's own attachment,
+/// which is what lets it later find, strip, or replace the link.
+pub fn attach_macro_call(
+    description: Option<&str>,
+    location: Option<&str>,
+    url: &str,
+) -> (String, String) {
+    let description = description.unwrap_or_default();
+    let separator = if description.is_empty() { "" } else { "\n" };
+    let description =
+        format!("{description}{separator}<p>{JOIN_LINE_LABEL}: <a href=\"{url}\">{url}</a></p>");
+    let location = match location.map(str::trim) {
+        Some(location) if !location.is_empty() => location.to_string(),
+        _ => url.to_string(),
+    };
+    (description, location)
+}
+
+/// The join link already written into an event, including inside the
+/// generated HTML paragraph.
+pub fn first_macro_call_url(location: Option<&str>, description: Option<&str>) -> Option<String> {
+    for text in [location, description].into_iter().flatten() {
+        for token in text.split(|character: char| {
+            character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>' | '&')
+        }) {
+            let token = token.trim_end_matches(|character: char| {
+                matches!(character, '.' | ',' | ')' | ']' | ';')
+            });
+            if token.starts_with("http") && token.contains("/meet/join/") {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Take back out what [`attach_macro_call`] wrote, as the calendar UI does
+/// before showing an event: the join line of a description already reduced
+/// to plain text, whichever call it names, and a location that is only the
+/// event's call link `url`. Everything the user wrote stays, including a
+/// link written anywhere else. The text may show the link in brackets, as
+/// html2text writes links.
+pub fn strip_macro_call(description_text: &str, location: &str, url: &str) -> (String, String) {
+    let description = description_text
+        .lines()
+        .filter(|line| !is_join_line(&line.trim().replace(['[', ']'], "")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let location = if location.trim() == url {
+        String::new()
+    } else {
+        location.to_string()
+    };
+    (description.trim().to_string(), location)
+}
+
+/// Whether `line` is the generated join line: the label alone, or the label
+/// followed by a Macro call link.
+fn is_join_line(line: &str) -> bool {
+    match line.strip_prefix(JOIN_LINE_LABEL) {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix(": ")
+            .is_some_and(|link| first_macro_call_url(Some(link), None).as_deref() == Some(link)),
+        None => false,
+    }
+}
+
+/// Create an event that carries a Macro call.
+///
+/// The meeting is minted first so the single invitation attendees receive
+/// already names the call, instead of an invitation followed by an update.
+/// A calendar write known to have failed before reaching the provider
+/// cancels the fresh meeting on a best-effort basis so it does not linger
+/// in the user's meeting list; an outcome that may have left the event (and
+/// its link) at the provider keeps the meeting alive.
+#[tracing::instrument(skip_all, err)]
+pub async fn create_event_with_macro_call<M, L>(
+    mutations: &M,
+    meeting_links: &L,
+    requester_id: &str,
+    email_link_id: Option<Uuid>,
+    calendar_id: Option<Uuid>,
+    mut draft: CalendarEventDraft,
+) -> Result<EventWithMacroCall, MacroCallEventError>
+where
+    M: CalendarMutationService,
+    L: MeetingLinkProvider,
+{
+    if draft.out_of_office.is_some() {
+        return Err(CalendarMutationError::InvalidInput(
+            "out-of-office events cannot have a Macro call".to_string(),
+        )
+        .into());
+    }
+    if draft.conference.is_some() {
+        return Err(CalendarMutationError::InvalidInput(
+            "an event carries either a Macro call or provider conferencing, not both".to_string(),
+        )
+        .into());
+    }
+
+    let link = meeting_links
+        .create_meeting_link(requester_id, MeetingLinkRequest::for_draft(&draft))
+        .await?;
+    let (description, location) = attach_macro_call(
+        draft.description.as_deref(),
+        draft.location.as_deref(),
+        &link.url,
+    );
+    draft.description = Some(description);
+    draft.location = Some(location);
+
+    match mutations
+        .create_event(requester_id, email_link_id, calendar_id, draft)
+        .await
+    {
+        Ok(event) => Ok(EventWithMacroCall {
+            event,
+            meeting_link: link,
+        }),
+        Err(error) => {
+            release_meeting_after_failed_write(meeting_links, requester_id, &link, &error).await;
+            Err(error.into())
+        }
+    }
+}
+
+/// Switch an existing event to a Macro call, in one write so attendees get
+/// one update: the patch gains the call's join link and drops the provider
+/// conference, on top of the changes it already carries.
+///
+/// An event that already holds a Macro call keeps it, so retrying after an
+/// unknown outcome neither mints a second meeting nor writes a second join
+/// line; only what is left of the patch is written. An Outlook event's Teams
+/// meeting cannot be removed, which the calendar write refuses.
+#[tracing::instrument(skip_all, fields(event_id = %event_id), err)]
+pub async fn update_event_with_macro_call<M, L>(
+    mutations: &M,
+    meeting_links: &L,
+    requester_id: &str,
+    event_id: Uuid,
+    calendar_id: Option<Uuid>,
+    mut patch: CalendarEventPatch,
+    scope: CalendarUpdateScope,
+) -> Result<CalendarEvent, MacroCallEventError>
+where
+    M: CalendarMutationService + CalendarEventDetailsReader,
+    L: MeetingLinkProvider,
+{
+    if patch.out_of_office.is_some() {
+        return Err(CalendarMutationError::InvalidInput(
+            "out-of-office events cannot have a Macro call".to_string(),
+        )
+        .into());
+    }
+    if patch.conference.is_some() {
+        return Err(CalendarMutationError::InvalidInput(
+            "an event carries either a Macro call or provider conferencing, not both".to_string(),
+        )
+        .into());
+    }
+
+    let stored = mutations
+        .details_for_update(requester_id, event_id, calendar_id, &scope)
+        .await?;
+    if stored.has_conference {
+        patch.conference = Some(ConferenceChange::Removed);
+    }
+
+    let description = patch
+        .description
+        .as_deref()
+        .or(stored.description.as_deref());
+    let location = patch.location.as_deref().or(stored.location.as_deref());
+    if let Some(url) = first_macro_call_url(location, description)
+        .or_else(|| first_macro_call_url(stored.location.as_deref(), stored.description.as_deref()))
+    {
+        // A replacement description that leaves the stored call's link out
+        // would drop it from the event, so it keeps the join line.
+        if let Some(replacement) = patch.description.as_deref()
+            && first_macro_call_url(None, Some(replacement)).is_none()
+        {
+            patch.description = Some(attach_macro_call(Some(replacement), None, &url).0);
+        }
+        if patch.is_empty() {
+            return Err(CalendarMutationError::InvalidInput(
+                "this event already carries a Macro call".to_string(),
+            )
+            .into());
+        }
+        let event = mutations
+            .update_event(requester_id, event_id, calendar_id, patch, scope)
+            .await?;
+        return Ok(event);
+    }
+
+    let title = patch.title.as_deref().unwrap_or(&stored.title);
+    let time = patch.time.as_ref().or(stored.time.as_ref());
+    let link = meeting_links
+        .create_meeting_link(requester_id, MeetingLinkRequest::for_event(title, time))
+        .await?;
+    let (description, location) = attach_macro_call(description, location, &link.url);
+    patch.description = Some(description);
+    patch.location = Some(location);
+
+    match mutations
+        .update_event(requester_id, event_id, calendar_id, patch, scope)
+        .await
+    {
+        Ok(event) => Ok(event),
+        Err(error) => {
+            release_meeting_after_failed_write(meeting_links, requester_id, &link, &error).await;
+            Err(error.into())
+        }
+    }
+}
+
+/// Cancel a meeting whose event write failed, unless the event carrying its
+/// link may have been written anyway.
+async fn release_meeting_after_failed_write<L: MeetingLinkProvider>(
+    meeting_links: &L,
+    requester_id: &str,
+    link: &MeetingLink,
+    error: &CalendarMutationError,
+) {
+    if event_may_carry_link(error) {
+        tracing::warn!(
+            error = ?error,
+            meeting_id = %link.id,
+            "keeping the meeting: the event carrying its link may have been written"
+        );
+    } else if let Err(cancel_error) = meeting_links
+        .cancel_meeting_link(requester_id, link.id)
+        .await
+    {
+        tracing::warn!(
+            error = ?cancel_error,
+            meeting_id = %link.id,
+            "failed to cancel the meeting minted for an event that was not written"
+        );
+    }
+}
+
+/// Whether a failed write may still have left the event at the provider.
+///
+/// `PersistFailed` means the provider accepted the event and only Macro's
+/// copy lagged; `Retryable` covers transport failures whose delivery is
+/// unknown, including a timeout after the write landed. Cancelling the
+/// meeting in either case would strand attendees on a dead link, so an
+/// unused meeting is the lesser cost. Every other variant is decided before
+/// the provider write.
+fn event_may_carry_link(error: &CalendarMutationError) -> bool {
+    matches!(
+        error,
+        CalendarMutationError::PersistFailed(_) | CalendarMutationError::Retryable(_)
+    )
+}
+
+#[cfg(test)]
+mod test;

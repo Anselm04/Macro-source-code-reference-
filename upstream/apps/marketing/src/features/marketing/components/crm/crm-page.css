@@ -1,0 +1,14 @@
+/* Walkthrough pointers sit over the product window they act in. */
+.crm-demo-frame { position: relative; }
+.crm-demo-pointer { position: absolute; top: 0; left: 0; z-index: 9; pointer-events: none; }
+.product-demo[data-action=stage] [data-company-property=stage],
+.product-demo[data-action=owner] [data-company-property=owner] { background: #ffffff25; box-shadow: 0 0 0 3px #ffffff0d; }
+.crm-demo-frame [data-thread-id] > .sample-message-row,
+.crm-demo-frame .sample-thread-replies .sample-message-row:last-child { animation: crm-arrive 400ms ease-out both; }
+@keyframes crm-arrive { from { opacity: 0; transform: translateY(4px); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .crm-demo-pointer { display: none; }
+  .crm-demo-frame [data-thread-id] > .sample-message-row,
+  .crm-demo-frame .sample-thread-replies .sample-message-row:last-child { animation: none; }
+}

@@ -1,0 +1,658 @@
+use std::str::FromStr;
+
+use anyhow::Context;
+use chrono::Utc;
+use document_sub_type::DocumentSubType;
+use lexical_client::types::MarkdownParseResult;
+use macro_db_client::document::get_document_version_id;
+use model::document::{DocumentMetadata, FileType};
+use model_owner::Owner;
+use models_properties::EntityType;
+use models_search::unified::is_searchable_file_type;
+use opensearch_client::{
+    OpensearchClient, date_format::EpochMillis, upsert::document::UpsertDocumentArgs,
+};
+use properties::outbound::entity_properties_get_query::get_entity_properties_for_index;
+use s3_key::{
+    CONVERTED_DOCUMENT_FILE_NAME, build_cloud_storage_bucket_document_key,
+    build_docx_to_pdf_converted_document_key,
+};
+
+#[cfg(all(feature = "pdf", not(feature = "no_pdf")))]
+use crate::parsers::pdf::parse_pdf_pages;
+use crate::{
+    parsers::{
+        ai::parse_ai_text, fig::parse_fig_pages, markdown::parse_markdown_legacy,
+        psd::parse_psd_text, text::decode_text,
+    },
+    process::document::document_info::{DocumentInfo, get_document_info},
+    process::properties::to_indexed_properties,
+};
+
+use super::SearchExtractorMessage;
+
+/// The node id of the one chunk a Photoshop or Illustrator document indexes
+/// as, fixed so that a new version replaces it.
+const DESIGN_TEXT_NODE_ID: &str = "0";
+
+async fn upsert_document(
+    opensearch_client: &OpensearchClient,
+    search_extractor_message: &SearchExtractorMessage,
+    upserts: Vec<UpsertDocumentArgs>,
+) -> anyhow::Result<()> {
+    let index_override = search_extractor_message.index_override.as_deref();
+    // Delete existing documents for the document id
+    // This ensures we replace any old nodes with new ones for editable files
+    // (a design's removed pages, for example)
+    match search_extractor_message.file_type {
+        FileType::Md
+        | FileType::Canvas
+        | FileType::Fig
+        | FileType::Psd
+        | FileType::Psb
+        | FileType::Ai => {
+            tracing::debug!("deleting existing search results");
+            opensearch_client
+                .delete_document(&search_extractor_message.document_id, index_override)
+                .await
+                .context("unable to delete existing search results")?;
+        }
+        _ => {}
+    }
+
+    let results = opensearch_client
+        .bulk_upsert_documents(&upserts, index_override)
+        .await
+        .context("unable to bulk upsert documents in opensearch")?;
+
+    if !results.errors.is_empty() {
+        tracing::error!(errors=?results.errors, "bulk upsert failed");
+
+        // delete document that failed to upsert
+        opensearch_client
+            .delete_document(&search_extractor_message.document_id, index_override)
+            .await
+            .context("failed to delete document for failed bulk upsert")?;
+
+        anyhow::bail!("failed to upsert documents");
+    }
+
+    tracing::trace!("upserted document");
+
+    Ok(())
+}
+
+/// Properties are keyed under the task entity type for tasks, otherwise the
+/// document entity type.
+fn properties_entity_type(sub_type: Option<&str>) -> EntityType {
+    sub_type
+        .and_then(|s| s.parse::<DocumentSubType>().ok())
+        .map(EntityType::from)
+        .unwrap_or(EntityType::Document)
+}
+
+/// Fetch the entity's indexed properties and attach them to every chunk upsert
+/// (parent metadata is denormalized identically across chunks).
+///
+/// A full index overwrites the parent doc, so an *empty* `properties` clears
+/// previously-indexed values — the deliberate "omit == remove" behavior used
+/// for `sub_type`. That is correct when the entity genuinely has no
+/// properties, but a fetch *failure* must not be mistaken for "empty": we
+/// propagate the error so the doc isn't overwritten and the message is retried
+/// (mirroring the partial-update path).
+async fn attach_indexed_properties(
+    db: &sqlx::Pool<sqlx::Postgres>,
+    document_id: &str,
+    sub_type: Option<&str>,
+    upserts: &mut [UpsertDocumentArgs],
+) -> anyhow::Result<()> {
+    if upserts.is_empty() {
+        return Ok(());
+    }
+    let properties =
+        get_entity_properties_for_index(db, document_id, properties_entity_type(sub_type))
+            .await
+            .context("failed to fetch properties for search index")?;
+    if properties.is_empty() {
+        return Ok(());
+    }
+    let indexed = to_indexed_properties(properties);
+    for upsert in upserts.iter_mut() {
+        upsert.properties = indexed.clone();
+    }
+    Ok(())
+}
+
+/// Builds the parent-only upsert for a file type with no indexable content.
+/// Returns `None` when the document has no file type.
+fn generate_parent_only_upsert(
+    document_info: DocumentMetadata,
+) -> anyhow::Result<Option<UpsertDocumentArgs>> {
+    let Some(file_type) = document_info.file_type else {
+        return Ok(None);
+    };
+    Ok(Some(UpsertDocumentArgs {
+        document_id: document_info.document_id,
+        node_id: String::new(),
+        raw_content: None,
+        document_name: document_info.document_name,
+        content: String::new(),
+        owner_id: document_info.owner.to_string(),
+        file_type,
+        updated_at_millis: EpochMillis::new(Utc::now().timestamp_millis())?,
+        sub_type: document_info.sub_type.map(|st| st.to_string()),
+        properties: vec![],
+    }))
+}
+
+/// Indexes a name-only parent doc (no content chunks) for file types whose
+/// content isn't searchable, so the document stays findable by name and
+/// filterable by its indexed properties.
+async fn update_search_with_parent_only_document(
+    opensearch_client: &OpensearchClient,
+    db: &sqlx::Pool<sqlx::Postgres>,
+    search_extractor_message: &SearchExtractorMessage,
+) -> anyhow::Result<()> {
+    let document_info = match get_document_info(db, search_extractor_message)
+        .await
+        .context("failed to get document info")?
+    {
+        DocumentInfo::Active(info) => *info,
+        DocumentInfo::Removable => {
+            tracing::trace!("document is deleted or missing, removing from search index");
+            opensearch_client
+                .delete_document(
+                    &search_extractor_message.document_id,
+                    search_extractor_message.index_override.as_deref(),
+                )
+                .await
+                .context("failed to delete document from search index")?;
+            return Ok(());
+        }
+        DocumentInfo::Skip => {
+            tracing::trace!("no document info returned");
+            return Ok(());
+        }
+    };
+
+    let Some(args) = generate_parent_only_upsert(document_info)? else {
+        tracing::debug!("file type is none");
+        return Ok(());
+    };
+
+    let sub_type = args.sub_type.clone();
+    let mut upserts = vec![args];
+    attach_indexed_properties(
+        db,
+        &search_extractor_message.document_id,
+        sub_type.as_deref(),
+        &mut upserts,
+    )
+    .await?;
+
+    opensearch_client
+        .upsert_parent_document(
+            &upserts[0],
+            search_extractor_message.index_override.as_deref(),
+        )
+        .await
+        .context("unable to upsert parent-only document in opensearch")?;
+
+    Ok(())
+}
+
+fn should_index_parent_only(file_type: &FileType) -> bool {
+    matches!(file_type, FileType::Canvas) || !is_searchable_file_type(file_type)
+}
+
+/// The searchable text of a Photoshop or Illustrator document. Decoding is
+/// CPU work, so it runs off the async workers; the engine failing on a
+/// damaged file is a read error like any other.
+async fn read_design_text(file_type: FileType, content: Vec<u8>) -> anyhow::Result<String> {
+    let parse: fn(&[u8]) -> anyhow::Result<String> = match file_type {
+        FileType::Ai => parse_ai_text,
+        FileType::Psd | FileType::Psb => parse_psd_text,
+        other => anyhow::bail!("{other} files are not read as designs"),
+    };
+    tokio::task::spawn_blocking(move || parse(&content))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("the design engine failed: {e}")))
+}
+
+/// Indexes a file its parser cannot read (a password-protected or damaged
+/// PDF, a design that is old, damaged, or too large to decode here, or a
+/// text file whose bytes are binary or in an unrecognized encoding) by
+/// name only, dropping the text an earlier version left, so it stays
+/// findable. Reading it again would fail the same way, so this is not an
+/// error to retry.
+async fn update_search_with_unreadable_file(
+    opensearch_client: &OpensearchClient,
+    db: &sqlx::Pool<sqlx::Postgres>,
+    search_extractor_message: &SearchExtractorMessage,
+) -> anyhow::Result<()> {
+    opensearch_client
+        .delete_document(
+            &search_extractor_message.document_id,
+            search_extractor_message.index_override.as_deref(),
+        )
+        .await
+        .context("unable to delete existing search results")?;
+    update_search_with_parent_only_document(opensearch_client, db, search_extractor_message).await
+}
+
+/// The version whose stored content search indexes. A PDF is served from its
+/// first version, and a save adds a version without rewriting that file, so
+/// text read from any other version (a message delivered out of order, or the
+/// bytes of an API save) is not what the document shows. A DOCX is indexed
+/// from its converted PDF, which each conversion overwrites in place. Every
+/// other file is indexed at its latest version.
+async fn indexed_version_id(
+    db: &sqlx::Pool<sqlx::Postgres>,
+    search_extractor_message: &SearchExtractorMessage,
+    latest_version_id: i64,
+) -> anyhow::Result<String> {
+    if !matches!(
+        search_extractor_message.file_type,
+        FileType::Pdf | FileType::Docx
+    ) {
+        return Ok(latest_version_id.to_string());
+    }
+    let message_version_id = search_extractor_message
+        .document_version_id
+        .as_deref()
+        .context("expected document version id to be provided for pdf/docx")?;
+    if message_version_id == CONVERTED_DOCUMENT_FILE_NAME {
+        return Ok(CONVERTED_DOCUMENT_FILE_NAME.to_string());
+    }
+    let (served_version_id, _) = get_document_version_id(db, &search_extractor_message.document_id)
+        .await
+        .context("failed to get the served document version")?;
+    Ok(served_version_id.to_string())
+}
+
+/// The S3 key of the content to index, or `None` when the message names a
+/// version other than the indexed one. Content is stored under the
+/// document's owner; sync messages carry no `user_id`.
+fn raw_document_key(
+    owner: &Owner,
+    search_extractor_message: &SearchExtractorMessage,
+    document_version_id: &str,
+) -> Option<String> {
+    let document_id = &search_extractor_message.document_id;
+    if document_version_id == CONVERTED_DOCUMENT_FILE_NAME {
+        return Some(build_docx_to_pdf_converted_document_key(owner, document_id));
+    }
+    match search_extractor_message.document_version_id.as_deref() {
+        Some(msg_version_id) if msg_version_id != document_version_id => None,
+        _ => Some(build_cloud_storage_bucket_document_key(
+            owner,
+            document_id,
+            document_version_id,
+        )),
+    }
+}
+
+/// Processes a message for a standard document and reads the updated contents from s3 and updates
+/// the document in opensearch.
+#[tracing::instrument(skip(opensearch_client, db, s3_client, document_storage_bucket, search_extractor_message), fields(document_id=search_extractor_message.document_id, file_type=?search_extractor_message.file_type))]
+pub async fn update_search_with_raw_document(
+    opensearch_client: &OpensearchClient,
+    db: &sqlx::Pool<sqlx::Postgres>,
+    s3_client: &s3_client::S3,
+    document_storage_bucket: &str,
+    search_extractor_message: &SearchExtractorMessage,
+) -> anyhow::Result<()> {
+    if should_index_parent_only(&search_extractor_message.file_type) {
+        return update_search_with_parent_only_document(
+            opensearch_client,
+            db,
+            search_extractor_message,
+        )
+        .await;
+    }
+
+    // This ensures we only process the latest version
+    let document_info = match get_document_info(db, search_extractor_message)
+        .await
+        .context("failed to get document info")?
+    {
+        DocumentInfo::Active(info) => *info,
+        DocumentInfo::Removable => {
+            tracing::trace!("document is deleted or missing, removing from search index");
+            opensearch_client
+                .delete_document(
+                    &search_extractor_message.document_id,
+                    search_extractor_message.index_override.as_deref(),
+                )
+                .await
+                .context("failed to delete document from search index")?;
+            return Ok(());
+        }
+        DocumentInfo::Skip => {
+            tracing::trace!("no document info returned");
+            return Ok(());
+        }
+    };
+
+    let document_name = document_info.document_name;
+    let owner_id = document_info.owner.to_string();
+    let sub_type = document_info.sub_type.map(|st| st.to_string());
+
+    // TODO: this is hacky, update the search event message to use the correctly serialized
+    // document key parts from the s3_key crate
+    let document_version_id = indexed_version_id(
+        db,
+        search_extractor_message,
+        document_info.document_version_id,
+    )
+    .await?;
+
+    if document_info.file_type.is_none() {
+        tracing::debug!("file type is none");
+        return Ok(());
+    }
+
+    let file_type = FileType::from_str(
+        document_info
+            .file_type
+            .context("expected a file type")?
+            .as_str(),
+    )?;
+
+    let Some(key) = raw_document_key(
+        &document_info.owner,
+        search_extractor_message,
+        &document_version_id,
+    ) else {
+        tracing::debug!(
+            msg_version_id = ?search_extractor_message.document_version_id,
+            document_version_id,
+            "message names a version search does not index, skipping"
+        );
+        return Ok(());
+    };
+
+    let content = s3_client
+        .get(document_storage_bucket, &key)
+        .await
+        .context("unable to get file")?;
+
+    // Handle empty content for things like new markdown/canvas files
+    if content.is_empty() {
+        tracing::debug!("empty content");
+        return Ok(());
+    }
+
+    tracing::trace!("got raw file content");
+
+    let updated_at_millis = EpochMillis::new(Utc::now().timestamp_millis())?;
+    let uuid = macro_uuid::generate_uuid_v7().to_string();
+
+    let mut upserts: Vec<UpsertDocumentArgs> = match file_type {
+        FileType::Pdf | FileType::Docx => {
+            #[cfg(all(feature = "pdf", not(feature = "no_pdf")))]
+            {
+                let Some(pages_content) =
+                    parse_pdf_pages(content).context("unable to parse pdf")?
+                else {
+                    return update_search_with_unreadable_file(
+                        opensearch_client,
+                        db,
+                        search_extractor_message,
+                    )
+                    .await;
+                };
+                pages_content
+                    .iter()
+                    .enumerate()
+                    .map(|(i, page_content)| UpsertDocumentArgs {
+                        document_id: search_extractor_message.document_id.clone(),
+                        node_id: i.to_string(), // page number
+                        raw_content: None,
+                        document_name: document_name.clone(),
+                        content: page_content.clone(),
+                        owner_id: owner_id.clone(),
+                        file_type: file_type.to_string(),
+                        updated_at_millis,
+                        sub_type: sub_type.clone(),
+                        properties: vec![],
+                    })
+                    .collect()
+            }
+            #[cfg(not(all(feature = "pdf", not(feature = "no_pdf"))))]
+            {
+                let _ = content;
+                tracing::debug!("pdf/docx indexing skipped: pdf feature disabled");
+                vec![]
+            }
+        }
+        FileType::Fig => {
+            // Decoding a design is CPU work.
+            let pages = tokio::task::spawn_blocking(move || parse_fig_pages(&content))
+                .await
+                .context("decoding the design")?
+                .context("unable to parse the design")?;
+            pages
+                .into_iter()
+                .map(|page| UpsertDocumentArgs {
+                    document_id: search_extractor_message.document_id.clone(),
+                    // The page's node id, so a page keeps its chunk.
+                    node_id: page.node_id,
+                    raw_content: None,
+                    document_name: document_name.clone(),
+                    content: page.content,
+                    owner_id: owner_id.clone(),
+                    file_type: file_type.to_string(),
+                    updated_at_millis,
+                    sub_type: sub_type.clone(),
+                    properties: vec![],
+                })
+                .collect()
+        }
+        FileType::Psd | FileType::Psb | FileType::Ai => {
+            match read_design_text(file_type, content).await {
+                Ok(text) if !text.trim().is_empty() => vec![UpsertDocumentArgs {
+                    document_id: search_extractor_message.document_id.clone(),
+                    node_id: DESIGN_TEXT_NODE_ID.to_string(),
+                    raw_content: None,
+                    document_name,
+                    content: text,
+                    owner_id,
+                    file_type: file_type.to_string(),
+                    updated_at_millis,
+                    sub_type: sub_type.clone(),
+                    properties: vec![],
+                }],
+                read => {
+                    if let Err(error) = &read {
+                        tracing::warn!(error = ?error, "indexing an unreadable design by name only");
+                    }
+                    return update_search_with_unreadable_file(
+                        opensearch_client,
+                        db,
+                        search_extractor_message,
+                    )
+                    .await;
+                }
+            }
+        }
+        FileType::Md => {
+            // NOTE: this is legacy now. MD parsing mainly happens through sync service via
+            // LexicalClient
+            tracing::trace!("markdown parsing from DSS is deprecated");
+            let Some(content) = decode_text(content, file_type) else {
+                tracing::warn!("indexing markdown that is not text by name only");
+                return update_search_with_unreadable_file(
+                    opensearch_client,
+                    db,
+                    search_extractor_message,
+                )
+                .await;
+            };
+            let result = parse_markdown_legacy(&content).context("unable to parse markdown")?;
+            result
+                .into_iter()
+                .map(|result| UpsertDocumentArgs {
+                    document_id: search_extractor_message.document_id.clone(),
+                    node_id: result.node_id,
+                    raw_content: Some(result.raw_content),
+                    document_name: document_name.clone(),
+                    content: result.content,
+                    owner_id: owner_id.clone(),
+                    file_type: file_type.to_string(),
+                    updated_at_millis,
+                    sub_type: sub_type.clone(),
+                    properties: vec![],
+                })
+                .collect::<Vec<UpsertDocumentArgs>>()
+        }
+        file_type => {
+            let Some(content) = decode_text(content, file_type) else {
+                tracing::warn!("indexing a file that is not text by name only");
+                return update_search_with_unreadable_file(
+                    opensearch_client,
+                    db,
+                    search_extractor_message,
+                )
+                .await;
+            };
+            if content.is_empty() {
+                vec![]
+            } else {
+                vec![UpsertDocumentArgs {
+                    document_id: search_extractor_message.document_id.clone(),
+                    node_id: uuid,
+                    raw_content: None,
+                    document_name,
+                    content: content.clone(),
+                    owner_id,
+                    file_type: file_type.to_string(),
+                    updated_at_millis,
+                    sub_type: sub_type.clone(),
+                    properties: vec![],
+                }]
+            }
+        }
+    };
+
+    attach_indexed_properties(
+        db,
+        &search_extractor_message.document_id,
+        sub_type.as_deref(),
+        &mut upserts,
+    )
+    .await?;
+
+    upsert_document(opensearch_client, search_extractor_message, upserts).await?;
+
+    Ok(())
+}
+
+fn generate_upserts(
+    document_info: DocumentMetadata,
+    markdown_result: Vec<MarkdownParseResult>,
+) -> anyhow::Result<Vec<UpsertDocumentArgs>> {
+    let result = markdown_result;
+    let updated_at_millis = EpochMillis::new(Utc::now().timestamp_millis())?;
+    let file_type = FileType::from_str(
+        document_info
+            .file_type
+            .context("expected a file type")?
+            .as_str(),
+    )?;
+    let document_name = document_info.document_name;
+    let sub_type = document_info.sub_type.map(|st| st.to_string());
+
+    let upserts = result
+        .into_iter()
+        .map(|result| UpsertDocumentArgs {
+            document_id: document_info.document_id.clone(),
+            node_id: result.node_id,
+            raw_content: Some(result.raw_content),
+            document_name: document_name.clone(),
+            content: result.content,
+            owner_id: document_info.owner.to_string(),
+            file_type: file_type.to_string(),
+            updated_at_millis,
+            sub_type: sub_type.clone(),
+            properties: vec![],
+        })
+        .collect::<Vec<UpsertDocumentArgs>>();
+
+    Ok(upserts)
+}
+
+/// Processes a message for a standard document and reads the updated contents from sync service and updates
+/// the document in opensearch.
+#[tracing::instrument(skip(opensearch_client, search_extractor_message, db, s3_client, document_storage_bucket, lexical_client), fields(document_id=search_extractor_message.document_id, file_type=?search_extractor_message.file_type))]
+pub async fn update_search_with_sync_document(
+    opensearch_client: &OpensearchClient,
+    db: &sqlx::Pool<sqlx::Postgres>,
+    s3_client: &s3_client::S3,
+    document_storage_bucket: &str,
+    lexical_client: &lexical_client::LexicalClient,
+    search_extractor_message: &SearchExtractorMessage,
+) -> anyhow::Result<()> {
+    match search_extractor_message.file_type.macro_app_path() {
+        model_file_type::FileAssociation::Md(_) => {}
+        _ => {
+            tracing::warn!("unsupported file type");
+            return Ok(());
+        }
+    }
+
+    let document_info = match get_document_info(db, search_extractor_message)
+        .await
+        .context("failed to get document info")?
+    {
+        DocumentInfo::Active(info) => *info,
+        DocumentInfo::Removable => {
+            tracing::trace!("document is deleted or missing, removing from search index");
+            opensearch_client
+                .delete_document(
+                    &search_extractor_message.document_id,
+                    search_extractor_message.index_override.as_deref(),
+                )
+                .await
+                .context("failed to delete document from search index")?;
+            return Ok(());
+        }
+        DocumentInfo::Skip => {
+            tracing::trace!("no document info returned");
+            return Ok(());
+        }
+    };
+
+    let document_id = &search_extractor_message.document_id;
+    let result = match lexical_client.parse_markdown(document_id).await {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!(error=?e, "failed to parse markdown with lexical");
+            // call DSS as fallback if lexical/sync service fails
+            update_search_with_raw_document(
+                opensearch_client,
+                db,
+                s3_client,
+                document_storage_bucket,
+                search_extractor_message,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let sub_type = document_info.sub_type.as_ref().map(|st| st.to_string());
+    let mut upserts =
+        generate_upserts(document_info, result).context("unable to generate upserts")?;
+
+    attach_indexed_properties(db, document_id, sub_type.as_deref(), &mut upserts).await?;
+
+    let chunk_count = upserts.len();
+    upsert_document(opensearch_client, search_extractor_message, upserts).await?;
+    tracing::info!(document_id = %document_id, chunk_count, "sync document indexed");
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod test;

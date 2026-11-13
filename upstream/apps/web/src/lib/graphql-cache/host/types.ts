@@ -1,0 +1,254 @@
+import type { PeopleCache } from '../people/host';
+import type { IdentityBindingWire, MutationInspection } from '../protocol';
+/**
+ * Transport-agnostic cache host interface consumed by the urql exchange and
+ * imperative writers (websocket handlers). Implementations:
+ * - worker-host.ts: browser (SharedWorker coordinator + elected WASM engine,
+ *   or no-op fallback)
+ * - tauri-host.ts (Phase 3b): Tauri IPC to the native engine
+ */
+
+import type { EntityResolverWire } from '../exchange/entity-resolvers';
+import type {
+  AffectedOperationsResult,
+  CacheChangeHints,
+  CachedQueryInstanceWire,
+  CachedQueryVariantWire,
+  CacheReadPriority,
+  CacheRevision,
+  CalendarCommitArgs,
+  CalendarCommitCacheResult,
+  CalendarRangeCacheArgs,
+  CalendarRangeCacheResult,
+  ClaimedMutation,
+  CommitOptimisticWriteResult,
+  DeferOptimisticWriteResult,
+  EnqueueOptimisticMutationResult,
+  EntityFilterCacheArgs,
+  EntityFilterCacheResult,
+  HydrationResult,
+  HydrationScope,
+  MutationClaim,
+  MutationSettlement,
+  OptimisticLinkPatchWire,
+  QueryRevalidationWire,
+  QueryUpdate,
+  QueryVariableFilter,
+  ReadRecordsByKeysArgs,
+  ReadRecordsByKeysResult,
+  ReadResult,
+  RecordFieldChange,
+  RollbackOptimisticWriteResult,
+  SearchCacheArgs,
+  SearchCachePage,
+  WriteResult,
+} from '../protocol';
+
+export interface CacheReadArgs {
+  /** urql operation key; registers the op for re-execution when set. */
+  opKey?: number;
+  query: string;
+  operationName?: string;
+  variables?: Record<string, unknown>;
+  /** Prioritizes a pushed, user-visible refresh over incidental reads. */
+  priority?: CacheReadPriority;
+  /** Read-only synthetic entity relations compiled by the exchange. */
+  entityResolvers?: readonly EntityResolverWire[];
+}
+
+export type CacheWatchArgs = CacheReadArgs & {
+  opKey: number;
+  since?: CacheRevision;
+};
+
+export interface InspectQueryArgs {
+  query: string;
+  operationName?: string;
+  /** Response-key field path from the query root. */
+  path: Array<{ field: string }>;
+  /** OR-ed recursive partial matches applied before result materialization. */
+  variableFilters?: QueryVariableFilter[];
+}
+
+/** Variables-only inspection always discovers every cached variant. */
+export type InspectQueryVariantsArgs = Omit<
+  InspectQueryArgs,
+  'variableFilters'
+>;
+
+export interface CacheWriteArgs extends Omit<CacheReadArgs, 'priority'> {
+  data: unknown;
+  /** Installs this active query's dependencies from the normalized response. */
+  registerDependencies?: boolean;
+  /** Opaque session tag; see protocol.ts `identity`. */
+  identity?: string;
+}
+
+export interface CacheHydrateArgs extends Omit<CacheWriteArgs, 'opKey'> {
+  /** Reject a response from another account or cleared database before writing. */
+  hydrationScope?: HydrationScope;
+}
+
+export interface EnqueueOptimisticMutationArgs extends CacheWriteArgs {
+  /** Caller-supplied RFC UUID used for explicit safe coalescing. */
+  uuid: string;
+  /** Opaque durable client correlation; never included in GraphQL variables. */
+  clientMetadata?: Record<string, unknown>;
+  identityBindings?: IdentityBindingWire[];
+  linkPatches?: OptimisticLinkPatchWire[];
+  /** Revalidations for relevant cached fields that could not be patched. */
+  revalidations?: QueryRevalidationWire[];
+  /**
+   * `GraphqlCalendarEvent` keys whose occurrence set this mutation cannot
+   * predict (for example a recurrence edit); calendar ranges report them
+   * until the mutation settles.
+   */
+  uncertainCalendarEventKeys?: string[];
+}
+
+/** Lease request used for the claim attempted immediately after enqueue. */
+export interface InitialMutationClaimArgs {
+  owner: string;
+  nowMs: number;
+  leaseExpiresAtMs: number;
+}
+
+export type CacheChangeListener = (
+  revision: CacheRevision,
+  /** Missing metadata/proof IDs mean unknown; resets always refresh. */
+  changes?: CacheChangeHints
+) => void;
+
+export type CacheChangeOptions = {
+  /** Also observe background hydration without re-executing foreground queries. */
+  includeHydration?: boolean;
+};
+
+/** Engine replacement is independent of whether durable cache data survived. */
+export type CacheGenerationChange = {
+  storage: 'preserved' | 'reset';
+};
+
+export type AffectedOperationsListener = (
+  opKeys: number[],
+  fieldChanges?: RecordFieldChange[]
+) => void;
+
+export interface CacheHost {
+  /** The host understands engine-maintained fragment query requests. */
+  readonly liveQueries?: boolean;
+  /** Stable id of this context; used to namespace operation ids. */
+  readonly clientId: string;
+  /** True for the storage-free fallback when browser cache APIs are unsupported. */
+  readonly disabled?: boolean;
+
+  /** Returns the current revision of the active cache-engine generation. */
+  currentRevision(): Promise<CacheRevision>;
+  /** Durable database identity, preserved across engine restarts and replaced
+   * whenever the stored cache is cleared or recreated. */
+  currentStorageGeneration(): Promise<string>;
+  readQuery(args: CacheReadArgs): Promise<ReadResult>;
+  /** Engine-owned document projection; absent on older/disabled runtimes. */
+  watchQuery?(args: CacheWatchArgs): Promise<QueryUpdate>;
+  /** Projects a bounded explicit set of normalized entity keys. */
+  readRecordsByKeys(
+    args: ReadRecordsByKeysArgs
+  ): Promise<ReadRecordsByKeysResult>;
+  /** Context-aware contact policy; absent on disabled/older host adapters. */
+  readonly people?: PeopleCache;
+  /** Searches the compact write-through materialized projection. Aborting
+   * `signal` releases a search the caller has superseded. */
+  search(
+    args: SearchCacheArgs,
+    options?: { signal?: AbortSignal }
+  ): Promise<SearchCachePage>;
+  /** Evaluates an exact initial Soup filter page over complete local projections. */
+  entityFilter(args: EntityFilterCacheArgs): Promise<EntityFilterCacheResult>;
+  /** Answers a calendar viewport from the local range index. */
+  calendarRange(
+    args: CalendarRangeCacheArgs
+  ): Promise<CalendarRangeCacheResult>;
+  /** Atomically applies calendar coverage, deletions, and sync state. */
+  calendarCommit(args: CalendarCommitArgs): Promise<CalendarCommitCacheResult>;
+  writeQuery(args: CacheWriteArgs): Promise<WriteResult>;
+  /**
+   * Stores a background query response and returns only fields not marked
+   * `@cacheOnly`. Advances the internal revision for coherent reads without
+   * notifying foreground subscribers unless the write resets cache identity.
+   * Cache-only consumers can opt into hydration via onCacheChanged.
+   */
+  hydrateQuery(args: CacheHydrateArgs): Promise<HydrationResult>;
+  /** Durably queues an optimistic mutation and claims the strict head. */
+  enqueueOptimisticMutation(
+    args: EnqueueOptimisticMutationArgs,
+    claim: InitialMutationClaimArgs
+  ): Promise<EnqueueOptimisticMutationResult>;
+  /** Recovers variables for cached variants without materializing values. */
+  inspectQueryVariants(
+    args: InspectQueryVariantsArgs
+  ): Promise<CachedQueryVariantWire[]>;
+  /** Enumerates and materializes cached query field variants. */
+  inspectQuery(args: InspectQueryArgs): Promise<CachedQueryInstanceWire[]>;
+  /** Read-only queue snapshots; their lease values do not authorize settlement. */
+  inspectMutations?(): Promise<MutationInspection[]>;
+  /** Claims the oldest runnable mutation; later entries are never skipped. */
+  claimNextMutation(
+    owner: string,
+    nowMs: number,
+    leaseExpiresAtMs: number
+  ): Promise<ClaimedMutation | undefined>;
+  /** Retains a retryable mutation and releases its lease. */
+  deferOptimisticWrite(
+    transactionId: string,
+    claim: MutationClaim,
+    nextAttemptAtMs: number,
+    error: string,
+    serverFailure?: boolean
+  ): Promise<DeferOptimisticWriteResult>;
+  /** Atomically commits a claimed mutation's real network response. */
+  commitOptimisticWrite(
+    transactionId: string,
+    claim: MutationClaim,
+    args: CacheWriteArgs
+  ): Promise<CommitOptimisticWriteResult>;
+  /** Permanently fails a claimed mutation and drops its optimistic layer. */
+  rollbackOptimisticWrite(
+    transactionId: string,
+    claim: MutationClaim,
+    error: string,
+    errorCode?: string
+  ): Promise<RollbackOptimisticWriteResult>;
+  /** Evict records by entity key (external/push updates); returns affected local op ids. */
+  invalidate(keys: string[]): Promise<AffectedOperationsResult>;
+  /** Apply explicit server-provided cache-deletion effects. */
+  deleteRecords(keys: string[]): Promise<AffectedOperationsResult>;
+  /** urql teardown for an operation key. */
+  teardown(opKey: number): Promise<void>;
+  /** Wipe all cached state (logout). */
+  clear(): Promise<CacheRevision>;
+
+  /**
+   * Subscribes to "these urql operation keys must re-execute" pushes
+   * (local writes from other operations, other tabs, push invalidation).
+   * Only keys belonging to this client are delivered. Returns unsubscribe.
+   */
+  onOpsAffected(cb: AffectedOperationsListener): () => void;
+
+  /** Subscribes whenever the effective normalized-cache view changes. */
+  onCacheChanged(
+    cb: CacheChangeListener,
+    options?: CacheChangeOptions
+  ): () => void;
+
+  /** Reports engine replacements and live storage resets. Durable checkpoints
+   * must also validate currentStorageGeneration on startup: notifications are
+   * not replayed and may precede a subscriber. */
+  onCacheGenerationChanged(
+    cb: (change: CacheGenerationChange) => void
+  ): () => void;
+
+  /** Subscribes to final commit, rollback, or supersession events. */
+  onMutationSettled(cb: (settlement: MutationSettlement) => void): () => void;
+
+  dispose(): void;
+}

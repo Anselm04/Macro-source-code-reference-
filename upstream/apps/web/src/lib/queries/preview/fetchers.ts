@@ -1,0 +1,547 @@
+import {
+  fetchCrmCompanyPreviews,
+  fetchCrmContactPreviews,
+  fetchCrmPipelinePreviews,
+} from '@app/features/crm/preview-adapter';
+import { readEntityAppearance } from '@app/features/entity-appearance/core/appearance';
+import { QUERY_FILTERS_BASE } from '@app/features/next-soup/filters/query-filters';
+import { itemToSafeName } from '@core/constant/allBlocks';
+import {
+  enableGraphqlSoup,
+  isFeatureEnabled,
+} from '@core/constant/featureFlags';
+import { DEFAULT_THREAD_MESSAGES_LIMIT } from '@core/constant/pagination';
+import { toSubType } from '@entity/types/entity';
+import { cognitionApiServiceClient } from '@service-cognition/client';
+import { emailClient } from '@service-email/client';
+import type { ApiThread } from '@service-email/generated/schemas';
+import { scheduledActionClient } from '@service-scheduled-action/client';
+import { storageServiceClient } from '@service-storage/client';
+import type { FileType } from '@service-storage/generated/schemas/fileType';
+import { entityMessagesClient } from '@service-storage/messages';
+import { formatDocumentName } from '@service-storage/util/filename';
+import type { InfiniteData } from '@tanstack/solid-query';
+import { fetchAgentSessionMentionPreviews } from '../agent-session/mention-fetchers';
+import { queryClient } from '../client';
+import { emailKeys } from '../email/keys';
+import { threadQueryOptions } from '../email/thread';
+import { representativeThreadMessage } from '../email/thread-subject';
+import { normalizeMessageSender } from '../messages/message-sender';
+import { fetchCachedDatabaseDetail } from '../storage/databases';
+import { failedReadAccess } from './failed-read';
+import type { ItemEntity, MessageContext, PreviewItem } from './types';
+
+async function fetchSessionPreviews(ids: string[]): Promise<PreviewItem[]> {
+  const previews = await fetchAgentSessionMentionPreviews(
+    ids,
+    isFeatureEnabled(enableGraphqlSoup)
+  );
+  return [...previews].map(([id, preview]): PreviewItem => {
+    const base = {
+      id,
+      type: 'agent_session' as const,
+      loading: false as const,
+    };
+    if (preview.access !== 'access') return { ...base, access: preview.access };
+    return {
+      ...base,
+      access: 'access',
+      name: preview.data.name,
+      rawName: preview.data.name,
+      owner: preview.data.ownerId,
+      updatedAt: preview.data.updatedAt,
+    };
+  });
+}
+
+async function fetchChannelPreviews(
+  channelIds: string[]
+): Promise<PreviewItem[]> {
+  const result = await storageServiceClient.getBatchChannelPreviews({
+    channel_ids: channelIds,
+  });
+
+  if (result.isErr()) {
+    console.error('Failed to fetch channel previews');
+    return [];
+  }
+
+  const data = result.value;
+  return data.previews.map((channel) => {
+    const base = {
+      id: channel.channel_id,
+      type: 'channel',
+    } as const;
+
+    switch (channel.type) {
+      case 'access':
+        return {
+          ...base,
+          access: 'access' as const,
+          loading: false,
+          rawName: channel.channel_name,
+          name: channel.channel_name,
+          channelType: channel.channel_type,
+          profilePictureId: channel.profile_picture_id,
+        };
+      case 'no_access':
+      case 'does_not_exist':
+        return {
+          ...base,
+          access: channel.type,
+          loading: false,
+        };
+    }
+  });
+}
+
+export async function fetchMessageContext(
+  channelId: string,
+  messageId: string,
+  signal?: AbortSignal
+): Promise<MessageContext | null> {
+  if (signal?.aborted) return null;
+  try {
+    const message = await entityMessagesClient.get(
+      { type: 'channel', id: channelId },
+      messageId
+    );
+    return signal?.aborted ? null : normalizeMessageSender(message);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchDocumentPreviews(ids: string[]): Promise<PreviewItem[]> {
+  const result = await storageServiceClient.getBatchDocumentPreviews({
+    document_ids: ids,
+  });
+
+  if (result.isErr()) {
+    console.error('Failed to fetch document previews');
+    return [];
+  }
+
+  const data = result.value;
+  return data.previews.map((doc) => {
+    const base = {
+      id: doc.document_id,
+      type: 'document',
+    } as const;
+
+    switch (doc.type) {
+      case 'access':
+        return {
+          ...base,
+          access: 'access' as const,
+          loading: false,
+          rawName: doc.document_name,
+          name: doc.document_name,
+          appearance: readEntityAppearance(doc.appearance),
+          fileType: doc.file_type as FileType,
+          owner: doc.owner,
+          updatedAt: doc.updated_at,
+          subType: toSubType(doc.sub_type) ?? undefined,
+        };
+      case 'no_access':
+      case 'does_not_exist':
+        return {
+          ...base,
+          access: doc.type,
+          loading: false,
+        };
+    }
+  });
+}
+
+async function fetchCallPreviews(ids: string[]): Promise<PreviewItem[]> {
+  const result = await storageServiceClient.getBatchCallPreviews({
+    call_ids: ids,
+  });
+
+  if (result.isErr()) {
+    console.error('Failed to fetch call previews');
+    return [];
+  }
+
+  const data = result.value;
+  return data.previews.map((call) => {
+    const base = {
+      id: call.callId,
+      type: 'call',
+    } as const;
+
+    switch (call.type) {
+      case 'exists': {
+        // Match the call block (CallRecordingSplitHeader / CallRecordingBody):
+        // prefer the user-supplied / AI-generated `customName`, fall back to
+        // the channel the call lives in.
+        const displayName = call.customName ?? call.channelName;
+        return {
+          ...base,
+          access: 'access' as const,
+          loading: false,
+          rawName: displayName ?? '',
+          name: displayName ?? 'Unknown Call',
+          updatedAt: call.startedAt,
+        };
+      }
+      case 'does_not_exist':
+        return {
+          ...base,
+          access: call.type,
+          loading: false,
+        };
+    }
+  });
+}
+
+async function fetchChatPreviews(ids: string[]): Promise<PreviewItem[]> {
+  const result = await cognitionApiServiceClient.getBatchChatPreviews({
+    chat_ids: ids,
+  });
+
+  if (result.isErr()) {
+    console.error('Failed to fetch chat previews');
+    return [];
+  }
+
+  const data = result.value;
+  return data.previews.map((chat) => {
+    const base = {
+      id: chat.chat_id,
+      type: 'chat',
+    } as const;
+
+    switch (chat.type) {
+      case 'access':
+        return {
+          ...base,
+          access: 'access' as const,
+          loading: false,
+          rawName: chat.chat_name,
+          name: chat.chat_name,
+          owner: chat.owner,
+          updatedAt: chat.updated_at,
+        };
+      case 'no_access':
+      case 'does_not_exist':
+        return {
+          ...base,
+          access: chat.type,
+          loading: false,
+        };
+    }
+  });
+}
+
+async function fetchProjectPreviews(
+  projectIds: string[]
+): Promise<PreviewItem[]> {
+  const result = await storageServiceClient.projects.getPreview({
+    projectIds,
+  });
+
+  if (result.isErr()) {
+    console.error('Failed to fetch projects previews');
+    return [];
+  }
+
+  return result.value.previews.map((preview) => {
+    const { updatedAt, ...rest } = preview as Extract<
+      typeof preview,
+      { updatedAt?: unknown }
+    >;
+    return {
+      type: 'project' as const,
+      loading: false as const,
+      ...rest,
+      rawName: rest.name,
+      updatedAt,
+    };
+  });
+}
+
+/** Task projects through the authorized Soup list; absent ids have no access. */
+async function fetchInitiativePreviews(
+  initiativeIds: string[]
+): Promise<PreviewItem[]> {
+  const result = await storageServiceClient.getSoupItems({
+    params: {},
+    body: {
+      ...QUERY_FILTERS_BASE,
+      initiative_filters: { initiative_ids: initiativeIds },
+      limit: initiativeIds.length,
+    },
+  });
+
+  if (result.isErr()) {
+    console.error('Failed to fetch project previews');
+    return [];
+  }
+
+  return result.value.items.flatMap((item): PreviewItem[] =>
+    item.tag === 'initiative'
+      ? [
+          {
+            id: item.data.id,
+            type: 'initiative',
+            access: 'access',
+            loading: false,
+            rawName: item.data.name,
+            name: item.data.name,
+            appearance: readEntityAppearance(item.data.appearance),
+            owner: item.data.ownerId,
+            updatedAt: item.data.updatedAt,
+          },
+        ]
+      : []
+  );
+}
+
+/**
+ * Reuse the thread-messages query the email block fetches on open: returns
+ * cached data (any staleness — previews tolerate 24h), or joins an in-flight
+ * fetch, so the preview doesn't issue a separate getThread request.
+ */
+async function threadFromOpenThreadQuery(
+  threadId: string
+): Promise<ApiThread | undefined> {
+  const queryKey = emailKeys.threadMessages(threadId).queryKey;
+  const cached =
+    queryClient.getQueryData<InfiniteData<ApiThread, number>>(queryKey);
+  if (cached?.pages[0]) return cached.pages[0];
+
+  if (queryClient.getQueryState(queryKey)?.fetchStatus !== 'fetching') {
+    return undefined;
+  }
+  try {
+    const data = await queryClient.fetchInfiniteQuery(
+      threadQueryOptions(threadId)
+    );
+    return data.pages[0];
+  } catch {
+    // Fall through to the limit=1 fetch so access errors map per-id.
+    return undefined;
+  }
+}
+
+async function fetchEmailPreviews(threadIds: string[]): Promise<PreviewItem[]> {
+  const results = await Promise.all(
+    threadIds.map(async (threadId) => {
+      const base = {
+        id: threadId,
+        type: 'email',
+      } as const;
+
+      let thread = await threadFromOpenThreadQuery(threadId);
+
+      if (!thread) {
+        const result = await emailClient.getThread({
+          thread_id: threadId,
+          offset: 0,
+          // Fetch a page rather than a single message: the newest message can
+          // be a subjectless draft (or, for a non-owner, be filtered out
+          // entirely), so a limit-1 fetch would resolve the thread as "No
+          // Subject" even though a real message in it has one.
+          limit: DEFAULT_THREAD_MESSAGES_LIMIT,
+        });
+
+        if (result.isErr()) {
+          return {
+            ...base,
+            access: 'no_access' as const,
+            loading: false as const,
+          };
+        }
+        thread = result.value.thread;
+      }
+
+      const representative = representativeThreadMessage(thread.messages);
+      const subject = representative?.subject ?? 'No Subject';
+      const sender =
+        representative?.from?.email ?? representative?.from?.name ?? undefined;
+
+      return {
+        ...base,
+        access: 'access' as const,
+        loading: false as const,
+        rawName: subject,
+        name: subject,
+        owner: sender as string | undefined,
+        updatedAt: thread.updated_at,
+      };
+    })
+  );
+
+  return results;
+}
+
+/**
+ * Calendar mention previews resolve through the requester's own copy of the
+ * meeting: the API answers with the viewer-relative event (or no_access /
+ * does_not_exist), never another user's row. The batch is occurrence-agnostic
+ * — previews cache per event id, and the server picks the instance nearest to
+ * now.
+ */
+async function fetchCalendarEventPreviews(
+  eventIds: string[]
+): Promise<PreviewItem[]> {
+  const result = await storageServiceClient.getBatchCalendarEventPreviews({
+    items: eventIds.map((eventId) => ({ eventId })),
+  });
+
+  if (result.isErr()) {
+    console.error('Failed to fetch calendar event previews');
+    return [];
+  }
+
+  return result.value.items.map((item) => {
+    const base = {
+      id: item.eventId,
+      type: 'calendar_event',
+    } as const;
+
+    if (item.type === 'access' && item.event) {
+      return {
+        ...base,
+        access: 'access' as const,
+        loading: false as const,
+        rawName: item.event.title,
+        name: item.event.title,
+        updatedAt: item.event.updatedAt,
+        event: item.event,
+      };
+    }
+    return {
+      ...base,
+      access:
+        item.type === 'does_not_exist'
+          ? ('does_not_exist' as const)
+          : ('no_access' as const),
+      loading: false as const,
+    };
+  });
+}
+
+/**
+ * A database previews as the viewer's own read of it: an owner or anyone it
+ * is shared with gets its name; one deleted or trashed is gone. The read is
+ * the cached schema an open of the database shares.
+ */
+async function fetchDatabasePreviews(ids: string[]): Promise<PreviewItem[]> {
+  return Promise.all(
+    ids.map(async (id): Promise<PreviewItem> => {
+      const base = { id, type: 'database', loading: false } as const;
+      const detail = await fetchCachedDatabaseDetail(id);
+      if (detail.isErr())
+        return { ...base, access: failedReadAccess(detail.error) };
+      const { database } = detail.value;
+      if (database.trashed_at !== null)
+        return { ...base, access: 'does_not_exist' };
+      return {
+        ...base,
+        access: 'access',
+        rawName: database.name,
+        name: database.name,
+        appearance: readEntityAppearance(database.appearance),
+        owner: database.owner_id,
+      };
+    })
+  );
+}
+
+/**
+ * A form previews from its own detail, which viewers (respondents) can read
+ * too; one that is gone reads as deleted.
+ */
+async function fetchFormPreviews(ids: string[]): Promise<PreviewItem[]> {
+  return Promise.all(
+    ids.map(async (id): Promise<PreviewItem> => {
+      const base = { id, type: 'form', loading: false } as const;
+      const detail = await storageServiceClient.forms.get({ id });
+      if (detail.isErr())
+        return { ...base, access: failedReadAccess(detail.error) };
+      const { form } = detail.value;
+      return {
+        ...base,
+        access: 'access',
+        rawName: form.name,
+        name: form.name,
+        appearance: readEntityAppearance(form.appearance),
+        owner: form.ownerId,
+      };
+    })
+  );
+}
+
+/** A routine previews from its own read; one that is gone reads as deleted. */
+async function fetchRoutinePreviews(ids: string[]): Promise<PreviewItem[]> {
+  return Promise.all(
+    ids.map(async (id): Promise<PreviewItem> => {
+      const base = { id, type: 'routine', loading: false } as const;
+      const routine = await scheduledActionClient.getRoutine(id);
+      if (routine.isErr())
+        return { ...base, access: failedReadAccess(routine.error) };
+      return {
+        ...base,
+        access: 'access',
+        rawName: routine.value.name,
+        name: routine.value.name,
+        appearance: readEntityAppearance(routine.value.appearance),
+        owner: routine.value.owner,
+        updatedAt: routine.value.updated_at,
+      };
+    })
+  );
+}
+
+function filterMapToId(items: Array<ItemEntity>, type: ItemEntity['type']) {
+  return items.filter((i) => i.type === type).map(({ id }) => id);
+}
+
+function doFetch(
+  fetcher: (ids: string[]) => Promise<PreviewItem[]>,
+  ids: string[]
+) {
+  if (ids.length > 0) return fetcher(ids);
+  return Promise.resolve([]);
+}
+
+export async function fetchRestPreviewBatch(
+  items: ItemEntity[]
+): Promise<Map<string, PreviewItem>> {
+  const results = await Promise.all([
+    doFetch(fetchSessionPreviews, filterMapToId(items, 'agent_session')),
+    doFetch(fetchChatPreviews, filterMapToId(items, 'chat')),
+    doFetch(fetchCallPreviews, filterMapToId(items, 'call')),
+    doFetch(fetchChannelPreviews, filterMapToId(items, 'channel')),
+    doFetch(fetchDocumentPreviews, filterMapToId(items, 'document')),
+    doFetch(fetchProjectPreviews, filterMapToId(items, 'project')),
+    doFetch(fetchInitiativePreviews, filterMapToId(items, 'initiative')),
+    doFetch(fetchEmailPreviews, filterMapToId(items, 'email')),
+    doFetch(fetchCrmCompanyPreviews, filterMapToId(items, 'crm_company')),
+    doFetch(fetchCrmContactPreviews, filterMapToId(items, 'crm_contact')),
+    doFetch(fetchCrmPipelinePreviews, filterMapToId(items, 'crm_pipeline')),
+    doFetch(fetchCalendarEventPreviews, filterMapToId(items, 'calendar_event')),
+    doFetch(fetchDatabasePreviews, filterMapToId(items, 'database')),
+    doFetch(fetchFormPreviews, filterMapToId(items, 'form')),
+    doFetch(fetchRoutinePreviews, filterMapToId(items, 'routine')),
+  ]);
+  const resultMap = new Map<string, PreviewItem>();
+  results.flat().forEach((result) => {
+    resultMap.set(result.id, result);
+  });
+  return resultMap;
+}
+
+export function defaultNameTransform(item: PreviewItem): PreviewItem {
+  if (item.loading) return item;
+  if (item.access !== 'access') return item;
+  const rawName = item.rawName === '' ? itemToSafeName(item) : item.rawName;
+  const fileType = 'fileType' in item ? item.fileType : undefined;
+  const name = formatDocumentName(rawName, fileType, {
+    fullyQualifiedBlockName: true,
+  });
+  return { ...item, rawName, name };
+}

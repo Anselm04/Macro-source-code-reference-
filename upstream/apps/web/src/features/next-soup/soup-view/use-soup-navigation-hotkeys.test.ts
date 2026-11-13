@@ -1,0 +1,490 @@
+import { createRoot } from 'solid-js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@app/features/next-soup/filters/configs/', () => ({
+  SOUP_FILTERS: [],
+}));
+
+vi.mock('@app/features/next-soup/soup-view/sort-options', () => ({
+  SORT_CONFIGS: {
+    updated_at: {
+      id: 'updated_at',
+      fn: (a: { updatedAt?: number }, b: { updatedAt?: number }) =>
+        (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
+    },
+  },
+}));
+
+vi.mock('@core/mobile/inputModality', () => ({
+  isModality: vi.fn(() => false),
+}));
+
+vi.mock('@app/features/next-soup/utils', () => ({
+  openEntityInSplitFromUnifiedList: vi.fn(),
+}));
+
+vi.mock('@app/signal/splitLayout', () => ({
+  globalSplitManager: () => undefined,
+}));
+
+vi.mock('@components/app/split-layout/layoutUtils', () => ({
+  withSplitPanelOwner: vi.fn((_name: string, factory: () => unknown) =>
+    factory()
+  ),
+}));
+
+vi.mock('@components/app/GlobalAppState', () => ({
+  useGlobalNotificationSource: () => ({ bulkMarkAsRead: vi.fn() }),
+}));
+
+vi.mock('@core/hotkey/hotkeys', () => {
+  const registration = {
+    dispose: vi.fn(),
+    hotkey: () => undefined,
+    withGroup: vi.fn(),
+  };
+  return {
+    registerHotkey: vi.fn(() => registration),
+    createHotkeyGroup: vi.fn(() => ({ add: vi.fn(), dispose: vi.fn() })),
+  };
+});
+
+vi.mock('@core/hotkey/tokens', () => ({
+  TOKENS: {
+    entity: {
+      step: { start: 'entity.step.start', end: 'entity.step.end' },
+      select: { start: 'entity.select.start', end: 'entity.select.end' },
+    },
+    unifiedList: {
+      navigation: {
+        parent: 'unifiedList.navigation.parent',
+        collapseGroup: 'unifiedList.navigation.collapseGroup',
+        child: 'unifiedList.navigation.child',
+      },
+    },
+  },
+}));
+
+import {
+  getListNavigationSource,
+  listNavigationSourceId,
+  withListNavigationSource,
+} from '@app/features/soup/collection/list-navigation-source';
+import type { SplitHandle } from '@components/app/split-layout/layoutManager';
+import { withSplitPanelOwner } from '@components/app/split-layout/layoutUtils';
+import { createOwnedSlots } from '@components/app/split-layout/utils/createOwnedSlots';
+import { registerHotkey } from '@core/hotkey/hotkeys';
+import type { ValidHotkey } from '@core/hotkey/types';
+import type { EntityData } from '@entity';
+import {
+  createSoupState,
+  type GroupMeta,
+  type SoupState,
+} from '../create-soup-state';
+import { useSoupNavigationHotkeys } from './use-soup-navigation-hotkeys';
+
+const createTestEntity = (id: string): EntityData => ({
+  id,
+  type: 'document',
+  name: `Entity ${id}`,
+  ownerId: 'test-owner',
+  updatedAt: new Date(),
+});
+
+const createTestGroup = (key: string, count: number): GroupMeta => ({
+  key,
+  label: key,
+  value: key,
+  count,
+  isExpanded: vi.fn(() => true),
+  toggle: () => {},
+});
+
+/** headerA, a1, a2, headerB, b1, b2 */
+const setGroupedRows = (soup: SoupState) => {
+  const groupA = createTestGroup('a', 2);
+  const groupB = createTestGroup('b', 2);
+  const [a1, a2, b1, b2] = ['a1', 'a2', 'b1', 'b2'].map(createTestEntity);
+
+  soup.setRows([
+    soup.buildRow({
+      id: 'header:a',
+      index: 0,
+      original: a1,
+      group: groupA,
+      isGrouped: true,
+    }),
+    soup.buildRow({ id: 'a1', index: 1, original: a1, group: groupA }),
+    soup.buildRow({ id: 'a2', index: 2, original: a2, group: groupA }),
+    soup.buildRow({
+      id: 'header:b',
+      index: 3,
+      original: b1,
+      group: groupB,
+      isGrouped: true,
+    }),
+    soup.buildRow({ id: 'b1', index: 4, original: b1, group: groupB }),
+    soup.buildRow({ id: 'b2', index: 5, original: b2, group: groupB }),
+  ]);
+};
+
+const createSplitHandleStub = () =>
+  ({
+    id: 'split-test',
+    content: () => ({ type: 'component', id: 'tasks' }),
+    referredFrom: () => undefined,
+    registerEntryStateCaptor: () => () => {},
+  }) as unknown as SplitHandle;
+
+const handlerFor = (key: ValidHotkey) => {
+  const call = vi
+    .mocked(registerHotkey)
+    .mock.calls.find(([options]) =>
+      Array.isArray(options.hotkey)
+        ? options.hotkey.includes(key)
+        : options.hotkey === key
+    );
+  const handler = call?.[0].keyDownHandler;
+  expect(handler).toBeDefined();
+  return handler!;
+};
+
+const setupHotkeys = () =>
+  createRoot((dispose) => {
+    const soup = createSoupState();
+    setGroupedRows(soup);
+    useSoupNavigationHotkeys({
+      scopeId: 'test-scope',
+      soup,
+      splitHandle: createSplitHandleStub(),
+      virtualizerHandle: () => undefined,
+    });
+    return { soup, dispose };
+  });
+
+describe('useSoupNavigationHotkeys', () => {
+  beforeEach(() => {
+    vi.mocked(registerHotkey).mockClear();
+    vi.mocked(withSplitPanelOwner).mockImplementation((_name, factory) =>
+      factory()
+    );
+  });
+
+  it('reserves H for reminders on child rows while ArrowLeft collapses their group', () => {
+    const { soup, dispose } = setupHotkeys();
+    try {
+      soup.focus.set('a1');
+      const group = soup.focus.row()!.group!;
+      const toggle = vi.spyOn(group, 'toggle');
+      expect(handlerFor('h')()).toBe(false);
+      expect(toggle).not.toHaveBeenCalled();
+      expect(soup.focus.id()).toBe('a1');
+      expect(handlerFor('arrowleft')()).toBe(true);
+      expect(toggle).toHaveBeenCalledOnce();
+      expect(soup.focus.id()).toBe('header:a');
+    } finally {
+      dispose();
+    }
+  });
+
+  it('collapses task groups with H without consuming H on emails', () => {
+    const { soup, dispose } = setupHotkeys();
+    try {
+      soup.focus.set('a1');
+      const row = soup.focus.row()!;
+      const toggle = vi.spyOn(row.group!, 'toggle');
+      soup.setRows(
+        soup.rows().map((r) => ({
+          ...r,
+          original:
+            r.id === 'a1'
+              ? ({ ...r.original, type: 'email' } as EntityData)
+              : r.original,
+        }))
+      );
+      expect(
+        handlerFor('arrowleft')(new KeyboardEvent('keydown', { key: 'h' }))
+      ).toBe(false);
+      expect(toggle).not.toHaveBeenCalled();
+      soup.setRows(
+        soup.rows().map((r) => ({
+          ...r,
+          original:
+            r.id === 'a1'
+              ? ({
+                  ...r.original,
+                  type: 'document',
+                  fileType: 'md',
+                  subType: { type: 'task', is_completed: false },
+                } as EntityData)
+              : r.original,
+        }))
+      );
+      expect(
+        handlerFor('arrowleft')(new KeyboardEvent('keydown', { key: 'h' }))
+      ).toBe(true);
+      expect(toggle).toHaveBeenCalledOnce();
+      expect(soup.focus.id()).toBe('header:a');
+    } finally {
+      dispose();
+    }
+  });
+
+  it('consumes H on expanded and collapsed headers', () => {
+    const { soup, dispose } = setupHotkeys();
+    try {
+      soup.focus.set('header:a');
+      const group = soup.focus.row()!.group!;
+      const toggle = vi.spyOn(group, 'toggle');
+      expect(handlerFor('h')()).toBe(true);
+      expect(toggle).toHaveBeenCalledOnce();
+      vi.mocked(group.isExpanded).mockReturnValue(false);
+      expect(handlerFor('h')()).toBe(true);
+      expect(toggle).toHaveBeenCalledOnce();
+    } finally {
+      dispose();
+    }
+  });
+
+  it('makes the legacy list available to a separate native detail split', async () => {
+    let finishLoading!: () => void;
+    const fetchNextPage = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishLoading = resolve;
+        })
+    );
+    const { soup, source, dispose } = createRoot((dispose) => {
+      const slots = createOwnedSlots();
+      vi.mocked(withSplitPanelOwner).mockImplementation(slots.replace);
+      const soup = createSoupState();
+      setGroupedRows(soup);
+      const list = createSplitHandleStub();
+      list.content = () => ({ type: 'component', id: 'mail' });
+      const disposeView = createRoot((disposeView) => {
+        useSoupNavigationHotkeys({
+          scopeId: 'test-scope',
+          soup,
+          splitHandle: list,
+          virtualizerHandle: () => undefined,
+          hasNextPage: () => true,
+          fetchNextPage,
+        });
+        return disposeView;
+      });
+      disposeView();
+      const detail = {
+        ...list,
+        id: 'native-detail' as SplitHandle['id'],
+        content: () =>
+          withListNavigationSource({ type: 'email', id: 'a1' }, list),
+      };
+      const source = getListNavigationSource(listNavigationSourceId(detail));
+      return { soup, source, dispose };
+    });
+    try {
+      expect(source?.viewId).toBe('mail');
+      expect(source?.entities().map((entity) => entity.id)).toEqual([
+        'a1',
+        'a2',
+        'b1',
+        'b2',
+      ]);
+      expect(source?.hasMore()).toBe(true);
+      let loaded = false;
+      const loading = (async () => {
+        await source!.loadMore();
+        loaded = true;
+      })();
+      await Promise.resolve();
+      expect(fetchNextPage).toHaveBeenCalledOnce();
+      expect(loaded).toBe(false);
+      soup.setRows([
+        soup.buildRow({
+          id: 'next',
+          index: 0,
+          original: createTestEntity('next'),
+        }),
+      ]);
+      finishLoading();
+      await loading;
+      expect(source?.entities().map((entity) => entity.id)).toEqual(['next']);
+    } finally {
+      dispose();
+    }
+    expect(getListNavigationSource('split-test')).toBeUndefined();
+  });
+
+  it('j and k step through entities without focusing group headers', () => {
+    const { soup, dispose } = setupHotkeys();
+    const down = handlerFor('j');
+    const up = handlerFor('k');
+
+    // First press lands on the first entity, not the leading header
+    down();
+    expect(soup.focus.id()).toBe('a1');
+
+    down();
+    expect(soup.focus.id()).toBe('a2');
+
+    // Crossing the group boundary skips header:b
+    down();
+    expect(soup.focus.id()).toBe('b1');
+
+    up();
+    expect(soup.focus.id()).toBe('a2');
+
+    dispose();
+  });
+
+  it('keeps detail navigation without reading the unmounted list virtualizer', () => {
+    const virtualizer = vi.fn(() => undefined);
+    const { soup, dispose, disposeView } = createRoot((dispose) => {
+      const slots = createOwnedSlots();
+      vi.mocked(withSplitPanelOwner).mockImplementation(slots.replace);
+      const soup = createSoupState();
+      setGroupedRows(soup);
+      const disposeView = createRoot((disposeView) => {
+        useSoupNavigationHotkeys({
+          scopeId: 'test-scope',
+          soup,
+          splitHandle: createSplitHandleStub(),
+          virtualizerHandle: virtualizer,
+        });
+        return disposeView;
+      });
+      return { soup, dispose, disposeView };
+    });
+    try {
+      handlerFor('j')();
+      expect(virtualizer).toHaveBeenCalled();
+      disposeView();
+      virtualizer.mockClear();
+      handlerFor('j')();
+      expect(soup.focus.id()).toBe('a2');
+      handlerFor('k')();
+      expect(soup.focus.id()).toBe('a1');
+      expect(virtualizer).not.toHaveBeenCalled();
+    } finally {
+      dispose();
+    }
+  });
+
+  it('waits on the last loaded row of a group for its next page, or moves on after a failure', () => {
+    const load = vi.fn(async () => {});
+    let failed = false;
+    const { soup, dispose } = createRoot((dispose) => {
+      const soup = createSoupState();
+      useSoupNavigationHotkeys({
+        scopeId: 'test-scope',
+        soup,
+        splitHandle: createSplitHandleStub(),
+        virtualizerHandle: () => undefined,
+        groupPaging: {
+          load,
+          isLoading: () => false,
+          failed: () => failed,
+        },
+      });
+      return { soup, dispose };
+    });
+    const groupA = createTestGroup('a', 3);
+    const groupB = createTestGroup('b', 1);
+    const [a1, a2, a3, b1] = ['a1', 'a2', 'a3', 'b1'].map(createTestEntity);
+    const rows = (loaded: EntityData[]) => [
+      soup.buildRow({
+        id: 'header:a',
+        index: 0,
+        original: a1,
+        group: groupA,
+        isGrouped: true,
+      }),
+      ...loaded.map((entity, i) =>
+        soup.buildRow({
+          id: entity.id,
+          index: i + 1,
+          original: entity,
+          group: groupA,
+        })
+      ),
+      soup.buildRow({
+        id: 'loadmore:a',
+        index: loaded.length + 1,
+        original: loaded[loaded.length - 1],
+        group: groupA,
+        isLoadMore: true,
+      }),
+      soup.buildRow({
+        id: 'header:b',
+        index: loaded.length + 2,
+        original: b1,
+        group: groupB,
+        isGrouped: true,
+      }),
+      soup.buildRow({
+        id: 'b1',
+        index: loaded.length + 3,
+        original: b1,
+        group: groupB,
+      }),
+    ];
+    try {
+      soup.setRows(rows([a1, a2]));
+      soup.focus.set('a2');
+      handlerFor('j')();
+      expect(soup.focus.id()).toBe('a2');
+      expect(load).toHaveBeenCalledExactlyOnceWith('a');
+
+      soup.setRows(rows([a1, a2, a3]));
+      handlerFor('j')();
+      expect(soup.focus.id()).toBe('a3');
+
+      failed = true;
+      handlerFor('j')();
+      expect(soup.focus.id()).toBe('b1');
+      expect(load).toHaveBeenCalledOnce();
+    } finally {
+      dispose();
+    }
+  });
+
+  it('arrow keys share the header-skipping navigation', () => {
+    const { soup, dispose } = setupHotkeys();
+    soup.focus.set('a2');
+
+    handlerFor('arrowdown')();
+    expect(soup.focus.id()).toBe('b1');
+
+    handlerFor('arrowup')();
+    expect(soup.focus.id()).toBe('a2');
+
+    dispose();
+  });
+
+  it('k from no focus starts at the last entity', () => {
+    const { soup, dispose } = setupHotkeys();
+
+    handlerFor('k')();
+    expect(soup.focus.id()).toBe('b2');
+
+    dispose();
+  });
+
+  it('shift+arrowdown selects across a group boundary without touching the header', () => {
+    const { soup, dispose } = setupHotkeys();
+    const selectDown = handlerFor('shift+arrowdown');
+    soup.focus.set('a2');
+
+    // First press anchors the selection on the focused entity
+    selectDown();
+    expect(soup.selection.selectedIds()).toEqual(new Set(['a2']));
+    expect(soup.focus.id()).toBe('a2');
+
+    // Second press steps over header:b straight onto b1
+    selectDown();
+    expect(soup.focus.id()).toBe('b1');
+    expect(soup.selection.selectedIds()).toEqual(new Set(['a2', 'b1']));
+
+    dispose();
+  });
+});

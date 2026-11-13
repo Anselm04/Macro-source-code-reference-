@@ -1,0 +1,450 @@
+import { DocumentTitleHoverCard } from '@app/components/entity-detail/DocumentTitleHoverCard';
+import { t } from '@app/lib/i18n';
+import { isInBlock, useBlockAliasedName } from '@core/block';
+import {
+  ContextMenuContent,
+  MenuItem,
+  MenuSeparator,
+  SubTrigger,
+} from '@core/component/ContextMenu';
+import {
+  EntityIcon,
+  type EntityIconSelector,
+} from '@core/component/EntityIcon';
+import { InlineTitleEditor } from '@core/component/InlineTitleEditor';
+import { isTouchDevice } from '@core/mobile/isTouchDevice';
+import { blockMetadataSignal } from '@core/signal/load';
+import {
+  useCanComment,
+  useCanEdit,
+  useCanView,
+  useIsDocumentOwner,
+} from '@core/signal/permissions';
+import { useBlockDocumentName } from '@core/util/currentBlockDocumentName';
+import type { BuildEntityDataArgs } from '@entity';
+import CaretDownIcon from '@icon/system/regular/caret-down.svg';
+import { ContextMenu } from '@kobalte/core/context-menu';
+import { NotificationMuteMenu } from '@notifications/components/NotificationMuteMenu';
+import { cn, Tooltip } from '@ui';
+import {
+  type Accessor,
+  type Component,
+  children,
+  createMemo,
+  createSignal,
+  For,
+  type JSX,
+  onCleanup,
+  type ParentProps,
+  Show,
+} from 'solid-js';
+import { Portal } from 'solid-js/web';
+import {
+  getSplitFileMenuActionSections,
+  type SplitFileMenuAction,
+  type SplitPanelContextType,
+} from '../context';
+import { useSplitDisplayName, useSplitPanelOrThrow } from '../layoutUtils';
+import { HeaderIsland } from './HeaderIsland';
+
+export function StaticSplitLabel(props: {
+  label: string;
+  iconType?: EntityIconSelector;
+  icon?: JSX.Element;
+  badges?: JSX.Element;
+  class?: string;
+  colorIcon?: boolean;
+  /** Enables double-click renaming while retaining the split title/menu
+   * chrome. */
+  onRename?: (name: string) => void;
+  renameAriaLabel?: string;
+}) {
+  const panel = useSplitPanelOrThrow();
+  const [renaming, setRenaming] = createSignal(false);
+  useSplitDisplayName(() => props.label);
+  const startRename = (event: MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setRenaming(true);
+  };
+  const openTitleFileMenu = (e: MouseEvent) => {
+    if (!isTouchDevice()) return;
+    const trigger = panel.titleFileMenuTrigger();
+    if (!trigger) return;
+    e.preventDefault();
+    e.stopPropagation();
+    trigger();
+  };
+  return (
+    <SplitLabelContextMenu>
+      <HeaderIsland class="shrink" onClick={openTitleFileMenu}>
+        <div
+          class={cn(
+            'z-split-header-content relative flex items-center gap-1.5 max-w-full h-full shrink',
+            props.class
+          )}
+        >
+          <Show when={props.iconType}>
+            <EntityIcon
+              class="shrink-0"
+              targetType={props.iconType}
+              size="xs"
+              theme={props.colorIcon ? undefined : 'monochrome'}
+            />
+          </Show>
+          <Show when={props.icon}>
+            <div class="flex shrink-0 items-center justify-center">
+              {props.icon}
+            </div>
+          </Show>
+          <Show when={props.badges}>{props.badges}</Show>
+          <span class="inline-flex min-w-0 items-center gap-1">
+            <Show
+              when={props.onRename}
+              fallback={
+                <span class="inline-block truncate text-sm font-semibold">
+                  {props.label}
+                </span>
+              }
+            >
+              {(onRename) => (
+                <Show
+                  when={renaming()}
+                  fallback={
+                    <span
+                      class="inline-block truncate text-sm font-semibold"
+                      onDblClick={startRename}
+                      onClick={(event) => {
+                        if (isTouchDevice()) startRename(event);
+                      }}
+                    >
+                      {props.label}
+                    </span>
+                  }
+                >
+                  <span
+                    onClick={(event) => event.stopPropagation()}
+                    onDblClick={(event) => event.stopPropagation()}
+                  >
+                    <InlineTitleEditor
+                      value={props.label}
+                      placeholder={t('splitMenu.untitled')}
+                      ariaLabel={
+                        props.renameAriaLabel ?? t('entityActions.rename')
+                      }
+                      onRename={onRename()}
+                      class="text-sm"
+                      autofocus
+                      onExit={() => setRenaming(false)}
+                    />
+                  </span>
+                </Show>
+              )}
+            </Show>
+            <Show when={panel.titleFileMenuTrigger()}>
+              <CaretDownIcon class="hidden size-3.5 shrink-0 text-ink-muted touch:block" />
+            </Show>
+          </span>
+          <div
+            class="shrink-0 flex items-center h-full"
+            ref={titleFileMenuMount(panel)}
+          />
+        </div>
+      </HeaderIsland>
+    </SplitLabelContextMenu>
+  );
+}
+
+export function SplitLabel(props: {
+  label: string;
+  lockRename?: boolean;
+  /** Per-variant fields the block context can't supply (e.g. `channelType`
+   * for a channel rename). Merged into the args passed to `buildEntityData`. */
+  renameOverrides?: Partial<BuildEntityDataArgs>;
+  maxDisplayLength?: number;
+}) {
+  const panel = useSplitPanelOrThrow();
+
+  useSplitDisplayName(() => props.label);
+
+  const truncatedLabel = () => {
+    if (!props.maxDisplayLength) return props.label;
+    if (props.label.length <= props.maxDisplayLength) return props.label;
+    return props.label.slice(0, props.maxDisplayLength - 3) + '...';
+  };
+
+  const openTitleFileMenu = (e: MouseEvent) => {
+    if (!isTouchDevice()) return;
+    const trigger = panel.titleFileMenuTrigger();
+    if (!trigger) return;
+    e.preventDefault();
+    e.stopPropagation();
+    trigger();
+  };
+
+  return (
+    <span class="flex min-w-0 items-center gap-1" onClick={openTitleFileMenu}>
+      <span class="inline-block truncate text-sm font-semibold">
+        {truncatedLabel()}
+      </span>
+      <Show when={panel.titleFileMenuTrigger()}>
+        <CaretDownIcon class="hidden size-4 shrink-0 text-ink-muted touch:block" />
+      </Show>
+    </span>
+  );
+}
+
+export function SplitHeaderBadge(props: { text: string; tooltip?: string }) {
+  return (
+    <span class="py-0.5 px-2 rounded-none text-xxs text-ink-muted">
+      <Tooltip label={props.tooltip ?? ''} as="span">
+        <span class="font-mono uppercase">{props.text}</span>
+      </Tooltip>
+    </span>
+  );
+}
+
+export function SplitPermissionsBadge() {
+  const canEdit = useCanEdit();
+  const canComment = useCanComment();
+  const canView = useCanView();
+  const showBadge = () => !canEdit();
+
+  const tooltip = () => {
+    if (!canView()) return t('splitMenu.noAccess');
+    if (canComment()) return t('splitMenu.commentOnly');
+    return t('splitMenu.viewOnly');
+  };
+
+  const text = () => {
+    if (!canView()) return t('splitMenu.badgeNoAccess');
+    if (canComment()) return t('splitMenu.badgeCommentOnly');
+    return t('splitMenu.badgeViewer');
+  };
+
+  return (
+    <Show when={showBadge()}>
+      <SplitHeaderBadge text={text()} tooltip={tooltip()} />
+    </Show>
+  );
+}
+
+export function BlockItemSplitLabel(props: {
+  icon?: JSX.Element;
+  fallbackName?: string;
+  name?: Accessor<string | undefined>;
+  lockRename?: boolean;
+  badges?: JSX.Element;
+  /** Rendered after the file name. */
+  trailingBadges?: JSX.Element;
+  /** Replaces the static name, e.g. with an inline title editor. */
+  title?: JSX.Element;
+}) {
+  const panel = useSplitPanelOrThrow();
+  if (!isInBlock())
+    throw new Error('<BlockItemSplitLabel> must be used within a Block');
+
+  const fileName = useBlockDocumentName(props.fallbackName);
+  const displayName = () => props.name?.() ?? fileName();
+  const blockName = useBlockAliasedName();
+  const isOwner = useIsDocumentOwner();
+  const suppliedIcon = children(() => props.icon);
+  const appearance = () => {
+    const metadata = blockMetadataSignal();
+    return (blockName === 'md' || blockName === 'snippet') && metadata
+      ? metadata.appearance
+      : undefined;
+  };
+
+  const targetType = () => {
+    if (blockName === 'unknown') {
+      return blockMetadataSignal()?.fileType ?? blockName;
+    }
+    return blockName;
+  };
+
+  useSplitDisplayName(displayName);
+
+  const openTitleFileMenu = (e: MouseEvent) => {
+    if (!isTouchDevice()) return;
+    const trigger = panel.titleFileMenuTrigger();
+    if (!trigger) return;
+    e.preventDefault();
+    e.stopPropagation();
+    trigger();
+  };
+
+  return (
+    <SplitLabelContextMenu>
+      <HeaderIsland class="shrink" onClick={openTitleFileMenu}>
+        <div class="ph-no-capture z-split-header-content relative flex items-center gap-2 min-w-0 max-w-full h-full shrink">
+          <Show
+            when={suppliedIcon.toArray().length > 0}
+            fallback={
+              <EntityIcon
+                class="shrink-0"
+                targetType={targetType()}
+                appearance={appearance()}
+                size="xs"
+              />
+            }
+          >
+            {suppliedIcon()}
+          </Show>
+          <Show when={props.badges}>{props.badges}</Show>
+          <Show
+            when={props.title}
+            fallback={
+              <Show
+                when={blockMetadataSignal()}
+                fallback={
+                  <SplitLabel
+                    label={displayName() ?? ''}
+                    lockRename={!isOwner() || props.lockRename}
+                  />
+                }
+              >
+                {(metadata) => (
+                  <DocumentTitleHoverCard
+                    documentId={metadata().documentId}
+                    name={displayName() ?? ''}
+                    ownerId={metadata().owner}
+                    createdAt={metadata().createdAt}
+                    updatedAt={metadata().updatedAt}
+                  >
+                    <SplitLabel
+                      label={displayName() ?? ''}
+                      lockRename={!isOwner() || props.lockRename}
+                    />
+                  </DocumentTitleHoverCard>
+                )}
+              </Show>
+            }
+          >
+            {(title) => title()}
+          </Show>
+          {props.trailingBadges}
+          <div
+            class="shrink-0 flex items-center h-full"
+            ref={titleFileMenuMount(panel)}
+          />
+        </div>
+      </HeaderIsland>
+    </SplitLabelContextMenu>
+  );
+}
+
+function SplitLabelContextMenu(props: ParentProps) {
+  const panel = useSplitPanelOrThrow();
+  const actions = () => panel.titleFileMenuActions();
+  const sections = createMemo(() => {
+    const groups = actions();
+    return groups ? getSplitFileMenuActionSections(groups) : [];
+  });
+  const hasActions = createMemo(() => sections().length > 0);
+
+  const item = (action: SplitFileMenuAction) => {
+    if (action.muteMenu) return <NotificationMuteMenu {...action.muteMenu} />;
+    const children = () => action.children?.filter(Boolean) ?? [];
+
+    return (
+      <Show
+        when={children().length > 0}
+        fallback={
+          <MenuItem
+            icon={action.icon as Component<JSX.SvgSVGAttributes<SVGSVGElement>>}
+            text={action.label}
+            hotkeyToken={action.hotkeyToken}
+            onClick={() => action.action?.()}
+          />
+        }
+      >
+        <ContextMenu.Sub>
+          <SubTrigger
+            icon={action.icon as Component<JSX.SvgSVGAttributes<SVGSVGElement>>}
+            text={action.label}
+          />
+          <ContextMenuContent submenu class="w-64">
+            <For each={children()}>{item}</For>
+          </ContextMenuContent>
+        </ContextMenu.Sub>
+      </Show>
+    );
+  };
+
+  const openOnDoubleClick = (e: MouseEvent) => {
+    if (!hasActions()) return;
+    const target = e.currentTarget;
+    if (!target) return;
+    e.preventDefault();
+    e.stopPropagation();
+    target.dispatchEvent(
+      new MouseEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+        clientX: e.clientX,
+        clientY: e.clientY,
+        button: 2,
+      })
+    );
+  };
+
+  return (
+    <Show when={hasActions()} fallback={props.children}>
+      <ContextMenu>
+        <ContextMenu.Trigger class="contents" onDblClick={openOnDoubleClick}>
+          {props.children}
+        </ContextMenu.Trigger>
+        <ContextMenu.Portal>
+          <ContextMenuContent class="w-64">
+            <For each={sections()}>
+              {(section, index) => (
+                <>
+                  <Show when={index() > 0}>
+                    <MenuSeparator />
+                  </Show>
+                  <For each={section.actions}>{item}</For>
+                </>
+              )}
+            </For>
+          </ContextMenuContent>
+        </ContextMenu.Portal>
+      </ContextMenu>
+    </Show>
+  );
+}
+
+/**
+ * A ref that makes its element the split title's file menu mount until the
+ * element's owner is disposed. The split outlives the views in it, so a mount
+ * left behind would keep a view that has gone alive.
+ */
+export function titleFileMenuMount(
+  panel: Pick<SplitPanelContextType, 'setTitleFileMenuRef'>
+) {
+  return (element: HTMLDivElement) => {
+    panel.setTitleFileMenuRef(element);
+    onCleanup(() =>
+      panel.setTitleFileMenuRef((current) =>
+        current === element ? undefined : current
+      )
+    );
+  };
+}
+
+export function SplitTitleFileMenu(props: ParentProps) {
+  const panel = useSplitPanelOrThrow();
+
+  return (
+    <Show when={panel.titleFileMenuRef()}>
+      <Portal
+        mount={panel.titleFileMenuRef()}
+        ref={(div) => {
+          div.style.display = 'contents';
+        }}
+      >
+        {props.children}
+      </Portal>
+    </Show>
+  );
+}
