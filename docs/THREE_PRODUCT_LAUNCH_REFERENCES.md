@@ -13,7 +13,7 @@ Last research verification: 2026-11-14 (NZ time).
 
 ## Current verified library size
 
-**7 verified source snapshots · 103,692 Git-tracked files total** (including three existing snapshots and four sources imported for the joint launch: Trigger.dev, Activepieces, Chatwoot and OpenHands). Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
+**8 verified source snapshots · 120,365 Git-tracked files total** (including three existing snapshots and five sources imported for the joint launch: Trigger.dev, Activepieces, Chatwoot, OpenHands and Appwrite). Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
 
 ## Launch-critical reference projects
 
@@ -29,7 +29,7 @@ Last research verification: 2026-11-14 (NZ time).
 | HISTORICAL ONLY | Flowise | https://github.com/FlowiseAI/Flowise | https://flowiseai.com/sunset (project announced shutdown, code freeze July 29 2026 and EOL Aug 31 2026; older pricing pages are stale) | Apache-2.0 source | **Manager, historical comparison only** | Agent graphs, tooling and archived implementation patterns | **NOT an active paid commercial reference; do not import in launch-priority list** |
 | L1 | PostHog | https://github.com/PostHog/posthog | https://posthog.com/pricing (paid usage tiers) | MIT except enterprise `ee` code; GPL/third-party dependencies may apply | **Marketing + Manager + AppForge** | Funnels, campaigns analytics, cohorts, usage telemetry, feature flags | RESEARCH CANDIDATE |
 | L1 | Chatwoot | https://github.com/chatwoot/chatwoot | https://www.chatwoot.com/pricing (paid agent plans) | Mixed/open-core; verify repository licence and enterprise dirs | **Marketing + Manager** | Inbound support, customer messaging, escalation, ticket handling | **VERIFIED** [10,015 files](https://github.com/Anselm04/Macro-source-code-reference-/tree/reference-chatwoot-snapshot/upstream); upstream `1ef1d2b45ae0a17a35c5f1bd055e4ddf04dadabf`; tree `0d8bda9062fcc80ee5330d669ea550fb4053d402` |
-| L1 | Appwrite | https://github.com/appwrite/appwrite | https://appwrite.io/pricing (cloud tiers) | BSD-3-Clause upstream; dependencies separately licensed | **AppForge/shared customer backend** | Registration, sessions, storage, queues, functions, persistent data | RESEARCH CANDIDATE |
+| L1 | Appwrite | https://github.com/appwrite/appwrite | https://appwrite.io/pricing (cloud tiers) | BSD-3-Clause upstream; dependencies separately licensed | **AppForge/shared customer backend** | Registration, sessions, storage, queues, functions, persistent data | **VERIFIED** [16,673 files](https://github.com/Anselm04/Macro-source-code-reference-/tree/reference-appwrite-snapshot/upstream); upstream `8d5559c74e9d8ef336713cabfb9b512fdb86c5b1`; tree `9b3935082e0eda53bc811eb0d786ca9a96fe38c7` |
 | L1 | LangGraph.js | https://github.com/langchain-ai/langgraphjs | https://www.langchain.com/pricing (LangSmith commercial service, **distinct from OSS library**) | MIT | **Manager + AppForge** | Stateful agent graphs and checkpoints | RESEARCH CANDIDATE |
 | L2 | Medusa | https://github.com/medusajs/medusa | https://medusajs.com/pricing (paid Medusa Cloud) | MIT core; enterprise features separate | **Shared commercial services** | Events, orders, webhooks, transactions, subscriptions integration patterns | RESEARCH CANDIDATE |
 | L2 | Cal.com | https://github.com/calcom/cal.com | https://cal.com/pricing (paid scheduling tiers) | Mixed licensing; verify root and enterprise paths | **Manager + Marketing** | Bookings, appointment events, customer follow-up | RESEARCH CANDIDATE |
@@ -42,7 +42,7 @@ Last research verification: 2026-11-14 (NZ time).
 2. **Imported and verified:** Trigger.dev and Activepieces — durable execution and marketing workflows.
 3. **Imported and verified:** Chatwoot and OpenHands — customer support and coding agents.
 4. **Next study candidate:** Twenty — CRM model (large repo, AGPL and commercial source; copy only when a concrete comparison requires it).
-5. **Then:** PostHog and Appwrite, if specific launch defects require them.
+5. **Imported and verified:** Appwrite — backend/auth/storage reference. **Next if warranted:** PostHog for analytics.
 6. **Then:** PostHog and Appwrite — measurement and core backend services.
 7. **Optional:** Flowise, LangGraph.js, Medusa, Cal.com, Plane as defects warrant.
 
