@@ -6,12 +6,20 @@ Updated: 2026-11-14 (Pacific/Auckland). Entries explicitly distinguish verified 
 
 Study verified real-world implementations, compare them to actual TrillionAI repository code, and produce original fixes. **AppForge end-to-end customer delivery remains the first commercial milestone.** No paid runtime tests, subscriptions, cloud provisioning, or production deployment without explicit approval.
 
+## Verified imported sources
+
+- **Macro** — [41,545 Git-tracked files](https://github.com/Anselm04/Macro-source-code-reference-/tree/macro-upstream-snapshot/upstream), confirmed upstream source tree.
+- **Dyad** — [4,052 Git-tracked files](https://github.com/Anselm04/Dyad-Source-Code-Reference/tree/dyad-upstream-snapshot/upstream), separate repository, includes Apache-2.0 and separately licensed `src/pro`.
+- **bolt.diy** — [720 Git-tracked files](https://github.com/Anselm04/Macro-source-code-reference-/tree/reference-bolt-diy-snapshot/upstream), [successful verification run](https://github.com/Anselm04/Macro-source-code-reference-/actions/runs/43526883912); source MIT, WebContainers API commercial licensing is separate.
+
+These counts describe current tracked snapshots, not original authored LOC, dependencies, private cloud systems, Git history or proof of runtime fitness.
+
 ## Prioritized reference candidates
 
 | Priority | Candidate | Upstream | Source licence / important exclusions | TrillionAI application | Inspection target | Status |
 |---|---|---|---|---|---|---|
 | P0 | Macro | https://github.com/macro-inc/macro | AGPL-3.0; check bundled dependencies | Manager, AppForge, Identity | Agent harness, memory, events, authorization | **IMPORTED**: `macro-upstream-snapshot:upstream/`, 41,545 tracked files; commit `532fba5e60c14b91ae641619c32a58120b6b4546` |
-| P0 | bolt.diy | https://github.com/stackblitz-labs/bolt.diy | MIT source; **WebContainers API commercial licence** applies for relevant production uses | AppForge | Prompt→files→preview→edit→deploy, project snapshots and provider integration | **IMPORT IN PROGRESS**: intended branch `reference-bolt-diy-snapshot`; verify run before marking complete |
+| P0 | bolt.diy | https://github.com/stackblitz-labs/bolt.diy | MIT source; **WebContainers API commercial licence** applies for relevant production uses | AppForge | Prompt→files→preview→edit→deploy, project snapshots and provider integration | **IMPORTED**: [verified source snapshot](https://github.com/Anselm04/Macro-source-code-reference-/tree/reference-bolt-diy-snapshot/upstream), 720 tracked files; upstream `353b44c8f386aeb15abdf277515d78ff50f7578e`; tree `4ef29c5ebb20bd60f9f060e0ddd67042ff217d80` |
 | P0 | Dyad | https://github.com/dyad-sh/dyad | Apache-2.0 outside `src/pro/`; pro uses Functional Source License | AppForge | Local builder state, real file revisions, recovery and testing | **IMPORTED**: [separate Dyad reference repo](https://github.com/Anselm04/Dyad-Source-Code-Reference/tree/dyad-upstream-snapshot/upstream), 4,052 tracked files; upstream commit `1f3e4023af4bdd919be38e552b9494f6b10eb73f` |
 | P0 | LangGraph.js | https://github.com/langchain-ai/langgraphjs | MIT | AppForge, Manager | Agent state graph, persistence, resumability, tool invocation boundaries | CANDIDATE |
 | P0 | Temporal | https://github.com/temporalio/temporal | MIT | AppForge, Manager | Durable workflows, retries, signals, idempotence and failure recovery | CANDIDATE |
