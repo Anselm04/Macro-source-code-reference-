@@ -1,0 +1,122 @@
+name: Import selected engineering reference source
+
+# Manually triggered only. Imported code is never built or executed.
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Source project to snapshot"
+        required: true
+        type: choice
+        options:
+          - bolt-diy
+          - dyad
+          - langgraphjs
+          - temporal
+          - trigger-dev
+          - appwrite
+          - activepieces
+          - opentelemetry-js
+          - keycloak
+          - coolify
+          - medusa
+          - twenty
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reference-import-${{ inputs.project }}
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - name: Resolve audited allowlist
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          set -euo pipefail
+          case "$PROJECT" in
+            bolt-diy)          SOURCE="stackblitz-labs/bolt.diy" ;;
+            dyad)              SOURCE="dyad-sh/dyad" ;;
+            langgraphjs)       SOURCE="langchain-ai/langgraphjs" ;;
+            temporal)          SOURCE="temporalio/temporal" ;;
+            trigger-dev)       SOURCE="triggerdotdev/trigger.dev" ;;
+            appwrite)          SOURCE="appwrite/appwrite" ;;
+            activepieces)      SOURCE="activepieces/activepieces" ;;
+            opentelemetry-js)  SOURCE="open-telemetry/opentelemetry-js" ;;
+            keycloak)          SOURCE="keycloak/keycloak" ;;
+            coolify)           SOURCE="coollabsio/coolify" ;;
+            medusa)            SOURCE="medusajs/medusa" ;;
+            twenty)            SOURCE="twentyhq/twenty" ;;
+            *) echo "::error::Invalid source"; exit 1 ;;
+          esac
+          echo "SOURCE=$SOURCE" >> "$GITHUB_ENV"
+          echo "TARGET=reference-$PROJECT-snapshot" >> "$GITHUB_ENV"
+
+      - name: Ensure snapshot does not exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/${TARGET}" >/dev/null 2>&1; then
+            echo "::error::Snapshot branch already exists; will not overwrite it"
+            exit 1
+          fi
+
+      - name: Fetch selected public source
+        run: |
+          set -euo pipefail
+          git -c protocol.version=2 clone --depth=1 --single-branch --filter=blob:none \
+            "https://github.com/${SOURCE}.git" source
+          cd source
+          git rev-parse HEAD | tee ../UPSTREAM_SHA
+          git rev-parse 'HEAD^{tree}' | tee ../UPSTREAM_TREE
+          git ls-tree -r --name-only HEAD | wc -l | tee ../TRACKED_FILES
+          if [ -f .gitmodules ]; then
+            echo "::warning::Git submodule source payloads are not part of this Git tree snapshot"
+            cat .gitmodules
+          fi
+          if [ -f .gitattributes ] && grep -q "filter=lfs" .gitattributes; then
+            echo "::warning::Git LFS objects require separate integrity verification"
+          fi
+
+      - name: Create isolated tracked-file snapshot
+        run: |
+          set -euo pipefail
+          cd source
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan "$TARGET"
+          git read-tree --empty
+          git read-tree --prefix=upstream/ "$(cat ../UPSTREAM_TREE)"
+          test "$(git rev-parse "$(git write-tree):upstream")" = "$(cat ../UPSTREAM_TREE)"
+          git -c core.hooksPath=/dev/null commit --quiet -m "Reference source ${SOURCE} @ $(cat ../UPSTREAM_SHA)"
+          git fsck --no-reflogs --connectivity-only
+
+      - name: Push new snapshot branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd source
+          git remote add research "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git -c core.hooksPath=/dev/null push research "HEAD:refs/heads/${TARGET}"
+
+      - name: Independently verify pushed source tree
+        run: |
+          set -euo pipefail
+          cd source
+          git fetch research "$TARGET" --depth=1
+          LOCAL="$(git rev-parse 'HEAD:upstream')"
+          REMOTE="$(git rev-parse 'FETCH_HEAD:upstream')"
+          test "$LOCAL" = "$REMOTE"
+          test "$REMOTE" = "$(cat ../UPSTREAM_TREE)"
+          echo "Verified source: ${SOURCE}"
+          echo "Upstream SHA: $(cat ../UPSTREAM_SHA)"
+          echo "Matching Git tree: $REMOTE"
+          echo "Tracked-file count: $(cat ../TRACKED_FILES)"
+          echo "Reference branch: $TARGET"
