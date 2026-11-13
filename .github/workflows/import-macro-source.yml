@@ -63,7 +63,14 @@ jobs:
           IMPORT_TREE="$(git write-tree)"
           SUBTREE="$(git rev-parse "$IMPORT_TREE:upstream")"
           test "$SUBTREE" = "$UPSTREAM_TREE" || { echo "::error::Source subtree differs from upstream"; exit 1; }
-          git -c core.hooksPath=/dev/null commit -m "Reference snapshot of macro-inc/macro at $(cat ../UPSTREAM_COMMIT)"
+          # GitHub's GITHUB_TOKEN cannot push newly introduced workflow files.
+          # Preserve all upstream workflow file contents in a relocated directory.
+          # Do this only AFTER verifying the original Git tree is exact.
+          if [ -d .github/workflows ]; then
+            git mv .github/workflows upstream-workflow-files
+          fi
+          git add -A
+          git -c core.hooksPath=/dev/null commit -m "Reference source snapshot of macro-inc/macro at $(cat ../UPSTREAM_COMMIT) (workflow paths relocated)"
           git fsck --no-reflogs --connectivity-only
 
       - name: Push snapshot branch to research repository
