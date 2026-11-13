@@ -1,6 +1,6 @@
 name: Import selected engineering reference source
 
-# One-time public research import of Chatwoot; restored to manual-only afterward.
+# One-time public research import of OpenHands; restored to manual-only afterward.
 # Download and source verification only; never run upstream applications.
 on:
   push:
@@ -26,12 +26,13 @@ on:
           - medusa
           - twenty
           - chatwoot
+          - openhands
 
 permissions:
   contents: write
 
 concurrency:
-  group: reference-import-${{ github.event.inputs.project || 'chatwoot' }}
+  group: reference-import-${{ github.event.inputs.project || 'openhands' }}
   cancel-in-progress: false
 
 jobs:
@@ -41,7 +42,7 @@ jobs:
     steps:
       - name: Resolve audited allowlist
         env:
-          PROJECT: ${{ github.event.inputs.project || 'chatwoot' }}
+          PROJECT: ${{ github.event.inputs.project || 'openhands' }}
         run: |
           set -euo pipefail
           case "$PROJECT" in
@@ -58,6 +59,7 @@ jobs:
             medusa)            SOURCE="medusajs/medusa" ;;
             twenty)            SOURCE="twentyhq/twenty" ;;
             chatwoot)           SOURCE="chatwoot/chatwoot" ;;
+            openhands)          SOURCE="OpenHands/OpenHands" ;;
             *) echo "::error::Invalid source"; exit 1 ;;
           esac
           echo "SOURCE=$SOURCE" >> "$GITHUB_ENV"
