@@ -1,11 +1,7 @@
 name: Import selected engineering reference source
 
-# One-time bolt.diy bootstrap via this workflow-file commit; manual imports thereafter.
-# Imported code is never built or executed.
+# Explicitly manual imports only. Imported code is never built or executed.
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/import-selected-reference.yml']
   workflow_dispatch:
     inputs:
       project:
