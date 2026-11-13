@@ -1,0 +1,91 @@
+name: Import Macro complete source snapshot
+
+# Manual only. Private-repository GitHub Actions usage may be billed if included allowance is exceeded.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macro-source-import
+  cancel-in-progress: false
+
+jobs:
+  import-current-upstream-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - name: Check source branch does not exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            refs/heads/macro-upstream-snapshot >/dev/null 2>&1; then
+            echo "::error::Snapshot branch exists. This import will not overwrite it."
+            exit 1
+          fi
+
+      - name: Download complete tracked files from Macro main (not full history)
+        run: |
+          set -euo pipefail
+          git -c protocol.version=2 clone \
+            --depth=1 --single-branch --branch main --filter=blob:none \
+            https://github.com/macro-inc/macro.git upstream
+          cd upstream
+          git checkout -f main
+          git rev-parse HEAD > ../UPSTREAM_COMMIT
+          git rev-parse 'HEAD^{tree}' > ../UPSTREAM_TREE
+          git ls-tree -r --name-only HEAD | wc -l | tee ../UPSTREAM_TRACKED_FILE_COUNT
+          if [ -f .gitmodules ]; then
+            echo "::warning::Upstream contains submodules: their content is not included in the Git superproject snapshot."
+            cat .gitmodules
+          fi
+          if [ -f .gitattributes ] && grep -Eq 'filter=lfs' .gitattributes; then
+            echo "::warning::Upstream declares Git LFS paths; verify that binary LFS objects are available separately."
+          fi
+
+      - name: Prepare new branch containing all checked-out upstream files
+        run: |
+          set -euo pipefail
+          cd upstream
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --orphan macro-upstream-snapshot
+          git add -A
+          IMPORT_TREE="$(git write-tree)"
+          UPSTREAM_TREE="$(cat ../UPSTREAM_TREE)"
+          echo "Source tree:   ${UPSTREAM_TREE}"
+          echo "Imported tree: ${IMPORT_TREE}"
+          if [ "${IMPORT_TREE}" != "${UPSTREAM_TREE}" ]; then
+            echo "::error::Imported tracked file tree differs from Macro upstream."
+            exit 1
+          fi
+          git -c core.hooksPath=/dev/null commit -m "Reference snapshot of macro-inc/macro at $(cat ../UPSTREAM_COMMIT)"
+          git fsck --no-reflogs --connectivity-only
+
+      - name: Push snapshot branch to research repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd upstream
+          git remote add research "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push research HEAD:refs/heads/macro-upstream-snapshot
+
+      - name: Verify uploaded snapshot against upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd upstream
+          git fetch research macro-upstream-snapshot --depth=1
+          LOCAL_TREE="$(git rev-parse 'HEAD^{tree}')"
+          REMOTE_TREE="$(git rev-parse 'FETCH_HEAD^{tree}')"
+          test "${LOCAL_TREE}" = "${REMOTE_TREE}"
+          echo "Verified matching Git tree: ${REMOTE_TREE}"
+          echo "Upstream source commit: $(cat ../UPSTREAM_COMMIT)"
+          echo "Source tracked-file count: $(cat ../UPSTREAM_TRACKED_FILE_COUNT)"
+          echo "Imported branch: macro-upstream-snapshot"
