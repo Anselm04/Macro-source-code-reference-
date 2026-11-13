@@ -1,6 +1,6 @@
 name: Import selected engineering reference source
 
-# One-time public research import of Trigger.dev; restored to manual-only afterward.
+# One-time public research import of Activepieces; restored to manual-only afterward.
 # Download and source verification only; never run upstream applications.
 on:
   push:
@@ -30,7 +30,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: reference-import-${{ github.event.inputs.project || 'trigger-dev' }}
+  group: reference-import-${{ github.event.inputs.project || 'activepieces' }}
   cancel-in-progress: false
 
 jobs:
@@ -40,7 +40,7 @@ jobs:
     steps:
       - name: Resolve audited allowlist
         env:
-          PROJECT: ${{ github.event.inputs.project || 'trigger-dev' }}
+          PROJECT: ${{ github.event.inputs.project || 'activepieces' }}
         run: |
           set -euo pipefail
           case "$PROJECT" in
