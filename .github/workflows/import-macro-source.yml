@@ -53,7 +53,7 @@ jobs:
           cd upstream
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch --orphan macro-upstream-snapshot
+          git checkout --orphan macro-upstream-snapshot
           git add -A
           IMPORT_TREE="$(git write-tree)"
           UPSTREAM_TREE="$(cat ../UPSTREAM_TREE)"
