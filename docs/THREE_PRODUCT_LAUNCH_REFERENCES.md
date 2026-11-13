@@ -11,6 +11,10 @@ Last research verification: 2026-11-14 (NZ time).
 - **IMPORTED VERIFIED** means an immutable snapshot branch has passed exact Git-tree comparison against a particular upstream commit. Not the full Git history, private deployment configuration, all LFS payloads or nested submodules.
 - Licence classification is *preliminary*: inspect the exact files and third-party dependencies before reusing any implementation. Source-code studies use independent design; proprietary TrillionAI code is never contaminated by copying restricted sections.
 
+## Current verified library size
+
+**7 verified source snapshots · 103,692 Git-tracked files total** (including three existing snapshots and four sources imported for the joint launch: Trigger.dev, Activepieces, Chatwoot and OpenHands). Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
+
 ## Launch-critical reference projects
 
 | Priority | Product | Official upstream GitHub | Live commercial evidence | Licence boundary | TrillionAI target | What to inspect | Source status |
@@ -21,10 +25,10 @@ Last research verification: 2026-11-14 (NZ time).
 | L0 | Trigger.dev | https://github.com/triggerdotdev/trigger.dev | https://trigger.dev/pricing/ (paid hosted workflow tiers) | Apache-2.0, audit subtrees | **Manager + Marketing + AppForge** | Durable workflows, retries, schedules, concurrency, status reporting | **VERIFIED** [7,940 files](https://github.com/Anselm04/Macro-source-code-reference-/tree/reference-trigger-dev-snapshot/upstream); upstream `2fbd5c7cf4e9c8e19b88e2b72a7133795611e33d`; tree `c87759655a420817332da8d187a48265f2e41b03` |
 | L0 | Activepieces | https://github.com/activepieces/activepieces | https://www.activepieces.com/pricing (paid cloud/enterprise/embedded products) | MIT community core; commercial `packages/ee` and enterprise server paths | **Marketing + Manager** | Connector patterns, consented automation, flow versioning | **VERIFIED** [36,504 files](https://github.com/Anselm04/Macro-source-code-reference-/tree/reference-activepieces-snapshot/upstream); upstream `b9f66339ed218e564a645d5c8d23e632e9b2d90c`; tree `d5602f7f09abf4ad8f7c03a95a659485de940d74` |
 | L0 | Twenty | https://github.com/twentyhq/twenty | https://twenty.com/pricing (paid cloud CRM) | AGPLv3 with exceptions; examine exact licences | **Marketing + Manager** | CRM leads, workspaces, tenancy, workflows, onboarding | RESEARCH CANDIDATE |
-| L1 | OpenHands | https://github.com/OpenHands/OpenHands | https://www.openhands.dev/pricing/ (hosted/enterprise offerings) | MIT core; **separate OpenHands-Cloud has non-OSS Polyform restrictions** | **AppForge** | Tool execution, coding agent lifecycle, sandbox and validation | RESEARCH CANDIDATE |
+| L1 | OpenHands | https://github.com/OpenHands/OpenHands | https://www.openhands.dev/pricing/ (hosted/enterprise offerings) | MIT core; **separate OpenHands-Cloud has non-OSS Polyform restrictions** | **AppForge** | Tool execution, coding agent lifecycle, sandbox and validation | **VERIFIED** [2,916 files](https://github.com/Anselm04/Macro-source-code-reference-/tree/reference-openhands-snapshot/upstream); upstream `46f20abafecbd03c422213bff4bc4499607b9b4f`; tree `3c7ae35db4ee1c485551cdf9ad79366852354426` |
 | L1 | Flowise | https://github.com/FlowiseAI/Flowise | https://flowiseai.com/ (hosted commercial AI workflow platform; verify current billing plans before import) | Apache-2.0 claimed upstream | **Manager** | Visual agent orchestration, tool schema, memory, approvals | RESEARCH CANDIDATE |
 | L1 | PostHog | https://github.com/PostHog/posthog | https://posthog.com/pricing (paid usage tiers) | MIT except enterprise `ee` code; GPL/third-party dependencies may apply | **Marketing + Manager + AppForge** | Funnels, campaigns analytics, cohorts, usage telemetry, feature flags | RESEARCH CANDIDATE |
-| L1 | Chatwoot | https://github.com/chatwoot/chatwoot | https://www.chatwoot.com/pricing (paid agent plans) | Mixed/open-core; verify repository licence and enterprise dirs | **Marketing + Manager** | Inbound support, customer messaging, escalation, ticket handling | IMPORT RUNNING — [workflow](https://github.com/Anselm04/Macro-source-code-reference-/actions/runs/43529389065) |
+| L1 | Chatwoot | https://github.com/chatwoot/chatwoot | https://www.chatwoot.com/pricing (paid agent plans) | Mixed/open-core; verify repository licence and enterprise dirs | **Marketing + Manager** | Inbound support, customer messaging, escalation, ticket handling | **VERIFIED** [10,015 files](https://github.com/Anselm04/Macro-source-code-reference-/tree/reference-chatwoot-snapshot/upstream); upstream `1ef1d2b45ae0a17a35c5f1bd055e4ddf04dadabf`; tree `0d8bda9062fcc80ee5330d669ea550fb4053d402` |
 | L1 | Appwrite | https://github.com/appwrite/appwrite | https://appwrite.io/pricing (cloud tiers) | BSD-3-Clause upstream; dependencies separately licensed | **AppForge/shared customer backend** | Registration, sessions, storage, queues, functions, persistent data | RESEARCH CANDIDATE |
 | L1 | LangGraph.js | https://github.com/langchain-ai/langgraphjs | https://www.langchain.com/pricing (LangSmith commercial service, **distinct from OSS library**) | MIT | **Manager + AppForge** | Stateful agent graphs and checkpoints | RESEARCH CANDIDATE |
 | L2 | Medusa | https://github.com/medusajs/medusa | https://medusajs.com/pricing (paid Medusa Cloud) | MIT core; enterprise features separate | **Shared commercial services** | Events, orders, webhooks, transactions, subscriptions integration patterns | RESEARCH CANDIDATE |
@@ -36,9 +40,9 @@ Last research verification: 2026-11-14 (NZ time).
 
 1. **Already verified:** Macro, Dyad, bolt.diy.
 2. **Imported and verified:** Trigger.dev and Activepieces — durable execution and marketing workflows.
-3. **Importing:** Chatwoot — customer support, inbound communication and service operations.
-4. **Next:** Twenty — CRM domain model (large repository and AGPL/commercial sections; copy only when justified).
-5. **Then:** OpenHands — coding agents and verification.
+3. **Imported and verified:** Chatwoot and OpenHands — customer support and coding agents.
+4. **Next study candidate:** Twenty — CRM model (large repo, AGPL and commercial source; copy only when a concrete comparison requires it).
+5. **Then:** PostHog and Appwrite, if specific launch defects require them.
 6. **Then:** PostHog and Appwrite — measurement and core backend services.
 7. **Optional:** Flowise, LangGraph.js, Medusa, Cal.com, Plane as defects warrant.
 
