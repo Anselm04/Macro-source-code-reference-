@@ -1,6 +1,6 @@
 # TrillionAI Engineering Reference Library — priority register
 
-Updated: 2026-11-14 (Pacific/Auckland). This is a **candidate catalogue**, not proof the sources have been cloned or tested.
+Updated: 2026-11-14 (Pacific/Auckland). Entries explicitly distinguish verified imports from candidates; source verification does not prove tests have passed.
 
 ## Objective
 
@@ -11,8 +11,8 @@ Study verified real-world implementations, compare them to actual TrillionAI rep
 | Priority | Candidate | Upstream | Source licence / important exclusions | TrillionAI application | Inspection target | Status |
 |---|---|---|---|---|---|---|
 | P0 | Macro | https://github.com/macro-inc/macro | AGPL-3.0; check bundled dependencies | Manager, AppForge, Identity | Agent harness, memory, events, authorization | **IMPORTED**: `macro-upstream-snapshot:upstream/`, 41,545 tracked files; commit `532fba5e60c14b91ae641619c32a58120b6b4546` |
-| P0 | bolt.diy | https://github.com/stackblitz-labs/bolt.diy | MIT source; **WebContainers API commercial licence** applies for relevant production uses | AppForge | Prompt→files→preview→edit→deploy, project snapshots and provider integration | CANDIDATE |
-| P0 | Dyad | https://github.com/dyad-sh/dyad | Apache-2.0 outside `src/pro/`; pro uses Functional Source License | AppForge | Local builder state, real file revisions, recovery and testing | CANDIDATE |
+| P0 | bolt.diy | https://github.com/stackblitz-labs/bolt.diy | MIT source; **WebContainers API commercial licence** applies for relevant production uses | AppForge | Prompt→files→preview→edit→deploy, project snapshots and provider integration | **IMPORT IN PROGRESS**: intended branch `reference-bolt-diy-snapshot`; verify run before marking complete |
+| P0 | Dyad | https://github.com/dyad-sh/dyad | Apache-2.0 outside `src/pro/`; pro uses Functional Source License | AppForge | Local builder state, real file revisions, recovery and testing | **IMPORTED**: [separate Dyad reference repo](https://github.com/Anselm04/Dyad-Source-Code-Reference/tree/dyad-upstream-snapshot/upstream), 4,052 tracked files; upstream commit `1f3e4023af4bdd919be38e552b9494f6b10eb73f` |
 | P0 | LangGraph.js | https://github.com/langchain-ai/langgraphjs | MIT | AppForge, Manager | Agent state graph, persistence, resumability, tool invocation boundaries | CANDIDATE |
 | P0 | Temporal | https://github.com/temporalio/temporal | MIT | AppForge, Manager | Durable workflows, retries, signals, idempotence and failure recovery | CANDIDATE |
 | P1 | Trigger.dev | https://github.com/triggerdotdev/trigger.dev | Apache-2.0 top-level; check subdirectories and dependencies | Manager, Marketing | TypeScript background task runtime, retry behavior, queues | CANDIDATE |
