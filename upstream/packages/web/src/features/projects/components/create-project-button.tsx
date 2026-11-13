@@ -1,0 +1,205 @@
+import {
+  PlatformAdminLimit,
+  ProjectWithLimits,
+  TelemetryEventName,
+} from '@activepieces/shared';
+import { t } from 'i18next';
+import { Plus } from 'lucide-react';
+import React, { useState } from 'react';
+
+import { AnimatedIconButton } from '@/components/custom/animated-icon-button';
+import { PlusIcon } from '@/components/icons/plus';
+import { useTelemetry } from '@/components/providers/telemetry-provider';
+import { Button } from '@/components/ui/button';
+import { SidebarMenuButton } from '@/components/ui/sidebar-shadcn';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
+import {
+  LockedGem,
+  useLockedFeature,
+  useTeamProjectLimitGuard,
+} from '@/features/billing';
+import { AdminControl, adminControl } from '@/lib/admin-control';
+import { cn } from '@/lib/utils';
+
+import { NewProjectDialog } from './new-project-dialog';
+
+export function CreateProjectButton({
+  variant,
+  projects,
+  onCreate,
+  className,
+}: CreateProjectButtonProps) {
+  const { hasReachedLimit, used, limit } = useTeamProjectLimitGuard({
+    projects,
+  });
+  const lockedFeature = useLockedFeature({
+    unlocked: !hasReachedLimit,
+    featureKey: 'PROJECTS',
+  });
+  const [createOpen, setCreateOpen] = useState(false);
+  const { capture } = useTelemetry();
+  const reportBlocked = () => {
+    capture({
+      name: TelemetryEventName.PLATFORM_ADMIN_GATE_BLOCKED,
+      payload: {
+        feature: 'PROJECTS',
+        control: AdminControl.PROJECTS_NEW_OPEN,
+      },
+    });
+    capture({
+      name: TelemetryEventName.PLATFORM_ADMIN_LIMIT_REACHED,
+      payload: {
+        limit: PlatformAdminLimit.TEAM_PROJECTS,
+        used,
+        allowed: limit ?? 0,
+      },
+    });
+  };
+
+  const trigger = triggerFor({
+    variant,
+    className,
+    locked: lockedFeature.locked,
+    expanded: createOpen,
+    onClick: () => {
+      if (!lockedFeature.locked) {
+        setCreateOpen(true);
+        return;
+      }
+      reportBlocked();
+      lockedFeature.showLockedDialog();
+    },
+  });
+
+  const triggerNode =
+    variant === 'icon' ? (
+      <TooltipTrigger
+        asChild
+        aria-label={
+          lockedFeature.locked
+            ? `${t('Create Project')}, ${t('Requires a plan upgrade')}`
+            : t('Create Project')
+        }
+      >
+        {trigger}
+      </TooltipTrigger>
+    ) : (
+      trigger
+    );
+
+  const dialog = (
+    <>
+      {triggerNode}
+      <NewProjectDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreate={onCreate}
+        limitReached={lockedFeature.locked}
+        onLimitReached={() => {
+          reportBlocked();
+          lockedFeature.showLockedDialog();
+        }}
+      />
+    </>
+  );
+
+  if (variant !== 'icon') {
+    return dialog;
+  }
+
+  return (
+    <Tooltip>
+      {dialog}
+      <TooltipContent side="bottom">
+        <span className="flex flex-col">
+          <span>{t('Create Project')}</span>
+          {lockedFeature.locked && (
+            <span className="opacity-70">{t('Requires a plan upgrade')}</span>
+          )}
+        </span>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function triggerFor({
+  variant,
+  className,
+  locked,
+  expanded,
+  onClick,
+}: TriggerForParams) {
+  const control = {
+    ...adminControl(locked ? undefined : AdminControl.PROJECTS_NEW_OPEN),
+    'aria-haspopup': DIALOG_POPUP,
+    'aria-expanded': expanded,
+    onClick,
+  };
+  switch (variant) {
+    case 'icon':
+      return (
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          className={cn('hover:bg-gray-4', className)}
+          {...control}
+        >
+          <Plus />
+        </Button>
+      );
+    case 'full':
+      return locked ? (
+        <Button
+          size="sm"
+          className={cn('has-[>svg]:px-2.5', className)}
+          {...control}
+        >
+          <LockedGem />
+          {t('New Project')}
+        </Button>
+      ) : (
+        <AnimatedIconButton
+          icon={PlusIcon}
+          iconSize={16}
+          size="sm"
+          className={className}
+          {...control}
+        >
+          {t('New Project')}
+        </AnimatedIconButton>
+      );
+    case 'sidebar-menu':
+      return (
+        <SidebarMenuButton
+          className={cn('text-gray-11 gap-2', className)}
+          {...control}
+        >
+          <Plus className="size-4" />
+          <span>{t('Add team project')}</span>
+        </SidebarMenuButton>
+      );
+  }
+}
+
+const DIALOG_POPUP: React.AriaAttributes['aria-haspopup'] = 'dialog';
+
+type CreateProjectButtonVariant = 'icon' | 'full' | 'sidebar-menu';
+
+type TriggerForParams = {
+  variant: CreateProjectButtonVariant;
+  className?: string;
+  locked: boolean;
+  expanded: boolean;
+  onClick?: () => void;
+};
+
+type CreateProjectButtonProps = {
+  variant: CreateProjectButtonVariant;
+  projects: Pick<ProjectWithLimits, 'type'>[];
+  onCreate?: (project: ProjectWithLimits) => void;
+  className?: string;
+};

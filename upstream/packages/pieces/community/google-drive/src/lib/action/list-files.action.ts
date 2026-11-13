@@ -1,0 +1,143 @@
+import { extension, extensions } from 'mime-types';
+import { googleDriveAuth } from '../auth';
+import { Property, createAction } from "@activepieces/pieces-framework";
+import { common } from '../common';
+import { DriveTreeItem, listDriveFilesRecursive } from '../common/list-drive-files';
+import { downloadFileFromDrive } from '../common/get-file-content';
+import { listFilesActionOutputSchema } from '../output-schemas';
+
+interface ListFilesResult {
+  type: string;
+  incompleteSearch: boolean;
+  files: unknown[];
+  downloadedFiles?: string[];
+}
+
+export const googleDriveListFiles = createAction({
+  auth: googleDriveAuth,
+  name: 'list-files',
+  classification: 'SEARCH',
+  displayName: 'List Files',
+  description: 'List the files and folders inside a folder.',
+  audience: 'human',
+  aiMetadata: { description: 'Lists files and subfolders inside a given Drive folder, with optional recursion to a chosen depth and optional download of each file\'s content. Use to enumerate the contents of a known folder ID. Read-only and idempotent. Requires the folder ID, not a name.', idempotent: true },
+  props: {
+    folderId: Property.ShortText({
+      displayName: 'Folder ID',
+      description: 'The ID after /folders/ in the folder URL, or from an earlier step.',
+      required: true,
+      placeholder: '1aMEtTqIYn5651wdK7WLxaK_SDim4mvXW',
+    }),
+
+    depthLevel: Property.Number({
+      displayName: 'Folder Depth',
+      description: '1 lists only this folder; 2 adds its subfolders, and so on.',
+      required: false,
+      defaultValue: 1,
+      display: 'stepper',
+      min: 1,
+      max: 100,
+      step: 1,
+    }),
+
+    downloadFiles: Property.Checkbox({
+      displayName: 'Download Files',
+      description: 'Also download every file. Slow for large folders.',
+      required: false,
+      defaultValue: false
+    }),
+
+    include_team_drives: common.properties.include_team_drives,
+
+    includeTrashed: Property.Checkbox({
+      displayName: 'Include Trashed',
+      description: 'Also list files that are in the bin.',
+      required: false,
+      defaultValue: false,
+      advanced: true
+    }),
+  },
+  outputSchema: listFilesActionOutputSchema,
+  async run(context) {
+    const result: ListFilesResult = {
+      type: 'drive#fileList',
+      incompleteSearch: false,
+      files: [],
+    }
+
+    const depthLevel = context.propsValue.depthLevel || 1;
+    
+    // Get files level-by-level, batching all folders at a level into as few queries as possible
+    const listing = await listDriveFilesRecursive({
+      auth: context.auth,
+      rootFolderId: context.propsValue.folderId,
+      maxLevel: depthLevel,
+      includeTrashed: context.propsValue.includeTrashed ?? false,
+      includeTeamDrives: context.propsValue.include_team_drives ?? false,
+    });
+    const files = listing.files;
+    result.incompleteSearch = listing.incompleteSearch;
+
+    // If downloadFiles is enabled, download each file and return a new file object carrying the URL
+    if (context.propsValue.downloadFiles) {
+      const processedFiles: (DriveTreeItem & { downloadedFile?: string })[] = [];
+
+      for (const file of files) {
+        // Skip folders when downloading
+        if (file.mimeType === 'application/vnd.google-apps.folder') {
+          processedFiles.push(file);
+          continue;
+        }
+
+        const safeName = isGoogleNativeFile(file.mimeType)
+          ? file.name
+          : nameWithExtension({ name: file.name, mimeType: file.mimeType });
+
+        try {
+          const downloadedFile = await downloadFileFromDrive({
+            auth: context.auth,
+            files: context.files,
+            fileId: file.id,
+            fileName: safeName,
+          });
+          processedFiles.push({ ...file, downloadedFile });
+        } catch (error) {
+          console.warn(`Failed to download file ${file.name}: ${error instanceof Error ? error.message : 'Download failed'}`);
+          processedFiles.push(file);
+        }
+      }
+
+      result.files = processedFiles;
+      // Kept for backward compatibility; each URL now also lives on its file's `downloadedFile`
+      result.downloadedFiles = processedFiles
+        .map(f => f.downloadedFile)
+        .filter((url): url is string => url !== undefined);
+    } else {
+      result.files = files;
+    }
+
+    return result;
+  }
+});
+
+function isGoogleNativeFile(mimeType: string): boolean {
+  return mimeType.startsWith('application/vnd.google-apps.');
+}
+
+function nameWithExtension({
+  name,
+  mimeType,
+}: {
+  name: string;
+  mimeType: string;
+}): string {
+  const correctExtension = extension(mimeType);
+  const knownExtensions =
+    extensions[mimeType] ?? (correctExtension ? [correctExtension] : []);
+  const hasKnownExtension = knownExtensions.some((knownExtension) =>
+    name.toLowerCase().endsWith(`.${knownExtension}`)
+  );
+  return correctExtension && !hasKnownExtension
+    ? `${name}.${correctExtension}`
+    : name;
+}

@@ -1,0 +1,88 @@
+import { BaseModelSchema, Nullable, NullableEnum, ProjectRole } from '@activepieces/core-utils'
+import { z } from 'zod'
+import { PlatformRole } from '../../core/user/index'
+
+export enum InvitationType {
+    PLATFORM = 'PLATFORM',
+    PROJECT = 'PROJECT',
+}
+
+export enum InvitationStatus {
+    PENDING = 'PENDING',
+    ACCEPTED = 'ACCEPTED',
+}
+
+export const UserInvitation = z.object({
+    ...BaseModelSchema,
+    email: z.string(),
+    status: z.nativeEnum(InvitationStatus),
+    type: z.nativeEnum(InvitationType),
+    platformId: z.string(),
+    platformRole: NullableEnum(PlatformRole),
+    projectId: Nullable(z.string()),
+    projectRoleId: Nullable(z.string()),
+    projectRole: Nullable(ProjectRole),
+})
+
+export type UserInvitation = z.infer<typeof UserInvitation>
+
+export const UserInvitationWithLink = UserInvitation.extend({
+    link: z.string().optional(),
+    addedNow: z.boolean().optional(),
+})
+
+export type UserInvitationWithLink = z.infer<typeof UserInvitationWithLink>
+
+export const UserInvitationPreview = z.object({
+    email: z.string(),
+    platformName: z.string(),
+    platformLogoUrl: Nullable(z.string()),
+    memberCount: z.number(),
+    status: z.enum(InvitationStatus),
+})
+
+export type UserInvitationPreview = z.infer<typeof UserInvitationPreview>
+
+export const RemoveProjectFromInvitationResponse = z.object({
+    revoked: z.boolean(),
+    invitation: UserInvitation.nullable(),
+})
+
+export type RemoveProjectFromInvitationResponse = z.infer<typeof RemoveProjectFromInvitationResponse>
+
+export const SendUserInvitationRequest = z.union([
+    z.object({
+        type: z.literal(InvitationType.PROJECT),
+        email: z.string(),
+        projectId: z.string(),
+        projectRole: z.string(),
+    }),
+    z.object({
+        type: z.literal(InvitationType.PLATFORM),
+        email: z.string(),
+        platformRole: z.nativeEnum(PlatformRole),
+        projectId: z.string().optional(),
+        projectRole: z.string().optional(),
+    }),
+])
+
+
+export type SendUserInvitationRequest = z.infer<typeof SendUserInvitationRequest>
+
+export const AcceptUserInvitationRequest = z.object({
+    invitationToken: z.string(),
+})
+
+export type AcceptUserInvitationRequest = z.infer<typeof AcceptUserInvitationRequest>
+
+export const ListUserInvitationsRequest = z.object({
+    limit: z.coerce.number().optional(),
+    cursor: z.string().optional(),
+    type: z.nativeEnum(InvitationType),
+    projectId: Nullable(z.string()),
+    status: z.nativeEnum(InvitationStatus).optional(),
+})
+
+export type ListUserInvitationsRequest = z.infer<typeof ListUserInvitationsRequest>
+
+export const INVITATION_EXPIRY_SECONDS = 7 * 24 * 60 * 60
