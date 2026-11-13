@@ -1,0 +1,149 @@
+<?php
+
+namespace Appwrite\Vcs;
+
+use Appwrite\Auth\OAuth2;
+use Appwrite\Extend\Exception;
+use Utopia\Cache\Cache;
+use Utopia\Client\Client;
+use Utopia\Config\Config;
+use Utopia\Database\Document;
+use Utopia\System\System;
+use Utopia\VCS\Adapter\Git;
+
+class Factory
+{
+    /**
+     * @var array<string, array<string, mixed>>
+     */
+    protected array $registry = [];
+
+    /**
+     * @param array<string, array<string, mixed>>|null $registry Override, defaults to the `vcs` config.
+     */
+    public function __construct(
+        protected Cache $cache,
+        protected Client $client,
+        ?array $registry = null,
+    ) {
+        $this->registry = $registry ?? Config::getParam('vcs', []);
+    }
+
+    public function getProviders(): array
+    {
+        return \array_values(\array_filter(
+            \array_keys($this->registry),
+            fn (string $key) => $this->isConfigured($key),
+        ));
+    }
+
+    public function isConfigured(string $key): bool
+    {
+        if (!isset($this->registry[$key])) {
+            return false;
+        }
+
+        foreach ($this->registry[$key]['variables'] ?? [] as $name => $variable) {
+            if (($variable['required'] ?? false) && empty($this->getEnv($key, $name))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public function fromProvider(string $key): Git
+    {
+        if (!isset($this->registry[$key])) {
+            throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'Unsupported VCS provider: ' . $key);
+        }
+
+        $adapter = new ($this->registry[$key]['adapter'])($this->cache);
+
+        $endpoint = $this->registry[$key]['endpoint'] ?? $this->getEnv($key, 'endpoint');
+        if (!empty($endpoint) && \method_exists($adapter, 'setEndpoint')) {
+            $adapter->setEndpoint(\rtrim($endpoint, '/'));
+        }
+
+        // The identity a provider registered for this server (Entire's plugin issuer)
+        $issuer = $this->registry[$key]['issuer'] ?? $this->getEnv($key, 'issuer');
+        if (!empty($issuer) && \method_exists($adapter, 'setIssuer')) {
+            $adapter->setIssuer($issuer);
+        }
+
+        return $adapter;
+    }
+
+    /**
+     * Adapter for building links a browser will open, which can reach the
+     * provider on a different host than the server-side API does.
+     */
+    public function fromProviderForBrowser(string $key): Git
+    {
+        $adapter = $this->fromProvider($key);
+
+        $browserEndpoint = $this->registry[$key]['browserEndpoint'] ?? '';
+        if (!empty($browserEndpoint) && \method_exists($adapter, 'setEndpoint')) {
+            $adapter->setEndpoint(\rtrim($browserEndpoint, '/'));
+        }
+
+        return $adapter;
+    }
+
+    public function fromInstallation(Document $installation): Git
+    {
+        if ($installation->isEmpty()) {
+            throw new Exception(Exception::INSTALLATION_NOT_FOUND);
+        }
+
+        $provider = $installation->getAttribute('provider', '');
+        if (empty($provider)) {
+            throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'Missing VCS provider for installation: ' . $installation->getId());
+        }
+
+        $adapter = $this->fromProvider($provider);
+
+        $adapter->initializeVariables(
+            $installation->getAttribute('providerInstallationId', ''),
+            $this->getEnv($provider, 'privateKey'),
+            $this->getEnv($provider, 'appId'),
+            $installation->getAttribute('personalAccessToken', ''),
+            $installation->getAttribute('personalRefreshToken', ''),
+        );
+
+        return $adapter;
+    }
+
+    public function getWebhookSecret(string $key): string
+    {
+        return $this->getEnv($key, 'webhookSecret');
+    }
+
+    public function oauth2FromProvider(string $key): OAuth2
+    {
+        $builder = $this->registry[$key]['oauth2'] ?? null;
+
+        if (!\is_callable($builder)) {
+            throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'Unsupported VCS provider: ' . $key);
+        }
+
+        $clientId = $this->getEnv($key, 'clientId');
+        $clientSecret = $this->getEnv($key, 'clientSecret');
+        $endpoint = $this->registry[$key]['endpoint'] ?? $this->getEnv($key, 'endpoint');
+
+        $oauth2 = $builder($this->client, $clientId, $clientSecret, $endpoint);
+
+        if (!$oauth2 instanceof OAuth2) {
+            throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'VCS provider "' . $key . '" oauth2 builder returned an invalid client');
+        }
+
+        return $oauth2;
+    }
+
+    protected function getEnv(string $key, string $name): string
+    {
+        $variable = $this->registry[$key]['variables'][$name]['envVariable'] ?? '';
+
+        return empty($variable) ? '' : System::getEnv($variable, '');
+    }
+}

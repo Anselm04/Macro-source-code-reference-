@@ -1,0 +1,170 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Functions\Http\Functions\Deployment;
+
+use Appwrite\Bus\Events\RuleUpdated;
+use Appwrite\Event\Event;
+use Appwrite\Extend\Exception;
+use Appwrite\Platform\Modules\Compute\Base;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response;
+use Utopia\Bus\Bus;
+use Utopia\Database\Database;
+use Utopia\Database\DateTime;
+use Utopia\Database\Document;
+use Utopia\Database\Query;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\UID;
+use Utopia\Platform\Action;
+use Utopia\Platform\Scope\HTTP;
+
+class Update extends Base
+{
+    use HTTP;
+
+    public static function getName()
+    {
+        return 'updateFunctionDeployment';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_PATCH)
+            ->setHttpPath('/v1/functions/:functionId/deployment')
+            ->httpAlias('/v1/functions/:functionId/deployments/:deploymentId')
+            ->desc('Update function\'s deployment')
+            ->groups(['api', 'functions'])
+            ->label('scope', 'functions.write')
+            ->label('resourceType', RESOURCE_TYPE_FUNCTIONS)
+            ->label('event', 'functions.[functionId].deployments.[deploymentId].update')
+            ->label('audits.event', 'deployment.update')
+            ->label('audits.resource', 'function/{request.functionId}')
+            ->label('usage.resource', 'function/{request.functionId}')
+            ->label('sdk', new Method(
+                namespace: 'functions',
+                group: 'functions',
+                name: 'updateFunctionDeployment',
+                description: <<<EOT
+                Update the function active deployment. Use this endpoint to switch the code deployment that should be used when visitor opens your function.
+                EOT,
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_OK,
+                        model: Response::MODEL_FUNCTION,
+                    )
+                ]
+            ))
+            ->param('functionId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Function ID.', false, ['dbForProject'])
+            ->param('deploymentId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Deployment ID.', false, ['dbForProject'])
+            ->inject('project')
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('queueForEvents')
+            ->inject('dbForPlatform')
+            ->inject('authorization')
+            ->inject('bus')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        string $functionId,
+        string $deploymentId,
+        Document $project,
+        Response $response,
+        Database $dbForProject,
+        Event $queueForEvents,
+        Database $dbForPlatform,
+        Authorization $authorization,
+        Bus $bus
+    ) {
+        $function = $dbForProject->getDocument('functions', $functionId);
+        $deployment = $dbForProject->getDocument('deployments', $deploymentId);
+
+        if ($function->isEmpty()) {
+            throw new Exception(Exception::FUNCTION_NOT_FOUND);
+        }
+
+        if ($deployment->isEmpty()) {
+            throw new Exception(Exception::DEPLOYMENT_NOT_FOUND);
+        }
+
+        $resourceType = $deployment->getAttribute('resourceType');
+        // Untyped deployments predate Sites and belong to Functions.
+        if (
+            $deployment->getAttribute('resourceId') !== $function->getId()
+            || ($resourceType !== 'functions' && !empty($resourceType))
+        ) {
+            throw new Exception(Exception::DEPLOYMENT_NOT_FOUND);
+        }
+
+        if ($deployment->getAttribute('status') !== 'ready') {
+            throw new Exception(Exception::BUILD_NOT_READY);
+        }
+
+        $function = $dbForProject->updateDocument('functions', $function->getId(), new Document(array_merge($function->getArrayCopy(), [
+            'deploymentInternalId' => $deployment->getSequence(),
+            'deploymentId' => $deployment->getId(),
+            'deploymentCreatedAt' => $deployment->getCreatedAt(),
+        ])));
+
+        // Inform scheduler if function is still active
+        $schedule = $dbForPlatform->getDocument('schedules', $function->getAttribute('scheduleId'));
+        $schedule
+            ->setAttribute('resourceUpdatedAt', DateTime::now())
+            ->setAttribute('schedule', $function->getAttribute('schedule'))
+            ->setAttribute('interval', $function->getAttribute('interval', 0))
+            ->setAttribute('active', (!empty($function->getAttribute('schedule')) || !empty($function->getAttribute('interval'))) && !empty($function->getAttribute('deploymentId')));
+        $authorization->skip(fn () => $dbForPlatform->updateDocument('schedules', $schedule->getId(), new Document([
+            'resourceUpdatedAt' => $schedule->getAttribute('resourceUpdatedAt'),
+            'schedule' => $schedule->getAttribute('schedule'),
+            'interval' => $schedule->getAttribute('interval', 0),
+            'active' => $schedule->getAttribute('active'),
+        ])));
+
+        // Template deployments reuse providerBranch for their resolved ref (tags
+        // included), which must not repoint a rule pinned to a real branch.
+        $branch = $deployment->getAttribute('providerBranch', '');
+        $isBranchBuild = $branch !== '' && ! empty($deployment->getAttribute('installationId'));
+        $branches = $isBranchBuild ? ['', $branch] : [''];
+
+        /** @var list<Query> $queries */
+        $queries = [
+            Query::equal('trigger', ['manual']),
+            Query::equal('type', ['deployment']),
+            Query::equal('deploymentResourceType', ['function']),
+            Query::equal('deploymentResourceInternalId', [$function->getSequence()]),
+            Query::equal('deploymentVcsProviderBranch', $branches),
+            Query::equal('projectInternalId', [$project->getSequence()])
+        ];
+
+        /** @var list<array<string, mixed>> $updatedRules */
+        $updatedRules = $authorization->skip(function () use ($dbForPlatform, $deployment, $queries): array {
+            $collected = [];
+            foreach ($dbForPlatform->cursor('rules', $queries, batchSize: 25) as $rule) {
+                $rule = $dbForPlatform->updateDocument('rules', $rule->getId(), new Document([
+                    'deploymentId' => $deployment->getId(),
+                    'deploymentInternalId' => $deployment->getSequence(),
+                ]));
+                $collected[] = $rule->getArrayCopy();
+            }
+
+            return $collected;
+        });
+
+        if ($updatedRules !== []) {
+            foreach ($updatedRules as $rule) {
+                $bus->dispatch(new RuleUpdated($rule));
+            }
+        }
+
+        $queueForEvents
+            ->setParam('functionId', $function->getId())
+            ->setParam('deploymentId', $deployment->getId());
+
+        $response->dynamic($function, Response::MODEL_FUNCTION);
+    }
+}

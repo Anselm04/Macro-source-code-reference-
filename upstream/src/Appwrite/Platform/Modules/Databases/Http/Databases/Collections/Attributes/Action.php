@@ -1,0 +1,769 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\Databases\Collections\Attributes;
+
+use Appwrite\Event\Event;
+use Appwrite\Event\Message\Database as DatabaseMessage;
+use Appwrite\Event\Publisher\Database as DatabasePublisher;
+use Appwrite\Extend\Exception;
+use Appwrite\Platform\Modules\Databases\Http\Databases\Action as DatabasesAction;
+use Appwrite\Utopia\Database\Attribute as AttributeDefinition;
+use Appwrite\Utopia\Response;
+use Appwrite\Utopia\Response as UtopiaResponse;
+use Throwable;
+use Utopia\Database\Attribute;
+use Utopia\Database\Attribute\Update as AttributeUpdate;
+use Utopia\Database\Capability;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Exception\Duplicate as DuplicateException;
+use Utopia\Database\Exception\Index as IndexException;
+use Utopia\Database\Exception\Limit as LimitException;
+use Utopia\Database\Exception\Relationship as RelationshipException;
+use Utopia\Database\Exception\Structure as StructureException;
+use Utopia\Database\Exception\Truncate as TruncateException;
+use Utopia\Database\Format;
+use Utopia\Database\Id;
+use Utopia\Database\Relationship\Update as DatabaseRelationshipUpdate;
+use Utopia\Database\RelationshipDeleteAction;
+use Utopia\Database\RelationshipSide;
+use Utopia\Database\Unchanged;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\Structure;
+use Utopia\Http\Adapter\Swoole\Response as SwooleResponse;
+use Utopia\Query\Schema\ColumnType;
+use Utopia\Validator\Range;
+
+abstract class Action extends DatabasesAction
+{
+    /**
+     * @var string The current context (either 'column' or 'attribute')
+     */
+    private string $context = ATTRIBUTES;
+
+    /**
+     * Get the correct response model.
+     */
+    abstract protected function getResponseModel(): string|array;
+
+    public function setHttpPath(string $path): DatabasesAction
+    {
+        if (\str_contains($path, '/tablesdb')) {
+            $this->context = COLUMNS;
+        }
+        parent::setHttpPath($path);
+
+        return $this;
+    }
+
+    /**
+     * Get the current context.
+     */
+    protected function getContext(): string
+    {
+        return $this->context;
+    }
+
+    /**
+     * Returns true if current context is Collections API.
+     */
+    protected function isCollectionsAPI(): bool
+    {
+        // columns in tables context
+        // attributes in collections context
+        return $this->getContext() === ATTRIBUTES;
+    }
+
+    /**
+     * Get the SDK group name for the current action.
+     *
+     * Can be used for XList operations as well!
+     */
+    protected function getSDKGroup(): string
+    {
+        return $this->isCollectionsAPI() ? 'attributes' : 'columns';
+    }
+
+    /**
+     * Get the SDK namespace for the current action.
+     */
+    protected function getSDKNamespace(): string
+    {
+        return $this->isCollectionsAPI() ? 'databases' : 'tablesDB';
+    }
+
+    /**
+     * Get the appropriate parent level not found exception.
+     */
+    protected function getParentNotFoundException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::COLLECTION_NOT_FOUND
+            : Exception::TABLE_NOT_FOUND;
+    }
+
+    /**
+     * Get the appropriate not found exception.
+     */
+    protected function getNotFoundException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_NOT_FOUND
+            : Exception::COLUMN_NOT_FOUND;
+    }
+
+    /**
+     * Get the appropriate not found exception.
+     */
+    protected function getIndexDependencyException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::INDEX_DEPENDENCY
+            : Exception::COLUMN_INDEX_DEPENDENCY;
+    }
+
+    /**
+     * Get the appropriate already exists exception.
+     */
+    protected function getDuplicateException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_ALREADY_EXISTS
+            : Exception::COLUMN_ALREADY_EXISTS;
+    }
+
+    /**
+     * Get the correct invalid structure message.
+     */
+    protected function getStructureException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::DOCUMENT_INVALID_STRUCTURE
+            : Exception::ROW_INVALID_STRUCTURE;
+    }
+
+    /**
+     * Get the appropriate limit exceeded exception.
+     */
+    protected function getLimitException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_LIMIT_EXCEEDED
+            : Exception::COLUMN_LIMIT_EXCEEDED;
+    }
+
+    /**
+     * Get the appropriate index invalid exception.
+     */
+    protected function getInvalidIndexException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::INDEX_INVALID
+            : Exception::COLUMN_INDEX_INVALID;
+    }
+
+    /**
+     * Get the correct default unsupported message.
+     */
+    protected function getDefaultUnsupportedException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_DEFAULT_UNSUPPORTED
+            : Exception::COLUMN_DEFAULT_UNSUPPORTED;
+    }
+
+    /**
+     * Get the correct format unsupported message.
+     */
+    protected function getFormatUnsupportedException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_FORMAT_UNSUPPORTED
+            : Exception::COLUMN_FORMAT_UNSUPPORTED;
+    }
+
+    /**
+     * Get the exception for invalid type or format mismatch.
+     */
+    protected function getTypeInvalidException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_TYPE_INVALID
+            : Exception::COLUMN_TYPE_INVALID;
+    }
+
+    /**
+     * Get the exception for resizing invalid attributes/columns.
+     */
+    protected function getInvalidResizeException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_INVALID_RESIZE
+            : Exception::COLUMN_INVALID_RESIZE;
+    }
+
+    /**
+     * Get the exception for invalid attributes/columns value.
+     */
+    protected function getInvalidValueException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_VALUE_INVALID
+            : Exception::COLUMN_VALUE_INVALID;
+    }
+
+    /**
+     * Get the exception for non-available column/attribute.
+     */
+    protected function getNotAvailableException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_NOT_AVAILABLE
+            : Exception::COLUMN_NOT_AVAILABLE;
+    }
+
+    /**
+     * Get the exception for spatial type attribute not supported by the database adapter
+    */
+    protected function getSpatialTypeNotSupportedException(): string
+    {
+        return $this->isCollectionsAPI() ? Exception::ATTRIBUTE_TYPE_NOT_SUPPORTED : Exception::COLUMN_TYPE_NOT_SUPPORTED;
+    }
+
+    /**
+     * Get the correct collections context for Events queue.
+     */
+    protected function getCollectionsEventsContext(): string
+    {
+        return $this->isCollectionsAPI() ? 'collection' : 'table';
+    }
+
+    /**
+     *  Get the proper column/attribute type based on set context.
+     */
+    protected function getModel(string $type, string $format): string
+    {
+        $isCollections = $this->isCollectionsAPI();
+
+        return match (AttributeDefinition::columnType($type)) {
+            ColumnType::Boolean => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_BOOLEAN
+                : UtopiaResponse::MODEL_COLUMN_BOOLEAN,
+
+            ColumnType::Integer => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_INTEGER
+                : UtopiaResponse::MODEL_COLUMN_INTEGER,
+
+            ColumnType::BigInteger => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_BIGINT
+                : UtopiaResponse::MODEL_COLUMN_BIGINT,
+
+            ColumnType::Float,
+            ColumnType::Double => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_FLOAT
+                : UtopiaResponse::MODEL_COLUMN_FLOAT,
+
+            ColumnType::Datetime => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_DATETIME
+                : UtopiaResponse::MODEL_COLUMN_DATETIME,
+
+            ColumnType::Relationship => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_RELATIONSHIP
+                : UtopiaResponse::MODEL_COLUMN_RELATIONSHIP,
+
+            ColumnType::Point => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_POINT
+                : UtopiaResponse::MODEL_COLUMN_POINT,
+
+            ColumnType::Linestring => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_LINE
+                : UtopiaResponse::MODEL_COLUMN_LINE,
+
+            ColumnType::Polygon => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_POLYGON
+                : UtopiaResponse::MODEL_COLUMN_POLYGON,
+
+            ColumnType::Varchar => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_VARCHAR
+                : UtopiaResponse::MODEL_COLUMN_VARCHAR,
+
+            ColumnType::Text => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_TEXT
+                : UtopiaResponse::MODEL_COLUMN_TEXT,
+
+            ColumnType::MediumText => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_MEDIUMTEXT
+                : UtopiaResponse::MODEL_COLUMN_MEDIUMTEXT,
+
+            ColumnType::LongText => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE_LONGTEXT
+                : UtopiaResponse::MODEL_COLUMN_LONGTEXT,
+
+            ColumnType::String => match ($format) {
+                APP_DATABASE_ATTRIBUTE_EMAIL => $isCollections
+                    ? UtopiaResponse::MODEL_ATTRIBUTE_EMAIL
+                    : UtopiaResponse::MODEL_COLUMN_EMAIL,
+
+                APP_DATABASE_ATTRIBUTE_ENUM => $isCollections
+                    ? UtopiaResponse::MODEL_ATTRIBUTE_ENUM
+                    : UtopiaResponse::MODEL_COLUMN_ENUM,
+
+                APP_DATABASE_ATTRIBUTE_IP => $isCollections
+                    ? UtopiaResponse::MODEL_ATTRIBUTE_IP
+                    : UtopiaResponse::MODEL_COLUMN_IP,
+
+                APP_DATABASE_ATTRIBUTE_URL => $isCollections
+                    ? UtopiaResponse::MODEL_ATTRIBUTE_URL
+                    : UtopiaResponse::MODEL_COLUMN_URL,
+
+                default => $isCollections
+                    ? UtopiaResponse::MODEL_ATTRIBUTE_STRING
+                    : UtopiaResponse::MODEL_COLUMN_STRING,
+            },
+            default => $isCollections
+                ? UtopiaResponse::MODEL_ATTRIBUTE
+                : UtopiaResponse::MODEL_COLUMN,
+        };
+    }
+
+    protected function createAttribute(string $databaseId, string $collectionId, Document $attribute, Response $response, Database $dbForProject, callable $getDatabasesDB, DatabasePublisher $publisherForDatabase, Event $queueForEvents, Authorization $authorization): Document
+    {
+        $key = $attribute->getAttribute('key');
+        $description = $attribute->getAttribute('description', '');
+        $type = $attribute->getAttribute('type', '');
+        $size = $attribute->getAttribute('size', 0);
+        $required = $attribute->getAttribute('required', true);
+        $signed = $attribute->getAttribute('signed', true); // integers are signed by default
+        $array = $attribute->getAttribute('array', false);
+        $format = $attribute->getAttribute('format', '');
+        $formatOptions = $attribute->getAttribute('formatOptions', []);
+        $filters = $attribute->getAttribute('filters', []); // filters are hidden from the endpoint
+        $default = $attribute->getAttribute('default');
+        $options = $attribute->getAttribute('options', []);
+
+        $db = $authorization->skip(fn () => $dbForProject->getDocument('databases', $databaseId));
+
+        if ($db->isEmpty() || $this->isDatabaseTypeMismatch($db)) {
+            throw new Exception(Exception::DATABASE_NOT_FOUND, params: [$databaseId]);
+        }
+
+        $dbForDatabases = $getDatabasesDB($db);
+
+        if (in_array($type, [ColumnType::Point->value, ColumnType::Linestring->value, ColumnType::Polygon->value]) && !$this->supportsSpatial($dbForDatabases->getAdapter())) {
+            throw new Exception($this->getSpatialTypeNotSupportedException(), params: [$type]);
+        }
+
+        $collection = $dbForProject->getDocument('database_' . $db->getSequence(), $collectionId);
+
+        if ($collection->isEmpty()) {
+            throw new Exception($this->getParentNotFoundException(), params: [$collectionId]);
+        }
+
+        if (!empty($format)) {
+            $columnType = AttributeDefinition::columnType($type);
+
+            if ($columnType === null || !Structure::hasFormat($format, $columnType)) {
+                throw new Exception($this->getFormatUnsupportedException(), "Format $format not available for $type columns.");
+            }
+        }
+
+        // Must throw here since dbForProject->createAttribute is performed by db worker
+        if ($required && isset($default)) {
+            throw new Exception($this->getDefaultUnsupportedException(), 'Cannot set default value for required ' . $this->getContext());
+        }
+
+        if ($array && isset($default)) {
+            throw new Exception($this->getDefaultUnsupportedException(), 'Cannot set default value for array ' . $this->getContext() . 's');
+        }
+
+        if ($type === ColumnType::Relationship->value) {
+            $options['side'] = RelationshipSide::Parent->value;
+            $relatedCollection = $dbForProject->getDocument('database_' . $db->getSequence(), $options['relatedCollection'] ?? '');
+            if ($relatedCollection->isEmpty()) {
+                $parent = $this->isCollectionsAPI() ? 'collection' : 'table';
+                throw new Exception($this->getParentNotFoundException(), "The related $parent was not found.");
+            }
+        }
+
+        try {
+            $attribute = new Document([
+                '$id' => Id::custom($db->getSequence() . '_' . $collection->getSequence() . '_' . $key),
+                'key' => $key,
+                'description' => $description,
+                'databaseInternalId' => $db->getSequence(),
+                'databaseId' => $db->getId(),
+                'collectionInternalId' => $collection->getSequence(),
+                'collectionId' => $collectionId,
+                'type' => $type,
+                'status' => 'processing', // processing, available, failed, deleting, stuck
+                'size' => $size,
+                'required' => $required,
+                'signed' => $signed,
+                'default' => $default,
+                'array' => $array,
+                'format' => $format,
+                'formatOptions' => $formatOptions,
+                'filters' => $filters,
+                'options' => $options,
+            ]);
+
+            if (
+                !$dbForDatabases->getAdapter()->supports(Capability::IndexSpatialNull) &&
+                \in_array($attribute->getAttribute('type'), [ColumnType::Point->value, ColumnType::Linestring->value, ColumnType::Polygon->value]) &&
+                $attribute->getAttribute('required')
+            ) {
+                $hasData = $authorization->skip(fn () => $dbForDatabases
+                    ->count('database_' . $db->getSequence() . '_collection_' . $collection->getSequence())) > 0;
+
+                if ($hasData) {
+                    throw new StructureException('Failed to add required spatial column: existing rows present. Make the column optional.');
+                }
+            }
+            $dbForDatabases->checkAttribute('database_' . $db->getSequence() . '_collection_' . $collection->getSequence(), Attribute::fromArray([
+                'key' => $key,
+                'type' => $type,
+                'size' => $size,
+                'required' => $required,
+                'signed' => $signed,
+                'default' => $default,
+                'array' => $array,
+                'format' => $format !== '' ? $format : null,
+                'formatOptions' => $formatOptions,
+                'filters' => $filters,
+                'options' => $options !== [] ? $options : null,
+            ]));
+            $attribute = $dbForProject->createDocument('attributes', $attribute);
+        } catch (DuplicateException) {
+            throw new Exception($this->getDuplicateException(), params: [$key]);
+        } catch (LimitException) {
+            throw new Exception($this->getLimitException(), params: [$collectionId]);
+        } catch (StructureException $e) {
+            throw new Exception($this->getStructureException(), $e->getMessage());
+        } catch (Throwable $e) {
+            $dbForProject->purgeCachedDocument('database_' . $db->getSequence(), $collectionId);
+            $dbForDatabases->purgeCachedCollection('database_' . $db->getSequence() . '_collection_' . $collection->getSequence());
+            throw $e;
+        }
+
+        $dbForProject->purgeCachedDocument('database_' . $db->getSequence(), $collectionId);
+        $dbForDatabases->purgeCachedCollection('database_' . $db->getSequence() . '_collection_' . $collection->getSequence());
+
+        if ($type === ColumnType::Relationship->value && $options['twoWay']) {
+            $twoWayKey = $options['twoWayKey'];
+            $options['relatedCollection'] = $collection->getId();
+            $options['twoWayKey'] = $key;
+            $options['side'] = RelationshipSide::Child->value;
+
+            try {
+                $twoWayAttribute = new Document([
+                    '$id' => Id::custom($db->getSequence() . '_' . $relatedCollection->getSequence() . '_' . $twoWayKey),
+                    'key' => $twoWayKey,
+                    'databaseInternalId' => $db->getSequence(),
+                    'databaseId' => $db->getId(),
+                    'collectionInternalId' => $relatedCollection->getSequence(),
+                    'collectionId' => $relatedCollection->getId(),
+                    'type' => $type,
+                    'status' => 'processing', // processing, available, failed, deleting, stuck
+                    'size' => $size,
+                    'required' => $required,
+                    'signed' => $signed,
+                    'default' => $default,
+                    'array' => $array,
+                    'format' => $format,
+                    'formatOptions' => $formatOptions,
+                    'filters' => $filters,
+                    'options' => $options,
+                ]);
+
+                $dbForDatabases->checkAttribute('database_' . $db->getSequence() . '_collection_' . $relatedCollection->getSequence(), Attribute::fromArray([
+                    'key' => $twoWayKey,
+                    'type' => $type,
+                    'size' => $size,
+                    'required' => $required,
+                    'signed' => $signed,
+                    'default' => $default,
+                    'array' => $array,
+                    'format' => $format !== '' ? $format : null,
+                    'formatOptions' => $formatOptions,
+                    'filters' => $filters,
+                    'options' => $options !== [] ? $options : null,
+                ]));
+                $dbForProject->createDocument('attributes', $twoWayAttribute);
+            } catch (DuplicateException) {
+                throw new Exception($this->getDuplicateException(), params: [$twoWayKey]);
+            } catch (LimitException) {
+                throw new Exception($this->getLimitException(), params: [$relatedCollection->getId()]);
+            } catch (StructureException) {
+                throw new Exception($this->getStructureException());
+            } catch (Throwable $e) {
+                $dbForProject->deleteDocument('attributes', $attribute->getId());
+                throw $e;
+            } finally {
+                $dbForProject->purgeCachedDocument('database_' . $db->getSequence(), $collectionId);
+                $dbForDatabases->purgeCachedCollection('database_' . $db->getSequence() . '_collection_' . $collection->getSequence());
+            }
+
+            // If operation succeeded, purge the cache for the related collection too
+            $dbForProject->purgeCachedDocument('database_' . $db->getSequence(), $relatedCollection->getId());
+            $dbForDatabases->purgeCachedCollection('database_' . $db->getSequence() . '_collection_' . $relatedCollection->getSequence());
+        }
+
+        $queueForEvents
+            ->setContext('database', $db)
+            ->setParam('databaseId', $databaseId)
+            ->setParam('collectionId', $collection->getId())
+            ->setParam('tableId', $collection->getId())
+            ->setParam('attributeId', $attribute->getId())
+            ->setParam('columnId', $attribute->getId())
+            ->setContext($this->getCollectionsEventsContext(), $collection);
+
+        $publisherForDatabase->enqueue(new DatabaseMessage(
+            project: $queueForEvents->getProject(),
+            type: DATABASE_TYPE_CREATE_ATTRIBUTE,
+            database: $db,
+            collection: $this->isCollectionsAPI() ? $collection : null,
+            document: $this->isCollectionsAPI() ? $attribute : null,
+            table: $this->isCollectionsAPI() ? null : $collection,
+            row: $this->isCollectionsAPI() ? null : $attribute,
+            events: Event::generateEvents($queueForEvents->getEvent(), $queueForEvents->getParams()),
+        ));
+
+        $response->setStatusCode(SwooleResponse::STATUS_CODE_CREATED);
+
+        return $attribute;
+    }
+
+    protected function updateAttribute(string $databaseId, string $collectionId, string $key, Database $dbForProject, callable $getDatabasesDB, Event $queueForEvents, Authorization $authorization, string $type, ?int $size = null, ?string $filter = null, string|bool|int|float|array|null $default = null, ?bool $required = null, int|float|null $min = null, int|float|null $max = null, ?array $elements = null, array $options = [], ?string $newKey = null, ?string $description = null): Document
+    {
+        $db = $authorization->skip(fn () => $dbForProject->getDocument('databases', $databaseId));
+
+        if ($db->isEmpty() || $this->isDatabaseTypeMismatch($db)) {
+            throw new Exception(Exception::DATABASE_NOT_FOUND, params: [$databaseId]);
+        }
+
+        $collection = $dbForProject->getDocument('database_' . $db->getSequence(), $collectionId);
+
+        if ($collection->isEmpty()) {
+            throw new Exception($this->getParentNotFoundException(), params: [$collectionId]);
+        }
+
+        $attribute = $dbForProject->getDocument('attributes', $db->getSequence() . '_' . $collection->getSequence() . '_' . $key);
+
+        if ($attribute->isEmpty()) {
+            throw new Exception($this->getNotFoundException(), params: [$key]);
+        }
+
+        if ($attribute->getAttribute('status') !== 'available') {
+            throw new Exception($this->getNotAvailableException());
+        }
+
+        if (!AttributeDefinition::sameType($attribute->getAttribute('type', ''), $type)) {
+            throw new Exception($this->getTypeInvalidException());
+        }
+
+        // The discriminator for a formatted string is persisted as 'format', and is
+        // the empty string for a plain one, while the plain string endpoint passes
+        // no filter at all.
+        if ($attribute->getAttribute('type') === ColumnType::String->value && $attribute->getAttribute('format', '') !== ($filter ?? '')) {
+            throw new Exception($this->getTypeInvalidException());
+        }
+
+        if ($required && isset($default)) {
+            throw new Exception($this->getDefaultUnsupportedException(), 'Cannot set default value for required ' . $this->getContext());
+        }
+
+        if ($attribute->getAttribute('array', false) && isset($default)) {
+            throw new Exception($this->getDefaultUnsupportedException(), 'Cannot set default value for array ' . $this->getContext() . 's');
+        }
+
+        if ($size !== null && $size < APP_DATABASE_ENCRYPT_SIZE_MIN && \in_array('encrypt', $attribute->getAttribute('filters', []), true)) {
+            throw new Exception(
+                Exception::GENERAL_BAD_REQUEST,
+                'Size too small. Encrypted strings require a minimum size of ' . APP_DATABASE_ENCRYPT_SIZE_MIN . ' characters.'
+            );
+        }
+
+        $collectionId = 'database_' . $db->getSequence() . '_collection_' . $collection->getSequence();
+        $dbForDatabases = $getDatabasesDB($db);
+
+        $attribute
+            ->setAttribute('default', $default)
+            ->setAttribute('required', $required);
+
+        if (!\is_null($description)) {
+            $attribute->setAttribute('description', $description);
+        }
+
+        if (!empty($size)) {
+            $attribute->setAttribute('size', $size);
+        }
+
+        $format = Unchanged::Value;
+
+        switch ($attribute->getAttribute('format')) {
+            case APP_DATABASE_ATTRIBUTE_INT_RANGE:
+            case APP_DATABASE_ATTRIBUTE_BIGINT_RANGE:
+            case APP_DATABASE_ATTRIBUTE_FLOAT_RANGE:
+                $min ??= $attribute->getAttribute('formatOptions')['min'];
+                $max ??= $attribute->getAttribute('formatOptions')['max'];
+
+                if ($min > $max) {
+                    throw new Exception($this->getInvalidValueException(), 'Minimum value must be lesser than maximum value');
+                }
+
+                if ($attribute->getAttribute('format') === APP_DATABASE_ATTRIBUTE_FLOAT_RANGE) {
+                    $validator = new Range($min, $max, ColumnType::Double->value);
+
+                    if (!is_null($default)) {
+                        $default = \floatval($default);
+                    }
+                } else {
+                    $validator = new Range($min, $max, ColumnType::Integer->value);
+                }
+
+                if (!is_null($default) && !$validator->isValid($default)) {
+                    throw new Exception($this->getInvalidValueException(), $validator->getDescription());
+                }
+
+                $options = [
+                    'min' => $min,
+                    'max' => $max
+                ];
+                $attribute->setAttribute('formatOptions', $options);
+                $format = new Format($attribute->getAttribute('format'), $options);
+
+                break;
+            case APP_DATABASE_ATTRIBUTE_ENUM:
+                if (empty($elements)) {
+                    throw new Exception($this->getInvalidValueException(), 'Enum elements must not be empty');
+                }
+
+                foreach ($elements as $element) {
+                    if (\strlen($element) === 0) {
+                        throw new Exception($this->getInvalidValueException(), 'Each enum element must not be empty');
+                    }
+                }
+
+                if (!is_null($default) && !in_array($default, $elements)) {
+                    throw new Exception($this->getInvalidValueException(), 'Default value not found in elements');
+                }
+
+                $options = [
+                    'elements' => $elements
+                ];
+
+                $attribute->setAttribute('formatOptions', $options);
+                $format = new Format($attribute->getAttribute('format'), $options);
+
+                break;
+        }
+
+        if ($type === ColumnType::Relationship->value) {
+            $options = \array_filter($options, fn (mixed $option): bool => $option !== null);
+            $primaryDocumentOptions = \array_merge($attribute->getAttribute('options', []), $options);
+            $attribute->setAttribute('options', $primaryDocumentOptions);
+            try {
+                $dbForDatabases->updateRelationship(
+                    collection: $collectionId,
+                    key: $key,
+                    update: new DatabaseRelationshipUpdate(
+                        key: $newKey ?: null,
+                        onDelete: isset($options['onDelete']) ? RelationshipDeleteAction::from($options['onDelete']) : null,
+                    ),
+                );
+            } catch (IndexException) {
+                throw new Exception(Exception::INDEX_INVALID);
+            } catch (LimitException) {
+                throw new Exception($this->getLimitException(), params: [$collectionId]);
+            } catch (RelationshipException $e) {
+                throw new Exception(Exception::RELATIONSHIP_VALUE_INVALID, $e->getMessage());
+            } catch (StructureException $e) {
+                throw new Exception($this->getStructureException(), $e->getMessage());
+            }
+
+            if ($primaryDocumentOptions['twoWay']) {
+                $relatedCollection = $dbForProject->getDocument('database_' . $db->getSequence(), $primaryDocumentOptions['relatedCollection']);
+
+                $relatedAttribute = $dbForProject->getDocument('attributes', $db->getSequence() . '_' . $relatedCollection->getSequence() . '_' . $primaryDocumentOptions['twoWayKey']);
+
+                if (!empty($newKey) && $newKey !== $key) {
+                    $options['twoWayKey'] = $newKey;
+                }
+
+                $relatedOptions = \array_merge($relatedAttribute->getAttribute('options'), $options);
+                $relatedAttribute->setAttribute('options', $relatedOptions);
+                $dbForProject->updateDocument('attributes', $db->getSequence() . '_' . $relatedCollection->getSequence() . '_' . $primaryDocumentOptions['twoWayKey'], $relatedAttribute);
+
+                $dbForProject->purgeCachedDocument('database_' . $db->getSequence(), $relatedCollection->getId());
+            }
+        } else {
+            try {
+                $dbForDatabases->updateAttribute(
+                    collection: $collectionId,
+                    key: $key,
+                    update: new AttributeUpdate(
+                        size: $size,
+                        required: $required,
+                        default: $default,
+                        format: $format,
+                        key: $newKey ?: null,
+                    ),
+                );
+            } catch (DuplicateException) {
+                throw new Exception($this->getDuplicateException(), params: [$key]);
+            } catch (IndexException $e) {
+                throw new Exception($this->getInvalidIndexException(), $e->getMessage());
+            } catch (LimitException) {
+                throw new Exception($this->getLimitException(), params: [$collectionId]);
+            } catch (TruncateException) {
+                throw new Exception($this->getInvalidResizeException());
+            }
+        }
+
+        if (!empty($newKey) && $key !== $newKey) {
+            $originalUid = $attribute->getId();
+
+            $attribute
+                ->setAttribute('$id', Id::custom($db->getSequence() . '_' . $collection->getSequence() . '_' . $newKey))
+                ->setAttribute('key', $newKey);
+
+            try {
+                $dbForProject->updateDocument('attributes', $originalUid, $attribute);
+            } catch (DuplicateException) {
+                throw new Exception($this->getDuplicateException(), params: [$newKey]);
+            }
+
+            /**
+             * @var Document $index
+             */
+            foreach ($collection->getAttribute('indexes') as $index) {
+                /**
+                 * @var array<string> $attributes
+                 */
+                $attributes = $index->getAttribute('attributes', []);
+                $found = \array_search($key, $attributes);
+
+                if ($found !== false) {
+                    $attributes[$found] = $newKey;
+                    $index->setAttribute('attributes', $attributes);
+                    $dbForProject->updateDocument('indexes', $index->getId(), $index);
+                }
+            }
+        } else {
+            $attribute = $dbForProject->updateDocument('attributes', $db->getSequence() . '_' . $collection->getSequence() . '_' . $key, $attribute);
+        }
+
+        $dbForProject->purgeCachedDocument('database_' . $db->getSequence(), $collection->getId());
+
+        $queueForEvents
+            ->setContext('database', $db)
+            ->setParam('databaseId', $databaseId)
+            ->setParam('collectionId', $collection->getId())
+            ->setParam('tableId', $collection->getId())
+            ->setParam('attributeId', $attribute->getId())
+            ->setParam('columnId', $attribute->getId())
+            ->setContext($this->getCollectionsEventsContext(), $collection);
+
+        return $attribute;
+    }
+}

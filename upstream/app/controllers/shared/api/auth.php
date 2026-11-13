@@ -1,0 +1,129 @@
+<?php
+
+use Appwrite\Extend\Exception;
+use Appwrite\Geo\Geo;
+use Appwrite\Utopia\Database\Documents\User;
+use Appwrite\Utopia\Request;
+use Utopia\Config\Config;
+use Utopia\Database\DateTime;
+use Utopia\Database\Document;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Http\Http;
+use Utopia\Http\Route;
+use Utopia\System\System;
+
+Http::init()
+    ->groups(['mfaProtected'])
+    ->inject('user')
+    ->inject('session')
+    ->action(function (User $user, Document $session) {
+        if (!$user->sessionChallengeRecent($session->getId())) {
+            throw new Exception(Exception::USER_CHALLENGE_REQUIRED);
+        }
+    });
+
+Http::init()
+    ->groups(['recentSession'])
+    ->inject('session')
+    ->action(function (Document $session) {
+        if ($session->isEmpty()) {
+            return; // Scope checks reject guests
+        }
+
+        // Signed in, or completed an MFA challenge, within the window
+        $recent = DateTime::formatTz(DateTime::addSeconds(new \DateTime(), -SESSION_RECENT_DURATION));
+        $signedInAt = DateTime::formatTz($session->getCreatedAt());
+        $verifiedAt = DateTime::formatTz($session->getAttribute('mfaUpdatedAt'));
+
+        if ($signedInAt < $recent && ($verifiedAt === null || $verifiedAt < $recent)) {
+            throw new Exception(Exception::USER_REAUTHENTICATION_REQUIRED);
+        }
+    });
+
+Http::init()
+    ->groups(['auth'])
+    ->inject('route')
+    ->inject('request')
+    ->inject('project')
+    ->inject('geo')
+    ->inject('user')
+    ->inject('authorization')
+    ->action(function (Route $route, Request $request, Document $project, Geo $geo, User $user, Authorization $authorization) {
+        $denylist = System::getEnv('_APP_CONSOLE_COUNTRIES_DENYLIST', '');
+        if (!empty($denylist) && $project->getId() === 'console') {
+            // A missing or unknown geo lookup ("--") is treated as allowed and falls
+            // through to the membership check below, matching the pre-geo-service behavior.
+            $countries = \array_map('strtoupper', \array_map('trim', explode(',', $denylist)));
+            $country = \strtoupper($geo->get($request->getIP())->getCountryCode());
+            if (in_array($country, $countries, true)) {
+                throw new Exception(Exception::GENERAL_REGION_ACCESS_DENIED);
+            }
+        }
+
+        $isPrivilegedUser = $user->isPrivileged($authorization->getRoles());
+        $isAppUser = $user->isKey($authorization->getRoles());
+
+        if ($isAppUser || $isPrivilegedUser) { // Skip limits for app and console devs
+            return;
+        }
+
+        $auths = $project->getAttribute('auths', []);
+        switch ($route->getLabel('auth.type', '')) {
+            case 'email-password':
+                if (($auths[Config::getParam('auth')['email-password']['key']] ?? true) === false) {
+                    throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'Email / Password authentication is disabled for this project');
+                }
+                break;
+
+            case 'magic-url':
+                if (($auths[Config::getParam('auth')['magic-url']['key']] ?? true) === false) {
+                    throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'Magic URL authentication is disabled for this project');
+                }
+                break;
+
+            case 'anonymous':
+                if (($auths[Config::getParam('auth')['anonymous']['key']] ?? true) === false) {
+                    throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'Anonymous authentication is disabled for this project');
+                }
+                break;
+
+            case 'phone':
+                if (($auths[Config::getParam('auth')['phone']['key']] ?? true) === false) {
+                    throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'Phone authentication is disabled for this project');
+                }
+                break;
+
+            case 'invites':
+                if (($auths[Config::getParam('auth')['invites']['key']] ?? true) === false) {
+                    throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'Invites authentication is disabled for this project');
+                }
+                break;
+
+            case 'jwt':
+                if (($auths[Config::getParam('auth')['jwt']['key']] ?? true) === false) {
+                    throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'JWT authentication is disabled for this project');
+                }
+                break;
+
+            case 'email-otp':
+                if (($auths[Config::getParam('auth')['email-otp']['key']] ?? true) === false) {
+                    throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'Email OTP authentication is disabled for this project');
+                }
+                break;
+
+            case 'passkey':
+                if (($auths[Config::getParam('auth')['passkey']['key']] ?? false) !== true) {
+                    throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'Passkey authentication is disabled for this project');
+                }
+                break;
+
+            case 'ldap':
+                if (($auths[Config::getParam('auth')['ldap']['key']] ?? false) !== true) {
+                    throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'LDAP authentication is disabled for this project');
+                }
+                break;
+
+            default:
+                throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'Unsupported authentication route');
+        }
+    });

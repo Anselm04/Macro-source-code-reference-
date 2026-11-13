@@ -1,0 +1,74 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\VectorsDB\Transactions\Operations;
+
+use Appwrite\Abuse\Limit;
+use Appwrite\Platform\Modules\Databases\Http\Databases\Transactions\Operations\Create as OperationsCreate;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Database\Validator\Operation;
+use Appwrite\Utopia\Response as UtopiaResponse;
+use Utopia\Database\Validator\UID;
+use Utopia\Http\Adapter\Swoole\Response as SwooleResponse;
+use Utopia\Validator\ArrayList;
+
+class Create extends OperationsCreate
+{
+    public static function getName(): string
+    {
+        return 'createVectorsDBOperations';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(self::HTTP_REQUEST_METHOD_POST)
+            ->setHttpPath('/v1/vectorsdb/transactions/:transactionId/operations')
+            ->desc('Create operations')
+            ->groups(['api', 'database', 'transactions'])
+            ->label('scope', 'vectorsdb.documents.write')
+            ->label('resourceType', RESOURCE_TYPE_DATABASES)
+            ->label('abuse', [Limit::attempts(['ip', 'method', 'url', 'userId'], APP_LIMIT_WRITE_RATE_DEFAULT * 2, seconds: APP_LIMIT_WRITE_RATE_PERIOD_DEFAULT)])
+            ->label('sdk', new Method(
+                namespace: 'vectorsDB',
+                group: 'transactions',
+                name: 'createOperations',
+                description: '/docs/references/vectorsdb/create-operations.md',
+                requestExamples: [
+                    'createDocument' => [
+                        'summary' => 'Stage a document creation in a four-dimensional collection',
+                        'value' => ['operations' => [[
+                            'action' => 'create',
+                            'databaseId' => '<DATABASE_ID>',
+                            'collectionId' => '<COLLECTION_ID>',
+                            'documentId' => '<DOCUMENT_ID>',
+                            'data' => [
+                                'embeddings' => [0.12, -0.55, 0.88, 1.02],
+                                'metadata' => ['name' => 'Example document'],
+                            ],
+                        ]]],
+                    ],
+                ],
+                auth: [AuthType::ADMIN, AuthType::KEY, AuthType::SESSION, AuthType::JWT],
+                responses: [
+                    new SDKResponse(
+                        code: SwooleResponse::STATUS_CODE_CREATED,
+                        model: UtopiaResponse::MODEL_TRANSACTION,
+                    )
+                ],
+                contentType: ContentType::JSON
+            ))
+            ->param('transactionId', '', new UID(), 'Transaction ID.')
+            ->param('operations', [], new ArrayList(new Operation(type: 'documentsdb')), 'Array of staged operations.', true, example: '[{"action":"create","databaseId":"<DATABASE_ID>","collectionId":"<COLLECTION_ID>","documentId":"<DOCUMENT_ID>","data":{"embeddings":[0.12,-0.55,0.88,1.02],"metadata":{"name":"First document"}}}]')
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('getDatabasesDB')
+            ->inject('transactionState')
+            ->inject('plan')
+            ->inject('authorization')
+            ->inject('user')
+            ->callback($this->action(...));
+    }
+}

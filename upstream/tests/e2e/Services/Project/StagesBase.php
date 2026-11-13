@@ -1,0 +1,312 @@
+<?php
+
+namespace Tests\E2E\Services\Project;
+
+use Appwrite\Extend\Exception;
+use Tests\E2E\Client;
+use Utopia\Config\Config;
+use Utopia\Database\Id;
+use Utopia\Database\Validator\Datetime as DatetimeValidator;
+
+trait StagesBase
+{
+    public function testListProjectStages(): void
+    {
+        $projectId = $this->getProject()['$id'];
+
+        $response = $this->listStages($projectId);
+
+        $this->assertSame(200, $response['headers']['status-code']);
+        $this->assertIsArray($response['body']['stages']);
+        $this->assertCount(\count(Config::getParam('onboarding', [])), $response['body']['stages']);
+
+        $ids = array_column($response['body']['stages'], 'id');
+        $this->assertContains('tablesDB.create', $ids);
+        $this->assertContains('vectorsDB.create', $ids);
+        $this->assertContains('storage.createBucket', $ids);
+        $this->assertContains('functions.create', $ids);
+        $this->assertContains('cli.install', $ids);
+        $this->assertContains('mcp.install', $ids);
+
+        foreach ($response['body']['stages'] as $stage) {
+            $this->assertSame($stage['id'], $stage['sdk']);
+            $this->assertArrayHasKey('status', $stage);
+            $this->assertArrayHasKey('at', $stage);
+            $this->assertArrayHasKey('actorType', $stage);
+        }
+    }
+
+    public function testListProjectStagesWithoutAuthentication(): void
+    {
+        $response = $this->listStages($this->getProject()['$id'], false);
+
+        $this->assertSame(401, $response['headers']['status-code']);
+    }
+
+    public function testUpdateProjectStageSkip(): void
+    {
+        $projectId = $this->getProject()['$id'];
+        $method = 'tablesDB.create';
+
+        $response = $this->updateStage($projectId, $method, true);
+
+        $this->assertSame(200, $response['headers']['status-code']);
+        $this->assertSame($method, $response['body']['id']);
+        $this->assertSame($method, $response['body']['sdk']);
+        $this->assertSame(ONBOARDING_STATUS_SKIPPED, $response['body']['status']);
+        $this->assertNotEmpty($response['body']['at']);
+        $this->assertSame(ACTOR_TYPE_USER, $response['body']['actorType']);
+
+        $dateValidator = new DatetimeValidator();
+        $this->assertSame(true, $dateValidator->isValid($response['body']['at']));
+
+        $list = $this->listStages($projectId);
+        $this->assertSame(200, $list['headers']['status-code']);
+        $databaseStage = null;
+        foreach ($list['body']['stages'] as $stage) {
+            if ($stage['id'] === $method) {
+                $databaseStage = $stage;
+                break;
+            }
+        }
+        $this->assertNotNull($databaseStage);
+        $this->assertSame(ONBOARDING_STATUS_SKIPPED, $databaseStage['status']);
+        $this->assertSame(ACTOR_TYPE_USER, $databaseStage['actorType']);
+
+        $response = $this->updateStage($projectId, 'unknown.method', true);
+        $this->assertSame(400, $response['headers']['status-code']);
+        $this->assertSame(Exception::GENERAL_ARGUMENT_INVALID, $response['body']['type']);
+    }
+
+    public function testUpdateProjectStageSkipFalseLeavesPending(): void
+    {
+        $projectId = $this->getProject()['$id'];
+        $method = 'storage.createBucket';
+
+        $response = $this->updateStage($projectId, $method, false);
+
+        $this->assertSame(200, $response['headers']['status-code']);
+        $this->assertSame($method, $response['body']['id']);
+        $this->assertSame('pending', $response['body']['status']);
+    }
+
+    public function testUpdateProjectStageWithoutAuthentication(): void
+    {
+        $response = $this->updateStage($this->getProject()['$id'], 'tablesDB.create', true, false);
+
+        $this->assertSame(401, $response['headers']['status-code']);
+    }
+
+    public function testPingWithMcpSdkCompletesInstallStage(): void
+    {
+        $projectId = $this->getProject()['$id'];
+
+        $response = $this->client->call(Client::METHOD_GET, '/ping', [
+            'x-appwrite-project' => $projectId,
+            'x-sdk-name' => 'mcp',
+        ]);
+        $this->assertSame(200, $response['headers']['status-code']);
+
+        $stage = $this->awaitStage($projectId, 'mcp.install', ONBOARDING_STATUS_COMPLETED);
+        $this->assertNotEmpty($stage['at']);
+        $this->assertSame(ACTOR_TYPE_GUEST, $stage['actorType']);
+    }
+
+    public function testPingWithCliSdkCompletesInstallStage(): void
+    {
+        $projectId = $this->getProject()['$id'];
+
+        $response = $this->client->call(Client::METHOD_GET, '/ping', [
+            'x-appwrite-project' => $projectId,
+            'x-sdk-name' => 'cli',
+        ]);
+        $this->assertSame(200, $response['headers']['status-code']);
+
+        $stage = $this->awaitStage($projectId, 'cli.install', ONBOARDING_STATUS_COMPLETED);
+        $this->assertNotEmpty($stage['at']);
+        $this->assertSame(ACTOR_TYPE_GUEST, $stage['actorType']);
+    }
+
+    public function testPingWithCliLanguageCompletesInstallStage(): void
+    {
+        $projectId = $this->getProject()['$id'];
+
+        $response = $this->client->call(Client::METHOD_GET, '/ping', [
+            'x-appwrite-project' => $projectId,
+            'x-sdk-language' => 'cli',
+        ]);
+        $this->assertSame(200, $response['headers']['status-code']);
+
+        $this->awaitStage($projectId, 'cli.install', ONBOARDING_STATUS_COMPLETED);
+    }
+
+    public function testMcpInstallStageIsNotRewritten(): void
+    {
+        $project = $this->getProject(fresh: true);
+        $projectId = $project['$id'];
+
+        $first = $this->client->call(Client::METHOD_GET, '/ping', [
+            'x-appwrite-project' => $projectId,
+            'x-sdk-name' => 'mcp',
+        ]);
+        $this->assertSame(200, $first['headers']['status-code']);
+
+        $stage = $this->awaitStage($projectId, 'mcp.install', ONBOARDING_STATUS_COMPLETED);
+        $this->assertSame(ACTOR_TYPE_GUEST, $stage['actorType']);
+        $at = $stage['at'];
+        $this->assertNotEmpty($at);
+
+        $this->assertSame('pending', $this->getStage($projectId, 'teams.create')['status']);
+
+        // The second MCP request also completes teams.create, so its stage write is observable.
+        $second = $this->client->call(Client::METHOD_POST, '/teams', [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $projectId,
+            'x-appwrite-key' => $project['apiKey'],
+            'x-sdk-name' => 'mcp',
+        ], [
+            'teamId' => Id::unique(),
+            'name' => 'Onboarding',
+        ]);
+        $this->assertSame(201, $second['headers']['status-code']);
+        $this->awaitStage($projectId, 'teams.create', ONBOARDING_STATUS_COMPLETED);
+
+        $again = $this->getStage($projectId, 'mcp.install');
+        $this->assertNotNull($again);
+        $this->assertSame(ONBOARDING_STATUS_COMPLETED, $again['status']);
+        $this->assertSame($at, $again['at']);
+        $this->assertSame(ACTOR_TYPE_GUEST, $again['actorType']);
+    }
+
+    public function testSkippedStageUpgradesToCompleted(): void
+    {
+        $projectId = $this->getProject()['$id'];
+
+        $skip = $this->updateStage($projectId, 'teams.create', true);
+        $this->assertSame(200, $skip['headers']['status-code']);
+        $this->assertSame(ONBOARDING_STATUS_SKIPPED, $skip['body']['status']);
+
+        $response = $this->client->call(Client::METHOD_POST, '/teams', [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $projectId,
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ], [
+            'teamId' => Id::unique(),
+            'name' => 'Onboarding',
+        ]);
+        $this->assertSame(201, $response['headers']['status-code']);
+
+        $this->awaitStage($projectId, 'teams.create', ONBOARDING_STATUS_COMPLETED);
+    }
+
+    public function testCreateVectorsDBDatabaseCompletesStage(): void
+    {
+        $projectId = $this->getProject()['$id'];
+
+        $response = $this->client->call(Client::METHOD_POST, '/vectorsdb', [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $projectId,
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ], [
+            'databaseId' => Id::unique(),
+            'name' => 'Onboarding',
+        ]);
+        $this->assertSame(201, $response['headers']['status-code']);
+
+        $this->awaitStage($projectId, 'vectorsDB.create', ONBOARDING_STATUS_COMPLETED);
+    }
+
+    public function testCreateProjectKeyFromConsoleCompletesStageOnPathProject(): void
+    {
+        $projectId = $this->getProject(fresh: true)['$id'];
+        $headers = [
+            'origin' => 'http://localhost',
+            'content-type' => 'application/json',
+            'cookie' => 'a_session_console=' . $this->getRoot()['session'],
+            'x-appwrite-project' => 'console',
+        ];
+
+        $project = $this->client->call(Client::METHOD_GET, '/projects/' . $projectId, $headers);
+        $this->assertSame(200, $project['headers']['status-code']);
+        $headers['x-appwrite-organization'] = $project['body']['teamId'];
+
+        $this->assertSame('pending', $this->getStage($projectId, 'organization.createProjectKey')['status']);
+
+        // The request runs on the console project; the stage belongs to the project in the path.
+        $key = $this->client->call(Client::METHOD_POST, '/organization/projects/' . $projectId . '/keys', $headers, [
+            'keyId' => Id::unique(),
+            'name' => 'Onboarding',
+            'scopes' => ['users.read'],
+        ]);
+        $this->assertSame(201, $key['headers']['status-code']);
+        $this->assertSame('Onboarding', $key['body']['name']);
+        $this->assertSame(['users.read'], $key['body']['scopes']);
+
+        $this->awaitStage($projectId, 'organization.createProjectKey', ONBOARDING_STATUS_COMPLETED);
+    }
+
+    protected function listStages(string $projectId, bool $authenticated = true): mixed
+    {
+        // Stages live under /projects (console scope); use the root console session.
+        $headers = [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => 'console',
+        ];
+
+        if ($authenticated) {
+            $headers['origin'] = 'http://localhost';
+            $headers['cookie'] = 'a_session_console=' . $this->getRoot()['session'];
+        }
+
+        return $this->client->call(Client::METHOD_GET, '/projects/' . $projectId . '/stages', $headers, []);
+    }
+
+    protected function updateStage(string $projectId, string $stageId, bool $skip, bool $authenticated = true): mixed
+    {
+        $headers = [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => 'console',
+        ];
+
+        if ($authenticated) {
+            $headers['origin'] = 'http://localhost';
+            $headers['cookie'] = 'a_session_console=' . $this->getRoot()['session'];
+        }
+
+        return $this->client->call(Client::METHOD_PATCH, '/projects/' . $projectId . '/stages/' . rawurlencode($stageId), $headers, [
+            'skip' => $skip,
+        ]);
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    protected function getStage(string $projectId, string $stageId): ?array
+    {
+        $list = $this->listStages($projectId);
+        $this->assertSame(200, $list['headers']['status-code']);
+
+        foreach ($list['body']['stages'] as $stage) {
+            if ($stage['id'] === $stageId) {
+                return $stage;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function awaitStage(string $projectId, string $stageId, string $status): array
+    {
+        $stage = null;
+        $this->assertEventually(function () use ($projectId, $stageId, $status, &$stage) {
+            $stage = $this->getStage($projectId, $stageId);
+            $this->assertNotNull($stage);
+            $this->assertSame($status, $stage['status']);
+        });
+
+        return $stage;
+    }
+}

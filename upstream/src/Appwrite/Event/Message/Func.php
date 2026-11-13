@@ -1,0 +1,108 @@
+<?php
+
+namespace Appwrite\Event\Message;
+
+use Appwrite\Event\Event;
+use Utopia\Config\Config;
+use Utopia\Database\Document;
+use Utopia\Database\Id;
+
+final class Func extends Base
+{
+    public function __construct(
+        public readonly ?Document $project = null,
+        public readonly ?Document $user = null,
+        public readonly ?string $userId = null,
+        public readonly ?Document $function = null,
+        public readonly ?string $functionId = null,
+        public readonly ?Document $execution = null,
+        public readonly string $type = '',
+        public readonly string $jwt = '',
+        public readonly array $payload = [],
+        public readonly array $events = [],
+        public readonly string $body = '',
+        public readonly string $path = '',
+        public readonly array $headers = [],
+        public readonly string $method = '',
+        public readonly array $platform = [],
+        // Names one triggered event, so a redelivery of it can be told from a new one.
+        public readonly string $eventId = '',
+    ) {
+    }
+
+    public static function fromEvent(
+        string $event,
+        array $params,
+        ?Document $project = null,
+        ?Document $user = null,
+        ?string $userId = null,
+        array $payload = [],
+        array $platform = [],
+        ?Document $database = null,
+    ): static {
+        // Queue decoders turn nested JSON objects into associative arrays.
+        // Keep the original body only when that conversion changes its shape.
+        $body = \json_encode($payload) ?: '';
+        $decoded = \json_decode($body, true);
+        $preserveBody = $body !== \json_encode($decoded);
+
+        return new self(
+            project: $project,
+            user: $user,
+            userId: $userId,
+            payload: $payload,
+            body: $preserveBody ? $body : '',
+            events: $event !== '' ? Event::generateEvents($event, $params, $database) : [],
+            platform: $platform,
+            eventId: Id::unique(),
+        );
+    }
+
+    #[\Override]
+    public function toArray(): array
+    {
+        $platform = !empty($this->platform) ? $this->platform : Config::getParam('platform', []);
+
+        return [
+            'project' => $this->project === null ? null : ProjectContext::fromDocument($this->project)->toArray(),
+            'user' => $this->user === null ? null : UserContext::fromDocument($this->user)->toArray(),
+            'userId' => $this->userId,
+            'function' => $this->function?->getArrayCopy(),
+            'functionId' => $this->functionId,
+            'execution' => $this->execution?->getArrayCopy(),
+            'type' => $this->type,
+            'jwt' => $this->jwt,
+            'payload' => $this->payload,
+            'events' => $this->events,
+            'body' => $this->body,
+            'path' => $this->path,
+            'headers' => $this->headers,
+            'method' => $this->method,
+            'platform' => $platform,
+            'eventId' => $this->eventId,
+        ];
+    }
+
+    #[\Override]
+    public static function fromArray(array $data): static
+    {
+        return new self(
+            project: !empty($data['project']) ? new Document($data['project']) : null,
+            user: !empty($data['user']) ? new Document($data['user']) : null,
+            userId: $data['userId'] ?? null,
+            function: !empty($data['function']) ? new Document($data['function']) : null,
+            functionId: $data['functionId'] ?? null,
+            execution: !empty($data['execution']) ? new Document($data['execution']) : null,
+            type: $data['type'] ?? '',
+            jwt: $data['jwt'] ?? '',
+            payload: $data['payload'] ?? [],
+            events: $data['events'] ?? [],
+            body: $data['body'] ?? '',
+            path: $data['path'] ?? '',
+            headers: $data['headers'] ?? [],
+            method: $data['method'] ?? '',
+            platform: $data['platform'] ?? [],
+            eventId: $data['eventId'] ?? '',
+        );
+    }
+}

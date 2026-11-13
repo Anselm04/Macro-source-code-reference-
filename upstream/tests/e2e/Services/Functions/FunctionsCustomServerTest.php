@@ -1,0 +1,4712 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\E2E\Services\Functions;
+
+use Appwrite\Deployment\Deployments;
+use Appwrite\Event\Event;
+use Appwrite\Extend\Exception;
+use Appwrite\Platform\Modules\Compute\Specification;
+use Appwrite\Tests\Async\Exceptions\Critical;
+use Appwrite\Tests\Retry;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
+use Tests\E2E\Client;
+use Tests\E2E\Scopes\ProjectCustom;
+use Tests\E2E\Scopes\Scope;
+use Tests\E2E\Scopes\SideServer;
+use Utopia\Console\Command;
+use Utopia\Console\Console;
+use Utopia\Database\Document;
+use Utopia\Database\Id;
+use Utopia\Database\Query;
+use Utopia\Database\Role;
+use Utopia\Database\Validator\Datetime as DatetimeValidator;
+
+final class FunctionsCustomServerTest extends Scope
+{
+    use FunctionsBase;
+    use ProjectCustom;
+    use SideServer;
+
+    protected static array $testFunctionCache = [];
+    protected static array $testDeploymentCache = [];
+
+    private function setupDeployedFunction(string $name, string $fixture = 'basic', array $overrides = []): string
+    {
+        $functionId = $this->setupFunction(\array_merge([
+            'functionId' => Id::unique(),
+            'name' => $name,
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 60,
+        ], $overrides));
+
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction($fixture),
+            'activate' => true,
+        ]);
+
+        return $functionId;
+    }
+
+    public function testExecutionLogsPersistAndCanBeManaged(): void
+    {
+        $functionId = '';
+
+        try {
+            $functionId = $this->setupDeployedFunction('Execution logs');
+            $execution = $this->createExecution($functionId, [
+                'async' => true,
+                'path' => '/execution-logs',
+                'method' => 'PATCH',
+                'body' => 'execution-body',
+                'headers' => [
+                    'x-custom-header' => 'execution-header',
+                ],
+            ]);
+
+            $this->assertEquals(202, $execution['headers']['status-code']);
+            $executionId = $execution['body']['$id'] ?? '';
+
+            $this->assertEventually(function () use ($functionId, $executionId) {
+                $execution = $this->getExecution($functionId, $executionId);
+
+                $this->assertEquals(200, $execution['headers']['status-code']);
+                $this->assertEquals('completed', $execution['body']['status']);
+                $this->assertStringContainsString('body-is-execution-body', (string) $execution['body']['logs']);
+                $this->assertStringContainsString('custom-header-is-execution-header', (string) $execution['body']['logs']);
+                $this->assertStringContainsString('path-is-/execution-logs', (string) $execution['body']['logs']);
+                $this->assertStringContainsString('error-log-works', (string) $execution['body']['errors']);
+            }, 60000, 500);
+
+            $executions = $this->listExecutions($functionId, [
+                'queries' => [
+                    Query::equal('$id', [$executionId])->toString(),
+                ],
+            ]);
+            $this->assertEquals(200, $executions['headers']['status-code']);
+            $this->assertCount(1, $executions['body']['executions']);
+            $this->assertEquals($executionId, $executions['body']['executions'][0]['$id']);
+
+            $deleted = $this->client->call(Client::METHOD_DELETE, '/functions/' . $functionId . '/executions/' . $executionId, \array_merge([
+                'content-type' => 'application/json',
+                'x-appwrite-project' => $this->getProject()['$id'],
+            ], $this->getHeaders()));
+            $this->assertEquals(204, $deleted['headers']['status-code']);
+            $this->assertEquals(404, $this->getExecution($functionId, $executionId)['headers']['status-code']);
+        } finally {
+            if ($functionId !== '') {
+                $this->cleanupFunction($functionId);
+            }
+        }
+    }
+
+    /**
+     * Setup a test function with variables for independent tests (with static caching)
+     */
+    protected function setupTestFunction(): array
+    {
+        $cacheKey = $this->getProject()['$id'] ?? 'default';
+        if (!empty(static::$testFunctionCache[$cacheKey])) {
+            return static::$testFunctionCache[$cacheKey];
+        }
+
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'events' => [
+                'buckets.*.create',
+                'buckets.*.delete',
+            ],
+            'timeout' => 10,
+        ]);
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+
+        $functionId = $function['body']['$id'] ?? '';
+
+        $variable = $this->createVariable($functionId, [
+            'variableId' => 'unique()',
+            'key' => 'funcKey1',
+            'value' => 'funcValue1',
+        ]);
+        $variable2 = $this->createVariable($functionId, [
+            'variableId' => 'unique()',
+            'key' => 'funcKey2',
+            'value' => 'funcValue2',
+        ]);
+        $variable3 = $this->createVariable($functionId, [
+            'variableId' => 'unique()',
+            'key' => 'funcKey3',
+            'value' => 'funcValue3',
+        ]);
+
+        $this->assertEquals(201, $variable['headers']['status-code']);
+        $this->assertEquals(201, $variable2['headers']['status-code']);
+        $this->assertEquals(201, $variable3['headers']['status-code']);
+
+        static::$testFunctionCache[$cacheKey] = [
+            'functionId' => $functionId,
+        ];
+
+        return static::$testFunctionCache[$cacheKey];
+    }
+
+    /**
+     * Setup a test function with updated settings and deployment for independent tests (with static caching)
+     */
+    protected function setupTestDeployment(): array
+    {
+        $cacheKey = $this->getProject()['$id'] ?? 'default';
+        if (!empty(static::$testDeploymentCache[$cacheKey])) {
+            return static::$testDeploymentCache[$cacheKey];
+        }
+
+        $data = $this->setupTestFunction();
+        $functionId = $data['functionId'];
+
+        // Update the function like testUpdateFunction does
+        $function = $this->client->call(Client::METHOD_PUT, '/functions/' . $functionId, array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), [
+            'name' => 'Test1',
+            'events' => [
+                'users.*.update.name',
+                'users.*.update.email',
+            ],
+            'schedule' => '0 0 1 1 *',
+            'timeout' => 15,
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ]);
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+
+        // Create a variable for later tests
+        $variable = $this->createVariable($functionId, [
+            'variableId' => 'unique()',
+            'key' => 'GLOBAL_VARIABLE',
+            'value' => 'Global Variable Value',
+        ]);
+
+        $this->assertEquals(201, $variable['headers']['status-code']);
+
+        // Create deployment
+        $deployment = $this->createDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $deploymentIdActive = $deployment['body']['$id'] ?? '';
+
+        $this->assertEventually(function () use ($functionId, $deploymentIdActive) {
+            $deployment = $this->getDeployment($functionId, $deploymentIdActive);
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 50000, 500);
+
+        // Create inactive deployment
+        $deployment = $this->createDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => 'false'
+        ]);
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $deploymentIdInactive = $deployment['body']['$id'] ?? '';
+
+        $this->assertEventually(function () use ($functionId, $deploymentIdInactive) {
+            $deployment = $this->getDeployment($functionId, $deploymentIdInactive);
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 50000, 500);
+
+        // Verify active deployment is set
+        $function = $this->getFunction($functionId);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($deploymentIdActive, $function['body']['deploymentId']);
+
+        // Delete inactive deployment
+        $deployment = $this->client->call(Client::METHOD_DELETE, '/functions/' . $functionId . '/deployments/' . $deploymentIdInactive, array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), []);
+
+        $this->assertEquals(204, $deployment['headers']['status-code']);
+
+        static::$testDeploymentCache[$cacheKey] = array_merge($data, [
+            'deploymentId' => $deploymentIdActive,
+        ]);
+
+        return static::$testDeploymentCache[$cacheKey];
+    }
+
+    /**
+     * Setup a test execution for independent tests (with static caching)
+     */
+    public function testListSpecs(): void
+    {
+        $specifications = $this->listSpecifications(['type' => 'runtimes']);
+        $this->assertEquals(200, $specifications['headers']['status-code']);
+        $this->assertGreaterThanOrEqual(2, $specifications['body']['total']);
+        $this->assertArrayHasKey(0, $specifications['body']['specifications']);
+        $this->assertArrayHasKey(1, $specifications['body']['specifications']);
+        $this->assertArrayHasKey('memory', $specifications['body']['specifications'][0]);
+        $this->assertArrayHasKey('cpus', $specifications['body']['specifications'][0]);
+        $this->assertArrayHasKey('enabled', $specifications['body']['specifications'][0]);
+        $this->assertArrayHasKey('slug', $specifications['body']['specifications'][0]);
+        $this->assertArrayHasKey('memory', $specifications['body']['specifications'][1]);
+        $this->assertArrayHasKey('cpus', $specifications['body']['specifications'][1]);
+        $this->assertArrayHasKey('enabled', $specifications['body']['specifications'][1]);
+        $this->assertArrayHasKey('slug', $specifications['body']['specifications'][1]);
+
+        $buildSpecifications = $this->listSpecifications(['type' => 'builds']);
+        $this->assertEquals(200, $buildSpecifications['headers']['status-code']);
+        $this->assertEquals($specifications['body']['total'], $buildSpecifications['body']['total']);
+        $buildSpecification = $this->getEnabledSpecification($buildSpecifications['body']['specifications']);
+
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Specs function',
+            'runtime' => 'node-22',
+            'buildSpecification' => $buildSpecification,
+            'runtimeSpecification' => $specifications['body']['specifications'][1]['slug'],
+        ]);
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $this->assertEquals($buildSpecification, $function['body']['buildSpecification']);
+        $this->assertEquals($specifications['body']['specifications'][1]['slug'], $function['body']['runtimeSpecification']);
+
+        $function = $this->getFunction($function['body']['$id']);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($buildSpecification, $function['body']['buildSpecification']);
+        $this->assertEquals($specifications['body']['specifications'][1]['slug'], $function['body']['runtimeSpecification']);
+
+        $this->cleanupFunction($function['body']['$id']);
+
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Specs function',
+            'runtime' => 'node-22',
+            'buildSpecification' => 'cheap-please'
+        ]);
+        $this->assertEquals(400, $function['headers']['status-code']);
+
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Specs function',
+            'runtime' => 'node-22',
+            'runtimeSpecification' => 'cheap-please'
+        ]);
+        $this->assertEquals(400, $function['headers']['status-code']);
+    }
+
+    public function testCreateFunction(): void
+    {
+        /**
+         * Test for SUCCESS
+         */
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test',
+            'description' => 'Function created via E2E test',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'events' => [
+                'buckets.*.create',
+                'buckets.*.delete',
+            ],
+            'timeout' => 10,
+        ]);
+
+        $functionId = $function['body']['$id'] ?? '';
+
+        $dateValidator = new DatetimeValidator();
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $this->assertNotEmpty($function['body']['$id']);
+        $this->assertEquals('Test', $function['body']['name']);
+        $this->assertSame('Function created via E2E test', $function['body']['description']);
+        $this->assertEquals('node-22', $function['body']['runtime']);
+        $this->assertEquals(true, $dateValidator->isValid($function['body']['$createdAt']));
+        $this->assertEquals(true, $dateValidator->isValid($function['body']['$updatedAt']));
+        $this->assertEquals('', $function['body']['deploymentId']);
+        $this->assertEquals([
+            'buckets.*.create',
+            'buckets.*.delete',
+        ], $function['body']['events']);
+        $this->assertEmpty($function['body']['schedule']);
+        $this->assertEquals(10, $function['body']['timeout']);
+
+        // An explicit null for an optional param must fall back to its default, not 500.
+        $nullSchedule = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'schedule' => null,
+        ]);
+
+        $this->assertEquals(201, $nullSchedule['headers']['status-code']);
+        $this->assertSame('', $nullSchedule['body']['schedule']);
+        $this->assertSame('', $nullSchedule['body']['description']);
+
+        $function = $this->getFunction($functionId);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertSame('Function created via E2E test', $function['body']['description']);
+
+        $variable = $this->createVariable($functionId, [
+            'variableId' => 'unique()',
+            'key' => 'funcKey1',
+            'value' => 'funcValue1',
+        ]);
+        $variable2 = $this->createVariable($functionId, [
+            'variableId' => 'unique()',
+            'key' => 'funcKey2',
+            'value' => 'funcValue2',
+        ]);
+        $variable3 = $this->createVariable($functionId, [
+            'variableId' => 'unique()',
+            'key' => 'funcKey3',
+            'value' => 'funcValue3',
+        ]);
+
+        $this->assertEquals(201, $variable['headers']['status-code']);
+        $this->assertEquals(201, $variable2['headers']['status-code']);
+        $this->assertEquals(201, $variable3['headers']['status-code']);
+
+        /**
+         * Test for FAILURE
+         */
+        $function = $this->createFunction([
+            'functionId' => ID::unique(),
+            'name' => 'Test',
+            'description' => \str_repeat('a', 1025),
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ]);
+
+        $this->assertEquals(400, $function['headers']['status-code']);
+        $this->assertSame('general_argument_invalid', $function['body']['type']);
+    }
+
+    public function testListFunctions(): void
+    {
+        $data = $this->setupTestFunction();
+
+        /**
+         * Test for SUCCESS
+         */
+        // Test search id
+        $functions = $this->listFunctions([
+            'search' => $data['functionId']
+        ]);
+
+        $this->assertEquals(200, $functions['headers']['status-code']);
+        $this->assertCount(1, $functions['body']['functions']);
+        $this->assertEquals('Test', $functions['body']['functions'][0]['name']);
+
+        // Test pagination limit
+        $functions = $this->listFunctions([
+            'queries' => [
+                Query::limit(1)->toString(),
+            ],
+        ]);
+
+        $this->assertEquals(200, $functions['headers']['status-code']);
+        $this->assertCount(1, $functions['body']['functions']);
+
+        // Test pagination offset - combined with limit to verify offset works
+        // We can't assume exact function count in parallel mode
+        $functions = $this->listFunctions([
+            'queries' => [
+                Query::limit(1)->toString(),
+                Query::offset(1)->toString(),
+            ],
+        ]);
+
+        $this->assertEquals(200, $functions['headers']['status-code']);
+        // In parallel mode, other tests may create functions, so just verify offset works
+        $this->assertIsArray($functions['body']['functions']);
+
+        // Test filter enabled
+        $functions = $this->listFunctions([
+            'queries' => [
+                Query::equal('enabled', [true])->toString(),
+            ],
+        ]);
+
+        $this->assertEquals(200, $functions['headers']['status-code']);
+        // In parallel mode, other tests may create enabled functions
+        $this->assertGreaterThanOrEqual(1, count($functions['body']['functions']));
+
+        // Test filter disabled
+        $functions = $this->listFunctions([
+            'queries' => [
+                Query::equal('enabled', [false])->toString(),
+            ],
+        ]);
+
+        $this->assertEquals(200, $functions['headers']['status-code']);
+        // In parallel mode, other tests may create disabled functions
+        $this->assertIsArray($functions['body']['functions']);
+
+        // Test search name
+        $functions = $this->listFunctions([
+            'search' => 'Test'
+        ]);
+
+        $this->assertEquals(200, $functions['headers']['status-code']);
+        // In parallel mode, other tests may create functions with 'Test' in the name
+        $this->assertGreaterThanOrEqual(1, count($functions['body']['functions']));
+        // Verify our function is in the results
+        $functionIds = array_column($functions['body']['functions'], '$id');
+        $this->assertContains($data['functionId'], $functionIds);
+
+        // Test search runtime
+        $functions = $this->listFunctions([
+            'search' => 'node-22'
+        ]);
+
+        $this->assertEquals(200, $functions['headers']['status-code']);
+        // In parallel mode, other tests may create functions with node-22 runtime
+        $this->assertGreaterThanOrEqual(1, count($functions['body']['functions']));
+        // Verify our function is in the results
+        $functionIds = array_column($functions['body']['functions'], '$id');
+        $this->assertContains($data['functionId'], $functionIds);
+
+        // Test search description
+        $keyword = ID::unique();
+        $describedId = $this->setupFunction([
+            'functionId' => ID::unique(),
+            'name' => 'Described',
+            'description' => 'Resizes avatars tagged ' . $keyword,
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ]);
+
+        $functions = $this->listFunctions([
+            'search' => $keyword
+        ]);
+
+        $this->assertEquals(200, $functions['headers']['status-code']);
+        $this->assertCount(1, $functions['body']['functions']);
+        $this->assertSame($describedId, $functions['body']['functions'][0]['$id']);
+
+        $this->cleanupFunction($describedId);
+
+        /**
+         * Test pagination
+         */
+        $function2 = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test 2',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'events' => [
+                'buckets.*.create',
+                'buckets.*.delete',
+            ],
+            'timeout' => 10,
+        ]);
+
+        $functions = $this->listFunctions();
+
+        $this->assertEquals(200, $functions['headers']['status-code']);
+        // In parallel mode, there may be more functions created by other tests
+        $this->assertGreaterThanOrEqual(2, $functions['body']['total']);
+        $this->assertIsArray($functions['body']['functions']);
+        $this->assertGreaterThanOrEqual(2, count($functions['body']['functions']));
+        // Verify our functions are in the list
+        $functionNames = array_column($functions['body']['functions'], 'name');
+        $this->assertContains('Test', $functionNames);
+        $this->assertContains('Test 2', $functionNames);
+
+        // Find our Test function's position for cursor testing
+        $testFunctionIndex = array_search('Test', $functionNames);
+        $test2FunctionIndex = array_search('Test 2', $functionNames);
+        $this->assertNotFalse($testFunctionIndex);
+        $this->assertNotFalse($test2FunctionIndex);
+
+        $functions1 = $this->listFunctions([
+            'queries' => [
+                Query::cursorAfter(new Document(['$id' => $functions['body']['functions'][$testFunctionIndex]['$id']]))->toString(),
+            ],
+        ]);
+
+        $this->assertEquals(200, $functions1['headers']['status-code']);
+        // Should have at least Test 2 after Test (may have more from parallel tests)
+        $this->assertGreaterThanOrEqual(1, count($functions1['body']['functions']));
+        $functionNames1 = array_column($functions1['body']['functions'], 'name');
+        $this->assertContains('Test 2', $functionNames1);
+
+        $functions2 = $this->listFunctions([
+            'queries' => [
+                Query::cursorBefore(new Document(['$id' => $functions['body']['functions'][$test2FunctionIndex]['$id']]))->toString(),
+            ],
+        ]);
+
+        $this->assertEquals(200, $functions2['headers']['status-code']);
+        // Should have at least Test before Test 2
+        $this->assertGreaterThanOrEqual(1, count($functions2['body']['functions']));
+        $functionNames2 = array_column($functions2['body']['functions'], 'name');
+        $this->assertContains('Test', $functionNames2);
+
+        /**
+         * Test for FAILURE
+         */
+        $functions = $this->listFunctions([
+            'queries' => [
+                Query::search('name', 'Test')->toString(),
+            ],
+        ]);
+        $this->assertEquals(400, $functions['headers']['status-code']);
+        $this->assertSame('general_query_invalid', $functions['body']['type']);
+
+        $functions = $this->listFunctions([
+            'queries' => [
+                Query::cursorAfter(new Document(['$id' => 'unknown']))->toString(),
+            ],
+        ]);
+        $this->assertEquals(400, $functions['headers']['status-code']);
+    }
+
+    public function testGetFunction(): void
+    {
+        $data = $this->setupTestFunction();
+
+        /**
+         * Test for SUCCESS
+         */
+        $function = $this->getFunction($data['functionId']);
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals('Test', $function['body']['name']);
+
+        /**
+         * Test for FAILURE
+         */
+        $function = $this->getFunction('x');
+
+        $this->assertEquals(404, $function['headers']['status-code']);
+    }
+
+    public function testUpdateFunction(): void
+    {
+        // Create fresh function for this test since it modifies the function
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test',
+            'description' => 'Function created via E2E test',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'events' => [
+                'buckets.*.create',
+                'buckets.*.delete',
+            ],
+            'timeout' => 10,
+        ]);
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $functionId = $function['body']['$id'] ?? '';
+
+        /**
+         * Test for SUCCESS
+         */
+        $function = $this->client->call(Client::METHOD_PUT, '/functions/' . $functionId, array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), [
+            'name' => 'Test1',
+            'description' => 'Updated function description',
+            'events' => [
+                'users.*.update.name',
+                'users.*.update.email',
+            ],
+            'schedule' => '0 0 1 1 *',
+            'timeout' => 15,
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ]);
+
+        $dateValidator = new DatetimeValidator();
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertNotEmpty($function['body']['$id']);
+        $this->assertEquals('Test1', $function['body']['name']);
+        $this->assertSame('Updated function description', $function['body']['description']);
+        $this->assertEquals(true, $dateValidator->isValid($function['body']['$createdAt']));
+        $this->assertEquals(true, $dateValidator->isValid($function['body']['$updatedAt']));
+        $this->assertEquals('', $function['body']['deploymentId']);
+        $this->assertEquals([
+            'users.*.update.name',
+            'users.*.update.email',
+        ], $function['body']['events']);
+        $this->assertEquals('0 0 1 1 *', $function['body']['schedule']);
+        $this->assertEquals(15, $function['body']['timeout']);
+
+        // Omitting description keeps the stored one
+        $function = $this->updateFunction($functionId, [
+            'name' => 'Test1',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ]);
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertSame('Updated function description', $function['body']['description']);
+
+        $function = $this->updateFunction($functionId, [
+            'name' => 'Test1',
+            'description' => '',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ]);
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertSame('', $function['body']['description']);
+
+        /**
+         * Test for FAILURE
+         */
+        $function = $this->updateFunction($functionId, [
+            'name' => 'Test1',
+            'description' => \str_repeat('a', 1025),
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ]);
+
+        $this->assertEquals(400, $function['headers']['status-code']);
+        $this->assertSame('general_argument_invalid', $function['body']['type']);
+
+        // Create a variable for later tests
+        $variable = $this->createVariable($functionId, [
+            'variableId' => 'unique()',
+            'key' => 'GLOBAL_VARIABLE',
+            'value' => 'Global Variable Value',
+        ]);
+
+        $this->assertEquals(201, $variable['headers']['status-code']);
+    }
+
+    public function testUpdateFunctionPreservesOmittedSettings(): void
+    {
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Function Settings Test',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 45,
+            'enabled' => false,
+            'logging' => false,
+            'deploymentRetention' => 7,
+            'commands' => 'npm install',
+            'events' => ['users.*.create'],
+            'schedule' => '0 0 1 1 *',
+            'execute' => ['any'],
+            'scopes' => ['users.read'],
+        ]);
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $functionId = $function['body']['$id'] ?? '';
+        $this->assertEquals(45, $function['body']['timeout']);
+        $this->assertFalse($function['body']['enabled']);
+        $this->assertFalse($function['body']['logging']);
+        $this->assertEquals(7, $function['body']['deploymentRetention']);
+        $this->assertEquals('npm install', $function['body']['commands']);
+        $this->assertEquals(['users.*.create'], $function['body']['events']);
+        $this->assertEquals('0 0 1 1 *', $function['body']['schedule']);
+        $this->assertEquals(['any'], $function['body']['execute']);
+        $this->assertEquals(['users.read'], $function['body']['scopes']);
+
+        // Perform a partial PUT update omitting those fields
+        $updated = $this->updateFunction($functionId, [
+            'name' => 'Function Settings Updated',
+        ]);
+
+        $this->assertEquals(200, $updated['headers']['status-code']);
+        $this->assertEquals('Function Settings Updated', $updated['body']['name']);
+        $this->assertEquals(45, $updated['body']['timeout']);
+        $this->assertFalse($updated['body']['enabled']);
+        $this->assertFalse($updated['body']['logging']);
+        $this->assertEquals(7, $updated['body']['deploymentRetention']);
+        $this->assertEquals('npm install', $updated['body']['commands']);
+        $this->assertEquals(['users.*.create'], $updated['body']['events']);
+        $this->assertEquals('0 0 1 1 *', $updated['body']['schedule']);
+        $this->assertEquals(['any'], $updated['body']['execute']);
+        $this->assertEquals(['users.read'], $updated['body']['scopes']);
+
+        // Assert values are preserved in the database
+        $fetched = $this->getFunction($functionId);
+        $this->assertEquals(200, $fetched['headers']['status-code']);
+        $this->assertEquals('Function Settings Updated', $fetched['body']['name']);
+        $this->assertEquals(45, $fetched['body']['timeout']);
+        $this->assertFalse($fetched['body']['enabled']);
+        $this->assertFalse($fetched['body']['logging']);
+        $this->assertEquals(7, $fetched['body']['deploymentRetention']);
+        $this->assertEquals('npm install', $fetched['body']['commands']);
+        $this->assertEquals(['users.*.create'], $fetched['body']['events']);
+        $this->assertEquals('0 0 1 1 *', $fetched['body']['schedule']);
+        $this->assertEquals(['any'], $fetched['body']['execute']);
+        $this->assertEquals(['users.read'], $fetched['body']['scopes']);
+
+        // Match the interval update pattern from issue #14401.
+        $updated = $this->updateFunction($functionId, [
+            'name' => 'Function Interval Updated',
+            'interval' => 30,
+        ]);
+
+        $this->assertEquals(200, $updated['headers']['status-code']);
+        $this->assertEquals(30, $updated['body']['interval']);
+        $this->assertEquals(['users.read'], $updated['body']['scopes']);
+        $this->assertEquals(45, $updated['body']['timeout']);
+        $this->assertEquals(['users.*.create'], $updated['body']['events']);
+
+        $fetched = $this->getFunction($functionId);
+        $this->assertEquals(200, $fetched['headers']['status-code']);
+        $this->assertEquals(30, $fetched['body']['interval']);
+        $this->assertEquals(['users.read'], $fetched['body']['scopes']);
+        $this->assertEquals(45, $fetched['body']['timeout']);
+
+        $this->deleteFunction($functionId);
+    }
+
+    public function testUpdateVariableDescription(): void
+    {
+        $settings = [
+            'name' => 'Test Update Variable Description',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ];
+
+        $functionId = $this->setupFunction([...$settings, 'functionId' => ID::unique()]);
+
+        /**
+         * Test for SUCCESS
+         */
+        $variable = $this->createVariable($functionId, [
+            'variableId' => ID::unique(),
+            'key' => 'STRIPE_KEY',
+            'value' => 'sk_test',
+            'secret' => false,
+            'description' => 'Stripe key used at checkout',
+        ]);
+
+        $this->assertEquals(201, $variable['headers']['status-code']);
+        $this->assertSame('Stripe key used at checkout', $variable['body']['description']);
+        $variableId = $variable['body']['$id'];
+
+        $plain = $this->createVariable($functionId, [
+            'variableId' => ID::unique(),
+            'key' => 'PLAIN_KEY',
+            'value' => 'plain',
+        ]);
+
+        $this->assertEquals(201, $plain['headers']['status-code']);
+        $this->assertSame('', $plain['body']['description']);
+
+        // Re-saving unchanged settings marks the function live again
+        $function = $this->updateFunction($functionId, $settings);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertTrue($function['body']['live']);
+
+        $variable = $this->updateVariable($functionId, $variableId, [
+            'description' => 'Rotated quarterly',
+        ]);
+
+        $this->assertEquals(200, $variable['headers']['status-code']);
+        $this->assertSame('Rotated quarterly', $variable['body']['description']);
+        $this->assertSame('STRIPE_KEY', $variable['body']['key']);
+        $this->assertSame('sk_test', $variable['body']['value']);
+        $this->assertTrue($this->getFunction($functionId)['body']['live']);
+
+        $variable = $this->updateVariable($functionId, $variableId, [
+            'value' => 'sk_live',
+        ]);
+
+        $this->assertEquals(200, $variable['headers']['status-code']);
+        $this->assertSame('Rotated quarterly', $variable['body']['description']);
+        $this->assertFalse($this->getFunction($functionId)['body']['live']);
+
+        $variable = $this->updateVariable($functionId, $variableId, [
+            'description' => '',
+        ]);
+
+        $this->assertEquals(200, $variable['headers']['status-code']);
+        $this->assertSame('', $variable['body']['description']);
+
+        /**
+         * Test for FAILURE
+         */
+        $variable = $this->createVariable($functionId, [
+            'variableId' => ID::unique(),
+            'key' => 'LONG_DESCRIPTION',
+            'value' => 'value',
+            'description' => \str_repeat('a', 1025),
+        ]);
+
+        $this->assertEquals(400, $variable['headers']['status-code']);
+        $this->assertSame('general_argument_invalid', $variable['body']['type']);
+
+        $variable = $this->updateVariable($functionId, $variableId, [
+            'description' => \str_repeat('a', 1025),
+        ]);
+
+        $this->assertEquals(400, $variable['headers']['status-code']);
+        $this->assertSame('general_argument_invalid', $variable['body']['type']);
+
+        $variable = $this->updateVariable($functionId, $variableId, []);
+
+        $this->assertEquals(400, $variable['headers']['status-code']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateDeploymentFromCLI()
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test',
+            'execute' => [Role::user($this->getUser()['$id'])->toString()],
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'events' => [
+                'users.*.create',
+                'users.*.delete',
+            ],
+            'schedule' => '0 0 1 1 *', // Once a year
+            'timeout' => 10,
+        ]);
+
+        $deployment = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/deployments', [
+            'content-type' => 'multipart/form-data',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+            'x-sdk-language' => 'cli',
+        ], [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+
+        $deploymentId = $deployment['body']['$id'] ?? '';
+
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+
+            $this->assertEquals(200, $deployment['headers']['status-code']);
+            $this->assertEquals('ready', $deployment['body']['status']);
+            $this->assertEquals('cli', $deployment['body']['type']);
+        }, 120000, 500);
+    }
+
+    public function testCreateDeploymentWithSingleContentRangeChunk(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Single Chunk Range',
+            'execute' => [Role::user($this->getUser()['$id'])->toString()],
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 10,
+        ]);
+
+        $code = $this->packageFunction('basic');
+        $size = \filesize($code->getFilename());
+
+        $deployment = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/deployments', array_merge([
+            'content-type' => 'multipart/form-data',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'content-range' => 'bytes 0-' . ($size - 1) . '/' . $size,
+        ], $this->getHeaders()), [
+            'code' => $code,
+            'activate' => true,
+        ]);
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $this->assertNotEmpty($deployment['body']['$id']);
+
+        $deploymentId = $deployment['body']['$id'];
+
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+
+            $this->assertEquals(200, $deployment['headers']['status-code']);
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 120000, 500);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateDeploymentRejectsPathTraversalId(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Traversal Deployment Id',
+            'execute' => [Role::user($this->getUser()['$id'])->toString()],
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 10,
+        ]);
+
+        $code = $this->packageFunction('basic');
+        $size = \filesize($code->getFilename());
+
+        // A `..` deployment id escapes the per-project storage root (CWE-22).
+        // The chunked-upload branch reads x-appwrite-id as the on-disk name, so
+        // it must be UID-validated exactly like Storage file uploads are.
+        $deployment = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/deployments', array_merge([
+            'content-type' => 'multipart/form-data',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'content-range' => 'bytes 0-' . ($size - 1) . '/' . $size,
+            'x-appwrite-id' => '../../../tmp/appwrite-poc',
+        ], $this->getHeaders()), [
+            'code' => $code,
+            'activate' => true,
+        ]);
+
+        $this->assertEquals(400, $deployment['headers']['status-code']);
+        $this->assertEquals(Exception::STORAGE_INVALID_APPWRITE_ID, $deployment['body']['type']);
+
+        // The rejection must happen before anything is written: no poisoned
+        // deployment row is persisted for the traversal id.
+        $deployments = $this->client->call(Client::METHOD_GET, '/functions/' . $functionId . '/deployments', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), []);
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        $this->assertEquals(0, $deployments['body']['total']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateFunctionAndDeploymentFromTemplate()
+    {
+
+        $starterTemplate = $this->getTemplate('starter');
+        $this->assertEquals(200, $starterTemplate['headers']['status-code']);
+
+        $runtime = array_values(array_filter($starterTemplate['body']['runtimes'], function ($runtime) {
+            return $runtime['name'] === 'node-22';
+        }))[0];
+
+        // If this fails, the template has variables, and this test needs to be updated
+        $this->assertEmpty($starterTemplate['body']['variables']);
+
+        $function = $this->createFunction(
+            [
+                'functionId' => Id::unique(),
+                'name' => $starterTemplate['body']['name'],
+                'runtime' => 'node-22',
+                'execute' => $starterTemplate['body']['permissions'],
+                'entrypoint' => $runtime['entrypoint'],
+                'events' => $starterTemplate['body']['events'],
+                'schedule' => $starterTemplate['body']['cron'],
+                'timeout' => $starterTemplate['body']['timeout'],
+                'commands' => $runtime['commands'],
+                'scopes' => $starterTemplate['body']['scopes'],
+                'templateRepository' => $starterTemplate['body']['providerRepositoryId'],
+                'templateOwner' => $starterTemplate['body']['providerOwner'],
+                'templateRootDirectory' => $runtime['providerRootDirectory'],
+                'templateVersion' => $starterTemplate['body']['providerVersion'],
+            ]
+        );
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $this->assertNotEmpty($function['body']['$id']);
+
+        $functionId = $function['body']['$id'] ?? '';
+
+        $deployment = $this->createTemplateDeployment(
+            $functionId,
+            [
+                'resourceId' => Id::unique(),
+                'activate' => true,
+                'repository' => $starterTemplate['body']['providerRepositoryId'],
+                'owner' => $starterTemplate['body']['providerOwner'],
+                'rootDirectory' => $runtime['providerRootDirectory'],
+                'type' => 'tag',
+                'reference' => $starterTemplate['body']['providerVersion'],
+            ]
+        );
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $this->assertNotEmpty($deployment['body']['$id']);
+
+        // Wait for deployment to be ready
+        $deploymentId = $deployment['body']['$id'];
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 50000, 500);
+
+        // Verify deployment sizes
+        $deployment = $this->getDeployment($functionId, $deploymentId);
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertGreaterThan(0, $deployment['body']['sourceSize']);
+        $this->assertGreaterThan(0, $deployment['body']['buildSize']);
+        $totalSize = $deployment['body']['sourceSize'] + $deployment['body']['buildSize'];
+        $this->assertEquals($totalSize, $deployment['body']['totalSize']);
+
+        $deployments = $this->listDeployments($functionId);
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        $this->assertEquals(1, $deployments['body']['total']);
+
+        /**
+         * Test for SUCCESS with total=false
+         */
+        $deploymentsWithIncludeTotalFalse = $this->listDeployments($functionId, ['total' => false]);
+
+        $this->assertEquals(200, $deploymentsWithIncludeTotalFalse['headers']['status-code']);
+        $this->assertIsArray($deploymentsWithIncludeTotalFalse['body']);
+        $this->assertIsArray($deploymentsWithIncludeTotalFalse['body']['deployments']);
+        $this->assertIsInt($deploymentsWithIncludeTotalFalse['body']['total']);
+        $this->assertSame(0, $deploymentsWithIncludeTotalFalse['body']['total']);
+        $this->assertGreaterThan(0, count($deploymentsWithIncludeTotalFalse['body']['deployments']));
+
+        $lastDeployment = $deployments['body']['deployments'][0];
+
+        $this->assertNotEmpty($lastDeployment['$id']);
+        $this->assertGreaterThan(0, $lastDeployment['sourceSize']);
+
+        $function = $this->getFunction($functionId);
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($deploymentId, $function['body']['deploymentId']);
+
+        // Test starter code is used and that ephemeral keys work
+        $execution = $this->createExecution($functionId, [
+            'path' => '/ping',
+        ]);
+
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertEquals("completed", $execution['body']['status']);
+        $this->assertEquals(200, $execution['body']['responseStatusCode']);
+        $this->assertEquals("Pong", $execution['body']['responseBody']);
+        $this->assertEmpty($execution['body']['errors'], 'Failed to execute function, ' . json_encode($execution['body']['errors']));
+
+        // Test execution logged correct total users
+        $users = $this->client->call(Client::METHOD_GET, '/users', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ], $this->getHeaders()), []);
+
+        $this->assertEquals(200, $users['headers']['status-code']);
+        $this->assertIsInt($users['body']['total']);
+
+        $totalUsers = $users['body']['total'];
+
+        $this->assertStringContainsString("Total users: " . $totalUsers, (string) $execution['body']['logs']);
+
+        // Execute function again but async
+        $execution = $this->createExecution($functionId, [
+            'path' => '/ping',
+            'async' => true
+        ]);
+
+        $this->assertEquals(202, $execution['headers']['status-code']);
+        $this->assertNotEmpty($execution['body']['$id']);
+        $this->assertEquals('waiting', $execution['body']['status']);
+
+        $deployment = $this->getDeployment($functionId, $deployment['body']['$id']);
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertGreaterThan(0, $deployment['body']['sourceSize']);
+        $this->assertGreaterThan(0, $deployment['body']['buildSize']);
+        $totalSize = $deployment['body']['sourceSize'] + $deployment['body']['buildSize'];
+        $this->assertEquals($totalSize, $deployment['body']['totalSize']);
+
+        $function = $this->getFunction($functionId);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertNotEmpty($function['body']['deploymentId']);
+        $this->assertNotEmpty($function['body']['deploymentCreatedAt']);
+        $this->assertEquals($deployment['body']['$id'], $function['body']['deploymentId']);
+        $this->assertEquals($deployment['body']['$createdAt'], $function['body']['deploymentCreatedAt']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateFunctionAndDeploymentFromTemplateBranch()
+    {
+        $starterTemplate = $this->getTemplate('starter');
+        $this->assertEquals(200, $starterTemplate['headers']['status-code']);
+
+        $runtime = array_values(array_filter($starterTemplate['body']['runtimes'], function ($runtime) {
+            return $runtime['name'] === 'node-22';
+        }))[0];
+
+        // If this fails, the template has variables, and this test needs to be updated
+        $this->assertEmpty($starterTemplate['body']['variables']);
+
+        $function = $this->createFunction(
+            [
+                'functionId' => Id::unique(),
+                'name' => $starterTemplate['body']['name'] . ' - Branch Test',
+                'runtime' => 'node-22',
+                'execute' => $starterTemplate['body']['permissions'],
+                'entrypoint' => $runtime['entrypoint'],
+                'events' => $starterTemplate['body']['events'],
+                'schedule' => $starterTemplate['body']['cron'],
+                'timeout' => $starterTemplate['body']['timeout'],
+                'commands' => $runtime['commands'],
+                'scopes' => $starterTemplate['body']['scopes'],
+            ]
+        );
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $this->assertNotEmpty($function['body']['$id']);
+
+        $functionId = $function['body']['$id'] ?? '';
+
+        // Deploy using branch
+        $deployment = $this->createTemplateDeployment(
+            $functionId,
+            [
+                'resourceId' => Id::unique(),
+                'activate' => true,
+                'repository' => $starterTemplate['body']['providerRepositoryId'],
+                'owner' => $starterTemplate['body']['providerOwner'],
+                'rootDirectory' => $runtime['providerRootDirectory'],
+                'type' => 'branch',
+                'reference' => 'main',
+            ]
+        );
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $this->assertNotEmpty($deployment['body']['$id']);
+
+        $deploymentId = $deployment['body']['$id'];
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 50000, 500);
+
+        $deployment = $this->getDeployment($functionId, $deploymentId);
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertGreaterThan(0, $deployment['body']['sourceSize']);
+        $this->assertGreaterThan(0, $deployment['body']['buildSize']);
+        $totalSize = $deployment['body']['sourceSize'] + $deployment['body']['buildSize'];
+        $this->assertEquals($totalSize, $deployment['body']['totalSize']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testRootDirectoryMustStayInsideRepository(): void
+    {
+        /**
+         * Test for SUCCESS
+         */
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Root directory test',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'providerRootDirectory' => '/functions/starter',
+        ]);
+
+        $this->assertSame(201, $function['headers']['status-code']);
+        $this->assertSame('/functions/starter', $function['body']['providerRootDirectory']);
+
+        $functionId = $function['body']['$id'];
+
+        /**
+         * Test for FAILURE
+         */
+        foreach (['..', '../other', 'functions/../../storage', '/../etc'] as $rootDirectory) {
+            $deployment = $this->createTemplateDeployment($functionId, [
+                'repository' => 'templates',
+                'owner' => 'appwrite',
+                'rootDirectory' => $rootDirectory,
+                'type' => 'branch',
+                'reference' => 'main',
+                'activate' => true,
+            ]);
+            $this->assertSame(400, $deployment['headers']['status-code'], $rootDirectory);
+            $this->assertSame(Exception::GENERAL_ARGUMENT_INVALID, $deployment['body']['type']);
+
+            $created = $this->createFunction([
+                'functionId' => Id::unique(),
+                'name' => 'Root directory test',
+                'runtime' => 'node-22',
+                'entrypoint' => 'index.js',
+                'providerRootDirectory' => $rootDirectory,
+            ]);
+            $this->assertSame(400, $created['headers']['status-code'], $rootDirectory);
+
+            $updated = $this->updateFunction($functionId, [
+                'name' => 'Root directory test',
+                'runtime' => 'node-22',
+                'entrypoint' => 'index.js',
+                'providerRootDirectory' => $rootDirectory,
+            ]);
+            $this->assertSame(400, $updated['headers']['status-code'], $rootDirectory);
+        }
+
+        $function = $this->getFunction($functionId);
+        $this->assertSame('/functions/starter', $function['body']['providerRootDirectory']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateFunctionAndDeploymentFromTemplateCommit()
+    {
+        $starterTemplate = $this->getTemplate('starter');
+        $this->assertEquals(200, $starterTemplate['headers']['status-code']);
+
+        // Get latest commit using helper function
+        $latestCommit = $this->helperGetLatestCommit(
+            $starterTemplate['body']['providerOwner'],
+            $starterTemplate['body']['providerRepositoryId']
+        );
+
+        // Skip test if GitHub API is rate-limited or unavailable
+        if ($latestCommit === null) {
+            $this->markTestSkipped('Could not fetch latest commit from GitHub API (may be rate-limited)');
+        }
+
+        $runtime = array_values(array_filter($starterTemplate['body']['runtimes'], function ($runtime) {
+            return $runtime['name'] === 'node-22';
+        }))[0];
+
+        // If this fails, the template has variables, and this test needs to be updated
+        $this->assertEmpty($starterTemplate['body']['variables']);
+
+        $function = $this->createFunction(
+            [
+                'functionId' => Id::unique(),
+                'name' => $starterTemplate['body']['name'] . ' - Commit Test',
+                'runtime' => 'node-22',
+                'execute' => $starterTemplate['body']['permissions'],
+                'entrypoint' => $runtime['entrypoint'],
+                'events' => $starterTemplate['body']['events'],
+                'schedule' => $starterTemplate['body']['cron'],
+                'timeout' => $starterTemplate['body']['timeout'],
+                'commands' => $runtime['commands'],
+                'scopes' => $starterTemplate['body']['scopes'],
+            ]
+        );
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $this->assertNotEmpty($function['body']['$id']);
+
+        $functionId = $function['body']['$id'] ?? '';
+
+        // Deploy using commit
+        $deployment = $this->createTemplateDeployment(
+            $functionId,
+            [
+                'resourceId' => Id::unique(),
+                'activate' => true,
+                'repository' => $starterTemplate['body']['providerRepositoryId'],
+                'owner' => $starterTemplate['body']['providerOwner'],
+                'rootDirectory' => $runtime['providerRootDirectory'],
+                'type' => 'commit',
+                'reference' => $latestCommit,
+            ]
+        );
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $this->assertNotEmpty($deployment['body']['$id']);
+
+        $deploymentId = $deployment['body']['$id'];
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 50000, 500);
+
+        $deployment = $this->getDeployment($functionId, $deploymentId);
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertGreaterThan(0, $deployment['body']['sourceSize']);
+        $this->assertGreaterThan(0, $deployment['body']['buildSize']);
+        $totalSize = $deployment['body']['sourceSize'] + $deployment['body']['buildSize'];
+        $this->assertEquals($totalSize, $deployment['body']['totalSize']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateDeployment(): void
+    {
+        // Create fresh function for this test
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Deployment',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'events' => [
+                'users.*.update.name',
+                'users.*.update.email',
+            ],
+            'schedule' => '0 0 1 1 *',
+            'timeout' => 15,
+        ]);
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $functionId = $function['body']['$id'] ?? '';
+
+        /**
+         * Test for SUCCESS
+         */
+        $deployment = $this->createDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $this->assertNotEmpty($deployment['body']['$id']);
+        $this->assertEquals('waiting', $deployment['body']['status']);
+        $this->assertEquals(true, (new DatetimeValidator())->isValid($deployment['body']['$createdAt']));
+        $this->assertEquals('index.js', $deployment['body']['entrypoint']);
+
+        $deploymentIdActive = $deployment['body']['$id'] ?? '';
+
+        $this->assertEventually(function () use ($functionId, $deploymentIdActive) {
+            $deployment = $this->getDeployment($functionId, $deploymentIdActive);
+
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 50000, 500);
+
+        $deployment = $this->createDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => 'false'
+        ]);
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $this->assertNotEmpty($deployment['body']['$id']);
+
+        $deploymentIdInactive = $deployment['body']['$id'] ?? '';
+
+        $this->assertEventually(function () use ($functionId, $deploymentIdInactive) {
+            $deployment = $this->getDeployment($functionId, $deploymentIdInactive);
+
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 50000, 500);
+
+        $function = $this->getFunction($functionId);
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($deploymentIdActive, $function['body']['deploymentId']);
+        $this->assertNotEquals($deploymentIdInactive, $function['body']['deploymentId']);
+
+        $deployment = $this->client->call(Client::METHOD_DELETE, '/functions/' . $functionId . '/deployments/' . $deploymentIdInactive, array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), []);
+
+        $this->assertEquals(204, $deployment['headers']['status-code']);
+    }
+
+    /**
+     * The build job writes onto the builds volume while the executor and the
+     * download endpoint read the deployment through the configured storage
+     * device. Runs in the `s3` CI group against MinIO, where the sidecar
+     * uploads the artifact as an s3:// object keyed under the bucket; on the
+     * default local device build.sh writes it straight to buildPath.
+     */
+    #[Group('s3')]
+    public function testDeploymentBuildOutputIsServedFromTheBuildsDevice(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Build output',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'execute' => [Role::any()->toString()],
+        ]);
+
+        try {
+            $deployment = $this->createDeployment($functionId, [
+                'code' => $this->packageFunction('basic'),
+                'activate' => true,
+            ]);
+            $this->assertSame(202, $deployment['headers']['status-code']);
+            $deploymentId = $deployment['body']['$id'];
+
+            $this->assertEventually(function () use ($functionId, $deploymentId) {
+                $deployment = $this->getDeployment($functionId, $deploymentId);
+                $this->assertSame('ready', $deployment['body']['status'], $deployment['body']['buildLogs'] ?? '');
+
+                $function = $this->getFunction($functionId);
+                if (($function['body']['deploymentId'] ?? '') !== $deploymentId) {
+                    throw new Critical('Deployment reported ready before the function was activated. deploymentId: ' . ($function['body']['deploymentId'] ?? ''));
+                }
+            }, 100000, 500);
+
+            /**
+             * Test for SUCCESS
+             */
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $this->assertGreaterThan(0, $deployment['body']['buildSize']);
+
+            // The executor fetches the artifact through its own storage connection.
+            $execution = $this->createExecution($functionId);
+            $this->assertSame(201, $execution['headers']['status-code']);
+            $this->assertSame('completed', $execution['body']['status'], $execution['body']['errors'] ?? '');
+            $this->assertSame(200, $execution['body']['responseStatusCode']);
+            $this->assertSame($deploymentId, $this->executionOutput($execution)['APPWRITE_FUNCTION_DEPLOYMENT']);
+
+            // The download endpoint reads buildPath through the builds device. The
+            // artifact format depends on the storage strategy, so compare sizes.
+            $output = $this->getDeploymentDownload($functionId, $deploymentId, 'output');
+            $this->assertSame(200, $output['headers']['status-code']);
+            $this->assertSame($deployment['body']['buildSize'], \strlen($output['body']));
+
+            $source = $this->getDeploymentDownload($functionId, $deploymentId, 'source');
+            $this->assertSame(200, $source['headers']['status-code']);
+            $this->assertStringStartsWith("\x1f\x8b", $source['body']);
+
+            // Every key holds the public scope, which is not enough to download a deployment.
+            $unscoped = $this->client->call(Client::METHOD_GET, '/functions/' . $functionId . '/deployments/' . $deploymentId . '/download', [
+                'content-type' => 'application/json',
+                'x-appwrite-project' => $this->getProject()['$id'],
+                'x-appwrite-key' => $this->getNewKey(['users.read']),
+            ], ['type' => 'source']);
+            $this->assertSame(401, $unscoped['headers']['status-code']);
+        } finally {
+            $this->cleanupFunction($functionId);
+        }
+    }
+
+    #[Retry(count: 3)]
+    public function testCancelDeploymentBuild(): void
+    {
+        $data = $this->setupTestDeployment();
+        $functionId = $data['functionId'];
+
+        $deployment = $this->createDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => 'false'
+        ]);
+
+        $deploymentId = $deployment['body']['$id'] ?? '';
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $this->assertNotEmpty($deployment['body']['$id']);
+        $this->assertEquals(true, (new DatetimeValidator())->isValid($deployment['body']['$createdAt']));
+        $this->assertEquals('index.js', $deployment['body']['entrypoint']);
+
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+
+            $this->assertEquals(200, $deployment['headers']['status-code']);
+            $this->assertEquals('building', $deployment['body']['status']);
+        }, 100000, 250);
+
+        $deployment = $this->cancelDeployment($functionId, $deploymentId);
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertEquals('canceled', $deployment['body']['status']);
+
+        // Ensures worker got eventually aware of cancellation and reacted properly
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $this->assertEquals(200, $deployment['headers']['status-code']);
+            $this->assertStringContainsString('Build has been canceled.', (string) $deployment['body']['buildLogs']);
+        });
+
+        $deployment = $this->getDeployment($functionId, $deploymentId);
+
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertEquals('canceled', $deployment['body']['status']);
+    }
+
+    public function testCreateDeploymentLarge(): void
+    {
+        $data = $this->setupTestDeployment();
+        $functionId = $data['functionId'];
+
+        /**
+         * Test for Large Code File SUCCESS
+         */
+        $folder = 'large';
+        $folderPath = realpath(__DIR__ . '/../../../resources/functions') . "/$folder";
+        $code = "$folderPath/code.tar.gz";
+        $tar = (new Command('tar'))
+            ->option('--exclude', 'code.tar.gz')
+            ->option('--exclude', 'node_modules')
+            ->flag('-czf')
+            ->argument($code)
+            ->option('-C', $folderPath)
+            ->argument('.');
+        Console::execute($tar, '', $this->stdout, $this->stderr);
+
+        $chunkSize = 5 * 1024 * 1024;
+        $handle = @fopen($code, "rb");
+        $mimeType = 'application/x-gzip';
+        $counter = 0;
+        $size = filesize($code);
+        $headers = [
+            'content-type' => 'multipart/form-data',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ];
+        $id = '';
+        $largeTag = null;
+        while (!feof($handle)) {
+            $curlFile = new \CURLFile('data://' . $mimeType . ';base64,' . base64_encode(@fread($handle, $chunkSize)), $mimeType, 'large-fx.tar.gz');
+            $headers['content-range'] = 'bytes ' . ($counter * $chunkSize) . '-' . min(((($counter * $chunkSize) + $chunkSize) - 1), $size - 1) . '/' . $size;
+            if (!empty($id)) {
+                $headers['x-appwrite-id'] = $id;
+            }
+            $largeTag = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/deployments', array_merge($headers, $this->getHeaders()), [
+                'entrypoint' => 'index.js',
+                'code' => $curlFile,
+                'activate' => true,
+                'commands' => 'head -c 12582912 /dev/urandom > random.bin && ls -al' // +12MB unique, incompressible: survives squashfs dedup and any compressor
+            ]);
+            $counter++;
+            $id = $largeTag['body']['$id'];
+        }
+        @fclose($handle);
+
+        $this->assertEquals(202, $largeTag['headers']['status-code']);
+        $this->assertNotEmpty($largeTag['body']['$id']);
+        $this->assertEquals(true, (new DatetimeValidator())->isValid($largeTag['body']['$createdAt']));
+        $this->assertEquals('index.js', $largeTag['body']['entrypoint']);
+        $this->assertGreaterThan(1024 * 1024 * 5, $largeTag['body']['sourceSize']); // ~7MB video file
+        $this->assertLessThan(1024 * 1024 * 10, $largeTag['body']['sourceSize']); // ~7MB video file
+
+        $deploymentSize = $largeTag['body']['sourceSize'];
+        $deploymentId = $largeTag['body']['$id'];
+
+        $this->assertEventually(function () use ($functionId, $deploymentId, $deploymentSize) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+
+            $this->assertEquals(200, $deployment['headers']['status-code']);
+            $this->assertEquals('ready', $deployment['body']['status']);
+            $this->assertEquals($deploymentSize, $deployment['body']['sourceSize']);
+            $this->assertGreaterThan(1024 * 1024 * 10, $deployment['body']['buildSize']); // ~7MB video + 12MB incompressible sample; compression/dedup-agnostic
+        }, 120000, 500);
+    }
+
+    public function testCreateDeploymentOutOfOrder(): void
+    {
+        $data = $this->setupTestFunction();
+        $functionId = $data['functionId'];
+
+        // Prepare a code file that spans at least 3 chunks
+        $folder = 'large';
+        $folderPath = realpath(__DIR__ . '/../../../resources/functions') . "/$folder";
+        $code = "$folderPath/code.tar.gz";
+
+
+
+        $totalSize = filesize($code);
+        $chunkSize = 5 * 1024 * 1024; // 5MB chunks
+        $mimeType = 'application/x-gzip';
+        $chunksTotal = (int) ceil($totalSize / $chunkSize);
+
+        // Read all chunks into memory
+        $handle = fopen($code, "rb");
+        $this->assertNotFalse($handle, "Could not open test resource: $code");
+        $chunks = [];
+        for ($i = 0; $i < $chunksTotal; $i++) {
+            $start = $i * $chunkSize;
+            $end = min($start + $chunkSize, $totalSize);
+            $length = $end - $start;
+            $chunkData = fread($handle, $length);
+            $chunks[] = [
+                'data' => $chunkData,
+                'start' => $start,
+                'end' => $end - 1,
+                'index' => $i,
+            ];
+        }
+        fclose($handle);
+
+        // We need at least 2 chunks for a meaningful out-of-order test
+        $this->assertGreaterThanOrEqual(2, count($chunks), 'Test file must span at least 2 chunks');
+
+        // Upload chunks in out-of-order sequence: last chunk first, then first, then second
+        $uploadOrder = [count($chunks) - 1, 0, 1];
+        $deploymentId = '';
+        $deployment = null;
+
+        foreach ($uploadOrder as $chunkIndex) {
+            $chunk = $chunks[$chunkIndex];
+            $curlFile = new \CURLFile(
+                'data://' . $mimeType . ';base64,' . base64_encode($chunk['data']),
+                $mimeType,
+                'large-fx.tar.gz'
+            );
+
+            $headers = [
+                'content-type' => 'multipart/form-data',
+                'x-appwrite-project' => $this->getProject()['$id'],
+                'content-range' => 'bytes ' . $chunk['start'] . '-' . $chunk['end'] . '/' . $totalSize,
+            ];
+
+            if (!empty($deploymentId)) {
+                $headers['x-appwrite-id'] = $deploymentId;
+            }
+
+            $deployment = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/deployments', array_merge($headers, $this->getHeaders()), [
+                'entrypoint' => 'index.js',
+                'code' => $curlFile,
+                'activate' => true,
+            ]);
+
+            $this->assertEquals(202, $deployment['headers']['status-code']);
+            $deploymentId = $deployment['body']['$id'];
+        }
+
+        // Upload remaining chunks in any order to complete the file
+        $remainingChunks = [];
+        for ($i = 2; $i < count($chunks) - 1; $i++) {
+            $remainingChunks[] = $i;
+        }
+        shuffle($remainingChunks);
+
+        foreach ($remainingChunks as $chunkIndex) {
+            $chunk = $chunks[$chunkIndex];
+            $curlFile = new \CURLFile(
+                'data://' . $mimeType . ';base64,' . base64_encode($chunk['data']),
+                $mimeType,
+                'large-fx.tar.gz'
+            );
+
+            $headers = [
+                'content-type' => 'multipart/form-data',
+                'x-appwrite-project' => $this->getProject()['$id'],
+                'content-range' => 'bytes ' . $chunk['start'] . '-' . $chunk['end'] . '/' . $totalSize,
+                'x-appwrite-id' => $deploymentId,
+            ];
+
+            $deployment = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/deployments', array_merge($headers, $this->getHeaders()), [
+                'entrypoint' => 'index.js',
+                'code' => $curlFile,
+                'activate' => true,
+            ]);
+
+            $this->assertEquals(202, $deployment['headers']['status-code']);
+        }
+
+
+
+        // Wait for build to complete
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $this->assertEquals(200, $deployment['headers']['status-code']);
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 120000, 500);
+    }
+
+    public function testCreateDeploymentParallelChunksLargeFile(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Parallel Chunk Deployment',
+            'execute' => [Role::user($this->getUser()['$id'])->toString()],
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 10,
+        ]);
+
+        $deploymentId = Id::unique();
+        $tmpDirectory = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'appwrite-parallel-function-deployment-' . $deploymentId;
+
+        mkdir($tmpDirectory);
+
+        try {
+            copy(__DIR__ . '/../../../resources/functions/basic/index.js', $tmpDirectory . DIRECTORY_SEPARATOR . 'index.js');
+            file_put_contents($tmpDirectory . DIRECTORY_SEPARATOR . 'large.bin', random_bytes(20 * 1024 * 1024));
+
+            $source = $tmpDirectory . DIRECTORY_SEPARATOR . 'code.tar.gz';
+            $tar = (new Command('tar'))
+                ->option('--exclude', 'code.tar.gz')
+                ->flag('-czf')
+                ->argument($source)
+                ->option('-C', $tmpDirectory)
+                ->argument('.');
+            Console::execute($tar, '', $this->stdout, $this->stderr);
+
+            $totalSize = filesize($source);
+            $chunkSize = 5 * 1024 * 1024;
+            $chunksTotal = (int) ceil($totalSize / $chunkSize);
+
+            $this->assertGreaterThanOrEqual(4, $chunksTotal, 'Test deployment must span at least 4 chunks');
+
+            $requests = [];
+            $sourceHandle = fopen($source, 'rb');
+            $this->assertNotFalse($sourceHandle, 'Could not open deployment package');
+
+            try {
+                for ($i = 0; $i < $chunksTotal; $i++) {
+                    $start = $i * $chunkSize;
+                    $end = min($start + $chunkSize, $totalSize) - 1;
+                    $length = $end - $start + 1;
+                    $chunkPath = $tmpDirectory . DIRECTORY_SEPARATOR . 'chunk-' . $i . '.part';
+
+                    fseek($sourceHandle, $start);
+                    file_put_contents($chunkPath, fread($sourceHandle, $length));
+
+                    $requests[] = [
+                        'headers' => [
+                            'x-appwrite-project' => $this->getProject()['$id'],
+                            'x-appwrite-key' => $this->getProject()['apiKey'],
+                            'x-appwrite-id' => $deploymentId,
+                            'content-range' => 'bytes ' . $start . '-' . $end . '/' . $totalSize,
+                        ],
+                        'chunkPath' => $chunkPath,
+                    ];
+                }
+            } finally {
+                fclose($sourceHandle);
+            }
+
+            $responses = [];
+            $endpoint = parse_url($this->client->getEndpoint());
+            $scheme = $endpoint['scheme'] ?? 'http';
+            $host = $endpoint['host'] ?? 'appwrite';
+            $port = $endpoint['port'] ?? ($scheme === 'https' ? 443 : 80);
+            $basePath = rtrim($endpoint['path'] ?? '', '/');
+
+            \Swoole\Coroutine\run(function () use ($basePath, $functionId, $host, $port, $requests, $scheme, &$responses): void {
+                $wg = new \Swoole\Coroutine\WaitGroup();
+
+                foreach ($requests as $index => $request) {
+                    $wg->add();
+                    \Swoole\Coroutine::create(function () use ($basePath, $functionId, $host, $index, $port, $request, &$responses, $scheme, $wg): void {
+                        try {
+                            for ($attempt = 0; $attempt < 3; $attempt++) {
+                                $client = new \Swoole\Coroutine\Http\Client($host, (int) $port, $scheme === 'https');
+                                $client->set([
+                                    'timeout' => 300,
+                                    'ssl_verify_peer' => false,
+                                    'ssl_verify_host' => false,
+                                ]);
+                                $client->setHeaders($request['headers']);
+                                $client->setMethod(Client::METHOD_POST);
+                                $client->setData([
+                                    'entrypoint' => 'index.js',
+                                    'activate' => true,
+                                ]);
+                                $client->addFile($request['chunkPath'], 'code', 'application/x-gzip', 'code.tar.gz');
+                                $client->execute($basePath . '/functions/' . $functionId . '/deployments');
+
+                                $responses[$index] = [
+                                    'body' => $client->body,
+                                    'error' => $client->errMsg,
+                                    'headers' => $client->headers ?? [],
+                                    'statusCode' => $client->statusCode,
+                                ];
+
+                                $client->close();
+
+                                if ($responses[$index]['statusCode'] !== 429) {
+                                    break;
+                                }
+
+                                $retryAfter = (float) ($responses[$index]['headers']['retry-after'] ?? 0.1);
+                                \Swoole\Coroutine::sleep(max($retryAfter, 0.1));
+                            }
+                        } finally {
+                            $wg->done();
+                        }
+                    });
+                }
+
+                $wg->wait();
+            });
+
+            ksort($responses);
+
+            foreach ($responses as $response) {
+                $this->assertSame('', $response['error']);
+                $this->assertContains($response['statusCode'], [202], (string) $response['body']);
+            }
+
+            $this->assertEventually(function () use ($functionId, $deploymentId) {
+                $deployment = $this->getDeployment($functionId, $deploymentId);
+
+                $this->assertEquals(200, $deployment['headers']['status-code']);
+                $this->assertEquals('ready', $deployment['body']['status']);
+                $this->assertEquals($deploymentId, $deployment['body']['$id']);
+            }, 120000, 500);
+        } finally {
+            $this->cleanupFunction($functionId);
+
+            if (is_dir($tmpDirectory)) {
+                foreach (glob($tmpDirectory . DIRECTORY_SEPARATOR . '*') ?: [] as $file) {
+                    unlink($file);
+                }
+                rmdir($tmpDirectory);
+            }
+        }
+    }
+
+    public function testUpdateDeployment(): void
+    {
+        $data = $this->setupTestDeployment();
+
+        /**
+         * Test for SUCCESS
+         */
+        $dateValidator = new DatetimeValidator();
+
+        $response = $this->client->call(Client::METHOD_PATCH, '/functions/' . $data['functionId'] . '/deployments/' . $data['deploymentId'], array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), []);
+
+        $this->assertEquals(200, $response['headers']['status-code']);
+        $this->assertNotEmpty($response['body']['$id']);
+        $this->assertEquals(true, $dateValidator->isValid($response['body']['$createdAt']));
+        $this->assertEquals(true, $dateValidator->isValid($response['body']['$updatedAt']));
+        $this->assertEquals($data['deploymentId'], $response['body']['deploymentId']);
+    }
+
+    public function testCancelDeploymentRequiresOwnership(): void
+    {
+        $data = $this->setupTestDeployment();
+        $functionId = $data['functionId'];
+        $deploymentId = $data['deploymentId'];
+
+        $otherFunctionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Other function',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'execute' => [Role::any()->toString()],
+        ]);
+
+        /**
+         * Test for FAILURE — canceling through a function that does not own
+         * the deployment must not succeed.
+         */
+        $response = $this->cancelDeployment($otherFunctionId, $deploymentId);
+
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertEquals('deployment_not_found', $response['body']['type']);
+
+        $this->cleanupFunction($otherFunctionId);
+    }
+
+    public function testUpdateFunctionDeploymentRequiresOwnership(): void
+    {
+        $data = $this->setupTestDeployment();
+        $functionId = $data['functionId'];
+        $deploymentId = $data['deploymentId'];
+
+        // A second function the deployment does not belong to.
+        $otherFunctionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Other function',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'execute' => [Role::any()->toString()],
+        ]);
+
+        /**
+         * Test for FAILURE — activating through a function that does not own
+         * the deployment must not succeed.
+         */
+        $response = $this->updateFunctionDeployment($otherFunctionId, $deploymentId);
+
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertEquals('deployment_not_found', $response['body']['type']);
+
+        // Owning function is unchanged.
+        $function = $this->getFunction($functionId);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($deploymentId, $function['body']['deploymentId']);
+
+        /**
+         * Test for SUCCESS — the owning function can still activate it.
+         */
+        $response = $this->updateFunctionDeployment($functionId, $deploymentId);
+
+        $this->assertEquals(200, $response['headers']['status-code']);
+        $this->assertEquals($deploymentId, $response['body']['deploymentId']);
+
+        $this->cleanupFunction($otherFunctionId);
+    }
+
+    public function testDeploymentEndpointsRequireMatchingResourceType(): void
+    {
+        $sharedId = Id::unique();
+
+        $functionId = $this->setupFunction([
+            'functionId' => $sharedId,
+            'name' => 'Resource type function',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'execute' => [Role::any()->toString()],
+        ]);
+
+        $site = $this->client->call(Client::METHOD_POST, '/sites', [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ], [
+            'siteId' => $sharedId,
+            'name' => 'Resource type site',
+            'framework' => 'other',
+            'buildRuntime' => 'node-22',
+            'outputDirectory' => './',
+            'providerBranch' => 'main',
+            'providerRootDirectory' => './',
+            'fallbackFile' => '',
+        ]);
+        $this->assertEquals(201, $site['headers']['status-code']);
+
+        $deployment = $this->createDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => 'false',
+            'entrypoint' => 'index.js',
+        ]);
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $deploymentId = $deployment['body']['$id'] ?? '';
+
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 120000, 500);
+
+        /**
+         * Test for FAILURE — a site that shares the function custom ID must not
+         * read or mutate the function deployment (resourceType mismatch).
+         */
+        $response = $this->client->call(Client::METHOD_GET, '/sites/' . $sharedId . '/deployments/' . $deploymentId, [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ]);
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertEquals('deployment_not_found', $response['body']['type']);
+
+        $response = $this->client->call(Client::METHOD_PATCH, '/sites/' . $sharedId . '/deployment', [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ], [
+            'deploymentId' => $deploymentId,
+        ]);
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertEquals('deployment_not_found', $response['body']['type']);
+
+        $response = $this->client->call(Client::METHOD_DELETE, '/sites/' . $sharedId . '/deployments/' . $deploymentId, [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ]);
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertEquals('deployment_not_found', $response['body']['type']);
+
+        /**
+         * Test for SUCCESS — the owning function path still works.
+         */
+        $response = $this->getDeployment($functionId, $deploymentId);
+        $this->assertEquals(200, $response['headers']['status-code']);
+        $this->assertEquals($deploymentId, $response['body']['$id']);
+
+        $this->client->call(Client::METHOD_DELETE, '/sites/' . $sharedId, [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ]);
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateDuplicateDeploymentRequiresOwnership(): void
+    {
+        $data = $this->setupTestDeployment();
+        $functionId = $data['functionId'];
+        $deploymentId = $data['deploymentId'];
+
+        $otherFunctionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Other function',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'execute' => [Role::any()->toString()],
+        ]);
+
+        /**
+         * Test for FAILURE — duplicating through a function that does not own
+         * the deployment must not succeed.
+         */
+        $response = $this->createDuplicateDeployment($otherFunctionId, $deploymentId);
+
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertEquals('deployment_not_found', $response['body']['type']);
+
+        /**
+         * Test for SUCCESS — the owning function can still duplicate it.
+         */
+        $response = $this->createDuplicateDeployment($functionId, $deploymentId);
+
+        $this->assertEquals(202, $response['headers']['status-code']);
+        $duplicateId = $response['body']['$id'] ?? '';
+        $this->assertNotEmpty($duplicateId);
+
+        $this->assertEventually(function () use ($functionId, $duplicateId) {
+            $deployment = $this->getDeployment($functionId, $duplicateId);
+
+            $this->assertEquals(200, $deployment['headers']['status-code']);
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 120000, 500);
+
+        // Duplicates activate when their build completes. Restore the shared
+        // fixture before later execution tests reuse its cached deployment ID.
+        $response = $this->updateFunctionDeployment($functionId, $deploymentId);
+        $this->assertEquals(200, $response['headers']['status-code']);
+        $this->assertEquals($deploymentId, $response['body']['deploymentId']);
+
+        $response = $this->client->call(Client::METHOD_DELETE, '/functions/' . $functionId . '/deployments/' . $duplicateId, array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), []);
+        $this->assertEquals(204, $response['headers']['status-code']);
+
+        $this->cleanupFunction($otherFunctionId);
+    }
+
+    public function testCreateDeploymentPartialResumeRequiresOwnership(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Owner function',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'execute' => [Role::any()->toString()],
+        ]);
+
+        $folder = 'large';
+        $folderPath = realpath(__DIR__ . '/../../../resources/functions') . "/$folder";
+        $code = "$folderPath/code.tar.gz";
+        $tar = (new Command('tar'))
+            ->option('--exclude', 'code.tar.gz')
+            ->option('--exclude', 'node_modules')
+            ->flag('-czf')
+            ->argument($code)
+            ->option('-C', $folderPath)
+            ->argument('.');
+        Console::execute($tar, '', $this->stdout, $this->stderr);
+
+        $totalSize = \filesize($code);
+        $chunkSize = 5 * 1024 * 1024;
+        $this->assertGreaterThan($chunkSize, $totalSize, 'Test file must span at least 2 chunks');
+
+        $handle = fopen($code, 'rb');
+        $this->assertNotFalse($handle);
+        $firstChunk = fread($handle, $chunkSize);
+        fclose($handle);
+
+        $mimeType = 'application/x-gzip';
+        $curlFile = new \CURLFile(
+            'data://' . $mimeType . ';base64,' . base64_encode($firstChunk),
+            $mimeType,
+            'large-fx.tar.gz'
+        );
+
+        $partial = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/deployments', array_merge([
+            'content-type' => 'multipart/form-data',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'content-range' => 'bytes 0-' . ($chunkSize - 1) . '/' . $totalSize,
+        ], $this->getHeaders()), [
+            'entrypoint' => 'index.js',
+            'code' => $curlFile,
+            'activate' => 'false',
+        ]);
+
+        $this->assertEquals(202, $partial['headers']['status-code']);
+        $deploymentId = $partial['body']['$id'];
+        $this->assertNotEmpty($deploymentId);
+
+        $otherFunctionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Other function',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'execute' => [Role::any()->toString()],
+        ]);
+
+        /**
+         * Test for FAILURE — resuming a partial upload through a function that
+         * does not own the deployment must not succeed.
+         */
+        $response = $this->client->call(Client::METHOD_POST, '/functions/' . $otherFunctionId . '/deployments', array_merge([
+            'content-type' => 'multipart/form-data',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'content-range' => 'bytes 0-' . ($chunkSize - 1) . '/' . $totalSize,
+            'x-appwrite-id' => $deploymentId,
+        ], $this->getHeaders()), [
+            'entrypoint' => 'index.js',
+            'code' => $curlFile,
+            'activate' => 'false',
+        ]);
+
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertEquals('deployment_not_found', $response['body']['type']);
+
+        $this->cleanupFunction($otherFunctionId);
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateDeploymentRejectsShortChunk(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Short chunk function',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'execute' => [Role::any()->toString()],
+        ]);
+
+        $upload = function (string $range, string $body, ?string $resumeId = null) use ($functionId): array {
+            $headers = [
+                'content-type' => 'multipart/form-data',
+                'x-appwrite-project' => $this->getProject()['$id'],
+                'content-range' => $range,
+            ];
+
+            if ($resumeId !== null) {
+                $headers['x-appwrite-id'] = $resumeId;
+            }
+
+            return $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/deployments', array_merge($headers, $this->getHeaders()), [
+                'entrypoint' => 'index.js',
+                'code' => new \CURLFile('data://application/x-gzip;base64,' . base64_encode($body), 'application/x-gzip', 'code.tar.gz'),
+                'activate' => 'false',
+            ]);
+        };
+
+        $chunkSize = 5 * 1024 * 1024;
+        $totalSize = $chunkSize + 1024;
+
+        $first = $upload('bytes 0-' . ($chunkSize - 1) . '/' . $totalSize, str_repeat('a', $chunkSize));
+        $this->assertEquals(202, $first['headers']['status-code']);
+        $deploymentId = $first['body']['$id'];
+
+        /**
+         * Test for FAILURE
+         * The last chunk carries fewer bytes than its range announces.
+         */
+        $last = $upload('bytes ' . $chunkSize . '-' . ($totalSize - 1) . '/' . $totalSize, str_repeat('b', 10), $deploymentId);
+        $this->assertEquals(400, $last['headers']['status-code']);
+        $this->assertEquals('storage_invalid_content_range', $last['body']['type']);
+
+        $deployment = $this->getDeployment($functionId, $deploymentId);
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertEquals('failed', $deployment['body']['status']);
+
+        // A retried chunk returns the failed deployment instead of writing to the removed source.
+        $retry = $upload('bytes ' . $chunkSize . '-' . ($totalSize - 1) . '/' . $totalSize, str_repeat('b', 1024), $deploymentId);
+        $this->assertEquals(202, $retry['headers']['status-code']);
+        $this->assertEquals('failed', $retry['body']['status']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateDeploymentResumeRequiresOwnership(): void
+    {
+        $data = $this->setupTestDeployment();
+        $deploymentId = $data['deploymentId'];
+
+        $otherFunctionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Other function',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'execute' => [Role::any()->toString()],
+        ]);
+
+        /**
+         * Test for FAILURE — resuming via content-range + x-appwrite-id under a
+         * function that does not own the deployment must not succeed.
+         * x-appwrite-id is only honored when content-range is present.
+         */
+        $code = $this->packageFunction('basic');
+        $size = \filesize($code->getFilename());
+
+        $response = $this->client->call(Client::METHOD_POST, '/functions/' . $otherFunctionId . '/deployments', array_merge([
+            'content-type' => 'multipart/form-data',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'content-range' => 'bytes 0-' . ($size - 1) . '/' . $size,
+            'x-appwrite-id' => $deploymentId,
+        ], $this->getHeaders()), [
+            'code' => $code,
+            'activate' => 'false',
+        ]);
+
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertEquals('deployment_not_found', $response['body']['type']);
+
+        $this->cleanupFunction($otherFunctionId);
+    }
+
+    public function testListDeployments(): void
+    {
+        $data = $this->setupTestDeployment();
+
+        /**
+         * Test for SUCCESS
+         */
+        $functionId = $data['functionId'];
+        $deployments = $this->listDeployments($functionId);
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        $this->assertGreaterThanOrEqual(1, $deployments['body']['total']);
+        $this->assertIsArray($deployments['body']['deployments']);
+        $this->assertGreaterThanOrEqual(1, count($deployments['body']['deployments']));
+        $this->assertArrayHasKey('sourceSize', $deployments['body']['deployments'][0]);
+        $this->assertArrayHasKey('buildSize', $deployments['body']['deployments'][0]);
+
+        /**
+         * Test for FAILURE
+         */
+        $deployments = $this->listDeployments($functionId, [
+            'search' => 'deployment',
+        ]);
+
+        $this->assertEquals(400, $deployments['headers']['status-code']);
+        $this->assertSame('general_query_invalid', $deployments['body']['type']);
+
+        $deployments = $this->listDeployments($functionId, [
+            'queries' => [
+                Query::limit(1)->toString(),
+            ],
+        ]);
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        $this->assertCount(1, $deployments['body']['deployments']);
+
+        $deployments = $this->listDeployments($functionId, [
+            'queries' => [
+                Query::select(['status'])->toString(),
+            ],
+        ]);
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        $this->assertGreaterThanOrEqual(1, count($deployments['body']['deployments']));
+        // Check all deployments have correct attributes from select query
+        foreach ($deployments['body']['deployments'] as $deployment) {
+            $this->assertArrayHasKey('status', $deployment);
+            $this->assertArrayNotHasKey('sourceSize', $deployment);
+        }
+
+        // Extra select query check, for attribute not allowed by filter queries
+        $deployments = $this->listDeployments($functionId, [
+            'queries' => [
+                Query::select(['buildLogs'])->toString(),
+            ],
+        ]);
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        $this->assertGreaterThanOrEqual(1, count($deployments['body']['deployments']));
+        // Check all deployments have correct attributes from select query
+        foreach ($deployments['body']['deployments'] as $deployment) {
+            $this->assertArrayHasKey('buildLogs', $deployment);
+            $this->assertArrayNotHasKey('sourceSize', $deployment);
+        }
+
+        $deployments = $this->listDeployments($functionId, [
+            'queries' => [
+                Query::offset(1)->toString(),
+            ],
+        ]);
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        // Offset 1 should return remaining deployments (can be 0 or more depending on total)
+        $this->assertIsArray($deployments['body']['deployments']);
+
+        $deployments = $this->listDeployments($functionId);
+
+        $this->assertIsArray($deployments['body']['deployments']);
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+
+        $deployments = $this->listDeployments(
+            $functionId,
+            [
+                'queries' => [
+                    Query::equal('type', ['manual'])->toString(),
+                ],
+            ]
+        );
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        // At least 1 manual deployment should exist
+        $this->assertGreaterThanOrEqual(1, $deployments['body']['total']);
+
+        $deployments = $this->listDeployments(
+            $functionId,
+            [
+                'queries' => [
+                    Query::equal('type', ['vcs'])->toString(),
+                ],
+            ]
+        );
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        $this->assertEquals(0, $deployments['body']['total']);
+
+        $deployments = $this->listDeployments(
+            $functionId,
+            [
+                'queries' => [
+                    Query::equal('type', ['invalid-string'])->toString(),
+                ],
+            ]
+        );
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        $this->assertEquals(0, $deployments['body']['total']);
+
+        $deployments = $this->listDeployments(
+            $functionId,
+            [
+                'queries' => [
+                    Query::greaterThan('sourceSize', 0)->toString(),
+                ],
+            ]
+        );
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        // At least 1 deployment with sourceSize > 0 should exist
+        $this->assertGreaterThanOrEqual(1, $deployments['body']['total']);
+
+        $deployments = $this->listDeployments(
+            $functionId,
+            [
+                'queries' => [
+                    Query::greaterThan('sourceSize', -100)->toString(),
+                ],
+            ]
+        );
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        // At least 1 deployment with sourceSize > -100 should exist
+        $this->assertGreaterThanOrEqual(1, $deployments['body']['total']);
+
+        /**
+         * Ensure size output and size filters work exactly.
+         * Prevents buildSize being counted towards deployemtn size
+         */
+        $deployments = $this->listDeployments(
+            $functionId,
+            [
+                Query::limit(1)->toString(),
+            ]
+        );
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        $this->assertGreaterThanOrEqual(1, $deployments['body']['total']);
+        $this->assertNotEmpty($deployments['body']['deployments'][0]['$id']);
+        $this->assertNotEmpty($deployments['body']['deployments'][0]['sourceSize']);
+
+        $deploymentId = $deployments['body']['deployments'][0]['$id'];
+        $deploymentSize = $deployments['body']['deployments'][0]['sourceSize'];
+
+        $deployments = $this->listDeployments(
+            $functionId,
+            [
+                'queries' => [
+                    Query::equal('sourceSize', [$deploymentSize])->toString(),
+                ],
+            ]
+        );
+
+        $this->assertEquals(200, $deployments['headers']['status-code']);
+        $this->assertGreaterThan(0, $deployments['body']['total']);
+
+        $matchingDeployment = array_filter(
+            $deployments['body']['deployments'],
+            fn ($deployment) => $deployment['$id'] === $deploymentId
+        );
+
+        $this->assertNotEmpty($matchingDeployment, "Deployment with ID {$deploymentId} not found");
+
+        if (!empty($matchingDeployment)) {
+            $deployment = reset($matchingDeployment);
+            $this->assertEquals($deploymentSize, $deployment['sourceSize']);
+        }
+    }
+
+    public function testGetDeployment(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Build duration',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            // Deliberate build work: reporting zero must fail this test.
+            'commands' => 'sleep 3',
+        ]);
+
+        try {
+            $startedAt = \microtime(true);
+            $deploymentId = $this->setupDeployment($functionId, [
+                'code' => $this->packageFunction('basic'),
+                'activate' => true,
+            ]);
+
+            /**
+             * Test for SUCCESS
+             */
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $elapsed = (int) \ceil(\microtime(true) - $startedAt);
+
+            $this->assertEquals(200, $deployment['headers']['status-code']);
+            // Runtime must include the work, and cannot exceed submission-to-ready time.
+            $this->assertGreaterThanOrEqual(3, $deployment['body']['buildDuration']);
+            $this->assertLessThanOrEqual($elapsed, $deployment['body']['buildDuration']);
+            $this->assertEquals('ready', $deployment['body']['status']);
+            $this->assertNotEmpty($deployment['body']['buildLogs']);
+            $this->assertArrayHasKey('sourceSize', $deployment['body']);
+            $this->assertArrayHasKey('buildSize', $deployment['body']);
+
+            /**
+             * Test for FAILURE
+             */
+            $deployment = $this->getDeployment($functionId, 'x');
+
+            $this->assertEquals(404, $deployment['headers']['status-code']);
+        } finally {
+            $this->cleanupFunction($functionId);
+        }
+    }
+
+    public function testCreateExecution(): void
+    {
+        // Other deployment tests can replace the cached function's active build.
+        // Own the function here so the execution identity has a stable target.
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test1',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+        ]);
+        try {
+            $variable = $this->createVariable($functionId, [
+                'variableId' => Id::unique(),
+                'key' => 'GLOBAL_VARIABLE',
+                'value' => 'Global Variable Value',
+            ]);
+            $this->assertEquals(201, $variable['headers']['status-code']);
+            $deploymentId = $this->setupDeployment($functionId, [
+                'code' => $this->packageFunction('basic'),
+                'activate' => true,
+            ]);
+            $data = ['functionId' => $functionId, 'deploymentId' => $deploymentId];
+
+            /**
+             * Test for SUCCESS
+             */
+            // Explicitly send an empty JSON object instead of relying on the default empty array.
+            $execution = $this->createExecution($data['functionId'], [
+                'async' => 'false',
+                'headers' => new \stdClass(),
+            ]);
+
+            $this->assertEquals(201, $execution['headers']['status-code']);
+
+            $this->assertNotEmpty($execution['body']['responseHeaders']);
+
+            // An explicit null for an optional param must fall back to its default, not 500.
+            $nullPath = $this->createExecution($data['functionId'], [
+                'async' => 'false',
+                'path' => null,
+            ]);
+
+            $this->assertEquals(201, $nullPath['headers']['status-code']);
+            $this->assertSame('/', $nullPath['body']['requestPath']);
+
+            $executionIdHeader = null;
+            foreach ($execution['body']['responseHeaders'] as $header) {
+                if ($header['name'] === 'x-appwrite-execution-id') {
+                    $executionIdHeader = $header['value'];
+                    break;
+                }
+            }
+            $this->assertNotEmpty($executionIdHeader);
+            $this->assertEquals($execution['body']['$id'], $executionIdHeader);
+
+            $this->assertNotEmpty($execution['body']['$id']);
+            $this->assertNotEmpty($execution['body']['resourceId']);
+            $this->assertEquals(true, (new DatetimeValidator())->isValid($execution['body']['$createdAt']));
+            $this->assertEquals($data['functionId'], $execution['body']['resourceId']);
+            $this->assertEquals('functions', $execution['body']['resourceType']);
+            $this->assertEquals('completed', $execution['body']['status']);
+            $this->assertEquals(200, $execution['body']['responseStatusCode']);
+            $this->assertStringContainsString($execution['body']['resourceId'], (string) $execution['body']['responseBody']);
+            $this->assertStringContainsString($data['deploymentId'], (string) $execution['body']['responseBody']);
+            $this->assertStringContainsString('Test1', (string) $execution['body']['responseBody']);
+            $this->assertStringContainsString('http', (string) $execution['body']['responseBody']);
+            $this->assertStringContainsString('Node.js', (string) $execution['body']['responseBody']);
+            $this->assertStringContainsString('22', (string) $execution['body']['responseBody']);
+            $this->assertStringContainsString('Global Variable Value', (string) $execution['body']['responseBody']);
+            $this->assertNotEmpty($execution['body']['errors']);
+            $this->assertNotEmpty($execution['body']['logs']);
+            $this->assertLessThan(10, $execution['body']['duration']);
+
+            /** Test create execution with HEAD method */
+            $execution = $this->createExecution($data['functionId'], [
+                'async' => 'false',
+                'method' => 'HEAD',
+            ]);
+
+            $this->assertEquals(201, $execution['headers']['status-code']);
+            $this->assertEquals('completed', $execution['body']['status']);
+            $this->assertEquals(200, $execution['body']['responseStatusCode']);
+            $this->assertIsArray($execution['body']['responseHeaders']);
+            $this->assertEmpty($execution['body']['responseBody']); // For HEAD requests, response body is empty
+
+            $executionId = $execution['body']['$id'];
+            $this->assertEventually(function () use ($data, $executionId) {
+                $execution = $this->client->call(Client::METHOD_DELETE, '/functions/' . $data['functionId'] . '/executions/' . $executionId, array_merge([
+                    'content-type' => 'application/json',
+                    'x-appwrite-project' => $this->getProject()['$id'],
+                ], $this->getHeaders()), []);
+                $this->assertEquals(204, $execution['headers']['status-code']);
+            }, 10000, 500);
+
+            /** Test create execution with 400 status code */
+            $execution = $this->createExecution($data['functionId'], [
+                'async' => 'false',
+                'path' => '/?code=400'
+            ]);
+
+            $this->assertEquals(201, $execution['headers']['status-code']);
+            $this->assertEquals('completed', $execution['body']['status']);
+            $this->assertEquals(400, $execution['body']['responseStatusCode']);
+
+            $executionId = $execution['body']['$id'];
+            $this->assertEventually(function () use ($data, $executionId) {
+                $execution = $this->client->call(Client::METHOD_DELETE, '/functions/' . $data['functionId'] . '/executions/' . $executionId, array_merge([
+                    'content-type' => 'application/json',
+                    'x-appwrite-project' => $this->getProject()['$id'],
+                ], $this->getHeaders()), []);
+                $this->assertEquals(204, $execution['headers']['status-code']);
+            }, 10000, 500);
+
+            /**
+             * Test for FAILURE
+             */
+            $execution = $this->createExecution($data['functionId'], [
+                'headers' => [
+                    'X-Test' => ['bad'],
+                ],
+            ]);
+
+            $this->assertEquals(400, $execution['headers']['status-code']);
+            $this->assertEquals('general_argument_invalid', $execution['body']['type']);
+
+            $execution = $this->createExecution($data['functionId'], [
+                'headers' => [
+                    'bad/name' => 'value',
+                ],
+            ]);
+
+            $this->assertEquals(400, $execution['headers']['status-code']);
+            $this->assertEquals('general_argument_invalid', $execution['body']['type']);
+
+            $execution = $this->createExecution($data['functionId'], [
+                'headers' => [
+                    'X-Appwrite-User-Id' => 'impersonated-user',
+                    'X-Appwrite-Trigger' => 'event',
+                ],
+            ]);
+
+            $this->assertEquals(400, $execution['headers']['status-code']);
+            $this->assertEquals('general_argument_invalid', $execution['body']['type']);
+
+            $execution = $this->createExecution($data['functionId'], [
+                'headers' => [
+                    'X-APPWRITE-USER-ID' => 'impersonated-user',
+                    'X-APPWRITE-TRIGGER' => 'event',
+                ],
+            ]);
+
+            $this->assertEquals(400, $execution['headers']['status-code']);
+            $this->assertEquals('general_argument_invalid', $execution['body']['type']);
+        } finally {
+            $this->cleanupFunction($functionId);
+        }
+    }
+
+    public function testListExecutionsWithinCreatedAtWindow(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test executions createdAt window',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+        ]);
+        try {
+            $this->setupDeployment($functionId, [
+                'code' => $this->packageFunction('basic'),
+                'activate' => true,
+            ]);
+
+            $sync = $this->createExecution($functionId, ['async' => 'false']);
+            $this->assertEquals(201, $sync['headers']['status-code']);
+            $syncId = $sync['body']['$id'];
+            $this->assertNotFalse(\DateTime::createFromFormat('Y-m-d\TH:i:s.uP', $sync['body']['$createdAt']));
+
+            // The API stores the queued version and the worker the finished
+            // one, so the two versions of an async execution can carry
+            // different createdAt values.
+            $async = $this->createExecution($functionId, ['async' => true]);
+            $this->assertEquals(202, $async['headers']['status-code']);
+            $asyncId = $async['body']['$id'];
+            // The 202 response and reads both return ISO 8601, so the
+            // timestamps compare as strings.
+            $this->assertNotFalse(\DateTime::createFromFormat('Y-m-d\TH:i:s.uP', $async['body']['$createdAt']));
+            $queuedAt = $async['body']['$createdAt'];
+
+            // Both executions reach the store through the executions queue,
+            // so wait until each is stored in its final state.
+            $createdAt = [];
+            $this->assertEventually(function () use ($functionId, $syncId, $asyncId, &$createdAt) {
+                foreach ([$syncId, $asyncId] as $executionId) {
+                    $execution = $this->getExecution($functionId, $executionId);
+                    $this->assertEquals(200, $execution['headers']['status-code']);
+                    $this->assertEquals('completed', $execution['body']['status']);
+                    $createdAt[$executionId] = $execution['body']['$createdAt'];
+                }
+            }, 60000, 500);
+            $syncCreatedAt = $createdAt[$syncId];
+            $finishedAt = $createdAt[$asyncId];
+
+            $list = fn (array $window) => $this->listExecutions($functionId, [
+                'queries' => [...$window, Query::orderDesc('$createdAt')->toString()],
+            ]);
+            $byId = function (array $response): array {
+                $this->assertEquals(200, $response['headers']['status-code']);
+                return \array_column($response['body']['executions'], null, '$id');
+            };
+
+            /**
+             * Test for SUCCESS
+             */
+            $both = $list([
+                Query::greaterThanEqual('$createdAt', \min($syncCreatedAt, $queuedAt))->toString(),
+                Query::lessThanEqual('$createdAt', \max($syncCreatedAt, $finishedAt))->toString(),
+            ]);
+            $executions = $byId($both);
+            $this->assertEquals(2, $both['body']['total']);
+            $this->assertEquals('completed', $executions[$syncId]['status']);
+            $this->assertEquals('completed', $executions[$asyncId]['status']);
+
+            $syncOnly = $byId($list([Query::between('$createdAt', $syncCreatedAt, $syncCreatedAt)->toString()]));
+            $this->assertEquals('completed', $syncOnly[$syncId]['status']);
+
+            // A window around the queued version alone must answer from the
+            // latest version: the finished execution when its createdAt is
+            // still inside the window, nothing when it has moved out, and
+            // never the stale queued version.
+            $queued = $byId($list([Query::between('$createdAt', $queuedAt, $queuedAt)->toString()]));
+            if ($finishedAt === $queuedAt) {
+                $this->assertEquals('completed', $queued[$asyncId]['status']);
+            } else {
+                $this->assertArrayNotHasKey($asyncId, $queued);
+            }
+
+            $finished = $byId($list([Query::between('$createdAt', $finishedAt, $finishedAt)->toString()]));
+            $this->assertEquals('completed', $finished[$asyncId]['status']);
+
+            $before = $list([Query::lessThan('$createdAt', '2000-01-01T00:00:00.000+00:00')->toString()]);
+            $this->assertEquals(200, $before['headers']['status-code']);
+            $this->assertEquals(0, $before['body']['total']);
+            $this->assertEmpty($before['body']['executions']);
+        } finally {
+            $this->cleanupFunction($functionId);
+        }
+    }
+
+    public function testSyncCreateExecution(): void
+    {
+        $data = $this->setupTestDeployment();
+
+        /**
+         * Test for SUCCESS
+         */
+        $started = \microtime(true);
+        $execution = $this->createExecution($data['functionId'], [
+            // Testing default value, should be 'async' => 'false'
+        ]);
+        $elapsed = \microtime(true) - $started;
+
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertEquals('completed', $execution['body']['status']);
+        $this->assertEquals(200, $execution['body']['responseStatusCode']);
+        $this->assertStringContainsString('Test1', (string) $execution['body']['responseBody']);
+        $this->assertStringContainsString('http', (string) $execution['body']['responseBody']);
+        $this->assertStringContainsString('Node.js', (string) $execution['body']['responseBody']);
+        $this->assertStringContainsString('22', (string) $execution['body']['responseBody']);
+        // The synchronous execution is answered from memory, before any database read
+        $this->assertNotFalse(\DateTime::createFromFormat('Y-m-d\TH:i:s.uP', $execution['body']['$createdAt']));
+        $this->assertNotFalse(\DateTime::createFromFormat('Y-m-d\TH:i:s.uP', $execution['body']['$updatedAt']));
+        // Duration is a sub-interval of the call the client just timed, so it can
+        // never exceed it, and it must be the same order of magnitude -- the old
+        // warm-runtime window was a small fraction of a cold-started request.
+        $this->assertLessThanOrEqual($elapsed, $execution['body']['duration']);
+        $this->assertGreaterThan($elapsed / 2, $execution['body']['duration']);
+
+        $executionId = $execution['body']['$id'];
+        $this->assertEventually(function () use ($data, $executionId) {
+            $execution = $this->getExecution($data['functionId'], $executionId);
+
+            $this->assertEquals(200, $execution['headers']['status-code']);
+            $this->assertEquals('completed', $execution['body']['status']);
+            $this->assertNotEmpty($execution['body']['logs']);
+            $this->assertNotEmpty($execution['body']['errors']);
+        }, 10000, 500);
+    }
+
+    public function testUpdateSpecs(): void
+    {
+        $data = $this->setupTestDeployment();
+        $functionId = $data['functionId'];
+
+        /**
+         * Test for SUCCESS
+         */
+        // Change the function specs
+        $function = $this->client->call(Client::METHOD_PUT, '/functions/' . $functionId, array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), [
+            'name' => 'Test1',
+            'events' => [
+                'users.*.update.name',
+                'users.*.update.email',
+            ],
+            'timeout' => 15,
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'runtimeSpecification' => Specification::S_1VCPU_1GB,
+        ]);
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertNotEmpty($function['body']['$id']);
+        $this->assertEquals(Specification::S_1VCPU_1GB, $function['body']['runtimeSpecification']);
+
+        // Verify the updated specs
+        $execution = $this->createExecution($functionId);
+
+        $output = $this->executionOutput($execution);
+
+        $this->assertEquals(1, $output['APPWRITE_FUNCTION_CPUS']);
+        $this->assertEquals(1024, $output['APPWRITE_FUNCTION_MEMORY']);
+
+        // Test execution ID and client IP
+        $executionId = $execution['body']['$id'] ?? '';
+        $this->assertNotEmpty($output['APPWRITE_FUNCTION_EXECUTION_ID']);
+        $this->assertEquals($executionId, $output['APPWRITE_FUNCTION_EXECUTION_ID']);
+        $this->assertNotEmpty($output['APPWRITE_FUNCTION_CLIENT_IP']);
+
+        // Change the specs to 1vcpu 512mb
+        $function = $this->client->call(Client::METHOD_PUT, '/functions/' . $functionId, array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), [
+            'name' => 'Test1',
+            'events' => [
+                'users.*.update.name',
+                'users.*.update.email',
+            ],
+            'timeout' => 15,
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'runtimeSpecification' => Specification::S_1VCPU_512MB,
+        ]);
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertNotEmpty($function['body']['$id']);
+        $this->assertEquals(Specification::S_1VCPU_512MB, $function['body']['runtimeSpecification']);
+
+        // Verify the updated specs
+        $execution = $this->createExecution($functionId);
+
+        $output = $this->executionOutput($execution);
+
+        $this->assertEquals(1, $output['APPWRITE_FUNCTION_CPUS']);
+        $this->assertEquals(512, $output['APPWRITE_FUNCTION_MEMORY']);
+
+        /**
+         * Test for FAILURE
+         */
+        $function = $this->client->call(Client::METHOD_PUT, '/functions/' . $functionId, array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), [
+            'name' => 'Test1',
+            'events' => [
+                'users.*.update.name',
+                'users.*.update.email',
+            ],
+            'timeout' => 15,
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'buildSpecification' => 's-2vcpu-512mb', // Invalid specification
+        ]);
+
+        $this->assertEquals(400, $function['headers']['status-code']);
+        $this->assertStringStartsWith('Invalid `buildSpecification` param: Specification must be one of:', $function['body']['message']);
+
+        $function = $this->client->call(Client::METHOD_PUT, '/functions/' . $data['functionId'], array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), [
+            'name' => 'Test1',
+            'events' => [
+                'users.*.update.name',
+                'users.*.update.email',
+            ],
+            'timeout' => 15,
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'runtimeSpecification' => 's-2vcpu-512mb', // Invalid specification
+        ]);
+
+        $this->assertEquals(400, $function['headers']['status-code']);
+        $this->assertStringStartsWith('Invalid `runtimeSpecification` param: Specification must be one of:', $function['body']['message']);
+    }
+
+    public function testDeleteDeployment(): void
+    {
+        // Create fresh function and deployment for this test since we delete them
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Delete Deployment',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+        ]);
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $functionId = $function['body']['$id'] ?? '';
+
+        $deployment = $this->createDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+        $deploymentId = $deployment['body']['$id'] ?? '';
+
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $this->assertEquals('ready', $deployment['body']['status']);
+        }, 50000, 500);
+
+        /**
+         * Test for SUCCESS
+         */
+        $deployment = $this->client->call(Client::METHOD_DELETE, '/functions/' . $functionId . '/deployments/' . $deploymentId, array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()));
+
+        $this->assertEquals(204, $deployment['headers']['status-code']);
+        $this->assertEmpty($deployment['body']);
+
+        $deployment = $this->getDeployment($functionId, $deploymentId);
+
+        $this->assertEquals(404, $deployment['headers']['status-code']);
+    }
+
+    public function testDeleteDeploymentDuringBuild(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Delete Deployment During Build',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            // Keeps the build running while the deployment is deleted.
+            'commands' => 'sleep 10',
+        ]);
+
+        $deployment = $this->createDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true,
+        ]);
+        $this->assertSame(202, $deployment['headers']['status-code']);
+        $deploymentId = $deployment['body']['$id'];
+
+        $this->assertEventually(function () use ($functionId, $deploymentId): void {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $this->assertSame('building', $deployment['body']['status']);
+        }, 100000, 250);
+
+        $response = $this->deleteDeployment($functionId, $deploymentId);
+        $this->assertSame(204, $response['headers']['status-code']);
+
+        // Past the point where a build left running writes its output.
+        \sleep(15);
+
+        $builds = getDevice(APP_STORAGE_BUILDS . '/app-' . $this->getProject()['$id']);
+        $this->assertEventually(function () use ($builds, $deploymentId): void {
+            \clearstatcache();
+            $this->assertSame([], $builds->listFiles($builds->getPath($deploymentId))->files, 'Deleting a deployment mid-build left build files behind');
+        }, 60000, 500);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testDeleteFunction(): void
+    {
+        // Create fresh function for this test since we delete it
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Delete Function',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+        ]);
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $functionId = $function['body']['$id'] ?? '';
+
+        /**
+         * Test for SUCCESS
+         */
+        $function = $this->deleteFunction($functionId);
+
+        $this->assertEquals(204, $function['headers']['status-code']);
+        $this->assertEmpty($function['body']);
+
+        $function = $this->getFunction($functionId);
+
+        $this->assertEquals(404, $function['headers']['status-code']);
+    }
+
+    public function testDeleteFunctionBuildCache(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Delete Build Cache',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+        ]);
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true,
+        ]);
+
+        $builds = getDevice(APP_STORAGE_BUILDS . '/app-' . $this->getProject()['$id']);
+        $cache = $this->buildCache($functionId, 'node-22');
+        $this->assertTrue($builds->exists($cache), 'The build left no cache to clean up');
+
+        $response = $this->deleteFunction($functionId);
+        $this->assertSame(204, $response['headers']['status-code']);
+
+        $this->assertEventually(function () use ($builds, $cache): void {
+            \clearstatcache();
+            $this->assertFalse($builds->exists($cache), 'Deleting the function left its build cache behind');
+        }, 60000, 500);
+    }
+
+    public function testUpdateFunctionRuntimeBuildCache(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Runtime Build Cache',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+        ]);
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true,
+        ]);
+
+        $builds = getDevice(APP_STORAGE_BUILDS . '/app-' . $this->getProject()['$id']);
+        $cache = $this->buildCache($functionId, 'node-22');
+        $this->assertTrue($builds->exists($cache), 'The build left no cache to clean up');
+
+        // Same runtime: the next build reuses the cache
+        $response = $this->updateFunction($functionId, [
+            'name' => 'Test Runtime Build Cache',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ]);
+        $this->assertSame(200, $response['headers']['status-code']);
+        \clearstatcache();
+        $this->assertTrue($builds->exists($cache), 'An update that keeps the runtime must keep the build cache');
+
+        // New runtime: builds key a new cache, so nothing would read or delete the old one
+        $response = $this->updateFunction($functionId, [
+            'name' => 'Test Runtime Build Cache',
+            'runtime' => 'node-24',
+            'entrypoint' => 'index.js',
+        ]);
+        $this->assertSame(200, $response['headers']['status-code']);
+        \clearstatcache();
+        $this->assertFalse($builds->exists($cache), 'Changing the runtime left the previous build cache behind');
+
+        $this->cleanupFunction($functionId);
+    }
+
+    /**
+     * Where builds of this function on this runtime keep their package-manager cache.
+     */
+    private function buildCache(string $functionId, string $runtime): string
+    {
+        return Deployments::resourceCachePath($this->getProject()['$id'], new Document([
+            '$id' => $functionId,
+            '$collection' => 'functions',
+            'runtime' => $runtime,
+            'version' => 'v5',
+        ]));
+    }
+
+    public function testDeleteFunctionRulesCleanup(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Rules Cleanup Function',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+        ]);
+
+        $this->assertNotEmpty($functionId);
+
+        // Create a manual deployment rule (type = 'deployment')
+        $domain = $this->setupFunctionDomain($functionId);
+        $this->assertNotEmpty($domain);
+
+        // Create a redirect rule (type = 'redirect')
+        $redirectDomain = \uniqid() . '-redirect-cleanup.custom.localhost';
+        $redirectRule = $this->client->call(Client::METHOD_POST, '/proxy/rules/redirect', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), [
+            'domain' => $redirectDomain,
+            'url' => 'https://appwrite.io',
+            'statusCode' => 301,
+            'resourceType' => 'function',
+            'resourceId' => $functionId,
+        ]);
+
+        $this->assertEquals(201, $redirectRule['headers']['status-code']);
+        $this->assertNotEmpty($redirectRule['body']['$id']);
+
+        // Verify both rules exist (no type filter — catches all rule types)
+        $rules = $this->client->call(Client::METHOD_GET, '/proxy/rules', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), [
+            'queries' => [
+                Query::equal('deploymentResourceId', [$functionId])->toString()
+            ]
+        ]);
+
+        $this->assertEquals(200, $rules['headers']['status-code']);
+        $this->assertGreaterThanOrEqual(2, $rules['body']['total']);
+
+        // Delete the function
+        $this->cleanupFunction($functionId);
+
+        // Verify ALL rules (deployment + redirect) are cleaned up
+        $this->assertEventually(function () use ($functionId) {
+            $rules = $this->client->call(Client::METHOD_GET, '/proxy/rules', array_merge([
+                'content-type' => 'application/json',
+                'x-appwrite-project' => $this->getProject()['$id'],
+            ], $this->getHeaders()), [
+                'queries' => [
+                    Query::equal('deploymentResourceId', [$functionId])->toString()
+                ]
+            ]);
+
+            $this->assertEquals(200, $rules['headers']['status-code']);
+            $this->assertEquals(0, $rules['body']['total']);
+        }, 5000, 500);
+    }
+
+    #[Group('queueRetry')]
+    public function testEventSubscribersAreNotRunAgainAfterTheExecutorFailed(): void
+    {
+        // Test for SUCCESS: once the executor has been called, its failure is recorded on the
+        // execution and the event is not retried: the function has run, and a retry would run
+        // it, and every other subscriber of the event, a second time under new executions.
+        $userId = Id::unique();
+        $event = "users.{$userId}.create";
+        $succeeding = $this->setupDeployedFunction('Event subscriber that succeeds', 'basic', ['events' => [$event]]);
+        // The runtime exits in the middle of the request, so the executor answers with an error.
+        $crashing = $this->setupDeployedFunction('Event subscriber that crashes', 'crash', ['events' => [$event]]);
+
+        try {
+            $user = $this->client->call(Client::METHOD_POST, '/users', \array_merge([
+                'content-type' => 'application/json',
+                'x-appwrite-project' => $this->getProject()['$id'],
+            ], $this->getHeaders()), [
+                'userId' => $userId,
+                'email' => $userId . '@localhost.test',
+                'password' => 'password',
+            ]);
+            $this->assertSame(201, $user['headers']['status-code']);
+
+            $this->assertEventually(function () use ($succeeding, $crashing) {
+                $this->assertSame(['completed'], $this->executionStatuses($succeeding));
+                $this->assertSame(['failed'], $this->executionStatuses($crashing));
+            }, 60000, 1000);
+
+            // Whatever the broker parked as failed is now run again.
+            $this->retryFailedFunctions();
+            $settled = \microtime(true) + 15;
+            while (\microtime(true) < $settled) {
+                $this->assertSame(['completed'], $this->executionStatuses($succeeding), 'The retry ran the subscriber that succeeded a second time');
+                $this->assertSame(['failed'], $this->executionStatuses($crashing), 'The retry ran the subscriber that crashed a second time');
+                \usleep(1000000);
+            }
+        } finally {
+            $this->cleanupFunction($succeeding);
+            $this->cleanupFunction($crashing);
+        }
+    }
+
+    /**
+     * @return list<string> The status of every execution of the function, oldest first.
+     */
+    private function executionStatuses(string $functionId): array
+    {
+        $executions = $this->listExecutions($functionId, [
+            'queries' => [Query::orderAsc('$createdAt')->toString()],
+        ]);
+        $this->assertSame(200, $executions['headers']['status-code']);
+
+        return \array_column($executions['body']['executions'], 'status');
+    }
+
+    /**
+     * Run what an operator runs to retry the functions jobs the broker parked as failed.
+     */
+    private function retryFailedFunctions(): void
+    {
+        // Without --limit the task retries nothing: it reads the missing limit as 0. --connection names the broker
+        // hosting the functions queue, which Cloud requires when several are configured; this task ignores it.
+        \exec('queue-retry --name=' . \escapeshellarg(Event::FUNCTIONS_QUEUE_NAME) . ' --connection=queue --limit=1000 2>&1', $output, $exitCode);
+        $this->assertSame(0, $exitCode, \implode("\n", $output));
+    }
+
+    public function testExecutionTimeout()
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test timeout execution',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'events' => [],
+            'schedule' => '',
+            'timeout' => 5, // Should timeout after 5 seconds
+        ]);
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('timeout'),
+            'activate' => true,
+        ]);
+
+        $execution = $this->createExecution($functionId, [
+            'async' => true
+        ]);
+
+        $this->assertEquals(202, $execution['headers']['status-code']);
+
+        $this->assertNotEmpty($execution['body']['$id']);
+        $this->assertEquals('waiting', $execution['body']['status']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public static function provideCustomExecutions(): \Iterator
+    {
+        // Most disabled to keep tests fast
+        // Using positional arrays to avoid PHPUnit 11 named argument conflicts with @depends
+        // ['php-fn', 'php-8.0', 'index.php', 'PHP', '8.0'],
+        yield ['node', 'node-22', 'index.js', 'Node.js', '22'];
+    }
+
+    #[DataProvider('provideCustomExecutions')]
+    public function testCreateCustomExecution(string $folder, string $name, string $entrypoint, string $runtimeName, string $runtimeVersion): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test ' . $name,
+            'runtime' => $name,
+            'entrypoint' => $entrypoint,
+            'events' => [],
+            'timeout' => 15,
+        ]);
+
+        $variable = $this->createVariable($functionId, [
+            'variableId' => 'unique()',
+            'key' => 'CUSTOM_VARIABLE',
+            'value' => 'variable'
+        ]);
+
+        $this->assertEquals(201, $variable['headers']['status-code']);
+
+        $deploymentId = $this->setupDeployment($functionId, [
+            'entrypoint' => $entrypoint,
+            'code' => $this->packageFunction($folder),
+            'activate' => true
+        ]);
+
+        $execution = $this->createExecution($functionId, [
+            'async' => 'false'
+        ]);
+
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertEquals(200, $execution['body']['responseStatusCode']);
+        $this->assertEquals('OK', $execution['body']['responseBody']);
+        $this->assertEmpty($execution['body']['logs']);
+        $this->assertEmpty($execution['body']['errors']);
+
+        $this->assertNotEmpty($execution['body']['$id']);
+        $this->assertEquals('http', $execution['body']['trigger']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateCustomExecutionBinaryResponse()
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Binary executions',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'execute' => ['any']
+        ]);
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('binary-response'),
+            'activate' => true
+        ]);
+
+        $execution = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/executions', array_merge([
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'accept' => 'multipart/form-data', // Accept binary response
+        ], $this->getHeaders()), [
+            'body' => null,
+        ]);
+
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertStringContainsString('multipart/form-data', (string) $execution['headers']['content-type']);
+        $contentType = explode(';', $execution['headers']['content-type']);
+        $this->assertStringContainsString('boundary=----', $contentType[1]);
+        $bytes = unpack('C*byte', $execution['body']['responseBody']);
+        $this->assertCount(3, $bytes);
+        $this->assertEquals(0, $bytes['byte1']);
+        $this->assertEquals(10, $bytes['byte2']);
+        $this->assertEquals(255, $bytes['byte3']);
+
+        /**
+         * Test for FAILURE
+         */
+        $execution = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/executions', array_merge([
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'accept' => 'application/json', // Accept JSON response
+        ], $this->getHeaders()), [
+            'body' => null,
+        ]);
+
+        $this->assertEquals(400, $execution['headers']['status-code']);
+        $this->assertStringContainsString('Failed to parse response', (string) $execution['body']['message']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCreateCustomExecutionBinaryRequest()
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Binary executions',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'execute' => ['any']
+        ]);
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('binary-request'),
+            'activate' => true
+        ]);
+
+        $bytes = pack('C*', ...[0, 20, 255]);
+
+        $execution = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/executions', array_merge([
+            'content-type' => 'multipart/form-data', // Send binary request
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'accept' => 'application/json',
+        ], $this->getHeaders()), [
+            'body' => $bytes,
+        ], false);
+
+        $executionBody = json_decode($execution['body'], true);
+
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertEquals(\md5($bytes), $executionBody['responseBody']);
+        $this->assertStringStartsWith('application/json', $execution['headers']['content-type']);
+
+        /**
+         * Test for FAILURE
+         */
+        $execution = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/executions', array_merge([
+            'content-type' => 'application/json', // Send JSON headers
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'accept' => 'application/json',
+        ], $this->getHeaders()), [
+            'body' => $bytes,
+        ], false);
+
+        $executionBody = json_decode($execution['body'], true);
+
+        $this->assertNotEquals(\md5($bytes), $executionBody['responseBody']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testGetRuntimes()
+    {
+        $runtimes = $this->client->call(Client::METHOD_GET, '/functions/runtimes', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ]));
+
+        $this->assertEquals(200, $runtimes['headers']['status-code']);
+        $this->assertGreaterThan(0, $runtimes['body']['total']);
+
+        $runtime = $runtimes['body']['runtimes'][0];
+
+        $this->assertArrayHasKey('$id', $runtime);
+        $this->assertArrayHasKey('name', $runtime);
+        $this->assertArrayHasKey('key', $runtime);
+        $this->assertArrayHasKey('version', $runtime);
+        $this->assertArrayHasKey('logo', $runtime);
+        $this->assertArrayHasKey('image', $runtime);
+        $this->assertArrayHasKey('base', $runtime);
+        $this->assertArrayHasKey('supports', $runtime);
+
+        // An API key holds no 'public' scope of its own, but must still reach public endpoints
+        $runtimes = $this->client->call(Client::METHOD_GET, '/functions/runtimes', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()));
+
+        $this->assertSame(200, $runtimes['headers']['status-code']);
+        $this->assertGreaterThan(0, $runtimes['body']['total']);
+        $this->assertNotEmpty($runtimes['body']['runtimes']);
+    }
+
+    public function testListRuntimesAndSpecificationsTotal(): void
+    {
+        $headers = [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ];
+
+        $runtimes = $this->client->call(Client::METHOD_GET, '/functions/runtimes', $headers, ['total' => true]);
+        $this->assertEquals(200, $runtimes['headers']['status-code']);
+        $this->assertCount($runtimes['body']['total'], $runtimes['body']['runtimes']);
+        $this->assertGreaterThan(0, $runtimes['body']['total']);
+
+        $runtimes = $this->client->call(Client::METHOD_GET, '/functions/runtimes', $headers, ['total' => false]);
+        $this->assertEquals(200, $runtimes['headers']['status-code']);
+        $this->assertEquals(0, $runtimes['body']['total']);
+        $this->assertNotEmpty($runtimes['body']['runtimes']);
+
+        $specifications = $this->listSpecifications(['total' => true]);
+        $this->assertEquals(200, $specifications['headers']['status-code']);
+        $this->assertCount($specifications['body']['total'], $specifications['body']['specifications']);
+        $this->assertGreaterThan(0, $specifications['body']['total']);
+
+        $specifications = $this->listSpecifications(['total' => false]);
+        $this->assertEquals(200, $specifications['headers']['status-code']);
+        $this->assertEquals(0, $specifications['body']['total']);
+        $this->assertNotEmpty($specifications['body']['specifications']);
+    }
+
+
+    public function testEventTriggerWithFailingSubscribers(): void
+    {
+        $userId = Id::unique();
+        $functions = [];
+        $headers = array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders());
+
+        try {
+            // Every subscriber fails, so whichever one the worker reaches first, the rest record
+            // an execution only if the fan-out survived that failure. The one second timeout makes
+            // the executor throw while preparing the runtime; the runtime's own soft timeout would
+            // mark the execution failed without throwing.
+            foreach (['Failing event subscriber A', 'Failing event subscriber B'] as $name) {
+                $functions[] = $this->setupDeployedFunction($name, 'timeout', [
+                    'events' => ['users.' . $userId . '.create'],
+                    'timeout' => 1,
+                ]);
+            }
+
+            $user = $this->client->call(Client::METHOD_POST, '/users', $headers, [
+                'userId' => $userId,
+                'name' => 'Event subscriber isolation',
+            ]);
+            $this->assertEquals(201, $user['headers']['status-code']);
+
+            foreach ($functions as $functionId) {
+                $this->assertEventually(function () use ($functionId) {
+                    $executions = $this->listExecutions($functionId);
+                    $this->assertEquals(200, $executions['headers']['status-code']);
+                    $this->assertNotEmpty($executions['body']['executions']);
+                    $execution = $executions['body']['executions'][0];
+                    $this->assertEquals('failed', $execution['status']);
+                    $this->assertEquals('event', $execution['trigger']);
+                    $this->assertNotEmpty($execution['errors']);
+                }, 60000, 500);
+            }
+        } finally {
+            foreach ($functions as $functionId) {
+                $this->cleanupFunction($functionId);
+            }
+            $this->client->call(Client::METHOD_DELETE, '/users/' . $userId, $headers);
+        }
+    }
+
+    public function testEventTrigger()
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Event executions',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'events' => [
+                'users.*.create',
+            ],
+            'timeout' => 15,
+        ]);
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('event-handler'),
+            'activate' => true
+        ]);
+
+        // Create user as an event trigger
+        $user = $this->client->call(Client::METHOD_POST, '/users', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), [
+            'userId' => 'unique()',
+            'name' => 'Event User'
+        ]);
+
+        $this->assertEquals(201, $user['headers']['status-code']);
+
+        $userId = $user['body']['$id'] ?? '';
+
+        $this->assertEventually(function () use ($functionId, $userId) {
+            $executions = $this->listExecutions($functionId);
+
+            $this->assertEquals(200, $executions['headers']['status-code']);
+            $this->assertNotEmpty($executions['body']['executions']);
+            $execution = $executions['body']['executions'][0];
+            $this->assertEquals('completed', $execution['status']);
+            $this->assertStringContainsString($userId, (string) $execution['logs']);
+            $this->assertStringContainsString('Event User', (string) $execution['logs']);
+        }, 20000, 500);
+
+        $this->cleanupFunction($functionId);
+
+        // Cleanup user
+        $user = $this->client->call(Client::METHOD_DELETE, '/users/' . $userId, [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ], []);
+        $this->assertEquals(204, $user['headers']['status-code']);
+    }
+
+    public function testEventTriggerPreservesEmptyPreferences(): void
+    {
+        $userId = ID::unique();
+        $functionId = $this->setupDeployedFunction('User deletion event', 'event-handler', [
+            'events' => ['users.' . $userId . '.delete'],
+        ]);
+
+        try {
+            /**
+             * Test for SUCCESS
+             */
+            $user = $this->client->call(Client::METHOD_POST, '/users', array_merge([
+                'content-type' => 'application/json',
+                'x-appwrite-project' => $this->getProject()['$id'],
+            ], $this->getHeaders()), [
+                'userId' => $userId,
+                'name' => 'User without preferences',
+            ]);
+            $this->assertEquals(201, $user['headers']['status-code']);
+
+            $deleted = $this->client->call(Client::METHOD_DELETE, '/users/' . $userId, array_merge([
+                'content-type' => 'application/json',
+                'x-appwrite-project' => $this->getProject()['$id'],
+            ], $this->getHeaders()));
+            $this->assertEquals(204, $deleted['headers']['status-code']);
+
+            $this->assertEventually(function () use ($functionId, $userId) {
+                $executions = $this->listExecutions($functionId);
+                $this->assertEquals(200, $executions['headers']['status-code']);
+                $this->assertNotEmpty($executions['body']['executions']);
+                $execution = $executions['body']['executions'][0];
+                $this->assertEquals('completed', $execution['status']);
+                $this->assertStringContainsString($userId, (string) $execution['logs']);
+                $this->assertStringContainsString('"prefs":{}', (string) $execution['logs']);
+                $this->assertStringNotContainsString('"prefs":[]', (string) $execution['logs']);
+            }, 20000, 500);
+        } finally {
+            $this->cleanupFunction($functionId);
+        }
+    }
+
+    public function testScopesWithinKey(): void
+    {
+        $headers = [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getNewKey(['functions.read', 'functions.write', 'users.read']),
+        ];
+        $params = [
+            'name' => 'Scopes within key',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ];
+
+        /**
+         * Test for SUCCESS
+         */
+        $function = $this->client->call(Client::METHOD_POST, '/functions', $headers, [
+            'functionId' => Id::unique(),
+            ...$params,
+            'scopes' => ['users.read'],
+        ]);
+        $this->assertSame(201, $function['headers']['status-code']);
+        $this->assertSame(['users.read'], $function['body']['scopes']);
+
+        $functionId = $function['body']['$id'];
+
+        $function = $this->updateFunction($functionId, [...$params, 'scopes' => ['users.read', 'users.write']]);
+        $this->assertSame(200, $function['headers']['status-code']);
+
+        // Scopes the function already has are kept by a key that lacks them
+        $function = $this->client->call(Client::METHOD_PUT, '/functions/' . $functionId, $headers, [
+            ...$params,
+            'scopes' => ['users.read', 'users.write'],
+        ]);
+        $this->assertSame(200, $function['headers']['status-code']);
+        $this->assertSame(['users.read', 'users.write'], $function['body']['scopes']);
+
+        /**
+         * Test for FAILURE
+         */
+        $function = $this->client->call(Client::METHOD_POST, '/functions', $headers, [
+            'functionId' => Id::unique(),
+            ...$params,
+            'scopes' => ['users.read', 'databases.write'],
+        ]);
+        $this->assertSame(401, $function['headers']['status-code']);
+        $this->assertSame(Exception::GENERAL_UNAUTHORIZED_SCOPE, $function['body']['type']);
+
+        $function = $this->client->call(Client::METHOD_PUT, '/functions/' . $functionId, $headers, [
+            ...$params,
+            'scopes' => ['users.read', 'users.write', 'databases.write'],
+        ]);
+        $this->assertSame(401, $function['headers']['status-code']);
+        $this->assertSame(Exception::GENERAL_UNAUTHORIZED_SCOPE, $function['body']['type']);
+
+        $function = $this->getFunction($functionId);
+        $this->assertSame(['users.read', 'users.write'], $function['body']['scopes']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testScopes()
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Scopes executions',
+            'commands' => 'bash setup.sh && npm ci',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'scopes' => ['users.read'],
+            'timeout' => 15,
+        ]);
+
+        $deploymentId = $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('ephemeral-api-key'),
+            'activate' => true,
+        ]);
+
+        $deployment = $this->getDeployment($functionId, $deploymentId);
+
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertStringContainsStringIgnoringCase("200 OK", $deployment['body']['buildLogs']);
+        $this->assertStringContainsStringIgnoringCase('"total":', $deployment['body']['buildLogs']);
+        $this->assertStringContainsStringIgnoringCase('"users":', $deployment['body']['buildLogs']);
+
+        $execution = $this->createExecution($functionId, [
+            'async' => 'false',
+        ]);
+
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertEquals('completed', $execution['body']['status']);
+        $this->assertEquals(200, $execution['body']['responseStatusCode']);
+        $this->assertGreaterThan(0, $execution['body']['duration']);
+        $this->assertNotEmpty($execution['body']['responseBody']);
+        $this->assertStringContainsString("total", (string) $execution['body']['responseBody']);
+
+        $queuedAt = \microtime(true);
+        $execution = $this->createExecution($functionId, [
+            'async' => true,
+        ]);
+
+        $this->assertEquals(202, $execution['headers']['status-code']);
+        $this->assertNotEmpty($execution['body']['$id']);
+
+        // The worker measures the same window as the synchronous paths, so the
+        // stored duration has to be a positive sub-interval of the time between
+        // queueing the execution and observing it finish.
+        $asyncExecutionId = $execution['body']['$id'];
+
+        $this->assertEventually(function () use ($functionId, $asyncExecutionId, $queuedAt) {
+            $execution = $this->getExecution($functionId, $asyncExecutionId);
+
+            $this->assertEquals(200, $execution['headers']['status-code']);
+            $this->assertEquals('completed', $execution['body']['status']);
+            $this->assertGreaterThan(0, $execution['body']['duration']);
+            $this->assertLessThanOrEqual(\microtime(true) - $queuedAt, $execution['body']['duration']);
+        }, 60000, 500);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testCookieExecution()
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Cookie executions',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+        ]);
+        $this->assertNotEmpty($functionId);
+
+        $deploymentId = $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('cookies'),
+            'activate' => true
+        ]);
+        $this->assertNotEmpty($deploymentId);
+
+        $cookie = 'cookieName=cookieValue; cookie2=value2; cookie3=value=3; cookie4=val:ue4; cookie5=value5';
+        $execution = $this->createExecution($functionId, [
+            'async' => 'false',
+            'headers' => [
+                'cookie' => $cookie
+            ]
+        ]);
+
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertEquals('completed', $execution['body']['status']);
+        $this->assertEquals(200, $execution['body']['responseStatusCode']);
+        $this->assertEquals($cookie, $execution['body']['responseBody']);
+        $this->assertGreaterThan(0, $execution['body']['duration']);
+
+        $deployment = $this->getDeployment($functionId, $deploymentId);
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertGreaterThan(0, $deployment['body']['sourceSize']);
+        $this->assertGreaterThan(0, $deployment['body']['buildSize']);
+        $totalSize = $deployment['body']['sourceSize'] + $deployment['body']['buildSize'];
+        $this->assertEquals($totalSize, $deployment['body']['totalSize']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    /**
+     * A function domain resolves to the console, and clients send their own project's
+     * user JWT there for the function to read. That JWT authenticates nobody at the
+     * console, but it must not stop the request from reaching the function.
+     */
+    public function testFunctionsDomainServesRequestCarryingAnotherProjectsJwt(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Domain with foreign JWT',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'execute' => ['any'],
+        ]);
+        $domain = $this->setupFunctionDomain($functionId);
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('cookies'),
+            'activate' => true,
+        ]);
+
+        $otherProject = $this->getProject(true);
+        $user = $this->client->call(Client::METHOD_POST, '/users', [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $otherProject['$id'],
+            'x-appwrite-key' => $otherProject['apiKey'],
+        ], [
+            'userId' => Id::unique(),
+            'email' => 'foreign-jwt-' . Id::unique() . '@appwrite.io',
+            'password' => 'password',
+        ]);
+        $this->assertEquals(201, $user['headers']['status-code']);
+
+        $jwt = $this->client->call(Client::METHOD_POST, '/users/' . $user['body']['$id'] . '/jwts', [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $otherProject['$id'],
+            'x-appwrite-key' => $otherProject['apiKey'],
+        ]);
+        $this->assertEquals(201, $jwt['headers']['status-code']);
+
+        $proxyClient = new Client();
+        $proxyClient->setEndpoint('http://' . $domain);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/', [
+            'content-type' => 'application/json',
+            'x-appwrite-jwt' => $jwt['body']['jwt'],
+        ]);
+        $this->assertEquals(200, $response['headers']['status-code']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testFunctionsDomain()
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Cookie executions',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'execute' => ['any']
+        ]);
+
+        $domain = $this->setupFunctionDomain($functionId);
+
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('cookies'),
+            'activate' => true
+        ]);
+
+        $cookie = 'cookieName=cookieValue; cookie2=value2; cookie3=value=3; cookie4=val:ue4; cookie5=value5';
+
+        $proxyClient = new Client();
+        $proxyClient->setEndpoint('http://' . $domain);
+
+        $started = \microtime(true);
+        $response = $proxyClient->call(Client::METHOD_GET, '/', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'cookie' => $cookie
+        ]));
+        $elapsed = \microtime(true) - $started;
+
+        $this->assertEquals(200, $response['headers']['status-code']);
+        $this->assertEquals($cookie, $response['body']);
+
+        $this->assertArrayHasKey('x-appwrite-execution-id', $response['headers']);
+        $this->assertNotEmpty($response['headers']['x-appwrite-execution-id']);
+
+        // Duration covers the whole request, cold start included, so it tracks
+        // what the caller waited rather than only the warm runtime window. The
+        // execution record is written after the response, so wait for it.
+        $executionId = $response['headers']['x-appwrite-execution-id'];
+        $this->assertEventually(function () use ($functionId, $executionId, $elapsed) {
+            $execution = $this->getExecution($functionId, $executionId);
+
+            $this->assertEquals(200, $execution['headers']['status-code']);
+            $this->assertLessThanOrEqual($elapsed, $execution['body']['duration']);
+            $this->assertGreaterThan($elapsed / 2, $execution['body']['duration']);
+        }, 30000, 500);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testFunctionsDomainReservedHeaders(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test domain reserved headers',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'execute' => ['any'],
+        ]);
+
+        try {
+            $domain = $this->setupFunctionDomain($functionId);
+            $this->setupDeployment($functionId, [
+                'code' => $this->packageFunction('basic'),
+                'activate' => true,
+            ]);
+
+            $proxyClient = new Client();
+            $proxyClient->setEndpoint('http://' . $domain);
+
+            $response = $proxyClient->call(Client::METHOD_GET, '/', [
+                'content-type' => 'application/json',
+                'X-Appwrite-User-Id' => 'impersonated-user',
+                'X-APPWRITE-TRIGGER' => 'event',
+                'X-Appwrite-Event' => 'users.user.update',
+                'x-appwrite-user-jwt' => 'caller-jwt',
+                'X-Appwrite-Client-Ip' => '203.0.113.10',
+            ]);
+
+            $this->assertSame(200, $response['headers']['status-code']);
+            $this->assertSame('', $response['body']['APPWRITE_FUNCTION_USER_ID']);
+            $this->assertSame('http', $response['body']['APPWRITE_FUNCTION_TRIGGER']);
+            $this->assertSame('', $response['body']['APPWRITE_FUNCTION_EVENT']);
+            $this->assertSame('', $response['body']['APPWRITE_FUNCTION_JWT']);
+            $this->assertNotSame('203.0.113.10', $response['body']['APPWRITE_FUNCTION_CLIENT_IP']);
+            $this->assertNotSame('', $response['body']['APPWRITE_FUNCTION_CLIENT_IP']);
+        } finally {
+            $this->cleanupFunction($functionId);
+        }
+    }
+
+    public function testFunctionsDomainBinaryResponse()
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Binary executions',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'execute' => ['any']
+        ]);
+
+        $domain = $this->setupFunctionDomain($functionId);
+
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('binary-response'),
+            'activate' => true
+        ]);
+
+        $proxyClient = new Client();
+        $proxyClient->setEndpoint('http://' . $domain);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/', [], [], false);
+
+        $this->assertEquals(200, $response['headers']['status-code']);
+        $this->assertNotEmpty($response['body']);
+        $bytes = unpack('C*byte', $response['body']);
+        $this->assertCount(3, $bytes);
+        $this->assertEquals(0, $bytes['byte1']);
+        $this->assertEquals(10, $bytes['byte2']);
+        $this->assertEquals(255, $bytes['byte3']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testFunctionsDomainBinaryRequest()
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Binary executions',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'execute' => ['any']
+        ]);
+
+        $domain = $this->setupFunctionDomain($functionId);
+
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('binary-request'),
+            'activate' => true
+        ]);
+
+        $proxyClient = new Client();
+        $proxyClient->setEndpoint('http://' . $domain);
+
+        $bytes = pack('C*', ...[0, 20, 255]);
+
+        $response = $proxyClient->call(Client::METHOD_POST, '/', ['content-type' => 'text/plain'], $bytes, false);
+
+        $this->assertEquals(200, $response['headers']['status-code']);
+        $this->assertEquals(\md5($bytes), $response['body']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testResponseFilters()
+    {
+        // create function with 1.5.0 response format
+        $response = $this->client->call(Client::METHOD_POST, '/functions', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-response-format' => '1.5.0', // add response format header
+        ], $this->getHeaders()), [
+            'functionId' => Id::unique(),
+            'name' => 'Test',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+        ]);
+
+        $this->assertEquals(201, $response['headers']['status-code']);
+        $this->assertArrayNotHasKey('scopes', $response['body']);
+        $this->assertArrayNotHasKey('specification', $response['body']);
+        $this->assertArrayNotHasKey('buildSpecification', $response['body']);
+        $this->assertArrayNotHasKey('runtimeSpecification', $response['body']);
+
+        // get function with 1.5.0 response format header
+        $function = $this->client->call(Client::METHOD_GET, '/functions/' . $response['body']['$id'], array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-response-format' => '1.5.0', // add response format header
+        ], $this->getHeaders()));
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertArrayNotHasKey('scopes', $function['body']);
+        $this->assertArrayNotHasKey('buildSpecification', $function['body']);
+        $this->assertArrayNotHasKey('runtimeSpecification', $function['body']);
+        $this->assertArrayNotHasKey('specification', $function['body']);
+
+        // get function with 1.8.0 response format header
+        $function = $this->client->call(Client::METHOD_GET, '/functions/' . $response['body']['$id'], array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-response-format' => '1.8.0', // add response format header
+        ], $this->getHeaders()));
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertArrayHasKey('scopes', $function['body']);
+        $this->assertArrayHasKey('specification', $function['body']);
+        $this->assertArrayNotHasKey('buildSpecification', $function['body']);
+        $this->assertArrayNotHasKey('runtimeSpecification', $function['body']);
+
+        // get function with latest version
+        $function = $this->getFunction($function['body']['$id']);
+
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertArrayHasKey('scopes', $function['body']);
+        $this->assertArrayNotHasKey('specification', $function['body']);
+        $this->assertArrayHasKey('buildSpecification', $function['body']);
+        $this->assertArrayHasKey('runtimeSpecification', $function['body']);
+
+        $functionId = $function['body']['$id'] ?? '';
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testRequestFilters()
+    {
+        $function1Id = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'execute' => ['any']
+        ]);
+
+        $function2Id = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test2',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'execute' => ['any']
+        ]);
+
+        // list functions using request filters
+        $response = $this->client->call(
+            Client::METHOD_GET,
+            '/functions',
+            array_merge([
+                'content-type' => 'application/json',
+                'x-appwrite-project' => $this->getProject()['$id'],
+                'x-appwrite-response-format' => '1.4.0', // Set response format for 1.4 syntax
+            ], $this->getHeaders()),
+            [
+                'queries' => [ 'equal("name", ["Test2"])' ]
+            ]
+        );
+
+        $this->assertEquals(200, $response['headers']['status-code']);
+        $this->assertCount(1, $response['body']['functions']);
+        $this->assertEquals('Test2', $response['body']['functions'][0]['name']);
+
+        $this->cleanupFunction($function1Id);
+        $this->cleanupFunction($function2Id);
+    }
+
+    public function testFunctionLogging()
+    {
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'runtime' => 'node-22',
+            'name' => 'Logging Test',
+            'entrypoint' => 'index.js',
+            'logging' => false,
+            'execute' => ['any']
+        ]);
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $this->assertFalse($function['body']['logging']);
+        $this->assertNotEmpty($function['body']['$id']);
+
+        $functionId = $function['body']['$id'] ?? '';
+
+        $domain = $this->setupFunctionDomain($functionId);
+
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+
+        // Sync Executions test
+        $execution = $this->createExecution($functionId);
+
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertEmpty($execution['body']['logs']);
+        $this->assertEmpty($execution['body']['errors']);
+
+        // Async Executions test
+        $execution = $this->createExecution($functionId, [
+            'async' => true
+        ]);
+
+        $this->assertEquals(202, $execution['headers']['status-code']);
+        $this->assertEmpty($execution['body']['logs']);
+        $this->assertEmpty($execution['body']['errors']);
+        $this->assertNotEmpty($execution['body']['$id']);
+
+        // Domain Executions test
+        $domain = $this->getFunctionDomain($functionId);
+
+        $proxyClient = new Client();
+        $proxyClient->setEndpoint('http://' . $domain);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ]));
+
+        $this->assertEquals(200, $response['headers']['status-code']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testFunctionSpecifications()
+    {
+        // Check if the function specifications are correctly set in builds
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'runtime' => 'node-22',
+            'name' => 'Specification Test',
+            'entrypoint' => 'index.js',
+            'logging' => false,
+            'execute' => ['any'],
+            'buildSpecification' => Specification::S_2VCPU_2GB,
+            'runtimeSpecification' => Specification::S_1VCPU_1GB,
+            'commands' => 'echo $APPWRITE_FUNCTION_MEMORY:$APPWRITE_FUNCTION_CPUS',
+        ]);
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $this->assertEquals(Specification::S_2VCPU_2GB, $function['body']['buildSpecification']);
+        $this->assertEquals(Specification::S_1VCPU_1GB, $function['body']['runtimeSpecification']);
+        $this->assertNotEmpty($function['body']['$id']);
+
+        $functionId = $function['body']['$id'] ?? '';
+
+        $deploymentId = $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+
+        $this->assertEventually(function () use ($functionId, $deploymentId) {
+            $deployment = $this->getDeployment($functionId, $deploymentId);
+            $this->assertStringContainsString('2048:2', (string) $deployment['body']['buildLogs']);
+        }, 10000, 500);
+
+        // Check if the function specifications are correctly set in executions
+        $execution = $this->createExecution($functionId);
+
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertNotEmpty($execution['body']['$id']);
+
+        $executionResponse = $this->executionOutput($execution);
+        $this->assertEquals('1024', $executionResponse['APPWRITE_FUNCTION_MEMORY']);
+        $this->assertEquals('1', $executionResponse['APPWRITE_FUNCTION_CPUS']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testDuplicateDeployment(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'runtime' => 'node-22',
+            'name' => 'Duplicate Deployment Test',
+            'entrypoint' => 'index.js',
+            'commands' => ''
+        ]);
+        $this->assertNotEmpty($functionId);
+
+        $deploymentId1 = $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+        $this->assertNotEmpty($deploymentId1);
+
+        $execution = $this->createExecution($functionId);
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertStringContainsString('APPWRITE_FUNCTION_ID', (string) $execution['body']['responseBody']);
+
+        $function = $this->updateFunction($functionId, [
+            'runtime' => 'node-22',
+            'name' => 'Duplicate Deployment Test',
+            'entrypoint' => 'index.js',
+            'commands' => 'rm index.js && mv maintenance.js index.js'
+        ]);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertStringContainsString('maintenance.js', (string) $function['body']['commands']);
+
+        $deployment = $this->createDuplicateDeployment($functionId, $deploymentId1);
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+
+        $deploymentId2 = $deployment['body']['$id'];
+        $this->assertNotEmpty($deploymentId2);
+
+        $deployment = $this->getDeployment($functionId, $deploymentId2);
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertGreaterThan(0, $deployment['body']['sourceSize']);
+        $this->assertEquals(0, $deployment['body']['buildSize']);
+        $this->assertEquals($deployment['body']['sourceSize'], $deployment['body']['totalSize']);
+
+        $this->assertEventually(function () use ($functionId, $deploymentId2) {
+            $function = $this->getFunction($functionId);
+            $this->assertEquals($deploymentId2, $function['body']['deploymentId']);
+        }, 50000, 500);
+
+        $execution = $this->createExecution($functionId);
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertStringContainsString('Maintenance', (string) $execution['body']['responseBody']);
+
+        $deployment = $this->getDeployment($functionId, $deploymentId2);
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertGreaterThan(0, $deployment['body']['sourceSize']);
+        $this->assertGreaterThan(0, $deployment['body']['buildSize']);
+        $totalSize = $deployment['body']['sourceSize'] + $deployment['body']['buildSize'];
+        $this->assertEquals($totalSize, $deployment['body']['totalSize']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testUpdateDeploymentStatus(): void
+    {
+
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'runtime' => 'node-22',
+            'name' => 'Re-activate Test',
+            'entrypoint' => 'index.js',
+        ]);
+        $this->assertNotEmpty($functionId);
+
+        $function = $this->getFunction($functionId);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertArrayHasKey('latestDeploymentId', $function['body']);
+        $this->assertArrayHasKey('latestDeploymentCreatedAt', $function['body']);
+        $this->assertArrayHasKey('latestDeploymentStatus', $function['body']);
+        $this->assertEmpty($function['body']['latestDeploymentId']);
+        $this->assertEmpty($function['body']['latestDeploymentCreatedAt']);
+        $this->assertEmpty($function['body']['latestDeploymentStatus']);
+
+        $deploymentId1 = $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('cookies'),
+            'activate' => true
+        ]);
+        $this->assertNotEmpty($deploymentId1);
+
+        $function = $this->getFunction($functionId);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($deploymentId1, $function['body']['latestDeploymentId']);
+        $this->assertEquals('ready', $function['body']['latestDeploymentStatus']);
+
+        $execution = $this->createExecution($functionId, [
+            'headers' => [ 'cookie' => 'cookieName=cookieValue' ]
+        ]);
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertNotEmpty($execution['body']['$id']);
+        $this->assertStringContainsString('cookieValue', (string) $execution['body']['responseBody']);
+
+        $deploymentId2 = $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+        $this->assertNotEmpty($deploymentId2);
+
+        $function = $this->getFunction($functionId);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($deploymentId2, $function['body']['latestDeploymentId']);
+        $this->assertEquals('ready', $function['body']['latestDeploymentStatus']);
+
+        $execution = $this->createExecution($functionId);
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertNotEmpty($execution['body']['$id']);
+        $this->assertStringContainsString('UNICODE_TEST', (string) $execution['body']['responseBody']);
+
+        $function = $this->getFunction($functionId);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($deploymentId2, $function['body']['deploymentId']);
+        $this->assertEquals($deploymentId2, $function['body']['latestDeploymentId']);
+        $this->assertEquals('ready', $function['body']['latestDeploymentStatus']);
+
+        $function = $this->updateFunctionDeployment($functionId, $deploymentId1);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($deploymentId1, $function['body']['deploymentId']);
+
+        $function = $this->getFunction($functionId);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($deploymentId1, $function['body']['deploymentId']);
+        $this->assertEquals($deploymentId2, $function['body']['latestDeploymentId']);
+        $this->assertEquals('ready', $function['body']['latestDeploymentStatus']);
+
+        $execution = $this->createExecution($functionId, [
+            'headers' => [ 'cookie' => 'cookieName=cookieValue' ]
+        ]);
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertNotEmpty($execution['body']['$id']);
+        $this->assertStringContainsString('cookieValue', (string) $execution['body']['responseBody']);
+
+        $deployment = $this->deleteDeployment($functionId, $deploymentId2);
+        $this->assertEquals(204, $deployment['headers']['status-code']);
+
+        $function = $this->getFunction($functionId);
+        $this->assertEquals(200, $function['headers']['status-code']);
+        $this->assertEquals($deploymentId1, $function['body']['latestDeploymentId']);
+        $this->assertEquals('ready', $function['body']['latestDeploymentStatus']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    #[Retry(count: 3)]
+    public function testErrorPages(): void
+    {
+        // non-existent domain
+        $domain = 'non-existent-page.functions.localhost';
+
+        $proxyClient = new Client();
+        $proxyClient->setEndpoint('http://' . $domain);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/');
+
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertStringContainsString('Nothing is here yet', (string) $response['body']);
+        $this->assertStringContainsString('Start with this domain', (string) $response['body']);
+
+        // failed deployment
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Error Pages',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'commands' => 'cd non-existing-directory',
+            'execute' => ['any']
+        ]);
+
+        $domain = $this->setupFunctionDomain($functionId);
+        $proxyClient->setEndpoint('http://' . $domain);
+
+        $deployment = $this->createDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ]));
+
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertStringContainsString('No active deployments', (string) $response['body']);
+        $this->assertStringContainsString('View deployments', (string) $response['body']);
+
+        // canceled deployment
+        $deployment = $this->createDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+
+        $deploymentId = $deployment['body']['$id'] ?? '';
+        $this->assertEquals(202, $deployment['headers']['status-code']);
+
+        $deployment = $this->cancelDeployment($functionId, $deploymentId);
+        $this->assertEquals(200, $deployment['headers']['status-code']);
+        $this->assertEquals('canceled', $deployment['body']['status']);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ]));
+
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertStringContainsString('No active deployments', (string) $response['body']);
+        $this->assertStringContainsString('View deployments', (string) $response['body']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testErrorPagesPermissions(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Error Pages',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'commands' => '',
+            'execute' => ['users']
+        ]);
+
+        $domain = $this->setupFunctionDomain($functionId);
+        $proxyClient = new Client();
+        $proxyClient->setEndpoint('http://' . $domain);
+
+        $deploymentId = $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+        $this->assertNotEmpty($deploymentId);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ]));
+
+        $this->assertEquals(401, $response['headers']['status-code']);
+        $this->assertStringContainsString('Execution not permitted', (string) $response['body']);
+        $this->assertStringContainsString('View settings', (string) $response['body']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testErrorPagesEmptyBody(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Error Pages',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+            'commands' => '',
+            'execute' => ['any']
+        ]);
+
+        $domain = $this->setupFunctionDomain($functionId);
+        $proxyClient = new Client();
+        $proxyClient->setEndpoint('http://' . $domain);
+
+        $deploymentId = $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('basic'),
+            'activate' => true
+        ]);
+        $this->assertNotEmpty($deploymentId);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/custom-response?code=404', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ]));
+        $this->assertEquals(404, $response['headers']['status-code']);
+        $this->assertStringContainsString('Error 404', (string) $response['body']);
+        $this->assertStringContainsString('does not exist', (string) $response['body']);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/custom-response?code=504', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ]));
+        $this->assertEquals(504, $response['headers']['status-code']);
+        $this->assertStringContainsString('Error 504', (string) $response['body']);
+        $this->assertStringContainsString('respond in time', (string) $response['body']);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/custom-response?code=400', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ]));
+        $this->assertEquals(400, $response['headers']['status-code']);
+        $this->assertStringContainsString('Error 400', (string) $response['body']);
+        $this->assertStringContainsString('unexpected client error', (string) $response['body']);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/custom-response?code=500', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ]));
+        $this->assertEquals(500, $response['headers']['status-code']);
+        $this->assertStringContainsString('Error 500', (string) $response['body']);
+        $this->assertStringContainsString('unexpected server error', (string) $response['body']);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/custom-response?code=400&body=CustomError400', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ]));
+        $this->assertEquals(400, $response['headers']['status-code']);
+        $this->assertStringContainsString('CustomError400', (string) $response['body']);
+
+        $response = $proxyClient->call(Client::METHOD_GET, '/custom-response?code=500&body=CustomError500', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id']
+        ]));
+        $this->assertEquals(500, $response['headers']['status-code']);
+        $this->assertStringContainsString('CustomError500', (string) $response['body']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testLogAndErrorTruncation(): void
+    {
+        $functionId = $this->setupFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test Log Truncation',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+            'timeout' => 15,
+        ]);
+
+        $this->setupDeployment($functionId, [
+            'code' => $this->packageFunction('log-error-truncation'),
+            'activate' => true
+        ]);
+
+        $execution = $this->createExecution($functionId, [
+            'async' => 'false'
+        ]);
+
+        $this->assertEquals(201, $execution['headers']['status-code']);
+        $this->assertEquals(200, $execution['body']['responseStatusCode']);
+
+        // Verify logs are truncated and warning message is present at the beginning
+        $logs = $execution['body']['logs'];
+        $this->assertLessThanOrEqual(APP_FUNCTION_LOG_LENGTH_LIMIT, strlen($logs));
+        $this->assertStringStartsWith('[WARNING] Logs truncated', $logs);
+
+        $this->assertStringContainsString('a', (string) $logs);
+
+        // Verify errors are truncated and warning message is present at the beginning
+        $errors = $execution['body']['errors'];
+        $this->assertLessThanOrEqual(APP_FUNCTION_ERROR_LENGTH_LIMIT, strlen($errors));
+        $this->assertStringStartsWith('[WARNING] Errors truncated', $errors);
+
+        $this->assertStringContainsString('a', (string) $errors);
+
+        $this->cleanupFunction($functionId);
+    }
+
+    public function testFunctionDeploymentRetention(): void
+    {
+        $functionIds = [];
+
+        // Default
+        $response = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test retention function',
+            'runtime' => 'node-22',
+        ]);
+        $this->assertSame(201, $response['headers']['status-code']);
+        $this->assertSame(0, $response['body']['deploymentRetention']);
+        $functionIds[] = $response['body']['$id'];
+
+        $response = $this->getFunction($response['body']['$id']);
+        $this->assertSame(200, $response['headers']['status-code']);
+        $this->assertSame(0, $response['body']['deploymentRetention']);
+
+        // Success values
+        $response = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test retention function',
+            'runtime' => 'node-22',
+            'deploymentRetention' => 0
+        ]);
+        $this->assertSame(201, $response['headers']['status-code']);
+        $this->assertSame(0, $response['body']['deploymentRetention']);
+        $functionIds[] = $response['body']['$id'];
+
+        $response = $this->getFunction($response['body']['$id']);
+        $this->assertSame(200, $response['headers']['status-code']);
+        $this->assertSame(0, $response['body']['deploymentRetention']);
+
+        $response = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test retention function',
+            'runtime' => 'node-22',
+            'deploymentRetention' => 180
+        ]);
+        $this->assertSame(201, $response['headers']['status-code']);
+        $this->assertSame(180, $response['body']['deploymentRetention']);
+        $functionIds[] = $response['body']['$id'];
+
+        $response = $this->getFunction($response['body']['$id']);
+        $this->assertSame(200, $response['headers']['status-code']);
+        $this->assertSame(180, $response['body']['deploymentRetention']);
+
+        // Failure values
+        $response = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test retention function',
+            'runtime' => 'node-22',
+            'deploymentRetention' => 999999
+        ]);
+        $this->assertSame(400, $response['headers']['status-code']);
+
+        $response = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test retention function',
+            'runtime' => 'node-22',
+            'deploymentRetention' => -1
+        ]);
+        $this->assertSame(400, $response['headers']['status-code']);
+
+        // Update flow
+        $response = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test retention function',
+            'runtime' => 'node-22',
+            'deploymentRetention' => 180
+        ]);
+        $this->assertSame(201, $response['headers']['status-code']);
+        $this->assertSame(180, $response['body']['deploymentRetention']);
+        $functionIds[] = $response['body']['$id'];
+        $functionIdForUpdate = $response['body']['$id'];
+
+        $response = $this->updateFunction($functionIdForUpdate, [
+            'name' => 'Test retention function',
+            'deploymentRetention' => 90
+        ]);
+        $this->assertSame(200, $response['headers']['status-code']);
+        $this->assertSame(90, $response['body']['deploymentRetention']);
+
+        $response = $this->getFunction($functionIdForUpdate);
+        $this->assertSame(200, $response['headers']['status-code']);
+        $this->assertSame(90, $response['body']['deploymentRetention']);
+
+        $response = $this->updateFunction($functionIdForUpdate, [
+            'name' => 'Test retention function',
+        ]);
+        $this->assertSame(200, $response['headers']['status-code']);
+        $this->assertSame(90, $response['body']['deploymentRetention']);
+
+        $response = $this->getFunction($functionIdForUpdate);
+        $this->assertSame(200, $response['headers']['status-code']);
+        $this->assertSame(90, $response['body']['deploymentRetention']);
+
+        // Failed update flow
+        $response = $this->updateFunction($functionIdForUpdate, [
+            'name' => 'Test retention function',
+            'deploymentRetention' => -1
+        ]);
+        $this->assertSame(400, $response['headers']['status-code']);
+
+        $response = $this->updateFunction($functionIdForUpdate, [
+            'name' => 'Test retention function',
+            'deploymentRetention' => 999999
+        ]);
+        $this->assertSame(400, $response['headers']['status-code']);
+
+        foreach ($functionIds as $functionId) {
+            $this->cleanupFunction($functionId);
+        }
+    }
+
+    public function testCreateVcsDeploymentWithoutInstallation(): void
+    {
+        $function = $this->createFunction([
+            'functionId' => Id::unique(),
+            'name' => 'Test VCS No Installation',
+            'runtime' => 'node-22',
+            'entrypoint' => 'index.js',
+        ]);
+
+        $this->assertEquals(201, $function['headers']['status-code']);
+        $functionId = $function['body']['$id'];
+
+        /**
+         * Test for FAILURE
+         */
+        $deployment = $this->client->call(Client::METHOD_POST, '/functions/' . $functionId . '/deployments/vcs', array_merge([
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+        ], $this->getHeaders()), [
+            'type' => 'branch',
+            'reference' => 'main',
+        ]);
+
+        $this->assertEquals(404, $deployment['headers']['status-code']);
+        $this->assertEquals('installation_not_found', $deployment['body']['type']);
+
+        $this->cleanupFunction($functionId);
+    }
+
+
+    public function testDeleteExecutionRequiresOwnership(): void
+    {
+        $functionId = '';
+        $otherFunctionId = '';
+
+        try {
+            $functionId = $this->setupDeployedFunction('Execution ownership');
+
+            $execution = $this->createExecution($functionId, ['async' => 'false']);
+
+            $this->assertEquals(201, $execution['headers']['status-code']);
+            $executionId = $execution['body']['$id'];
+            $this->assertNotEmpty($executionId);
+
+            $this->assertEventually(function () use ($functionId, $executionId) {
+                $execution = $this->getExecution($functionId, $executionId);
+
+                $this->assertEquals(200, $execution['headers']['status-code']);
+                $this->assertEquals('completed', $execution['body']['status']);
+            }, 60000, 500);
+
+            $otherFunctionId = $this->setupFunction([
+                'functionId' => Id::unique(),
+                'name' => 'Execution ownership other',
+                'runtime' => 'node-22',
+                'entrypoint' => 'index.js',
+                'execute' => [Role::any()->toString()],
+            ]);
+
+            /**
+             * Test for FAILURE
+             */
+            $response = $this->client->call(Client::METHOD_DELETE, '/functions/' . $otherFunctionId . '/executions/' . $executionId, array_merge([
+                'content-type' => 'application/json',
+                'x-appwrite-project' => $this->getProject()['$id'],
+            ], $this->getHeaders()));
+
+            $this->assertEquals(404, $response['headers']['status-code']);
+            $this->assertEquals('execution_not_found', $response['body']['type']);
+
+            // A rejected call must not have deleted anything, which is what
+            // distinguishes an ownership rejection from an incidental 404.
+            $response = $this->getExecution($functionId, $executionId);
+
+            $this->assertEquals(200, $response['headers']['status-code']);
+
+            /**
+             * Test for SUCCESS
+             */
+            $response = $this->client->call(Client::METHOD_DELETE, '/functions/' . $functionId . '/executions/' . $executionId, array_merge([
+                'content-type' => 'application/json',
+                'x-appwrite-project' => $this->getProject()['$id'],
+            ], $this->getHeaders()));
+
+            $this->assertEquals(204, $response['headers']['status-code']);
+        } finally {
+            if ($otherFunctionId !== '') {
+                $this->cleanupFunction($otherFunctionId);
+            }
+            if ($functionId !== '') {
+                $this->cleanupFunction($functionId);
+            }
+        }
+    }
+}

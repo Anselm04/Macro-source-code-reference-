@@ -1,0 +1,75 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\DocumentsDB\Transactions;
+
+use Appwrite\Abuse\Limit;
+use Appwrite\Platform\Modules\Databases\Http\Databases\Transactions\Update as TransactionsUpdate;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response as UtopiaResponse;
+use Utopia\Database\Validator\UID;
+use Utopia\Http\Adapter\Swoole\Response as SwooleResponse;
+use Utopia\Validator\Boolean;
+
+class Update extends TransactionsUpdate
+{
+    public static function getName(): string
+    {
+        return 'updateDocumentsDBTransaction';
+    }
+
+    protected function getResponseModel(): string
+    {
+        return UtopiaResponse::MODEL_TRANSACTION;
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(self::HTTP_REQUEST_METHOD_PATCH)
+            ->setHttpPath('/v1/documentsdb/transactions/:transactionId')
+            ->desc('Update transaction')
+            ->groups(['api', 'database', 'transactions'])
+            ->label('scope', 'documentsdb.documents.write')
+            ->label('resourceType', RESOURCE_TYPE_DATABASES)
+            ->label('abuse', [Limit::attempts(['ip', 'method', 'url', 'userId'], APP_LIMIT_WRITE_RATE_DEFAULT * 2, seconds: APP_LIMIT_WRITE_RATE_PERIOD_DEFAULT)])
+            ->label('sdk', new Method(
+                namespace: 'documentsDB',
+                group: 'transactions',
+                name: 'updateTransaction',
+                description: '/docs/references/documentsdb/update-transaction.md',
+                requestExamples: [
+                    'commit' => ['summary' => 'Commit the transaction', 'value' => ['commit' => true]],
+                    'rollback' => ['summary' => 'Roll back the transaction', 'value' => ['rollback' => true]],
+                ],
+                auth: [AuthType::ADMIN, AuthType::KEY, AuthType::SESSION, AuthType::JWT],
+                responses: [
+                    new SDKResponse(
+                        code: SwooleResponse::STATUS_CODE_OK,
+                        model: UtopiaResponse::MODEL_TRANSACTION,
+                    )
+                ],
+                contentType: ContentType::JSON
+            ))
+            ->param('transactionId', '', new UID(), 'Transaction ID.')
+            ->param('commit', false, new Boolean(), 'Commit transaction?', true)
+            ->param('rollback', false, new Boolean(), 'Rollback transaction?', true)
+            ->inject('project')
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('getDatabasesDB')
+            ->inject('user')
+            ->inject('transactionState')
+            ->inject('publisherForDeletes')
+            ->inject('queueForEvents')
+            ->inject('usage')
+            ->inject('queueForRealtime')
+            ->inject('publisherForFunctions')
+            ->inject('queueForWebhooks')
+            ->inject('authorization')
+            ->inject('eventProcessor')
+            ->callback($this->action(...));
+    }
+}

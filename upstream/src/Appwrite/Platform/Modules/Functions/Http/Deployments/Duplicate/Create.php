@@ -1,0 +1,220 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Functions\Http\Deployments\Duplicate;
+
+use Appwrite\Deployment\Deployments;
+use Appwrite\Event\Event;
+use Appwrite\Extend\Exception;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response;
+use Appwrite\Vcs\Factory as VcsFactory;
+use Utopia\Database\Database;
+use Utopia\Database\Id;
+use Utopia\Database\Validator\UID;
+use Utopia\Platform\Action;
+use Utopia\Platform\Scope\HTTP;
+use Utopia\Storage\Device;
+use Utopia\VCS\Adapter\Git\GitHub;
+use Utopia\VCS\Exception\RepositoryNotFound;
+
+class Create extends Action
+{
+    use HTTP;
+
+    public static function getName()
+    {
+        return 'createDuplicateDeployment';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_POST)
+            ->setHttpPath('/v1/functions/:functionId/deployments/duplicate')
+            ->httpAlias('/v1/functions/:functionId/deployments/:deploymentId/build')
+            ->httpAlias('/v1/functions/:functionId/deployments/:deploymentId/builds/:buildId')
+            ->desc('Create duplicate deployment')
+            ->groups(['api', 'functions'])
+            ->label('scope', 'functions.write')
+            ->label('resourceType', RESOURCE_TYPE_FUNCTIONS)
+            ->label('event', 'functions.[functionId].deployments.[deploymentId].update')
+            ->label('audits.event', 'deployment.update')
+            ->label('audits.resource', 'function/{request.functionId}')
+            ->label('usage.resource', 'function/{request.functionId}')
+            ->label('sdk', new Method(
+                namespace: 'functions',
+                group: 'deployments',
+                name: 'createDuplicateDeployment',
+                description: <<<EOT
+                Create a new build for an existing function deployment. This endpoint allows you to rebuild a deployment with the updated function configuration, including its entrypoint and build commands if they have been modified. The build process will be queued and executed asynchronously. The original deployment's code will be preserved and used for the new build.
+                EOT,
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_ACCEPTED,
+                        model: Response::MODEL_DEPLOYMENT,
+                    )
+                ]
+            ))
+            ->param('functionId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Function ID.', false, ['dbForProject'])
+            ->param('deploymentId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Deployment ID.', false, ['dbForProject'])
+            ->param('buildId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Build unique ID.', true, ['dbForProject']) // added as optional param for backward compatibility
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('dbForPlatform')
+            ->inject('queueForEvents')
+            ->inject('deployments')
+            ->inject('buildTimeout')
+            ->inject('deviceForFunctions')
+            ->inject('vcsFactory')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        string $functionId,
+        string $deploymentId,
+        string $buildId,
+        Response $response,
+        Database $dbForProject,
+        Database $dbForPlatform,
+        Event $queueForEvents,
+        Deployments $deployments,
+        int $buildTimeout,
+        Device $deviceForFunctions,
+        VcsFactory $vcsFactory,
+    ) {
+        $function = $dbForProject->getDocument('functions', $functionId);
+
+        if ($function->isEmpty()) {
+            throw new Exception(Exception::FUNCTION_NOT_FOUND);
+        }
+        $deployment = $dbForProject->getDocument('deployments', $deploymentId);
+
+        if ($deployment->isEmpty()) {
+            throw new Exception(Exception::DEPLOYMENT_NOT_FOUND);
+        }
+
+        if (
+            $deployment->getAttribute('resourceId') !== $function->getId()
+            || $deployment->getAttribute('resourceType') !== 'functions'
+        ) {
+            throw new Exception(Exception::DEPLOYMENT_NOT_FOUND);
+        }
+
+        // Remote-source deployments (templates / VCS) re-fetch from the
+        // coordinates persisted on the deployment, so a VCS redeploy picks up
+        // the resource's current root directory. The source kept from their
+        // build only serves downloads.
+        $path = $deployment->getAttribute('sourcePath');
+        $installationId = $deployment->getAttribute('installationId', '');
+        $owner = $deployment->getAttribute('providerRepositoryOwner', '');
+        $repository = $deployment->getAttribute('providerRepositoryName', '');
+        $hasSource = ($owner === '' || $repository === '') && ! empty($path) && $deviceForFunctions->exists($path);
+
+        if (! $hasSource && ($owner === '' || $repository === '')) {
+            throw new Exception(Exception::DEPLOYMENT_NOT_FOUND);
+        }
+
+        $deploymentId = Id::unique();
+
+        $destination = '';
+        if ($hasSource) {
+            $destination = $deviceForFunctions->getPath($deploymentId . '.' . \pathinfo('code.tar.gz', PATHINFO_EXTENSION));
+            $deviceForFunctions->copy($path, $destination);
+        }
+
+        // Cloning the source deployment's attributes onto the new one, with
+        // its own $id and no $sequence, tells the service to create it fresh
+        // rather than update the deployment being duplicated. A re-fetched
+        // source starts unsized; its stat artifact reports the size.
+        $deployment->removeAttribute('$sequence');
+        $deployment->setAttributes([
+            '$id' => $deploymentId,
+            'sourcePath' => $destination,
+            'sourceSize' => $hasSource ? $deployment->getAttribute('sourceSize', 0) : 0,
+            'totalSize' => $hasSource ? $deployment->getAttribute('sourceSize', 0) : 0,
+            'entrypoint' => $function->getAttribute('entrypoint'),
+            'buildCommands' => $function->getAttribute('commands', ''),
+            'startCommand' => $function->getAttribute('startCommand', ''),
+            'buildStartedAt' => null,
+            'buildEndedAt' => null,
+            'buildDuration' => null,
+            'buildSize' => null,
+            'buildPath' => '',
+            'buildLogs' => '',
+            // Not inherited: a redeploy always goes live, and the source's own
+            // flag is unset by deactivateOthers() once anything newer builds.
+            'activate' => true,
+        ]);
+
+        if ($hasSource) {
+            $deployment = $deployments->createFromUpload($function, $deployment, $buildTimeout);
+        } elseif ($installationId !== '') {
+            $installation = $dbForPlatform->getDocument('installations', $installationId);
+
+            // Reconnecting git can delete or strand the installation older deployments were built
+            // through, so a function still connected to the repository redeploys through its own.
+            // Repository IDs are only unique within a provider, so its repository URL must match too.
+            $providerRepositoryId = $deployment->getAttribute('providerRepositoryId', '');
+            if ($providerRepositoryId !== '' && $providerRepositoryId === $function->getAttribute('providerRepositoryId', '')) {
+                $current = $dbForPlatform->getDocument('installations', $function->getAttribute('installationId', ''));
+                if (
+                    !$current->isEmpty()
+                    && $vcsFactory->fromProvider($current->getAttribute('provider', ''))->getRepositoryUrl($owner, $repository) === $deployment->getAttribute('providerRepositoryUrl', '')
+                ) {
+                    $installation = $current;
+                }
+            }
+
+            if ($installation->isEmpty()) {
+                throw new Exception(Exception::INSTALLATION_NOT_FOUND);
+            }
+
+            $github = $vcsFactory->fromInstallation($installation);
+
+            $deployment->setAttributes([
+                'installationId' => $installation->getId(),
+                'installationInternalId' => $installation->getSequence(),
+            ]);
+
+            $ref = $deployment->getAttribute('providerCommitHash') ?: $deployment->getAttribute('providerBranch');
+            try {
+                $deployment = $deployments->createFromVcs(
+                    $function,
+                    $deployment,
+                    $buildTimeout,
+                    $github,
+                    $owner,
+                    $repository,
+                    $ref,
+                    $function->getAttribute('providerRootDirectory', ''),
+                );
+            } catch (RepositoryNotFound) {
+                throw new Exception(Exception::PROVIDER_REPOSITORY_NOT_FOUND);
+            }
+        } else {
+            // Public template repo: providerBranch holds the resolved ref,
+            // fetched commit-style since a branch-type clone breaks on tags.
+            $deployment = $deployments->createFromRef(
+                $function,
+                $deployment,
+                $buildTimeout,
+                $owner,
+                $repository,
+                GitHub::CLONE_TYPE_COMMIT,
+                $deployment->getAttribute('providerBranch', ''),
+                $deployment->getAttribute('providerRootDirectory', ''),
+            );
+        }
+
+        $queueForEvents
+            ->setParam('functionId', $function->getId())
+            ->setParam('deploymentId', $deployment->getId());
+
+        $response
+            ->setStatusCode(Response::STATUS_CODE_ACCEPTED)
+            ->dynamic($deployment, Response::MODEL_DEPLOYMENT);
+    }
+}

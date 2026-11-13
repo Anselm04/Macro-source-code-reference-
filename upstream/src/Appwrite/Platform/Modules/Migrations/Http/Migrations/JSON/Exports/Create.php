@@ -1,0 +1,176 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Migrations\Http\Migrations\JSON\Exports;
+
+use Appwrite\Event\Event;
+use Appwrite\Event\Message\Migration as MigrationMessage;
+use Appwrite\Event\Publisher\Migration as MigrationPublisher;
+use Appwrite\Extend\Exception;
+use Appwrite\Platform\Modules\Migrations\Http\Migrations\Action;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Request;
+use Appwrite\Utopia\Response;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Exception\Query as QueryException;
+use Utopia\Database\Id;
+use Utopia\Database\Query;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\UID;
+use Utopia\Migration\Resource;
+use Utopia\Migration\Sources\Appwrite as AppwriteSource;
+use Utopia\Migration\Sources\JSON as JSONSource;
+use Utopia\Migration\Transfer;
+use Utopia\Validator\ArrayList;
+use Utopia\Validator\Boolean;
+use Utopia\Validator\Text;
+
+class Create extends Action
+{
+    public static function getName(): string
+    {
+        return 'createJSONExport';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_POST)
+            ->setHttpPath('/v1/migrations/json/exports')
+            ->desc('Export documents to JSON')
+            ->groups(['api', 'migrations'])
+            ->label('scope', 'migrations.write')
+            ->label('event', 'migrations.[migrationId].create')
+            ->label('audits.event', 'migration.create')
+            ->label('sdk', new Method(
+                namespace: 'migrations',
+                group: null,
+                name: 'createJSONExport',
+                description: '/docs/references/migrations/migration-json-export.md',
+                auth: [AuthType::KEY, AuthType::ADMIN],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_ACCEPTED,
+                        model: Response::MODEL_MIGRATION,
+                    )
+                ]
+            ))
+            ->param('databaseId', '', new UID(), 'Database ID containing the source collection.')
+            ->param('collectionId', '', new UID(), 'Collection ID to export documents from.')
+            ->param('filename', '', new Text(255), 'The name of the file to be created for the export, excluding the .json extension.')
+            ->param('columns', [], new ArrayList(new Text(Database::LENGTH_KEY)), 'List of attributes to export. If empty, all attributes will be exported. You can use the `*` wildcard to export all attributes from the collection.', true)
+            ->param('queries', [], new ArrayList(new Text(0)), 'Array of query strings generated using the Query class provided by the SDK to filter documents to export. [Learn more about queries](https://appwrite.io/docs/databases#querying-documents). Maximum of ' . APP_LIMIT_ARRAY_PARAMS_SIZE . ' queries are allowed, each ' . APP_LIMIT_ARRAY_ELEMENT_SIZE . ' characters long.', true)
+            ->param('notify', true, new Boolean(), 'Set to true to receive an email when the export is complete. Default is true.', true)
+            ->inject('user')
+            ->inject('request')
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('dbForPlatform')
+            ->inject('authorization')
+            ->inject('project')
+            ->inject('platform')
+            ->inject('queueForEvents')
+            ->inject('publisherForMigrations')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        string $databaseId,
+        string $collectionId,
+        string $filename,
+        array $columns,
+        array $queries,
+        bool $notify,
+        Document $user,
+        Request $request,
+        Response $response,
+        Database $dbForProject,
+        Database $dbForPlatform,
+        Authorization $authorization,
+        Document $project,
+        array $platform,
+        Event $queueForEvents,
+        MigrationPublisher $publisherForMigrations
+    ): void {
+        try {
+            $parsedQueries = Query::parseQueries($queries);
+        } catch (QueryException $e) {
+            throw new Exception(Exception::GENERAL_QUERY_INVALID, $e->getMessage());
+        }
+
+        $bucket = $authorization->skip(fn () => $dbForPlatform->getDocument('buckets', 'default'));
+        if ($bucket->isEmpty()) {
+            throw new Exception(Exception::STORAGE_BUCKET_NOT_FOUND);
+        }
+
+        $database = $authorization->skip(fn () => $dbForProject->getDocument('databases', $databaseId));
+        if ($database->isEmpty()) {
+            throw new Exception(Exception::DATABASE_NOT_FOUND);
+        }
+
+        $collection = $authorization->skip(fn () => $dbForProject->getDocument('database_' . $database->getSequence(), $collectionId));
+        if ($collection->isEmpty()) {
+            throw new Exception(Exception::COLLECTION_NOT_FOUND);
+        }
+
+        $databaseType = $database->getAttribute('type');
+
+        $validator = $this->exportQueriesValidator($dbForProject, $collection, $databaseType);
+
+        if (!$validator->isValid($parsedQueries)) {
+            throw new Exception(Exception::GENERAL_QUERY_INVALID, $validator->getDescription());
+        }
+
+        $scopes = $this->authorize($request, [], [
+            match ($databaseType) {
+                DATABASE_TYPE_DOCUMENTSDB => ['documentsdb.documents.read'],
+                DATABASE_TYPE_VECTORSDB => ['vectorsdb.documents.read'],
+                default => ['rows.read', 'documents.read'],
+            },
+        ]);
+
+        $resources = Transfer::extractServices([self::transferGroupForDatabaseType($databaseType)]);
+        $parentResourceType = self::resourceTypeForDatabaseType($databaseType);
+
+        $migration = $dbForProject->createDocument('migrations', new Document([
+            '$id' => Id::unique(),
+            'status' => 'pending',
+            'stage' => 'init',
+            'source' => AppwriteSource::getName(),
+            'destination' => JSONSource::getName(),
+            'resources' => $resources,
+            'resourceId' => $collection->getId(),
+            'resourceInternalId' => $collection->getSequence(),
+            'resourceType' => Resource::TYPE_COLLECTION,
+            'parentResourceId' => $database->getId(),
+            'parentResourceInternalId' => $database->getSequence(),
+            'parentResourceType' => $parentResourceType,
+            'statusCounters' => '{}',
+            'resourceData' => '{}',
+            'errors' => [],
+            'options' => [
+                'bucketId' => 'default', // Always use internal bucket
+                'filename' => $filename,
+                'columns' => $columns,
+                'queries' => $queries,
+                'notify' => $notify,
+                'userInternalId' => $user->getSequence(),
+                'scopes' => $scopes,
+            ],
+        ]));
+
+        $queueForEvents->setParam('migrationId', $migration->getId());
+
+        $publisherForMigrations->enqueue(new MigrationMessage(
+            project: $project,
+            migration: $migration,
+            platform: $platform,
+        ));
+
+        $response
+            ->setStatusCode(Response::STATUS_CODE_ACCEPTED)
+            ->dynamic($migration, Response::MODEL_MIGRATION);
+    }
+}

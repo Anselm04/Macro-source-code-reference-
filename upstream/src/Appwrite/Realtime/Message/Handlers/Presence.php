@@ -1,0 +1,205 @@
+<?php
+
+namespace Appwrite\Realtime\Message\Handlers;
+
+use Appwrite\Event\Event as QueueEvent;
+use Appwrite\Event\Publisher\Usage as UsagePublisher;
+use Appwrite\Event\Realtime as QueueRealtime;
+use Appwrite\Extend\Exception;
+use Appwrite\Messaging\Adapter\Realtime;
+use Appwrite\Presences\State as PresenceState;
+use Appwrite\Realtime\Message\Dispatcher;
+use Appwrite\Utopia\Database\Documents\User;
+use Appwrite\Utopia\Database\Validator\CustomId;
+use Swoole\Atomic;
+use Utopia\Database\Database;
+use Utopia\Database\DateTime;
+use Utopia\Database\Document;
+use Utopia\Database\PermissionType;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\Permissions;
+use Utopia\Platform\Action;
+use Utopia\Span\Span;
+use Utopia\System\System;
+use Utopia\Validator\JSON\ObjectValidator as JSONObject;
+use Utopia\Validator\Nullable;
+use Utopia\Validator\Text;
+
+class Presence extends Action
+{
+    public function __construct()
+    {
+        $this
+            ->desc('Upsert a presence document for the authenticated user')
+            ->label(Dispatcher::LABEL_MESSAGE_TYPE, 'presence')
+            ->param('status', '', new Text(2048), 'Presence status')
+            ->param('presenceId', CustomId::UNIQUE, new CustomId(), 'Presence document ID', true)
+            ->param('metadata', null, new Nullable(new JSONObject()), 'Optional metadata payload', true)
+            ->param('permissions', null, new Permissions(APP_LIMIT_ARRAY_PARAMS_SIZE, [PermissionType::Read, PermissionType::Update, PermissionType::Delete, PermissionType::Write]), 'An array of permissions strings. By default, only the current user is granted all permissions. [Learn more about permissions](https://appwrite.io/docs/permissions).', true)
+            ->inject('connectionId')
+            ->inject('realtime')
+            ->inject('database')
+            ->inject('authorization')
+            ->inject('presenceState')
+            ->inject('bootCleanupFinished')
+            ->inject('bootDeadline')
+            ->inject('project')
+            ->inject('publisherForUsage')
+            ->inject('queueForEvents')
+            ->inject('queueForRealtime')
+            ->callback($this->action(...));
+    }
+
+    /**
+     * @param array<int, string>|null $permissions
+     * @return array<string, mixed>
+     */
+    public function action(
+        string $status,
+        string $presenceId,
+        mixed $metadata,
+        ?array $permissions,
+        int $connectionId,
+        Realtime $realtime,
+        Database $database,
+        Authorization $authorization,
+        PresenceState $presenceState,
+        Atomic $bootCleanupFinished,
+        float $bootDeadline,
+        ?Document $project,
+        UsagePublisher $publisherForUsage,
+        QueueEvent $queueForEvents,
+        QueueRealtime $queueForRealtime,
+    ): array {
+        if ($project === null || $project->isEmpty()) {
+            throw new Exception(Exception::REALTIME_POLICY_VIOLATION, 'Presence requires a project context.');
+        }
+
+        $userId = $realtime->connections[$connectionId]['userId'] ?? '';
+        if (empty($userId)) {
+            throw new Exception(Exception::USER_UNAUTHORIZED, 'User must be authorized');
+        }
+
+        $user = new User($database->getDocument('users', $userId)->getArrayCopy());
+        if ($user->isEmpty()) {
+            throw new Exception(Exception::USER_NOT_FOUND, params: [$userId]);
+        }
+
+        $presenceData = [
+            'userInternalId' => $user->getSequence(),
+            'userId' => $user->getId(),
+            'source' => 'realtime',
+            'status' => $status,
+            'expiresAt' => DateTime::format((new \DateTime())->modify('+30 days')),
+            'hostname' => \gethostname() ?: null,
+        ];
+        if ($metadata !== null) {
+            $presenceData['metadata'] = $metadata;
+        }
+
+        $presenceDocument = new Document($presenceData);
+        $presenceState->setPermissions($presenceDocument, $permissions, $user, $authorization);
+        if ($presenceId !== CustomId::UNIQUE) {
+            $presenceDocument->setAttribute('$id', $presenceId);
+        }
+
+        $projectId = $project->getId();
+
+        // Row this socket already counts against; matching its sequence means a status refresh,
+        // not a new hold. Sequence (not id) so a same-id delete-and-recreate is seen as new.
+        $stash = $realtime->connections[$connectionId]['presence'] ?? null;
+        $sequence = (\is_array($stash) && ($stash['userId'] ?? null) === $userId)
+            ? ($stash['sequence'] ?? null)
+            : null;
+
+        // Held until the boot cleanup has removed rows left by gone processes, so it can't add to one.
+        if (System::getEnv('_APP_EDITION', 'self-hosted') === 'self-hosted') {
+            $this->waitForBootCleanup($bootCleanupFinished, $bootDeadline);
+        }
+
+        $write = $presenceState->upsertForUserWithConnections($database, $presenceDocument, $userId, $sequence);
+        $presence = $write['presence'];
+        $created = $write['created'];
+        $counted = $write['counted'];
+
+        // Socket closed mid-write: onClose ran before this hold was stashed, so undo any count we
+        // added, and if that deleted the row announce offline instead of the online upsert below.
+        if (!isset($realtime->connections[$connectionId])) {
+            $deleted = $counted
+                ? $presenceState->releaseConnectionForUser($database, $userId, (string) $presence->getSequence())
+                : null;
+
+            if ($deleted !== null) {
+                // created-then-deleted nets zero usage; otherwise undo the creator's +1.
+                $presenceState->triggerPresenceDeleted($database, $project, $userId, $deleted, $publisherForUsage, $queueForEvents, $queueForRealtime, triggerUsage: !$created);
+            } elseif ($created) {
+                // Created row survives under another socket's hold: count the online transition here.
+                $presenceState->triggerUsage($publisherForUsage, $project, 1);
+            }
+
+            foreach (['$collection', '$tenant', 'hostname', 'permissionsHash', 'userInternalId', 'connections'] as $attribute) {
+                $presence->removeAttribute($attribute);
+            }
+
+            return [
+                'type' => 'response',
+                'data' => [
+                    'to' => 'presence',
+                    'presence' => $presence->getArrayCopy(),
+                ],
+            ];
+        }
+
+        // Stash so onClose releases this exact hold; a heartbeat refreshes without recounting.
+        $realtime->connections[$connectionId]['presence'] = [
+            'projectId' => $projectId,
+            'userId' => $userId,
+            'sequence' => (string) $presence->getSequence(),
+        ];
+
+        // Usage +1 only on actual creation (user came online), not on an increment.
+        if ($created) {
+            $presenceState->triggerUsage($publisherForUsage, $project, 1);
+        }
+
+        $presence->removeAttribute('$collection');
+        $presence->removeAttribute('$tenant');
+        $presence->removeAttribute('hostname');
+        $presence->removeAttribute('permissionsHash');
+        $presence->removeAttribute('userInternalId');
+        $presence->removeAttribute('connections');
+
+        $presenceState->triggerEvent(
+            $queueForEvents,
+            $queueForRealtime,
+            $project,
+            $user,
+            'presences.[presenceId].upsert',
+            $presence,
+        );
+
+        return [
+            'type' => 'response',
+            'data' => [
+                'to' => 'presence',
+                'presence' => $presence->getArrayCopy(),
+            ],
+        ];
+    }
+
+    /**
+     * Waits until the boot cleanup has finished, or the boot timeout has passed.
+     */
+    private function waitForBootCleanup(Atomic $bootCleanupFinished, float $deadline): void
+    {
+        // Read with get() only: Atomic::wait() would consume the 1 and close the gate again.
+        while ($bootCleanupFinished->get() === 0 && \microtime(true) < $deadline) {
+            // A hooked sleep: only this message waits, the worker keeps serving others.
+            \usleep(50_000);
+        }
+
+        if ($bootCleanupFinished->get() === 0) {
+            Span::add('presence.boot_gate', 'timeout');
+        }
+    }
+}

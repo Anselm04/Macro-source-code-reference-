@@ -1,0 +1,140 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Console\Http\Variables;
+
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response;
+use Appwrite\Vcs\Factory as VcsFactory;
+use Utopia\Database\Adapter\Feature\Relationships as FeatureRelationships;
+use Utopia\Database\Adapter\Feature\Spatial as FeatureSpatial;
+use Utopia\Database\Capability;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Domains\Domain;
+use Utopia\Platform\Action;
+use Utopia\Platform\Scope\HTTP;
+use Utopia\Query\Schema\ColumnType;
+use Utopia\System\System;
+use Utopia\Validator\IP;
+
+class Get extends Action
+{
+    use HTTP;
+
+    public static function getName(): string
+    {
+        return 'getVariables';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_GET)
+            ->setHttpPath('/v1/console/variables')
+            ->desc('Get variables')
+            ->groups(['api', 'projects'])
+            ->label('scope', 'projects.read')
+            ->label('sdk', new Method(
+                namespace: 'console',
+                group: 'console',
+                name: 'variables',
+                description: 'Get all Environment Variables that are relevant for the console.',
+                auth: [AuthType::ADMIN],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_OK,
+                        model: Response::MODEL_CONSOLE_VARIABLES,
+                    )
+                ],
+                contentType: ContentType::JSON
+            ))
+            ->inject('vcsProviders')
+            ->inject('vcsFactory')
+            ->inject('response')
+            ->inject('platform')
+            ->inject('dbForProject')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        callable $vcsProviders,
+        VcsFactory $vcsFactory,
+        Response $response,
+        array $platform,
+        Database $dbForProject
+    ) {
+        $validator = new Domain(System::getEnv('_APP_DOMAIN_TARGET_CNAME'));
+        $isCNAMEValid = !empty(System::getEnv('_APP_DOMAIN_TARGET_CNAME', '')) && $validator->isKnown() && !$validator->isTest();
+
+        $validator = new IP(IP::V4);
+        $targetA = \explode(',', System::getEnv('_APP_DOMAIN_TARGET_A', ''))[0];
+        $isAValid = !empty($targetA) && ($validator->isValid($targetA));
+
+        $validator = new IP(IP::V6);
+        $isAAAAValid = !empty(System::getEnv('_APP_DOMAIN_TARGET_AAAA', '')) && $validator->isValid(System::getEnv('_APP_DOMAIN_TARGET_AAAA'));
+
+        $isDomainEnabled = $isAAAAValid || $isAValid || $isCNAMEValid;
+
+        $providers = $vcsProviders();
+        $isVcsEnabled = !empty($providers);
+
+        $providersWithRepositoryCreation = [];
+        $providersWithPublicRepositories = [];
+        foreach ($providers as $provider) {
+            $adapter = $vcsFactory->fromProvider($provider);
+            if ($adapter->supportsRepositoryCreation()) {
+                $providersWithRepositoryCreation[] = $provider;
+            }
+            if ($adapter->supportsPublicRepositories()) {
+                $providersWithPublicRepositories[] = $provider;
+            }
+        }
+
+        $adapter = $dbForProject->getAdapter();
+
+        // An empty issuer would render as '0 issue ""', a record that forbids every CA
+        $caa = System::getEnv('_APP_DOMAIN_TARGET_CAA', '');
+
+        $variables = new Document([
+            '_APP_DOMAIN_TARGET_CNAME' => System::getEnv('_APP_DOMAIN_TARGET_CNAME'),
+            '_APP_DOMAIN_TARGET_AAAA' => System::getEnv('_APP_DOMAIN_TARGET_AAAA'),
+            '_APP_DOMAIN_TARGET_A' => $targetA,
+            '_APP_DOMAIN_TARGET_CAA' => empty($caa) ? '' : '0 issue "' . $caa . '"',
+            '_APP_STORAGE_LIMIT' => +System::getEnv('_APP_STORAGE_LIMIT'),
+            '_APP_COMPUTE_BUILD_TIMEOUT' => +System::getEnv('_APP_COMPUTE_BUILD_TIMEOUT'),
+            '_APP_COMPUTE_SIZE_LIMIT' => +System::getEnv('_APP_COMPUTE_SIZE_LIMIT'),
+            '_APP_USAGE_STATS' => System::getEnv('_APP_USAGE_STATS', 'enabled'),
+            '_APP_VCS_ENABLED' => $isVcsEnabled,
+            '_APP_VCS_PROVIDERS' => $providers,
+            '_APP_VCS_PROVIDERS_WITH_REPOSITORY_CREATION' => $providersWithRepositoryCreation,
+            '_APP_VCS_PROVIDERS_WITH_PUBLIC_REPOSITORIES' => $providersWithPublicRepositories,
+            '_APP_DOMAIN_ENABLED' => $isDomainEnabled,
+            // Reviews are optional on self-hosted: they run only once the review service has a secret.
+            '_APP_REVIEWS_ENABLED' => System::getEnv('_APP_REVIEWS_SECRET', '') !== '',
+            '_APP_DOMAIN_SITES' => $platform['sitesDomain'],
+            '_APP_DOMAIN_FUNCTIONS' => $platform['functionsDomain'],
+            '_APP_OPTIONS_FORCE_HTTPS' => System::getEnv('_APP_OPTIONS_FORCE_HTTPS'),
+            '_APP_DOMAINS_NAMESERVERS' => System::getEnv('_APP_DOMAINS_NAMESERVERS'),
+            '_APP_DB_ADAPTER' => System::getEnv('_APP_DB_ADAPTER', 'mariadb'),
+            'supportForAttributes' => $adapter->supports(Capability::DefinedAttributes),
+            'supportForRelationships' => $adapter->hasFeature(FeatureRelationships::class),
+            'supportForOperators' => $adapter->supports(Capability::Operators),
+            'supportForSpatials' => $adapter->hasFeature(FeatureSpatial::class),
+            'supportForAggregations' => $adapter->supports(Capability::Aggregations),
+            'supportForJoins' => $adapter->supports(Capability::Joins),
+            'supportForSpatialIndexNull' => $adapter->supports(Capability::IndexSpatialNull),
+            'supportForFulltextWildcard' => $adapter->supports(Capability::IndexFulltextWildcard),
+            'supportForMultipleFulltextIndexes' => $adapter->supports(Capability::IndexFulltextMultiple),
+            'supportForTrigramIndex' => $adapter->supports(Capability::IndexTrigram),
+            'supportForAttributeResizing' => $adapter->supports(Capability::AttributeResizing),
+            'supportForSchemas' => $adapter->supports(Capability::Schemas),
+            'maxIndexLength' => $adapter->limits()->indexLength,
+            'supportForIntegerIds' => $adapter->limits()->idType === ColumnType::Integer,
+        ]);
+
+        $response->dynamic($variables, Response::MODEL_CONSOLE_VARIABLES);
+    }
+}

@@ -1,0 +1,96 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Project\Http\Project\Policies\PasswordDictionary;
+
+use Appwrite\Event\Event;
+use Appwrite\Platform\Action;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Platform\Scope\HTTP;
+use Utopia\Validator\ArrayList;
+use Utopia\Validator\Boolean;
+use Utopia\Validator\Nullable;
+use Utopia\Validator\Text;
+
+class Update extends Action
+{
+    use HTTP;
+
+    public static function getName()
+    {
+        return 'updateProjectPasswordDictionaryPolicy';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_PATCH)
+            ->setHttpPath('/v1/project/policies/password-dictionary')
+            ->httpAlias('/v1/projects/:projectId/auth/password-dictionary')
+            ->desc('Update password dictionary policy')
+            ->groups(['api', 'project'])
+            ->label('scope', ['policies.write', 'project.policies.write'])
+            ->label('event', 'projects.[projectId].policies.[policy].update')
+            ->label('audits.event', 'projects.[projectId].policies.[policy].update')
+            ->label('audits.resource', 'project/{response.$id}')
+            ->label('sdk', new Method(
+                namespace: 'project',
+                group: 'policies',
+                name: 'updatePasswordDictionaryPolicy',
+                description: <<<EOT
+                Updating this policy allows you to control if new passwords are checked against most common passwords dictionary. When enabled, and user changes their password, password must not be contained in the dictionary.
+
+                Custom denyList entries use case-sensitive equality and apply only while this policy is enabled. Omit denyList or pass null to preserve it, pass an array to replace it, or pass [] to clear it. Entries are stored without trimming or deduplication. Existing passwords remain valid for sign-in and password confirmation. The combined serialized project authentication configuration must fit within 16,384 characters, even when each list meets its entry limits.
+                EOT,
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_OK,
+                        model: Response::MODEL_PROJECT,
+                    )
+                ],
+            ))
+            ->param('enabled', null, new Boolean(), 'Toggle password dictionary policy. Set to true if you want password change to block passwords in the dictionary, or false to allow them. When changing this policy, existing passwords remain valid.')
+            ->param('denyList', null, new Nullable(new ArrayList(new Text(256, 1), 100)), 'Custom blocked values using case-sensitive equality. Up to 100 entries of 1 to 256 characters. Omit or pass null to preserve, an array to replace, or [] to clear. Combined authentication settings must fit within 16,384 characters.', true)
+            ->inject('response')
+            ->inject('dbForPlatform')
+            ->inject('project')
+            ->inject('authorization')
+            ->inject('queueForEvents')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        bool $enabled,
+        ?array $denyList,
+        Response $response,
+        Database $dbForPlatform,
+        Document $project,
+        Authorization $authorization,
+        Event $queueForEvents,
+    ): void {
+        $auths = $project->getAttribute('auths', []);
+        $auths['passwordDictionary'] = $enabled;
+        if ($denyList !== null) {
+            $auths['passwordDictionaryDenyList'] = $denyList;
+        }
+
+        $updates = new Document([
+            'auths' => $auths,
+        ]);
+
+        $project = $authorization->skip(fn () => $dbForPlatform->updateDocument('projects', $project->getId(), $updates));
+        $authorization->skip(fn () => $dbForPlatform->purgeCachedDocument('projects', $project->getId()));
+
+        $queueForEvents
+            ->setParam('projectId', $project->getId())
+            ->setParam('policy', 'password-dictionary');
+
+        $response->dynamic($project, Response::MODEL_PROJECT);
+    }
+}

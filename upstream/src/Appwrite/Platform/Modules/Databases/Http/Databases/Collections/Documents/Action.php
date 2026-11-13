@@ -1,0 +1,660 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\Databases\Collections\Documents;
+
+use Appwrite\Event\Event;
+use Appwrite\Event\Message\Func as FunctionMessage;
+use Appwrite\Event\Publisher\Func as FunctionPublisher;
+use Appwrite\Extend\Exception;
+use Appwrite\Functions\EventProcessor;
+use Appwrite\Platform\Modules\Databases\Http\Databases\Action as DatabasesAction;
+use Appwrite\Utopia\Database\Attribute;
+use Appwrite\Utopia\Database\Hook\UniqueId;
+use Appwrite\Utopia\Database\Validator\CustomId;
+use Throwable;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Query;
+use Utopia\Database\Validator\Datetime as DatetimeValidator;
+use Utopia\Query\Schema\ColumnType;
+
+abstract class Action extends DatabasesAction
+{
+    private const string BOUND_MAXIMUM = 'max';
+
+    private const string BOUND_MINIMUM = 'min';
+
+    /**
+     * @var string The current context (either 'row' or 'document')
+     */
+    private string $context = DOCUMENTS;
+    private string $databaseType = DATABASE_TYPE_LEGACY;
+
+    /**
+     * Get the response model used in the SDK and HTTP responses.
+     */
+    abstract protected function getResponseModel(): string;
+
+    public function setHttpPath(string $path): self
+    {
+        if (str_contains($path, '/tablesdb/')) {
+            $this->context = ROWS;
+        } elseif (str_contains($path, '/documentsdb/')) {
+            $this->databaseType = DATABASE_TYPE_DOCUMENTSDB;
+        } elseif (str_contains($path, '/vectorsdb/')) {
+            $this->databaseType = DATABASE_TYPE_VECTORSDB;
+        }
+
+        $contextId = '$' . $this->getCollectionsEventsContext() . 'Id';
+        $this->removableAttributes = [
+            '*' => [
+                '$sequence',
+                '$databaseId',
+                $contextId,
+            ],
+            'privileged' => [
+                '$createdAt',
+                '$updatedAt',
+            ],
+        ];
+
+        parent::setHttpPath($path);
+        return $this;
+    }
+
+    protected function getDatabasesOperationReadMetric(): string
+    {
+        if ($this->databaseType === DATABASE_TYPE_LEGACY || $this->databaseType === DATABASE_TYPE_TABLESDB) {
+            return METRIC_DATABASES_OPERATIONS_READS;
+        }
+        return $this->databaseType.'.'.METRIC_DATABASES_OPERATIONS_READS;
+    }
+
+    protected function getDatabasesOperationWriteMetric(): string
+    {
+        if ($this->databaseType === DATABASE_TYPE_LEGACY || $this->databaseType === DATABASE_TYPE_TABLESDB) {
+            return METRIC_DATABASES_OPERATIONS_WRITES;
+        }
+        return $this->databaseType.'.'.METRIC_DATABASES_OPERATIONS_WRITES;
+
+    }
+
+    /**
+     * Get the plural of the given name.
+     *
+     * Used for endpoints with multiple sdk methods.
+     */
+    protected function getBulkActionName(string $name): string
+    {
+        return "{$name}s";
+    }
+
+    /**
+     * Get the current context.
+     */
+    protected function getContext(): string
+    {
+        return $this->context;
+    }
+
+    /**
+     * Returns true if current context is Collections API.
+     */
+    protected function isCollectionsAPI(): bool
+    {
+        // rows in tables api context
+        // documents in collections api context
+        return $this->getContext() === DOCUMENTS;
+    }
+
+    /**
+     * Get the SDK group name for the current action.
+     *
+     * Can be used for XList operations as well!
+     */
+    protected function getSDKGroup(): string
+    {
+        return $this->isCollectionsAPI() ? 'documents' : 'rows';
+    }
+
+    /**
+     * Get the SDK namespace for the current action.
+     */
+    protected function getSDKNamespace(): string
+    {
+        return $this->isCollectionsAPI() ? 'databases' : 'tablesDB';
+    }
+
+    /**
+     * Get the correct attribute/column structure context for errors.
+     */
+    protected function getStructureContext(): string
+    {
+        return $this->isCollectionsAPI() ? 'attributes' : 'columns';
+    }
+
+    /**
+     * Get the appropriate parent level not found exception.
+     */
+    protected function getParentNotFoundException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::COLLECTION_NOT_FOUND
+            : Exception::TABLE_NOT_FOUND;
+    }
+
+    /**
+     * Get the appropriate attribute/column not found exception.
+     */
+    protected function getStructureNotFoundException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_NOT_FOUND
+            : Exception::COLUMN_NOT_FOUND;
+    }
+
+    /**
+     * Get the appropriate not found exception.
+     */
+    protected function getNotFoundException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::DOCUMENT_NOT_FOUND
+            : Exception::ROW_NOT_FOUND;
+    }
+
+    /**
+     * Get the appropriate already exists exception.
+     */
+    protected function getDuplicateException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::DOCUMENT_ALREADY_EXISTS
+            : Exception::ROW_ALREADY_EXISTS;
+    }
+
+    /**
+     * The maximum an increment was held to: the request's, floored on an integer, or the column's own when it is lower.
+     */
+    protected function getReachedMaximum(Document $collection, string $attribute, int|float|null $requested): int|float|null
+    {
+        [$column, $integer] = $this->getColumnBound($collection, $attribute, self::BOUND_MAXIMUM);
+        $requested = $requested !== null && $integer ? (int) \floor($requested) : $requested;
+
+        return match (true) {
+            $requested === null => $column,
+            $column === null => $requested,
+            default => \min($requested, $column),
+        };
+    }
+
+    /**
+     * The minimum a decrement was held to: the request's, ceiled on an integer, or the column's own when it is higher.
+     */
+    protected function getReachedMinimum(Document $collection, string $attribute, int|float|null $requested): int|float|null
+    {
+        [$column, $integer] = $this->getColumnBound($collection, $attribute, self::BOUND_MINIMUM);
+        $requested = $requested !== null && $integer ? (int) \ceil($requested) : $requested;
+
+        return match (true) {
+            $requested === null => $column,
+            $column === null => $requested,
+            default => \max($requested, $column),
+        };
+    }
+
+    /**
+     * @return array{int|float|null, bool} The column's bound under $key, and whether the column holds integers
+     */
+    private function getColumnBound(Document $collection, string $attribute, string $key): array
+    {
+        foreach ($collection->getAttribute('attributes', []) as $definition) {
+            if ($definition->getAttribute('key') !== $attribute) {
+                continue;
+            }
+
+            $bound = $definition->getAttribute('formatOptions', [])[$key] ?? null;
+            $integer = \in_array(Attribute::columnType((string) $definition->getAttribute('type')), [ColumnType::Integer, ColumnType::BigInteger], true);
+
+            return [\is_int($bound) || \is_float($bound) ? $bound : null, $integer];
+        }
+
+        return [null, false];
+    }
+
+    /**
+     * A batch write refused as a duplicate names the ID it repeats, else the first one already stored.
+     *
+     * @param array<Document> $documents
+     */
+    protected function getBatchDuplicateException(Database $dbForDatabases, string $collectionTableId, array $documents, Throwable $previous): Exception
+    {
+        $ids = [];
+        foreach ($documents as $document) {
+            $id = $document->getId();
+            if (isset($ids[$id])) {
+                return new Exception($this->getDuplicateException(), previous: $previous, params: [$id]);
+            }
+            $ids[$id] = true;
+        }
+
+        foreach (\array_chunk(\array_map(\strval(...), \array_keys($ids)), \max(1, $dbForDatabases->getMaxQueryValues())) as $chunk) {
+            $stored = $dbForDatabases->getAuthorization()->skip(fn (): Document => $dbForDatabases->findOne($collectionTableId, [
+                Query::equal('$id', $chunk),
+                Query::select(['$id']),
+            ]));
+
+            if (!$stored->isEmpty()) {
+                return new Exception($this->getDuplicateException(), previous: $previous, params: [$stored->getId()]);
+            }
+        }
+
+        return new Exception(
+            $this->getDuplicateException(),
+            ($this->isCollectionsAPI() ? 'Document' : 'Row') . ' with one of the requested IDs already exists. Try again with different IDs or use ID.unique() to generate unique IDs.',
+            previous: $previous,
+        );
+    }
+
+    /**
+     * Get the appropriate unique constraint exception.
+     */
+    protected function getUniqueConstraintException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::DOCUMENT_UNIQUE_CONSTRAINT_VIOLATION
+            : Exception::ROW_UNIQUE_CONSTRAINT_VIOLATION;
+    }
+
+    /**
+     * Get the appropriate conflict exception.
+     */
+    protected function getConflictException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::DOCUMENT_UPDATE_CONFLICT
+            : Exception::ROW_UPDATE_CONFLICT;
+    }
+
+    /**
+     * Get the appropriate delete restricted exception.
+     */
+    protected function getRestrictedException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::DOCUMENT_DELETE_RESTRICTED
+            : Exception::ROW_DELETE_RESTRICTED;
+    }
+
+    /**
+     * Get the correct invalid structure message.
+     */
+    protected function getStructureException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::DOCUMENT_INVALID_STRUCTURE
+            : Exception::ROW_INVALID_STRUCTURE;
+    }
+
+    /**
+     * Refuses a timestamp the database's own structure check refuses, with its message, before the Mongo adapter
+     * casts it and fails.
+     *
+     * @param array<string, mixed> $data
+     */
+    protected function validateTimestamps(array $data, Database $database): void
+    {
+        $limits = $database->profile()->limits;
+        $validator = new DatetimeValidator(min: $limits->minDateTime, max: $limits->maxDateTime);
+        foreach (['$createdAt', '$updatedAt'] as $attribute) {
+            if (!isset($data[$attribute]) || $data[$attribute] === '') {
+                continue;
+            }
+            if (!\is_string($data[$attribute]) || !$validator->isValid($data[$attribute])) {
+                throw new Exception($this->getStructureException(), 'Invalid document structure: Attribute "' . $attribute . '" has invalid type. ' . $validator->getDescription());
+            }
+        }
+    }
+
+    protected function hasRelationships(Document $collection): bool
+    {
+        return \array_any(
+            $collection->getAttribute('attributes', []),
+            fn (Document $attribute): bool => $attribute->getAttribute('type') === ColumnType::Relationship->value
+        );
+    }
+
+    /**
+     * Each attempt writes fresh clones: the database mutates the documents it writes and retries the transaction.
+     *
+     * @template T
+     *
+     * @param array<Document> $documents
+     * @param callable(array<Document>): T $write
+     * @return T
+     */
+    protected function withRelationshipTransaction(Database $database, Document $collection, array $documents, callable $write): mixed
+    {
+        if (!$this->hasRelationships($collection)) {
+            return $write($documents);
+        }
+
+        return $database->withTransaction(
+            fn (): mixed => $write(\array_map(fn (Document $document): Document => clone $document, $documents))
+        );
+    }
+
+    /**
+     * Get the appropriate missing data exception.
+     */
+    protected function getMissingDataException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::DOCUMENT_MISSING_DATA
+            : Exception::ROW_MISSING_DATA;
+    }
+
+    /**
+     * Get the exception to throw when the resource limit is exceeded.
+     */
+    protected function getLimitException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::ATTRIBUTE_LIMIT_EXCEEDED
+            : Exception::COLUMN_LIMIT_EXCEEDED;
+    }
+
+    /**
+     * Get the appropriate missing payload exception.
+     */
+    protected function getMissingPayloadException(): string
+    {
+        return $this->isCollectionsAPI()
+            ? Exception::DOCUMENT_MISSING_PAYLOAD
+            : Exception::ROW_MISSING_PAYLOAD;
+    }
+
+    /**
+     * Get the correct collections context for Events queue.
+     */
+    /**
+     * A document staged in a transaction is read from its log, not through the metadata decorator; main stamped
+     * every document it read.
+     */
+    protected function stampTransactionRead(Document $document, string $databaseId, string $collectionId): Document
+    {
+        if ($document->isEmpty()) {
+            return $document;
+        }
+
+        return $document
+            ->setAttribute('$databaseId', $databaseId)
+            ->setAttribute('$' . $this->getCollectionsEventsContext() . 'Id', $collectionId);
+    }
+
+    protected function getCollectionsEventsContext(): string
+    {
+        return $this->isCollectionsAPI() ? 'collection' : 'table';
+    }
+
+    /**
+     * Get the correct attribute/column key for increment/decrement operations.
+     */
+    protected function getAttributeKey(): string
+    {
+        return $this->isCollectionsAPI() ? 'attribute' : 'column';
+    }
+
+    /**
+     * Get the key used in ID parameters (e.g., 'collectionId' or 'tableId').
+     */
+    protected function getGroupId(): string
+    {
+        return $this->getCollectionsEventsContext() . 'Id';
+    }
+
+    /**
+     * Get the resource ID key for the current action.
+     */
+    protected function getResourceId(): string
+    {
+        $resource = $this->isCollectionsAPI() ? 'document' : 'row';
+        return $resource . 'Id';
+    }
+
+    /**
+     * Convert a request object to the associative shape Document expects while
+     * retaining empty objects at any nested depth.
+     *
+     * @return array<string, mixed>
+     */
+    protected function normalizeData(string|array|\stdClass $data): array
+    {
+        if (\is_string($data)) {
+            $data = \json_decode($data);
+            if (!$data instanceof \stdClass && !\is_array($data)) {
+                return [];
+            }
+        }
+
+        if ($data instanceof \stdClass) {
+            $data = (array) $data;
+        }
+
+        return \array_map($this->normalizeValue(...), $data);
+    }
+
+    private function normalizeValue(mixed $value): mixed
+    {
+        if ($value instanceof \stdClass) {
+            $properties = (array) $value;
+
+            return $properties === []
+                ? $value
+                : \array_map($this->normalizeValue(...), $properties);
+        }
+
+        if (\is_array($value)) {
+            return \array_map($this->normalizeValue(...), $value);
+        }
+
+        return $value;
+    }
+
+    /**
+     * Remove configured removable attributes from a document.
+     * Used for relationship path handling to remove API-specific attributes.
+     */
+    protected function removeReadonlyAttributes(
+        Document|array $document,
+        bool $privileged = false,
+    ): Document|array {
+        foreach ($this->removableAttributes['*'] as $attribute) {
+            unset($document[$attribute]);
+        }
+        if (!$privileged) {
+            foreach ($this->removableAttributes['privileged'] ?? [] as $attribute) {
+                unset($document[$attribute]);
+            }
+        }
+
+        return $document;
+    }
+
+    /**
+     * Validates the relationship values of a write at every depth and strips the readonly attributes of each nested
+     * related document. A staged write logs what its commit will write, so it gives nested related documents their
+     * IDs now; any other write leaves that to the database's UniqueId hook.
+     *
+     * @param array<string, mixed> $document
+     * @return array<string, mixed>
+     */
+    protected function prepareRelationships(array $document, Document $collection, Database $dbForProject, Document $database, bool $privileged, bool $staged): array
+    {
+        foreach (Attribute::relationships($collection) as $key => $relationship) {
+            $value = $document[$key] ?? null;
+            if (empty($value)) {
+                continue;
+            }
+
+            $isList = \is_array($value) && \array_is_list($value);
+            $relations = $isList ? $value : [$value];
+            $relatedCollection = null;
+
+            foreach ($relations as $index => $relation) {
+                $this->validateRelationship($relation);
+
+                if (\is_array($relation) && !\array_is_list($relation)) {
+                    $relatedCollection ??= $dbForProject->getAuthorization()->skip(fn (): Document => $dbForProject->getDocument(
+                        'database_' . $database->getSequence(),
+                        (string) $relationship->getAttribute('relatedCollection', '')
+                    ));
+                    if ($staged) {
+                        $relation = (new UniqueId())->prepare($relatedCollection, new Document($relation))->getArrayCopy();
+                    }
+                    $relation = $this->removeReadonlyAttributes($relation, $privileged);
+                    $relation = $this->prepareRelationships($relation, $relatedCollection, $dbForProject, $database, $privileged, $staged);
+                }
+
+                $relations[$index] = $relation;
+            }
+
+            $document[$key] = $isList ? $relations : $relations[0];
+        }
+
+        return $document;
+    }
+
+    /**
+     * Validate relationship values.
+     * Handles Document objects, ID strings, and associative arrays.
+     */
+    protected function validateRelationship(mixed $relation): void
+    {
+        $relationId = null;
+
+        if ($relation instanceof Document) {
+            $relationId = $relation->getId();
+        } elseif (\is_string($relation)) {
+            $relationId = $relation;
+        } elseif (\is_array($relation) && !\array_is_list($relation)) {
+            $relationId = $relation['$id'] ?? null;
+        } else {
+            throw new Exception(Exception::RELATIONSHIP_VALUE_INVALID, 'Relationship value must be an object, document ID string, or associative array');
+        }
+
+        if ($relationId !== null) {
+            if (!\is_string($relationId)) {
+                throw new Exception(Exception::RELATIONSHIP_VALUE_INVALID, 'Relationship $id must be a string');
+            }
+            $validator = new CustomId();
+            if (!$validator->isValid($relationId)) {
+                throw new Exception(Exception::RELATIONSHIP_VALUE_INVALID, $validator->getDescription());
+            }
+        }
+    }
+
+    /**
+     * For triggering different queues for each document for a bulk documents
+     * @param string $event
+     * @param Document $database
+     * @param Document $collection
+     * @param Document[] $documents
+     * @param Event $queueForEvents
+     * @param Event $queueForRealtime
+     * @param FunctionPublisher $publisherForFunctions
+     * @param Event $queueForWebhooks
+     * @param Database $dbForProject
+     * @param EventProcessor $eventProcessor
+     * @return void
+     */
+    protected function triggerBulk(
+        string $event,
+        Document $database,
+        Document $collection,
+        array $documents,
+        Event $queueForEvents,
+        Event $queueForRealtime,
+        FunctionPublisher $publisherForFunctions,
+        Event $queueForWebhooks,
+        Database $dbForProject,
+        EventProcessor $eventProcessor
+    ): void {
+        $queueForEvents
+            ->setEvent($event)
+            ->setParam('databaseId', $database->getId())
+            ->setContext('database', $database)
+            ->setParam('collectionId', $collection->getId())
+            ->setParam('tableId', $collection->getId())
+            ->setContext($this->getCollectionsEventsContext(), $collection);
+
+        // Get project and function events (cached)
+        $project = $queueForEvents->getProject();
+        $functionsEvents = $eventProcessor->getFunctionsEvents($project, $dbForProject);
+        $webhooksEvents = $eventProcessor->getWebhooksEvents($project);
+
+        $relationships = \array_map(
+            fn ($document) => $document->getAttribute('key'),
+            \array_filter(
+                $collection->getAttribute('attributes', []),
+                fn ($attribute) => $attribute->getAttribute('type') === ColumnType::Relationship->value
+            )
+        );
+
+        foreach ($documents as $document) {
+            $document->removeAttribute('$collection');
+            $document->removeAttribute('$tenant');
+
+            $queueForEvents
+                ->setParam('documentId', $document->getId())
+                ->setParam('rowId', $document->getId())
+                ->setPayload($document->getArrayCopy(), sensitive: $relationships);
+
+            $queueForRealtime
+                ->from($queueForEvents)
+                ->trigger();
+
+            // Generate events for this document operation
+            $generatedEvents = Event::generateEvents(
+                $queueForEvents->getEvent(),
+                $queueForEvents->getParams(),
+                $queueForEvents->getContext('database')
+            );
+
+
+            if (!empty($functionsEvents)) {
+                foreach ($generatedEvents as $event) {
+                    if (isset($functionsEvents[$event])) {
+                        $publisherForFunctions->enqueue(FunctionMessage::fromEvent(
+                            event: $queueForEvents->getEvent(),
+                            params: $queueForEvents->getParams(),
+                            project: $queueForEvents->getProject(),
+                            user: $queueForEvents->getUser(),
+                            userId: $queueForEvents->getUserId(),
+                            payload: $queueForEvents->getPayload(),
+                            platform: $queueForEvents->getPlatform(),
+                            database: $queueForEvents->getContext('database'),
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            if (!empty($webhooksEvents)) {
+                foreach ($generatedEvents as $event) {
+                    if (isset($webhooksEvents[$event])) {
+                        $queueForWebhooks
+                            ->from($queueForEvents)
+                            ->trigger();
+                        break;
+                    }
+                }
+            }
+        }
+
+        $queueForEvents->reset();
+        $queueForRealtime->reset();
+        $queueForWebhooks->reset();
+    }
+
+}

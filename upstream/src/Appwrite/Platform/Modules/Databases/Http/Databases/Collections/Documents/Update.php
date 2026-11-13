@@ -1,0 +1,323 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\Databases\Collections\Documents;
+
+use Appwrite\Abuse\Limit;
+use Appwrite\Databases\TransactionState;
+use Appwrite\Event\Event;
+use Appwrite\Extend\Exception;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Deprecated;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Usage\Context;
+use Appwrite\Usage\Operations;
+use Appwrite\Utopia\Database\Documents\User;
+use Appwrite\Utopia\Response as UtopiaResponse;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Exception\Authorization as AuthorizationException;
+use Utopia\Database\Exception\Conflict as ConflictException;
+use Utopia\Database\Exception\Duplicate as DuplicateException;
+use Utopia\Database\Exception\Limit as LimitException;
+use Utopia\Database\Exception\NotFound as NotFoundException;
+use Utopia\Database\Exception\Relationship as RelationshipException;
+use Utopia\Database\Exception\Structure as StructureException;
+use Utopia\Database\Exception\Unique as UniqueException;
+use Utopia\Database\Id;
+use Utopia\Database\Permission;
+use Utopia\Database\PermissionType;
+use Utopia\Database\Role;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\Permissions;
+use Utopia\Database\Validator\UID;
+use Utopia\Http\Adapter\Swoole\Response as SwooleResponse;
+use Utopia\Query\Schema\ColumnType;
+use Utopia\Validator\JSON\ObjectValidator as JSONObject;
+use Utopia\Validator\Nullable;
+
+class Update extends Action
+{
+    public static function getName(): string
+    {
+        return 'updateDocument';
+    }
+
+    protected function getResponseModel(): string
+    {
+        return UtopiaResponse::MODEL_DOCUMENT;
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(self::HTTP_REQUEST_METHOD_PATCH)
+            ->setHttpPath('/v1/databases/:databaseId/collections/:collectionId/documents/:documentId')
+            ->desc('Update document')
+            ->groups(['api', 'database'])
+            ->label('event', 'databases.[databaseId].collections.[collectionId].documents.[documentId].update')
+            ->label('scope', 'documents.write')
+            ->label('resourceType', RESOURCE_TYPE_DATABASES)
+            ->label('audits.event', 'document.update')
+            ->label('audits.resource', 'database/{request.databaseId}/collection/{request.collectionId}/document/{response.$id}')
+            ->label('usage.resource', 'database/{request.databaseId}/collection/{request.collectionId}/document/{response.$id}')
+            ->label('abuse', [Limit::attempts(['ip', 'method', 'url', 'userId'], APP_LIMIT_WRITE_RATE_DEFAULT * 2, seconds: APP_LIMIT_WRITE_RATE_PERIOD_DEFAULT)])
+            ->label('sdk', new Method(
+                namespace: $this->getSDKNamespace(),
+                group: $this->getSDKGroup(),
+                name: self::getName(),
+                description: '/docs/references/databases/update-document.md',
+                requestExamples: [
+                    'update' => [
+                        'summary' => 'Update document data',
+                        'value' => ['data' => ['username' => 'walter.obrien']],
+                    ],
+                ],
+                auth: [AuthType::ADMIN, AuthType::SESSION, AuthType::KEY, AuthType::JWT],
+                responses: [
+                    new SDKResponse(
+                        code: SwooleResponse::STATUS_CODE_OK,
+                        model: $this->getResponseModel(),
+                    )
+                ],
+                contentType: ContentType::JSON,
+                deprecated: new Deprecated(
+                    since: '1.8.0',
+                    replaceWith: 'tablesDB.updateRow',
+                ),
+            ))
+            ->param('databaseId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Database ID.', false, ['dbForProject'])
+            ->param('collectionId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Collection ID.', false, ['dbForProject'])
+            ->param('documentId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Document ID.', false, ['dbForProject'])
+            ->param('data', [], new JSONObject(), 'Document data as JSON object. Include only attribute and value pairs to be updated.', true, example: '{"username":"walter.obrien","email":"walter.obrien@example.com","fullName":"Walter O\'Brien","age":33,"isAdmin":false}')
+            ->param('permissions', null, new Nullable(new Permissions(APP_LIMIT_ARRAY_PARAMS_SIZE, [PermissionType::Read, PermissionType::Update, PermissionType::Delete, PermissionType::Write])), 'An array of permissions strings. By default, the current permissions are inherited. [Learn more about permissions](https://appwrite.io/docs/permissions).', true)
+            ->param('transactionId', null, fn (Database $dbForProject) => new Nullable(new UID($dbForProject->getMaxUidLength())), 'Transaction ID for staging the operation.', true, ['dbForProject'])
+            ->inject('requestTimestamp')
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('getDatabasesDB')
+            ->inject('queueForEvents')
+            ->inject('usage')
+            ->inject('transactionState')
+            ->inject('plan')
+            ->inject('authorization')
+            ->inject('user')
+            ->callback($this->action(...));
+    }
+
+    public function action(string $databaseId, string $collectionId, string $documentId, string|array|\stdClass $data, ?array $permissions, ?string $transactionId, ?\DateTime $requestTimestamp, UtopiaResponse $response, Database $dbForProject, callable $getDatabasesDB, Event $queueForEvents, Context $usage, TransactionState $transactionState, array $plan, Authorization $authorization, User $user): void
+    {
+        $data = $this->normalizeData($data);
+
+        if (empty($data) && \is_null($permissions)) {
+            throw new Exception($this->getMissingPayloadException());
+        }
+
+        $database = $authorization->skip(fn () => $dbForProject->getDocument('databases', $databaseId));
+
+        $isAPIKey = $user->isKey($authorization->getRoles());
+        $isPrivilegedUser = $user->isPrivileged($authorization->getRoles());
+
+        if ($database->isEmpty() || $this->isDatabaseTypeMismatch($database) || (!$database->getAttribute('enabled', false) && !$isAPIKey && !$isPrivilegedUser)) {
+            throw new Exception(Exception::DATABASE_NOT_FOUND, params: [$databaseId]);
+        }
+
+        $collection = $authorization->skip(fn () => $dbForProject->getDocument('database_' . $database->getSequence(), $collectionId));
+
+        if ($collection->isEmpty() || (!$collection->getAttribute('enabled', false) && !$isAPIKey && !$isPrivilegedUser)) {
+            throw new Exception($this->getParentNotFoundException(), params: [$collectionId]);
+        }
+
+        if ($transactionId === null) {
+            $data = $this->parseOperators($data, $collection);
+        }
+
+        $dbForDatabases = $getDatabasesDB($database, $collection);
+        // Read permission should not be required for update
+        $collectionTableId = 'database_' . $database->getSequence() . '_collection_' . $collection->getSequence();
+
+        if ($transactionId !== null) {
+            // Use transaction-aware document retrieval to see changes from same transaction
+            $document = $transactionState->getDocument($database, $collectionTableId, $documentId, $transactionId);
+        } else {
+            $document = $authorization->skip(fn () => $dbForDatabases->getDocument($collectionTableId, $documentId));
+        }
+
+        if ($document->isEmpty()) {
+            throw new Exception($this->getNotFoundException(), params: [$documentId]);
+        }
+
+        // Map aggregate permissions into the multiple permissions they represent.
+        $permissions = Permission::aggregate($permissions, [
+            PermissionType::Read,
+            PermissionType::Update,
+            PermissionType::Delete,
+        ]);
+
+        $callerProvidedPermissions = !\is_null($permissions);
+
+        // Users can only manage their own roles, API keys and Admin users can manage any
+        $roles = $authorization->getRoles();
+        if (!$isAPIKey && !$isPrivilegedUser && $callerProvidedPermissions) {
+            foreach ([PermissionType::Read, PermissionType::Create, PermissionType::Update, PermissionType::Delete] as $type) {
+                foreach ($permissions as $permission) {
+                    $permission = Permission::parse($permission);
+                    if ($permission->getPermission() != $type->value) {
+                        continue;
+                    }
+                    $role = (new Role(
+                        $permission->getRole(),
+                        $permission->getIdentifier(),
+                        $permission->getDimension()
+                    ))->toString();
+                    if (!$authorization->hasRole($role)) {
+                        throw new Exception(Exception::USER_UNAUTHORIZED, 'Permissions must be one of: (' . \implode(', ', $roles) . ')');
+                    }
+                }
+            }
+        }
+
+        if (\is_null($permissions)) {
+            $permissions = $document->getPermissions() ?? [];
+        }
+
+        $data['$id'] = $documentId;
+        $data['$permissions'] = $permissions;
+        $data = $this->prepareRelationships($data, $collection, $dbForProject, $database, $isAPIKey || $isPrivilegedUser, $transactionId !== null);
+        $data = $this->removeReadonlyAttributes($data, $isAPIKey || $isPrivilegedUser);
+        $newDocument = new Document($data);
+
+        $writes = Operations::writes($collection, [$data], fn (string $id): Document => $authorization->skip(
+            fn () => $dbForProject->getDocument('database_' . $database->getSequence(), $id)
+        ));
+        $usage
+            ->setResource('database')
+            ->setResourceId($database->getId())
+            ->setResourceInternalId((string) $database->getSequence())
+            ->addMetric($this->getDatabasesOperationWriteMetric(), \max(1, $writes));
+
+        // Handle transaction staging
+        if ($transactionId !== null) {
+            $transaction = ($isAPIKey || $isPrivilegedUser)
+                ? $authorization->skip(fn () => $dbForProject->getDocument('transactions', $transactionId))
+                : $dbForProject->getDocument('transactions', $transactionId);
+            if ($transaction->isEmpty() || $this->isTransactionTypeMismatch($transaction)) {
+                throw new Exception(Exception::TRANSACTION_NOT_FOUND, params: [$transactionId]);
+            }
+            if ($transaction->getAttribute('status', '') !== 'pending') {
+                throw new Exception(Exception::TRANSACTION_NOT_READY);
+            }
+
+            $now = new \DateTime();
+            $expiresAt = new \DateTime($transaction->getAttribute('expiresAt', 'now'));
+            if ($now > $expiresAt) {
+                throw new Exception(Exception::TRANSACTION_EXPIRED);
+            }
+
+            // Enforce max operations per transaction
+            $maxBatch = $plan['databasesTransactionSize'] ?? APP_LIMIT_DATABASE_TRANSACTION;
+            $existing = $transaction->getAttribute('operations', 0);
+            if (($existing + 1) > $maxBatch) {
+                throw new Exception(
+                    Exception::TRANSACTION_LIMIT_EXCEEDED,
+                    'Transaction already has ' . $existing . ' operations, adding 1 would exceed the maximum of ' . $maxBatch
+                );
+            }
+
+            if (!$isAPIKey && !$isPrivilegedUser) {
+                $stagedView = $transactionState->stagedView($database, $transaction);
+                $this->authorizeStagedWrite(
+                    fn () => $dbForDatabases->authorizeUpdate($collectionTableId, $stagedView($collectionTableId, $documentId) ?? $document, $newDocument, $stagedView),
+                    $this->getParentNotFoundException(),
+                    $collectionId,
+                );
+            }
+
+            // Stage the operation in transaction logs
+            $staged = new Document([
+                '$id' => Id::unique(),
+                'databaseInternalId' => $database->getSequence(),
+                'collectionInternalId' => $collection->getSequence(),
+                'transactionInternalId' => $transaction->getSequence(),
+                'documentId' => $documentId,
+                'action' => 'update',
+                'data' => $data,
+            ]);
+
+            $this->stage($dbForProject, $transactionId, [$staged], $maxBatch);
+
+            // Return successful response without actually updating document
+            $groupId = $this->getGroupId();
+            $mockDocument = new Document([
+                '$id' => $documentId,
+                '$' . $groupId => $collectionId,
+                '$databaseId' => $databaseId,
+                ...$document->getArrayCopy(),
+                ...$data
+            ]);
+
+            $queueForEvents->reset();
+
+            $response
+                ->setStatusCode(SwooleResponse::STATUS_CODE_OK)
+                ->dynamic($mockDocument, $this->getResponseModel());
+            return;
+        }
+
+        $this->validateTimestamps($data, $dbForDatabases);
+
+        try {
+            $document = $this->withPermissionPurge(
+                $dbForProject,
+                $database,
+                $collection,
+                $callerProvidedPermissions,
+                fn () => $dbForDatabases->withRequestTimestamp(
+                    $requestTimestamp,
+                    fn () => $dbForDatabases->withPreserveDates(true, fn () => $dbForDatabases->updateDocument($collectionTableId, $document->getId(), $newDocument))
+                ),
+            );
+        } catch (ConflictException) {
+            throw new Exception($this->getConflictException());
+        } catch (UniqueException $e) {
+            throw new Exception($this->getUniqueConstraintException(), previous: $e);
+        } catch (DuplicateException $e) {
+            throw new Exception($this->getDuplicateException(), previous: $e, params: [$documentId]);
+        } catch (NotFoundException $e) {
+            if ($authorization->skip(fn () => $dbForProject->getDocument('database_' . $database->getSequence(), $collectionId))->isEmpty()) {
+                throw new Exception($this->getParentNotFoundException(), params: [$collectionId]);
+            }
+            // The table exists, so a column the write's schema listed was deleted or renamed before the write ran
+            throw new Exception($this->getStructureNotFoundException(), 'The schema changed while this request was running. Please try again.', previous: $e);
+        } catch (RelationshipException $e) {
+            throw new Exception(Exception::RELATIONSHIP_VALUE_INVALID, $e->getMessage());
+        } catch (StructureException $e) {
+            throw new Exception($this->getStructureException(), $e->getMessage());
+        } catch (AuthorizationException $e) {
+            throw $this->unauthorized($e);
+        } catch (LimitException $e) {
+            throw new Exception($this->getLimitException(), $e->getMessage());
+        }
+
+        $response->dynamic($document, $this->getResponseModel());
+
+        $relationships = \array_map(
+            fn ($document) => $document->getAttribute('key'),
+            \array_filter(
+                $collection->getAttribute('attributes', []),
+                fn ($attribute) => $attribute->getAttribute('type') === ColumnType::Relationship->value
+            )
+        );
+
+        $queueForEvents
+            ->setParam('databaseId', $databaseId)
+            ->setParam('collectionId', $collection->getId())
+            ->setParam('tableId', $collection->getId())
+            ->setParam('documentId', $document->getId())
+            ->setParam('rowId', $document->getId())
+            ->setContext('database', $database)
+            ->setContext($this->getCollectionsEventsContext(), $collection)
+            ->setPayload($response->getPayload(), sensitive: $relationships);
+    }
+}

@@ -1,0 +1,11 @@
+app/config/** linguist-detectable=false
+app/views/** linguist-detectable=false
+app/controllers/** linguist-detectable=false
+src/** linguist-detectable=false
+tests/** linguist-detectable=false
+public/scripts/** linguist-detectable=false
+public/dist/scripts/** linguist-detectable=false
+
+# Force LF so Docker images built from Windows (autocrlf) checkouts don't break
+bin/*  text eol=lf
+*.sh   text eol=lf

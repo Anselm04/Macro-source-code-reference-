@@ -1,0 +1,106 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Users\Http\Users;
+
+use Appwrite\Deletes\Identities as DeleteIdentities;
+use Appwrite\Deletes\Targets as DeleteTargets;
+use Appwrite\Event\Event;
+use Appwrite\Event\Message\Delete as DeleteMessage;
+use Appwrite\Event\Publisher\Delete as DeletePublisher;
+use Appwrite\Event\Realtime;
+use Appwrite\Extend\Exception;
+use Appwrite\Messaging\Adapter\Mqtt;
+use Appwrite\Platform\Action;
+use Appwrite\Presences\State as PresenceState;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Usage\Context;
+use Appwrite\Utopia\Response;
+use Utopia\Console\Console;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Query;
+use Utopia\Database\Validator\UID;
+use Utopia\Platform\Scope\HTTP;
+
+class Delete extends Action
+{
+    use HTTP;
+
+    public static function getName(): string
+    {
+        return 'deleteUser';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_DELETE)
+            ->setHttpPath('/v1/users/:userId')
+            ->desc('Delete user')
+            ->groups(['api', 'users'])
+            ->label('event', 'users.[userId].delete')
+            ->label('scope', 'users.write')
+            ->label('audits.event', 'user.delete')
+            ->label('audits.resource', 'user/{request.userId}')
+            ->label('sdk', new Method(
+                namespace: 'users',
+                group: 'users',
+                name: 'delete',
+                description: '/docs/references/users/delete.md',
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_NOCONTENT,
+                        model: Response::MODEL_NONE,
+                    )
+                ],
+                contentType: ContentType::NONE
+            ))
+            ->param('userId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'User ID.', false, ['dbForProject'])
+            ->inject('response')
+            ->inject('project')
+            ->inject('dbForProject')
+            ->inject('queueForEvents')
+            ->inject('publisherForDeletes')
+            ->inject('mqtt')
+            ->inject('queueForRealtime')
+            ->inject('usage')
+            ->callback($this->action(...));
+    }
+
+    public function action(string $userId, Response $response, Document $project, Database $dbForProject, Event $queueForEvents, DeletePublisher $publisherForDeletes, Mqtt $mqtt, Realtime $queueForRealtime, Context $usage): void
+    {
+        $user = $dbForProject->getDocument('users', $userId);
+
+        if ($user->isEmpty()) {
+            throw new Exception(Exception::USER_NOT_FOUND);
+        }
+
+        $dbForProject->deleteDocument('users', $userId);
+
+        try {
+            $mqtt->revoke($project->getId(), $user->getId());
+        } catch (\Throwable $error) {
+            Console::error('Failed to revoke MQTT connections: ' . $error->getMessage());
+        }
+
+        DeleteIdentities::delete($dbForProject, Query::equal('userInternalId', [$user->getSequence()]));
+        DeleteTargets::delete($dbForProject, Query::equal('userInternalId', [$user->getSequence()]));
+        (new PresenceState())->deleteForUser($dbForProject, $project, $user, $queueForRealtime, $usage);
+
+        $publisherForDeletes->enqueue(new DeleteMessage(
+            project: $project,
+            type: DELETE_TYPE_DOCUMENT,
+            document: $user,
+        ));
+
+        $queueForEvents
+            ->setParam('userId', $user->getId())
+            ->setPayload($response->output($user, Response::MODEL_USER));
+
+        $response->noContent();
+    }
+}

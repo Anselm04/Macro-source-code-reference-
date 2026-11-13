@@ -1,0 +1,313 @@
+<?php
+
+namespace Appwrite\Auth\OAuth2;
+
+use Appwrite\Auth\OAuth2;
+
+// Reference Material
+// https://docs.gitlab.com/ee/api/oauth2.html
+
+/**
+ * Shared with the "Sign in with GitLab" account-login OAuth2 provider, which
+ * stores its secret as JSON ({"clientSecret": "...", "endpoint": "..."}) to
+ * support self-hosted GitLab per-project. The VCS flow (see app/config/vcs.php)
+ * and the console project (see app/config/console.php) encode to that same JSON
+ * shape, taking their endpoint from _APP_VCS_GITLAB_ENDPOINT and
+ * _APP_CONSOLE_GITLAB_ENDPOINT respectively.
+ */
+class Gitlab extends OAuth2
+{
+    /**
+     * @var array
+     */
+    protected array $user = [];
+
+    /**
+     * @var array
+     */
+    protected array $tokens = [];
+
+    /**
+     * Existing GitLab applications must allow these scopes. openid and email
+     * are what /oauth/userinfo uses for the primary address. read_user remains
+     * for grants issued before those scopes existed.
+     *
+     * @var array
+     */
+    protected array $scopes = [
+        'read_user',
+        'openid',
+        'email',
+    ];
+
+    /**
+     * @return string
+     */
+    public function getName(): string
+    {
+        return 'gitlab';
+    }
+
+    /**
+     * @return string
+     */
+    public function getLoginURL(): string
+    {
+        return $this->getEndpoint() . '/oauth/authorize?' . \http_build_query([
+            'client_id' => $this->appID,
+            'redirect_uri' => $this->callback,
+            'scope' => \implode(' ', $this->getScopes()),
+            'state' => \json_encode($this->state),
+            'response_type' => 'code'
+        ]);
+    }
+
+    /**
+     * @param string $code
+     *
+     * @return array
+     */
+    protected function getTokens(string $code): array
+    {
+        if (empty($this->tokens)) {
+            $this->tokens = \json_decode($this->request(
+                'POST',
+                $this->getEndpoint() . '/oauth/token?' . \http_build_query([
+                    'code' => $code,
+                    'client_id' => $this->appID,
+                    'client_secret' => $this->getAppSecret()['clientSecret'],
+                    'redirect_uri' => $this->callback,
+                    'grant_type' => 'authorization_code'
+                ])
+            ), true);
+        }
+
+        return $this->tokens;
+    }
+
+    /**
+     * @param string $refreshToken
+     *
+     * @return array
+     */
+    public function refreshTokens(string $refreshToken): array
+    {
+        $this->tokens = \json_decode($this->request(
+            'POST',
+            $this->getEndpoint() . '/oauth/token?' . \http_build_query([
+                'refresh_token' => $refreshToken,
+                'client_id' => $this->appID,
+                'client_secret' => $this->getAppSecret()['clientSecret'],
+                'grant_type' => 'refresh_token'
+            ])
+        ), true);
+
+        if (empty($this->tokens['refresh_token'])) {
+            $this->tokens['refresh_token'] = $refreshToken;
+        }
+
+        return $this->tokens;
+    }
+
+    /**
+     * @param string $accessToken
+     *
+     * @return string
+     */
+    public function getUserID(string $accessToken): string
+    {
+        $user = $this->getUser($accessToken);
+
+        if (isset($user['sub'])) {
+            return (string) $user['sub'];
+        }
+
+        return '';
+    }
+
+    /**
+     * @param string $accessToken
+     *
+     * @return string
+     */
+    public function getUserEmail(string $accessToken): string
+    {
+        $user = $this->getUser($accessToken);
+
+        return $user['email'] ?? '';
+    }
+
+    /**
+     * @link https://docs.gitlab.com/integration/openid_connect_provider/
+     *
+     * @param string $accessToken
+     *
+     * @return bool
+     */
+    public function isEmailVerified(string $accessToken): bool
+    {
+        $user = $this->getUser($accessToken);
+
+        return ($user['email_verified'] ?? false) === true;
+    }
+
+    /**
+     * @param string $accessToken
+     *
+     * @return string
+     */
+    public function getUserPhoto(string $accessToken): string
+    {
+        $user = $this->getUser($accessToken);
+
+        return $user['picture'] ?? '';
+    }
+
+    /**
+     * @param string $accessToken
+     *
+     * @return string
+     */
+    public function getUserName(string $accessToken): string
+    {
+        $user = $this->getUser($accessToken);
+
+        return $user['name'] ?? '';
+    }
+
+    /**
+     * @param string $accessToken
+     *
+     * @return string
+     */
+    public function getUserSlug(string $accessToken): string
+    {
+        $user = $this->getUser($accessToken);
+
+        return $user['preferred_username'] ?? $user['nickname'] ?? '';
+    }
+
+    /**
+     * @link https://docs.gitlab.com/ee/api/projects.html#create-project
+     *
+     * @param string $accessToken
+     * @param string $repositoryName
+     * @param bool $private
+     *
+     * @return array
+     */
+    public function createRepository(string $accessToken, string $repositoryName, bool $private, string $namespaceId = ''): array
+    {
+        $payload = [
+            'name' => $repositoryName,
+            'visibility' => $private ? 'private' : 'public',
+        ];
+
+        if (!empty($namespaceId)) {
+            $payload['namespace_id'] = (int) $namespaceId;
+        }
+
+        $repository = $this->request('POST', $this->getEndpoint() . '/api/v4/projects', ['Authorization: Bearer ' . $accessToken, 'Content-Type: application/json'], \json_encode($payload));
+
+        $repository = \json_decode($repository, true) ?? [];
+
+        // Normalize to the GitHub/Gitea field shape ProviderRepository expects.
+        if (isset($repository['visibility'])) {
+            $repository['private'] = $repository['visibility'] !== 'public';
+        }
+
+        if (isset($repository['last_activity_at'])) {
+            $repository['pushed_at'] = $repository['last_activity_at'];
+        }
+
+        if (isset($repository['message']) && !\is_string($repository['message'])) {
+            $repository['message'] = \json_encode($repository['message']);
+        }
+
+        return $repository;
+    }
+
+    /**
+     * @param string $accessToken
+     *
+     * @return array
+     */
+    protected function getUser(string $accessToken): array
+    {
+        if (!empty($this->user)) {
+            return $this->user;
+        }
+
+        try {
+            $user = $this->request(
+                'GET',
+                $this->getEndpoint() . '/oauth/userinfo',
+                ['Authorization: Bearer ' . $accessToken],
+            );
+            $this->user = \json_decode($user, true) ?? [];
+        } catch (\Throwable) {
+            // A grant from before the openid scope cannot call userinfo.
+            // The profile still identifies the user. It does not verify the email.
+            $this->user = $this->profile($accessToken);
+        }
+
+        return $this->user;
+    }
+
+    /**
+     * @param string $accessToken
+     *
+     * @return array
+     */
+    private function profile(string $accessToken): array
+    {
+        $response = $this->request('GET', $this->getEndpoint() . '/api/v4/user?' . \http_build_query([
+            'access_token' => $accessToken,
+        ]));
+        $profile = \json_decode($response, true) ?? [];
+
+        return [
+            'sub' => isset($profile['id']) ? (string) $profile['id'] : '',
+            'email' => $profile['email'] ?? '',
+            'email_verified' => false,
+            'name' => $profile['name'] ?? '',
+            'preferred_username' => $profile['username'] ?? '',
+            'picture' => $profile['avatar_url'] ?? '',
+        ];
+    }
+
+    /**
+     * Decode the JSON stored in appSecret.
+     * Falls back to treating the raw string as the client secret for backwards compatibility.
+     *
+     * @return array
+     */
+    protected function getAppSecret(): array
+    {
+        try {
+            $secret = \json_decode($this->appSecret, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\Throwable $th) {
+            return ['clientSecret' => $this->appSecret];
+        }
+
+        if (!\is_array($secret)) {
+            return ['clientSecret' => $this->appSecret];
+        }
+
+        return $secret;
+    }
+
+    /**
+     * Extracts the endpoint from the JSON stored in appSecret. Defaults to
+     * gitlab.com as a fallback.
+     *
+     * @return string
+     */
+    protected function getEndpoint(): string
+    {
+        $defaultEndpoint = 'https://gitlab.com';
+        $secret = $this->getAppSecret();
+        $endpoint = $secret['endpoint'] ?? $defaultEndpoint;
+        return empty($endpoint) ? $defaultEndpoint : \rtrim($endpoint, '/');
+    }
+}

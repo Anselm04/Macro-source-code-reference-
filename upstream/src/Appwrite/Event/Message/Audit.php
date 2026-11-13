@@ -1,0 +1,87 @@
+<?php
+
+namespace Appwrite\Event\Message;
+
+use Appwrite\Event\Context\Audit as AuditContext;
+use Utopia\Database\Document;
+
+final class Audit extends Base
+{
+    /**
+     * @param array $payload Not queued: no audits consumer reads it. Kept so producers that still pass it keep working.
+     */
+    public function __construct(
+        public readonly string $event,
+        public readonly array $payload = [],
+        public readonly Document $project = new Document(),
+        public readonly Document $user = new Document(),
+        public readonly Document $impersonatorUser = new Document(),
+        public readonly string $resource = '',
+        public readonly string $mode = '',
+        public readonly string $ip = '',
+        public readonly string $userAgent = '',
+        public readonly string $hostname = '',
+        public readonly string $sdk = '',
+        public readonly string $sdkVersion = '',
+        public readonly string $reason = '',
+    ) {
+    }
+
+    #[\Override]
+    public function toArray(): array
+    {
+        return [
+            'project' => ProjectContext::fromDocument($this->project)->toArray(),
+            'user' => UserContext::fromDocument($this->user)->toArray(),
+            'impersonatorUser' => UserContext::fromDocument($this->impersonatorUser)->toArray(),
+            'resource' => $this->resource,
+            'mode' => $this->mode,
+            'ip' => $this->ip,
+            'userAgent' => $this->userAgent,
+            'event' => $this->event,
+            'hostname' => $this->hostname,
+            'sdk' => $this->sdk,
+            'sdkVersion' => $this->sdkVersion,
+            'reason' => $this->reason,
+        ];
+    }
+
+    #[\Override]
+    public static function fromArray(array $data): static
+    {
+        return new self(
+            event: $data['event'] ?? '',
+            project: new Document($data['project'] ?? []),
+            // Messages queued by older producers carry the whole user document; keep only what consumers read.
+            user: new Document(UserContext::fromArray($data['user'] ?? [])->toArray()),
+            impersonatorUser: new Document(UserContext::fromArray($data['impersonatorUser'] ?? [])->toArray()),
+            resource: $data['resource'] ?? '',
+            mode: $data['mode'] ?? '',
+            ip: $data['ip'] ?? '',
+            userAgent: $data['userAgent'] ?? '',
+            hostname: $data['hostname'] ?? '',
+            sdk: $data['sdk'] ?? '',
+            sdkVersion: $data['sdkVersion'] ?? '',
+            reason: $data['reason'] ?? '',
+        );
+    }
+
+    public static function fromContext(AuditContext $context): static
+    {
+        return new self(
+            event: $context->event,
+            payload: $context->payload,
+            project: $context->project ?? new Document(),
+            user: $context->user ?? new Document(),
+            impersonatorUser: $context->impersonatorUser ?? new Document(),
+            resource: $context->resource,
+            mode: $context->mode,
+            ip: $context->ip,
+            userAgent: $context->userAgent,
+            hostname: $context->hostname,
+            sdk: $context->sdk,
+            sdkVersion: $context->sdkVersion,
+            reason: $context->reason,
+        );
+    }
+}

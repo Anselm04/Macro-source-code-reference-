@@ -1,0 +1,82 @@
+# Patterns match the issue title only, as whole words, ignoring case.
+# Matching the body or bare substrings applied most labels to every issue.
+
+# Fixes and upgrades for the Appwrite Auth / Users / Teams services.
+"product / auth":
+  - '/\b(auth|authentication|sessions?|login|logout|2fa|mfa|users?|teams?|memberships?|invites?|oauth\w*|sso|saml|jwts?|passkeys?|passwords?)\b/i'
+
+# Fixes and upgrades for the Appwrite Realtime API.
+"api / realtime":
+  - '/\b(realtime|websockets?)\b/i'
+
+# Console, UI and UX issues
+"product / console":
+  - '/\b(console)\b/i'
+
+# Fixes and upgrades for the Appwrite Storage.
+"product / storage":
+  - '/\b(storage|buckets?|files?|image previews?|file previews?)\b/i'
+
+# Fixes and upgrades for the Appwrite Database.
+"product / databases":
+  - '/\b(databases?|dbs?|collections?|tables?|tablesdb|documentsdb|vectorsdb|attributes?|columns?|documents?|rows?|quer(y|ies)|indexes|postgres(ql)?|mariadb|mongodb|mysql|pagination)\b/i'
+
+# Fixes and upgrades for the Appwrite Functions.
+"product / functions":
+  - '/\b(functions?|runtimes?|deployments?|executions?|cron)\b/i'
+
+# Fixes and upgrades for the Appwrite Docs.
+# "product / docs":
+#   -
+
+# Fixes and upgrades for the Appwrite Migrations.
+"product / migrations":
+  - '/\b(migrate|migrations?)\b/i'
+
+# Fixes and upgrades for the Appwrite Messaging.
+"product / messaging":
+  - '/\b(messaging|emails?|sms|push notifications?|smtp|apns|fcm|topics?|subscribers?)\b/i'
+
+# Fixes and upgrades for the Appwrite Platform.
+# "product / platform":
+#   -
+
+# Fixes and upgrades for database relationships
+"feature / relationships":
+  - '/\b(relationships?)\b/i'
+
+# Issues found only on Appwrite Cloud
+# "product / cloud":
+#   -
+
+# Fixes and upgrades for the Appwrite VCS.
+"product / vcs":
+  - '/\b(vcs|github|gitlab|bitbucket|gitea|git repositor(y|ies))\b/i'
+
+# Fixes and upgrades for the Appwrite GraphQL API.
+"api / graphql":
+  - '/\b(graphql|gql)\b/i'
+
+# Fixes and upgrades for the Appwrite Domains.
+"product / domains":
+  - '/\b(domains?|dns|ssl|certificates?)\b/i'
+
+# Fixes and upgrades for the Appwrite Locale.
+"product / locale":
+  - '/\b(locale|i18n|internationalization|localization|l10n|translations?|timezones?)\b/i'
+
+# Fixes and upgrades for the Appwrite Avatars.
+"product / avatars":
+  - '/\b(avatars?)\b/i'
+
+# Fixes and upgrades for Appwrite Sites.
+"product / sites":
+  - '/\b(sites?|hosting|nextjs|next\.js|nuxt|sveltekit|astro)\b/i'
+
+# Fixes and upgrades for the Appwrite CLI.
+"sdk / cli":
+  - '/\b(cli|command line)\b/i'
+
+# Issues only found when self-hosting Appwrite
+"product / self-hosted":
+  - '/\b(self[- ]host(ed|ing)?)\b/i'

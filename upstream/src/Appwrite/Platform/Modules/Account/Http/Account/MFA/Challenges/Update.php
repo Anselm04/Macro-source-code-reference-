@@ -1,0 +1,192 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Account\Http\Account\MFA\Challenges;
+
+use Appwrite\Abuse\Limit;
+use Appwrite\Auth\MFA\Challenge;
+use Appwrite\Auth\MFA\Type;
+use Appwrite\Event\Event;
+use Appwrite\Extend\Exception;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Deprecated;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response;
+use Utopia\Database\Database;
+use Utopia\Database\DateTime;
+use Utopia\Database\Document;
+use Utopia\Platform\Action;
+use Utopia\Platform\Scope\HTTP;
+use Utopia\Validator\Text;
+
+class Update extends Action
+{
+    use HTTP;
+
+    public static function getName(): string
+    {
+        return 'updateMFAChallenge';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_PUT)
+            ->setHttpPath('/v1/account/mfa/challenges')
+            ->httpAlias('/v1/account/mfa/challenge')
+            ->desc('Update MFA challenge (confirmation)')
+            ->groups(['api', 'account', 'mfa'])
+            ->label('scope', 'account')
+            ->label('impersonation', 'allow')
+            ->label('event', 'users.[userId].sessions.[sessionId].create')
+            ->label('audits.event', 'challenges.update')
+            ->label('audits.resource', 'user/{response.userId}')
+            ->label('audits.userId', '{response.userId}')
+            ->label('sdk', [
+                new Method(
+                    namespace: 'account',
+                    group: 'mfa',
+                    name: 'updateMfaChallenge',
+                    description: '/docs/references/account/update-mfa-challenge.md',
+                    auth: [AuthType::ADMIN, AuthType::SESSION, AuthType::JWT],
+                    responses: [
+                        new SDKResponse(
+                            code: Response::STATUS_CODE_OK,
+                            model: Response::MODEL_SESSION,
+                        )
+                    ],
+                    contentType: ContentType::JSON,
+                    deprecated: new Deprecated(
+                        since: '1.8.0',
+                        replaceWith: 'account.updateMFAChallenge',
+                    ),
+                    public: false,
+                ),
+                new Method(
+                    namespace: 'account',
+                    group: 'mfa',
+                    name: 'updateMFAChallenge',
+                    description: '/docs/references/account/update-mfa-challenge.md',
+                    auth: [AuthType::ADMIN, AuthType::SESSION, AuthType::JWT],
+                    responses: [
+                        new SDKResponse(
+                            code: Response::STATUS_CODE_OK,
+                            model: Response::MODEL_SESSION,
+                        )
+                    ],
+                    contentType: ContentType::JSON
+                )
+            ])
+            ->label('abuse', [Limit::attempts(['projectId', 'url', 'param.challengeId'], 10, everyone: true)])
+            ->param('challengeId', '', new Text(256), 'ID of the challenge.')
+            ->param('otp', '', new Text(256), 'Valid verification token.')
+            ->inject('project')
+            ->inject('response')
+            ->inject('user')
+            ->inject('session')
+            ->inject('dbForProject')
+            ->inject('queueForEvents')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        string $challengeId,
+        string $otp,
+        Document $project,
+        Response $response,
+        Document $user,
+        Document $session,
+        Database $dbForProject,
+        Event $queueForEvents
+    ): void {
+        $challenge = $dbForProject->getDocument('challenges', $challengeId);
+
+        if ($challenge->isEmpty()) {
+            throw new Exception(Exception::USER_INVALID_TOKEN);
+        }
+
+        if ($challenge->getAttribute('expire') < DateTime::formatTz(DateTime::now())) {
+            throw new Exception(Exception::USER_INVALID_TOKEN);
+        }
+
+        $type = $challenge->getAttribute('type');
+
+        // Consult the current policy so disabling a factor also invalidates outstanding challenges
+        $mfaFactors = $project->getAttribute('auths', [])['mfaFactors'] ?? [];
+        $factorEnabled = match ($type) {
+            Type::TOTP => $mfaFactors['totp'] ?? true,
+            Type::EMAIL => $mfaFactors['email'] ?? true,
+            Type::PHONE => $mfaFactors['phone'] ?? true,
+            Type::CUSTOM => $mfaFactors['custom'] ?? false,
+            default => true, // Recovery codes always remain available as a fallback
+        };
+
+        if (!$factorEnabled) {
+            throw new Exception(Exception::USER_AUTH_METHOD_UNSUPPORTED, 'The requested factor is disabled by the MFA factors policy');
+        }
+
+        $step = $type === Type::TOTP ? Challenge\TOTP::step($user, $otp) : null;
+
+        $success = (match ($type) {
+            Type::TOTP => $step !== null,
+            Type::PHONE => Challenge\Phone::challenge($challenge, $user, $otp),
+            Type::EMAIL => Challenge\Email::challenge($challenge, $user, $otp),
+            Type::RECOVERY_CODE => \in_array($otp, $user->getAttribute('mfaRecoveryCodes', []), true),
+            Type::CUSTOM => Challenge\Custom::challenge($challenge, $user, $otp),
+            default => false
+        });
+
+        if (!$success) {
+            throw new Exception(Exception::USER_INVALID_TOKEN);
+        }
+
+        // Claim the challenge under the user row lock an address change takes, which deletes challenges sent to the old address
+        $dbForProject->withTransaction(function () use ($dbForProject, $user, $challengeId, $step, $type, $otp) {
+            $locked = $dbForProject->getDocument('users', $user->getId(), forUpdate: true);
+
+            // A recovery code is single-use: remove it from the locked row so concurrent confirmations cannot redeem or restore it
+            if ($type === Type::RECOVERY_CODE) {
+                $mfaRecoveryCodes = $locked->getAttribute('mfaRecoveryCodes', []);
+
+                if (!\in_array($otp, $mfaRecoveryCodes, true)) {
+                    throw new Exception(Exception::USER_INVALID_TOKEN);
+                }
+
+                $mfaRecoveryCodes = \array_values(\array_diff($mfaRecoveryCodes, [$otp]));
+                $user->setAttribute('mfaRecoveryCodes', $mfaRecoveryCodes);
+                $dbForProject->updateDocument('users', $user->getId(), new Document(['mfaRecoveryCodes' => $mfaRecoveryCodes]));
+            }
+
+            // A TOTP code is single-use: spend its step so no other challenge or session can redeem it again
+            if ($step !== null && !Challenge\TOTP::spend($dbForProject, $user, $step)) {
+                throw new Exception(Exception::USER_INVALID_TOKEN);
+            }
+
+            if (!$dbForProject->deleteDocument('challenges', $challengeId)) {
+                throw new Exception(Exception::USER_INVALID_TOKEN);
+            }
+        });
+        $dbForProject->purgeCachedDocument('users', $user->getId());
+
+        $factors = $session->getAttribute('factors', []);
+        $factors[] = $type;
+        $factors = \array_values(\array_unique($factors));
+
+        $mfaUpdatedAt = DateTime::now();
+
+        $session
+            ->setAttribute('factors', $factors)
+            ->setAttribute('mfaUpdatedAt', $mfaUpdatedAt)
+            ->setAttribute('userName', $user->getAttribute('name', ''));
+
+        $dbForProject->updateDocument('sessions', $session->getId(), new Document(['factors' => $factors, 'mfaUpdatedAt' => $mfaUpdatedAt]));
+
+        $queueForEvents
+            ->setParam('userId', $user->getId())
+            ->setParam('sessionId', $session->getId())
+            ->setPayload($response->output($session, Response::MODEL_SESSION), sensitive: ['secret', 'providerAccessToken', 'providerRefreshToken']);
+
+        $response->dynamic($session, Response::MODEL_SESSION);
+    }
+}

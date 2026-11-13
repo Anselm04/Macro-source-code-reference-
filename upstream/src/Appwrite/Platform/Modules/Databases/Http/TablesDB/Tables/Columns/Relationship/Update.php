@@ -1,0 +1,78 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\TablesDB\Tables\Columns\Relationship;
+
+use Appwrite\Platform\Modules\Databases\Http\Databases\Collections\Attributes\Relationship\Update as RelationshipUpdate;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response as UtopiaResponse;
+use Utopia\Database\Database;
+use Utopia\Database\RelationshipDeleteAction;
+use Utopia\Database\Validator\Key;
+use Utopia\Database\Validator\UID;
+use Utopia\Http\Adapter\Swoole\Response as SwooleResponse;
+use Utopia\Platform\Enum;
+use Utopia\Validator\Nullable;
+use Utopia\Validator\Text;
+use Utopia\Validator\WhiteList;
+
+class Update extends RelationshipUpdate
+{
+    public static function getName(): string
+    {
+        return 'updateRelationshipColumn';
+    }
+
+    protected function getResponseModel(): string|array
+    {
+        return UtopiaResponse::MODEL_COLUMN_RELATIONSHIP;
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(self::HTTP_REQUEST_METHOD_PATCH)
+            ->setHttpPath('/v1/tablesdb/:databaseId/tables/:tableId/columns/relationship/:key')
+            ->httpAlias('/v1/tablesdb/:databaseId/tables/:tableId/columns/:key/relationship')
+            ->desc('Update relationship column')
+            ->groups(['api', 'database', 'schema'])
+            ->label('scope', ['tables.write', 'collections.write', 'columns.write', 'attributes.write'])
+            ->label('resourceType', RESOURCE_TYPE_DATABASES)
+            ->label('event', 'databases.[databaseId].tables.[tableId].columns.[columnId].update')
+            ->label('audits.event', 'column.update')
+            ->label('audits.resource', 'database/{request.databaseId}/table/{request.tableId}')
+            ->label('usage.resource', 'database/{request.databaseId}/table/{request.tableId}')
+            ->label('sdk', new Method(
+                namespace: $this->getSDKNamespace(),
+                group: $this->getSDKGroup(),
+                name: self::getName(),
+                description: '/docs/references/tablesdb/update-relationship-column.md',
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: SwooleResponse::STATUS_CODE_OK,
+                        model: $this->getResponseModel()
+                    )
+                ],
+                contentType: ContentType::JSON
+            ))
+            ->param('databaseId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Database ID.', false, ['dbForProject'])
+            ->param('tableId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Table ID.', false, ['dbForProject'])
+            ->param('key', '', fn (Database $dbForProject) => new Key(false, $dbForProject->getMaxUidLength()), 'Column Key.', false, ['dbForProject'])
+            ->param('onDelete', null, new Nullable(new WhiteList([
+                RelationshipDeleteAction::Cascade->value,
+                RelationshipDeleteAction::Restrict->value,
+                RelationshipDeleteAction::SetNull->value
+            ], true)), 'Delete constraint. Possible values are: cascade, restrict, setNull.', true, enum: new Enum(name: 'RelationMutate'))
+            ->param('newKey', null, fn (Database $dbForProject) => new Nullable(new Key(false, $dbForProject->getMaxUidLength())), 'New Column Key.', true, ['dbForProject'])
+            ->param('description', null, new Nullable(new Text(1024, 0)), 'Optional description for the column.', true)
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('getDatabasesDB')
+            ->inject('queueForEvents')
+            ->inject('authorization')
+            ->callback($this->action(...));
+    }
+}

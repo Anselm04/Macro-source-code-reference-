@@ -1,0 +1,397 @@
+<?php
+
+use Appwrite\Database\Factory as DatabaseFactory;
+use Appwrite\Extend\Exception;
+use Appwrite\GraphQL\Promises\Adapter\Swoole;
+use Appwrite\Hooks\Hooks;
+use Appwrite\PubSub\Adapter\Redis as PubSub;
+use Appwrite\URL\URL as AppwriteURL;
+use Utopia\Cache\Adapter\Pool as CachePool;
+use Utopia\Cache\Adapter\Redis as RedisCache;
+use Utopia\Cache\Adapter\Sharding;
+use Utopia\Cache\Cache;
+use Utopia\Cache\Codec\Igbinary;
+use Utopia\Config\Config;
+use Utopia\Database\Adapter\MariaDB;
+use Utopia\Database\Adapter\Mongo;
+use Utopia\Database\Adapter\MySQL;
+use Utopia\Database\Adapter\Postgres;
+use Utopia\Database\PDO;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Domains\Validator\PublicDomain;
+use Utopia\DSN\DSN;
+use Utopia\Http\Http;
+use Utopia\Messaging\Adapter\Email\SMTP;
+use Utopia\Mongo\Client as MongoClient;
+use Utopia\Pools\Adapter\Swoole as SwoolePool;
+use Utopia\Pools\Group;
+use Utopia\Pools\Pool;
+use Utopia\Queue;
+use Utopia\Registry\Registry;
+use Utopia\System\System;
+
+global $register;
+$register = new Registry();
+
+Http::setMode(System::getEnv('_APP_ENV', Http::MODE_TYPE_PRODUCTION));
+
+if (!Http::isProduction()) {
+    // Allow specific domains to skip public domain validation in dev environment
+    // Useful for existing tests involving webhooks
+    PublicDomain::allow(['request-catcher-sms']);
+    PublicDomain::allow(['request-catcher-webhook']);
+}
+
+$register->set('pools', function () {
+    $group = new Group();
+
+    $fallbackForDB = 'db_main=' . AppwriteURL::unparse([
+        'scheme' => System::getEnv('_APP_DB_ADAPTER', 'postgresql'),
+        'host' => System::getEnv('_APP_DB_HOST', 'postgresql'),
+        'port' => System::getEnv('_APP_DB_PORT', '5432'),
+        'user' => \rawurlencode(System::getEnv('_APP_DB_USER', '')),
+        'pass' => \rawurlencode(System::getEnv('_APP_DB_PASS', '')),
+        'path' => System::getEnv('_APP_DB_SCHEMA', ''),
+    ]);
+    $fallbackForRedis = 'redis_main=' . AppwriteURL::unparse([
+        'scheme' => 'redis',
+        'host' => System::getEnv('_APP_REDIS_HOST', 'redis'),
+        'port' => System::getEnv('_APP_REDIS_PORT', '6379'),
+        'user' => \rawurlencode(System::getEnv('_APP_REDIS_USER', '')),
+        'pass' => \rawurlencode(System::getEnv('_APP_REDIS_PASS', '')),
+    ]);
+
+    $fallbackForDocumentsDB = 'db_main=' . AppwriteURL::unparse([
+        'scheme' => System::getEnv('_APP_DB_ADAPTER_DOCUMENTSDB', 'mongodb'),
+        'host' => System::getEnv('_APP_DB_HOST_DOCUMENTSDB', 'mongodb'),
+        'port' => System::getEnv('_APP_DB_PORT_DOCUMENTSDB', '27017'),
+        'user' => \rawurlencode(System::getEnv('_APP_DB_USER_DOCUMENTSDB', '') ?: System::getEnv('_APP_DB_USER', '')),
+        'pass' => \rawurlencode(System::getEnv('_APP_DB_PASS_DOCUMENTSDB', '') ?: System::getEnv('_APP_DB_PASS', '')),
+        'path' => System::getEnv('_APP_DB_SCHEMA_DOCUMENTSDB', '') ?: System::getEnv('_APP_DB_SCHEMA', ''),
+    ]);
+    $fallbackForVectorsDB = 'db_main=' . AppwriteURL::unparse([
+        'scheme' => System::getEnv('_APP_DB_ADAPTER_VECTORSDB', 'postgresql'),
+        'host' => System::getEnv('_APP_DB_HOST_VECTORSDB', 'postgresql'),
+        'port' => System::getEnv('_APP_DB_PORT_VECTORSDB', '5432'),
+        'user' => \rawurlencode(System::getEnv('_APP_DB_USER_VECTORSDB', '') ?: System::getEnv('_APP_DB_USER', '')),
+        'pass' => \rawurlencode(System::getEnv('_APP_DB_PASS_VECTORSDB', '') ?: System::getEnv('_APP_DB_PASS', '')),
+        'path' => System::getEnv('_APP_DB_SCHEMA_VECTORSDB', '') ?: System::getEnv('_APP_DB_SCHEMA', ''),
+    ]);
+
+    $connections = [
+        'console' => [
+            'type' => 'database',
+            'dsns' => $fallbackForDB,
+            'multiple' => false,
+            'schemes' => ['mariadb', 'mongodb', 'mysql', 'postgresql'],
+        ],
+        'database' => [
+            'type' => 'database',
+            'dsns' => $fallbackForDB,
+            'multiple' => true,
+            'schemes' => ['mongodb','mariadb', 'mysql','postgresql'],
+        ],
+        'documentsdb' => [
+            'type' => 'database',
+            'dsns' => System::getEnv('_APP_CONNECTIONS_DATABASE_DOCUMENTSDB', $fallbackForDocumentsDB),
+            'multiple' => true,
+            'schemes' => ['mongodb'],
+        ],
+        'vectorsdb' => [
+            'type' => 'database',
+            'dsns' => System::getEnv('_APP_CONNECTIONS_DATABASE_VECTORSDB', $fallbackForVectorsDB),
+            'multiple' => true,
+            'schemes' => ['postgresql'],
+        ],
+        'publisher' => [
+            'type' => 'publisher',
+            'dsns' => $fallbackForRedis,
+            'multiple' => false,
+            'schemes' => ['redis'],
+        ],
+        'pubsub' => [
+            'type' => 'pubsub',
+            'dsns' => $fallbackForRedis,
+            'multiple' => false,
+            'schemes' => ['redis'],
+        ],
+        'cache' => [
+            'type' => 'cache',
+            'dsns' => $fallbackForRedis,
+            'multiple' => true,
+            'schemes' => ['redis'],
+        ],
+        'lock' => [
+            'type' => 'lock',
+            'dsns' => $fallbackForRedis,
+            'multiple' => false,
+            'schemes' => ['redis'],
+        ],
+        // Abuse gets its own pool rather than sharing 'lock': lock leases are
+        // held for the whole guarded callback, which for storage chunk uploads
+        // spans the transfer. Rate limit checks must not queue behind those.
+        'abuse' => [
+            'type' => 'abuse',
+            'dsns' => $fallbackForRedis,
+            'multiple' => false,
+            'schemes' => ['redis'],
+        ],
+    ];
+
+    $maxConnections = (int) System::getEnv('_APP_CONNECTIONS_MAX', 151);
+    $instanceConnections = $maxConnections / (int) System::getEnv('_APP_POOL_CLIENTS', 15);
+
+    $workerCount = intval(System::getEnv('_APP_CPU_NUM', swoole_cpu_num())) * intval(System::getEnv('_APP_WORKER_PER_CORE', 6));
+    $poolSize = max(1, (int)($instanceConnections / $workerCount));
+
+    // Queue workers consume jobs concurrently with coroutines; each in-flight
+    // job may hold a connection, so pools must cover the coroutine count.
+    $poolSize = max($poolSize, (int) System::getEnv('_APP_WORKER_MAX_COROUTINES', 1));
+
+    $poolTimeout = (float) System::getEnv('_APP_CONNECTIONS_TIMEOUT', 10);
+
+    // Bounds every Redis connect and reply, so an unresponsive Redis fails a request
+    // instead of holding it. Must stay above the 2 s a queue retry blocks on a pop.
+    $redisTimeout = (float) System::getEnv('_APP_REDIS_TIMEOUT', 3);
+
+    foreach ($connections as $key => $connection) {
+        $type = $connection['type'];
+        $multiple = $connection['multiple'];
+        $schemes = $connection['schemes'];
+        $config = [];
+        $dsns = explode(',', $connection['dsns']);
+        foreach ($dsns as &$dsn) {
+            $dsn = explode('=', $dsn);
+            $name = ($multiple) ? $key . '_' . $dsn[0] : $key;
+            $dsn = $dsn[1] ?? '';
+            $config[] = $name;
+            if (empty($dsn)) {
+                //throw new Exception(Exception::GENERAL_SERVER_ERROR, "Missing value for DSN connection in {$key}");
+                continue;
+            }
+
+            $dsn = new DSN($dsn);
+            $dsnHost = $dsn->getHost();
+            $dsnPort = $dsn->getPort();
+            $dsnUser = $dsn->getUser();
+            $dsnPass = $dsn->getPassword();
+            $dsnScheme = $dsn->getScheme();
+            $dsnDatabase = $dsn->getPath();
+
+            if (!in_array($dsnScheme, $schemes)) {
+                throw new Exception(Exception::GENERAL_SERVER_ERROR, "Invalid console database scheme");
+            }
+
+            /**
+             * Get Resource
+             *
+             * Creation could be reused across connection types like database, cache, queue, etc.
+             *
+             * Resource assignment to an adapter will happen below.
+             */
+
+            $resource = match ($dsnScheme) {
+                'mysql',
+                'mariadb' => function () use ($dsnHost, $dsnPort, $dsnUser, $dsnPass, $dsnDatabase) {
+                    return new PDO("mysql:host={$dsnHost};port={$dsnPort};dbname={$dsnDatabase};charset=utf8mb4", $dsnUser, $dsnPass, APP_DATABASE_PDO_ATTRIBUTES + [\PDO::ATTR_PERSISTENT => false]);
+                },
+                'mongodb' => function () use ($dsnHost, $dsnPort, $dsnUser, $dsnPass, $dsnDatabase) {
+                    try {
+                        $mongo = new MongoClient($dsnDatabase, $dsnHost, (int)$dsnPort, $dsnUser, $dsnPass, false);
+                        @$mongo->connect();
+
+                        return $mongo;
+                    } catch (\Throwable $e) {
+                        throw new Exception(Exception::GENERAL_SERVER_ERROR, "MongoDB connection failed: " . $e->getMessage());
+                    }
+                },
+                'postgresql' => function () use ($dsnHost, $dsnPort, $dsnUser, $dsnPass, $dsnDatabase) {
+                    return new PDO("pgsql:host={$dsnHost};port={$dsnPort};dbname={$dsnDatabase};connect_timeout=3", $dsnUser, $dsnPass, APP_DATABASE_PDO_ATTRIBUTES + [\PDO::ATTR_PERSISTENT => false]);
+                },
+                default => function () use ($dsnHost, $dsnPort, $dsnUser, $dsnPass, $redisTimeout) {
+                    $redis = new \Redis();
+                    @$redis->pconnect($dsnHost, (int)$dsnPort, $redisTimeout);
+                    // Not the pconnect argument: a socket reused from the persistent pool keeps its old read timeout
+                    $redis->setOption(\Redis::OPT_READ_TIMEOUT, $redisTimeout);
+                    if ($dsnPass !== null && $dsnPass !== '') {
+                        $redis->auth($dsnUser !== null && $dsnUser !== '' ? [$dsnUser, $dsnPass] : $dsnPass);
+                    }
+
+                    return $redis;
+                },
+            };
+
+            // PubSub workers hold one long-lived subscribed connection and also need
+            // spare capacity for publishes from the same process.
+            // A lock lease is held for as long as the work it guards, so every
+            // concurrent request that takes a lock needs its own connection. The
+            // size above is derived from the MySQL connection budget and floored by
+            // a worker-only setting, which leaves the API server with one: the
+            // second concurrent lock taker then fails to get a connection to wait
+            // with and 500s, instead of queueing on the lock it was willing to wait
+            // out. The pool creates connections on demand, so this is a ceiling.
+            $connectionPoolSize = match ($type) {
+                'pubsub' => max(2, $poolSize),
+                'lock' => max(32, $poolSize),
+                default => $poolSize,
+            };
+
+            $pool = new Pool(new SwoolePool(), $name, $connectionPoolSize, function () use ($type, $resource, $dsn, $redisTimeout) {
+                // Get Adapter
+                switch ($type) {
+                    case 'database':
+                        $adapter = match ($dsn->getScheme()) {
+                            'mariadb' => new MariaDB($resource()),
+                            'mysql' => new MySQL($resource()),
+                            'mongodb' => new Mongo($resource()),
+                            'postgresql' => new Postgres($resource()),
+                            default => null
+                        };
+
+                        $adapter->setDatabase($dsn->getPath());
+                        return $adapter;
+                    case 'pubsub':
+                        return match ($dsn->getScheme()) {
+                            'redis' => new PubSub($resource()),
+                            default => null
+                        };
+                    case 'publisher':
+                        // Publishers never block on receive, so one connection backs both broker slots.
+                        return match ($dsn->getScheme()) {
+                            'redis' => (function () use ($dsn, $redisTimeout) {
+                                $connection = Queue\Connection\Redis::fromDSN($dsn, $redisTimeout, $redisTimeout);
+                                return new Queue\Broker\Redis($connection, $connection);
+                            })(),
+                            default => null
+                        };
+                    case 'cache':
+                        $adapter = match ($dsn->getScheme()) {
+                            'redis' => new RedisCache($resource(), new Igbinary()),
+                            default => null
+                        };
+
+                        if ($adapter !== null) {
+                            $adapter->setMaxRetries(CACHE_RECONNECT_MAX_RETRIES);
+                            $adapter->setRetryDelay(CACHE_RECONNECT_RETRY_DELAY);
+                        }
+
+                        return $adapter;
+                    case 'abuse':
+                    case 'lock':
+                        return $resource();
+                    default:
+                        throw new Exception(Exception::GENERAL_SERVER_ERROR, "Server error: Missing adapter implementation.");
+                }
+            }, $poolTimeout);
+
+            $group->add($pool);
+        }
+
+        Config::setParam('pools-' . $key, $config);
+    }
+
+    return $group;
+});
+
+// The cache the databases share. Code outside a request, such as tests seeding rows, reads it here so it
+// purges the same keys the server reads; Cloud registers its own.
+$register->set('cache', function () use ($register) {
+    // Resolving the pools is what sets pools-cache
+    $pools = $register->get('pools');
+
+    return new Cache(new Sharding(\array_map(
+        fn (string $name) => new CachePool($pools->get($name)),
+        Config::getParam('pools-cache', []),
+    )));
+});
+
+// Builds the database factory every request, worker and test uses, so a host that places its databases
+// differently overrides one entry; Cloud registers its own.
+$register->set('databaseFactory', fn () => fn (Group $pools, Cache $cache, Authorization $authorization): DatabaseFactory => new DatabaseFactory(
+    $pools,
+    $cache,
+    $authorization
+));
+
+$register->set('db', function () {
+    // This is usually for our workers or CLI commands scope
+    $dbHost = System::getEnv('_APP_DB_HOST', '');
+    $dbPort = System::getEnv('_APP_DB_PORT', '');
+    $dbUser = System::getEnv('_APP_DB_USER', '');
+    $dbPass = System::getEnv('_APP_DB_PASS', '');
+    $dbSchema = System::getEnv('_APP_DB_SCHEMA', '');
+    $dbAdapter = System::getEnv('_APP_DB_ADAPTER', 'postgresql');
+    $dsn = '';
+    $pdoAttributes = APP_DATABASE_PDO_ATTRIBUTES + [\PDO::ATTR_PERSISTENT => true];
+
+    switch ($dbAdapter) {
+        case 'mongodb':
+            try {
+                $mongo = new MongoClient($dbSchema, $dbHost, (int)$dbPort, $dbUser, $dbPass, false);
+                @$mongo->connect();
+                return $mongo;
+            } catch (\Throwable $e) {
+                throw new Exception(Exception::GENERAL_SERVER_ERROR, 'MongoDB connection failed: ' . $e->getMessage());
+            }
+        case 'mysql':
+        case 'mariadb':
+            $dsn = "mysql:host={$dbHost};port={$dbPort};dbname={$dbSchema};charset=utf8mb4";
+            return new PDO($dsn, $dbUser, $dbPass, $pdoAttributes);
+        case 'postgresql':
+            $dsn = "pgsql:host={$dbHost};port={$dbPort};dbname={$dbSchema};connect_timeout=3";
+            return new PDO($dsn, $dbUser, $dbPass, $pdoAttributes);
+        default:
+            throw new Exception(Exception::GENERAL_SERVER_ERROR, 'Invalid database adapter');
+    }
+});
+
+$register->set('smtp', function () {
+    $username = System::getEnv('_APP_SMTP_USERNAME', '');
+    $password = System::getEnv('_APP_SMTP_PASSWORD', '');
+
+    $workers = Config::getParam('workers', []);
+    $size = max(
+        1,
+        (int) System::getEnv('_APP_WORKER_MAX_COROUTINES', 1),
+        ((int) ($workers['mails']['coroutines'] ?? 1)) + ((int) ($workers['notifications']['coroutines'] ?? 1)),
+    );
+
+    return new Pool(
+        adapter: new SwoolePool(),
+        name: 'smtp',
+        size: $size,
+        init: fn () => new SMTP(
+            host: System::getEnv('_APP_SMTP_HOST', 'smtp'),
+            port: (int) System::getEnv('_APP_SMTP_PORT', 25),
+            username: $username,
+            password: $password,
+            smtpSecure: System::getEnv('_APP_SMTP_SECURE', ''),
+            smtpAutoTLS: false,
+            xMailer: 'Appwrite Mailer',
+            timeout: 10,
+            keepAlive: true,
+            timelimit: 30,
+        ),
+        timeout: (float) System::getEnv('_APP_CONNECTIONS_TIMEOUT', 10),
+    );
+});
+$register->set('passwordsDictionary', function () {
+    $content = \file_get_contents(__DIR__ . '/../assets/security/10k-common-passwords');
+    $content = explode("\n", $content);
+    $content = array_flip($content);
+    return $content;
+});
+$register->set('promiseAdapter', function () {
+    return new Swoole();
+});
+$register->set('hooks', function () {
+    return new Hooks();
+});
+$listeners = require __DIR__ . '/../listeners.php';
+$register->set('bus', function () use ($listeners) {
+    $bus = new \Utopia\Bus\Bus();
+    foreach ($listeners as $listener) {
+        $bus->subscribe($listener);
+    }
+    return $bus;
+});

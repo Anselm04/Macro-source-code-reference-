@@ -1,0 +1,328 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\Databases\Collections\Documents;
+
+use Appwrite\Abuse\Limit;
+use Appwrite\Databases\TransactionState;
+use Appwrite\Event\Event;
+use Appwrite\Event\Realtime;
+use Appwrite\Extend\Exception;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Deprecated;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Usage\Context;
+use Appwrite\Utopia\Database\Documents\User;
+use Appwrite\Utopia\Database\Hook\RelatedUpdates;
+use Appwrite\Utopia\Response as UtopiaResponse;
+use Utopia\Console\Console;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Exception\Conflict as ConflictException;
+use Utopia\Database\Exception\Restricted as RestrictedException;
+use Utopia\Database\Id;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\UID;
+use Utopia\Http\Adapter\Swoole\Response as SwooleResponse;
+use Utopia\Query\Schema\ColumnType;
+use Utopia\Validator\Nullable;
+
+class Delete extends Action
+{
+    public static function getName(): string
+    {
+        return 'deleteDocument';
+    }
+
+    /**
+     * 1. `SDKResponse` uses `UtopiaResponse::MODEL_NONE`.
+     * 2. But we later need the actual return type for events queue below!
+     */
+    protected function getResponseModel(): string
+    {
+        return UtopiaResponse::MODEL_DOCUMENT;
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(self::HTTP_REQUEST_METHOD_DELETE)
+            ->setHttpPath('/v1/databases/:databaseId/collections/:collectionId/documents/:documentId')
+            ->desc('Delete document')
+            ->groups(['api', 'database'])
+            ->label('scope', 'documents.write')
+            ->label('resourceType', RESOURCE_TYPE_DATABASES)
+            ->label('event', 'databases.[databaseId].collections.[collectionId].documents.[documentId].delete')
+            ->label('audits.event', 'document.delete')
+            ->label('audits.resource', 'database/{request.databaseId}/collection/{request.collectionId}/document/{request.documentId}')
+            ->label('usage.resource', 'database/{request.databaseId}/collection/{request.collectionId}/document/{request.documentId}')
+            ->label('abuse', [Limit::attempts(['ip', 'method', 'url', 'userId'], APP_LIMIT_WRITE_RATE_DEFAULT, seconds: APP_LIMIT_WRITE_RATE_PERIOD_DEFAULT)])
+            ->label('sdk', new Method(
+                namespace: $this->getSDKNamespace(),
+                group: $this->getSDKGroup(),
+                name: self::getName(),
+                description: '/docs/references/databases/delete-document.md',
+                auth: [AuthType::ADMIN, AuthType::SESSION, AuthType::KEY, AuthType::JWT],
+                responses: [
+                    new SDKResponse(
+                        code: SwooleResponse::STATUS_CODE_NOCONTENT,
+                        model: UtopiaResponse::MODEL_NONE,
+                    )
+                ],
+                contentType: ContentType::NONE,
+                deprecated: new Deprecated(
+                    since: '1.8.0',
+                    replaceWith: 'tablesDB.deleteRow',
+                ),
+            ))
+            ->param('databaseId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Database ID.', false, ['dbForProject'])
+            ->param('collectionId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Collection ID. You can create a new collection using the Database service [server integration](https://appwrite.io/docs/server/databases#databasesCreateCollection).', false, ['dbForProject'])
+            ->param('documentId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Document ID.', false, ['dbForProject'])
+            ->param('transactionId', null, fn (Database $dbForProject) => new Nullable(new UID($dbForProject->getMaxUidLength())), 'Transaction ID for staging the operation.', true, ['dbForProject'])
+            ->inject('requestTimestamp')
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('getDatabasesDB')
+            ->inject('queueForEvents')
+            ->inject('queueForRealtime')
+            ->inject('usage')
+            ->inject('transactionState')
+            ->inject('plan')
+            ->inject('authorization')
+            ->inject('user')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        string $databaseId,
+        string $collectionId,
+        string $documentId,
+        ?string $transactionId,
+        ?\DateTime $requestTimestamp,
+        UtopiaResponse $response,
+        Database $dbForProject,
+        callable $getDatabasesDB,
+        Event $queueForEvents,
+        Realtime $queueForRealtime,
+        Context $usage,
+        TransactionState $transactionState,
+        array $plan,
+        Authorization $authorization,
+        User $user
+    ): void {
+        $database = $authorization->skip(fn () => $dbForProject->getDocument('databases', $databaseId));
+
+        $isAPIKey = $user->isKey($authorization->getRoles());
+        $isPrivilegedUser = $user->isPrivileged($authorization->getRoles());
+
+        if ($database->isEmpty() || $this->isDatabaseTypeMismatch($database) || (!$database->getAttribute('enabled', false) && !$isAPIKey && !$isPrivilegedUser)) {
+            throw new Exception(Exception::DATABASE_NOT_FOUND, params: [$databaseId]);
+        }
+
+        $collection = $authorization->skip(fn () => $dbForProject->getDocument('database_' . $database->getSequence(), $collectionId));
+
+        if ($collection->isEmpty() || (!$collection->getAttribute('enabled', false) && !$isAPIKey && !$isPrivilegedUser)) {
+            throw new Exception($this->getParentNotFoundException(), params: [$collectionId]);
+        }
+
+        $dbForDatabases = $getDatabasesDB($database, $collection);
+        // Read permission should not be required for delete
+        $collectionTableId = 'database_' . $database->getSequence() . '_collection_' . $collection->getSequence();
+
+        if ($transactionId !== null) {
+            // Use transaction-aware document retrieval to see changes from same transaction
+            $document = $transactionState->getDocument($database, $collectionTableId, $documentId, $transactionId);
+        } else {
+            $document = $authorization->skip(fn () => $dbForDatabases->getDocument($collectionTableId, $documentId));
+        }
+
+        if ($document->isEmpty()) {
+            throw new Exception($this->getNotFoundException(), params: [$documentId]);
+        }
+
+        // Handle transaction staging
+        if ($transactionId !== null) {
+            $transaction = ($isAPIKey || $isPrivilegedUser)
+                ? $authorization->skip(fn () => $dbForProject->getDocument('transactions', $transactionId))
+                : $dbForProject->getDocument('transactions', $transactionId);
+            if ($transaction->isEmpty() || $this->isTransactionTypeMismatch($transaction)) {
+                throw new Exception(Exception::TRANSACTION_NOT_FOUND, params: [$transactionId]);
+            }
+            if ($transaction->getAttribute('status', '') !== 'pending') {
+                throw new Exception(Exception::TRANSACTION_NOT_READY);
+            }
+
+            $now = new \DateTime();
+            $expiresAt = new \DateTime($transaction->getAttribute('expiresAt', 'now'));
+            if ($now > $expiresAt) {
+                throw new Exception(Exception::TRANSACTION_EXPIRED);
+            }
+
+            // Enforce max operations per transaction
+            $maxBatch = $plan['databasesTransactionSize'] ?? APP_LIMIT_DATABASE_TRANSACTION;
+            $existing = $transaction->getAttribute('operations', 0);
+            if (($existing + 1) > $maxBatch) {
+                throw new Exception(
+                    Exception::TRANSACTION_LIMIT_EXCEEDED,
+                    'Transaction already has ' . $existing . ' operations, adding 1 would exceed the maximum of ' . $maxBatch
+                );
+            }
+
+            // Stage the operation in transaction logs
+            $staged = new Document([
+                '$id' => Id::unique(),
+                'databaseInternalId' => $database->getSequence(),
+                'collectionInternalId' => $collection->getSequence(),
+                'transactionInternalId' => $transaction->getSequence(),
+                'documentId' => $documentId,
+                'action' => 'delete',
+                'data' => [],
+            ]);
+
+            $this->stage($dbForProject, $transactionId, [$staged], $maxBatch);
+
+            $queueForEvents->reset();
+
+            // Return successful response without actually deleting document
+            $response->noContent();
+            return;
+        }
+
+        $recorder = new RelatedUpdates();
+        $dbForDatabases->addHook($recorder);
+
+        try {
+            $dbForDatabases->withRequestTimestamp($requestTimestamp, function () use ($dbForDatabases, $database, $collection, $documentId) {
+                $dbForDatabases->deleteDocument(
+                    'database_' . $database->getSequence() . '_collection_' . $collection->getSequence(),
+                    $documentId
+                );
+            });
+        } catch (ConflictException) {
+            throw new Exception($this->getConflictException());
+        } catch (RestrictedException) {
+            throw new Exception($this->getRestrictedException());
+        } finally {
+            $related = $recorder->stop();
+        }
+
+        $usage
+            ->setResource('database')
+            ->setResourceId($database->getId())
+            ->setResourceInternalId((string) $database->getSequence())
+            ->addMetric($this->getDatabasesOperationWriteMetric(), 1);
+
+        $response->addHeader('X-Debug-Operations', 1);
+
+        $relationships = \array_map(
+            fn ($document) => $document->getAttribute('key'),
+            \array_filter(
+                $collection->getAttribute('attributes', []),
+                fn ($attribute) => $attribute->getAttribute('type') === ColumnType::Relationship->value
+            )
+        );
+
+        $queueForEvents
+            ->setParam('databaseId', $databaseId)
+            ->setContext('database', $database)
+            ->setParam('collectionId', $collection->getId())
+            ->setParam('tableId', $collection->getId())
+            ->setParam('documentId', $document->getId())
+            ->setParam('rowId', $document->getId())
+            ->setContext($this->getCollectionsEventsContext(), $collection)
+            ->setPayload($response->output($document, $this->getResponseModel()), sensitive: $relationships);
+
+        // The delete already happened, so failing to notify related documents must not fail it
+        try {
+            $this->triggerRelationshipUpdates(
+                database: $database,
+                collection: $collection,
+                related: $related,
+                dbForProject: $dbForProject,
+                queueForEvents: $queueForEvents,
+                queueForRealtime: $queueForRealtime,
+                response: $response,
+                authorization: $authorization
+            );
+        } catch (\Throwable $e) {
+            Console::warning('Failed to publish relationship updates: ' . $e->getMessage());
+        }
+
+        $response->noContent();
+    }
+
+    /**
+     * Publish an update for each related document the delete changed
+     *
+     * @param array<Document> $related
+     */
+    private function triggerRelationshipUpdates(
+        Document $database,
+        Document $collection,
+        array $related,
+        Database $dbForProject,
+        Event $queueForEvents,
+        Realtime $queueForRealtime,
+        UtopiaResponse $response,
+        Authorization $authorization
+    ): void {
+        if (empty($related)) {
+            return;
+        }
+
+        // Related documents carry the internal collection id, so map it back through the two-way relationships
+        $relatedCollections = [];
+        foreach ($collection->getAttribute('attributes', []) as $attribute) {
+            if (
+                $attribute->getAttribute('type') !== ColumnType::Relationship->value
+                || !$attribute->getAttribute('twoWay')
+            ) {
+                continue;
+            }
+
+            $relatedCollection = $authorization->skip(fn () => $dbForProject->getDocument(
+                'database_' . $database->getSequence(),
+                $attribute->getAttribute('relatedCollection')
+            ));
+            if ($relatedCollection->isEmpty()) {
+                continue;
+            }
+
+            $relatedCollections['database_' . $database->getSequence() . '_collection_' . $relatedCollection->getSequence()] = $relatedCollection;
+        }
+
+        foreach ($related as $peer) {
+            $relatedCollection = $relatedCollections[$peer->getCollection()] ?? null;
+            if ($relatedCollection === null) {
+                continue;
+            }
+
+            $sensitive = \array_map(
+                fn (Document $attr) => $attr->getAttribute('key'),
+                \array_filter(
+                    $relatedCollection->getAttribute('attributes', []),
+                    fn (Document $attr) => $attr->getAttribute('type') === ColumnType::Relationship->value
+                )
+            );
+
+            $peer->setAttribute('$databaseId', $database->getId());
+            $peer->setAttribute('$' . $this->getCollectionsEventsContext() . 'Id', $relatedCollection->getId());
+
+            // Clone so the delete event stays intact for the shutdown hook.
+            $event = clone $queueForEvents;
+            $event->reset()
+                ->setEvent('databases.[databaseId].collections.[collectionId].documents.[documentId].update')
+                ->setParam('databaseId', $database->getId())
+                ->setParam('collectionId', $relatedCollection->getId())
+                ->setParam('tableId', $relatedCollection->getId())
+                ->setParam('documentId', $peer->getId())
+                ->setParam('rowId', $peer->getId())
+                ->setContext($this->getCollectionsEventsContext(), $relatedCollection)
+                // Filter through the model directly; output() would replace the audited response payload.
+                ->setPayload($response->getModel($this->getResponseModel())->filter($peer)->getArrayCopy(), sensitive: $sensitive);
+
+            $queueForRealtime->from($event)->trigger();
+        }
+    }
+}

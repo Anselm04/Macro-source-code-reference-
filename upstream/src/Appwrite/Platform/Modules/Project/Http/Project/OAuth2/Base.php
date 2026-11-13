@@ -1,0 +1,683 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Project\Http\Project\OAuth2;
+
+use Appwrite\Event\Event as QueueEvent;
+use Appwrite\Extend\Exception;
+use Appwrite\Platform\Action;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response;
+use Utopia\Client\Client;
+use Utopia\Config\Config;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Platform\Enum;
+use Utopia\Platform\Scope\HTTP;
+use Utopia\Validator\ArrayList;
+use Utopia\Validator\Boolean;
+use Utopia\Validator\Nullable;
+use Utopia\Validator\Text;
+use Utopia\Validator\Validator;
+use Utopia\Validator\WhiteList;
+
+abstract class Base extends Action
+{
+    use HTTP;
+
+    /**
+     * Provider ID used in paths, database keys and event labels.
+     *
+     * @return string e.g. 'github', 'discord', 'figma'
+     */
+    abstract public static function getProviderId(): string;
+
+    /**
+     * Provider OAuth2 implementation class. Must implement verifyCredentials().
+     *
+     * @return class-string e.g. Github::class
+     */
+    abstract public static function getProviderClass(): string;
+
+    /**
+     * Provider display label used in descriptions, SDK method name and action name.
+     *
+     * @return string e.g. 'GitHub', 'Discord', 'Figma'
+     */
+    abstract public static function getProviderLabel(): string;
+
+    /**
+     * Response model constant for this provider.
+     *
+     * @return string e.g. Response::MODEL_OAUTH2_GITHUB
+     */
+    abstract public static function getResponseModel(): string;
+
+    /**
+     * Description of the clientId param, auto-built from
+     * {@see getClientIdName()}, {@see getClientIdExample()} and
+     * {@see getClientIdHint()}. Returns an empty string when the name is
+     * empty (e.g. providers like Apple that don't expose a single clientId
+     * description but still need to bypass this default).
+     */
+    public static function getClientIdDescription(): string
+    {
+        return self::buildParamDescription(
+            static::getClientIdName(),
+            static::getClientIdExample(),
+            static::getClientIdHint()
+        );
+    }
+
+    /**
+     * Description of the clientSecret param, auto-built from
+     * {@see getClientSecretName()}, {@see getClientSecretExample()} and
+     * {@see getClientSecretHint()}. Returns an empty string when the name
+     * is empty (e.g. Apple, which uses keyId/teamId/p8File instead).
+     */
+    public static function getClientSecretDescription(): string
+    {
+        return self::buildParamDescription(
+            static::getClientSecretName(),
+            static::getClientSecretExample(),
+            static::getClientSecretHint()
+        );
+    }
+
+    /**
+     * Format a parameter description as
+     * "'<name>' of <providerLabel> OAuth2 app. For example: <example>[. <hint>]".
+     * Returns an empty string when the name is empty.
+     */
+    private static function buildParamDescription(string $name, string $example, string $hint): string
+    {
+        if ($name === '') {
+            return '';
+        }
+
+        $description = '\'' . $name . '\' of ' . static::getProviderLabel() . ' OAuth2 app. For example: ' . $example;
+        if ($hint !== '') {
+            $description .= '. ' . $hint;
+        }
+
+        return $description;
+    }
+
+    /**
+     * Verbose, user-facing name of the clientId param. Includes alternate
+     * names when the provider exposes more than one (e.g. "Client ID or App
+     * ID", "Application ID (also known as Client ID)").
+     *
+     * @return string
+     */
+    abstract public static function getClientIdName(): string;
+
+    /**
+     * Example value of the clientId param. Used to build the public OAuth2
+     * providers metadata response.
+     *
+     * @return string
+     */
+    abstract public static function getClientIdExample(): string;
+
+    /**
+     * Optional hint for the clientId param. Typically used to call out a
+     * common wrong value (e.g. "Example of wrong value: 370006"). Defaults
+     * to an empty string.
+     */
+    public static function getClientIdHint(): string
+    {
+        return '';
+    }
+
+    /**
+     * Verbose, user-facing name of the clientSecret param. Returns an empty
+     * string for providers that don't have a single clientSecret param
+     * (e.g. Apple uses keyId/teamId/p8File instead).
+     *
+     * @return string
+     */
+    abstract public static function getClientSecretName(): string;
+
+    /**
+     * Example value of the clientSecret param. Returns an empty string for
+     * providers without a clientSecret param.
+     *
+     * @return string
+     */
+    abstract public static function getClientSecretExample(): string;
+
+    /**
+     * Optional hint for the clientSecret param. Defaults to an empty string.
+     */
+    public static function getClientSecretHint(): string
+    {
+        return '';
+    }
+
+    /**
+     * Public-facing parameter metadata for this provider. Used by the public
+     * console OAuth2 providers endpoint to describe the form fields a project
+     * owner must fill in to configure the provider.
+     *
+     * Default shape: clientId + clientSecret. Providers that take additional
+     * fields (Apple, Auth0, Authentik, Gitlab, Microsoft, Oidc, Okta)
+     * override this method to add or replace entries. Each parameter is an
+     * associative array with keys `$id`, `name`, `example`, `hint`.
+     *
+     * @return array<int, array<string, string>>
+     */
+    public static function getParameters(): array
+    {
+        $parameters = [];
+
+        $clientIdName = static::getClientIdName();
+        if ($clientIdName !== '') {
+            $parameters[] = [
+                '$id' => static::getClientIdParamName(),
+                'name' => $clientIdName,
+                'example' => static::getClientIdExample(),
+                'hint' => static::getClientIdHint(),
+            ];
+        }
+
+        $clientSecretName = static::getClientSecretName();
+        if ($clientSecretName !== '') {
+            $parameters[] = [
+                '$id' => static::getClientSecretParamName(),
+                'name' => $clientSecretName,
+                'example' => static::getClientSecretExample(),
+                'hint' => static::getClientSecretHint(),
+            ];
+        }
+
+        $promptValues = static::getPromptValues();
+        if (!empty($promptValues)) {
+            $parameters[] = [
+                '$id' => 'prompt',
+                'name' => 'Prompt',
+                'example' => \json_encode(static::getPromptDefault() ?: [$promptValues[0]]),
+                'hint' => '',
+            ];
+        }
+
+        return $parameters;
+    }
+
+    /**
+     * Prompt values the provider accepts in its authorization URL. Providers
+     * that return values get an optional `prompt` param on the update
+     * endpoint and a `prompt` field on the response.
+     *
+     * @return array<int, string> e.g. ['none', 'consent']
+     */
+    public static function getPromptValues(): array
+    {
+        return [];
+    }
+
+    /**
+     * Prompt values used when none are configured.
+     *
+     * @return array<int, string>
+     */
+    public static function getPromptDefault(): array
+    {
+        return [];
+    }
+
+    /**
+     * Maximum number of prompt values the provider accepts together.
+     */
+    public static function getPromptLimit(): int
+    {
+        return \count(static::getPromptValues());
+    }
+
+    public static function getPromptDescription(): string
+    {
+        $meanings = [
+            'none' => '"none" means: don\'t display any authentication or consent screens.',
+            'login' => '"login" means: prompt the user to re-authenticate.',
+            'consent' => '"consent" means: prompt the user for consent.',
+            'select_account' => '"select_account" means: prompt the user to select an account.',
+            'create' => '"create" means: prompt the user to sign up.',
+        ];
+
+        $description = 'Array of ' . static::getProviderLabel() . ' OAuth2 prompt values.';
+        if (\in_array('none', static::getPromptValues()) && static::getPromptLimit() > 1) {
+            $description .= ' If "none" is included, it must be the only element.';
+        }
+
+        foreach (static::getPromptValues() as $value) {
+            $description .= ' ' . $meanings[$value];
+        }
+
+        return $description . ' Pass an empty array to use the ' . static::getProviderLabel() . ' default.';
+    }
+
+    public static function getPromptValidator(): Validator
+    {
+        return new Nullable(new ArrayList(new WhiteList(static::getPromptValues(), true), static::getPromptLimit()));
+    }
+
+    public static function getPromptEnum(): Enum
+    {
+        return new Enum(name: 'ProjectOAuth2' . static::getProviderLabel() . 'Prompt');
+    }
+
+    /**
+     * Public-facing name of the clientId param. Some providers use a different
+     * terminology (e.g. Dropbox calls it "App key"), so the param name and the
+     * corresponding response field can be customized by overriding this method.
+     *
+     * @return string e.g. 'clientId' (default), 'appKey'
+     */
+    public static function getClientIdParamName(): string
+    {
+        return 'clientId';
+    }
+
+    /**
+     * Public-facing name of the clientSecret param. Some providers use a
+     * different terminology (e.g. Dropbox calls it "App secret"), so the param
+     * name and the corresponding response field can be customized by
+     * overriding this method.
+     *
+     * @return string e.g. 'clientSecret' (default), 'appSecret'
+     */
+    public static function getClientSecretParamName(): string
+    {
+        return 'clientSecret';
+    }
+
+    /**
+     * SDK method name exposed to clients.
+     *
+     * @return string e.g. 'updateOAuth2GitHub'
+     */
+    abstract public static function getProviderSDKMethod(): string;
+
+    public static function getName()
+    {
+        return 'updateProjectOAuth2' . static::getProviderLabel();
+    }
+
+    public function __construct()
+    {
+        $providerId = static::getProviderId();
+        $providerLabel = static::getProviderLabel();
+
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_PATCH)
+            ->setHttpPath('/v1/project/oauth2/' . $providerId)
+            ->desc('Update project OAuth2 ' . $providerLabel)
+            ->groups(['api', 'project'])
+            ->label('scope', 'project.oauth2.write')
+            ->label('event', 'oauth2.[providerId].update')
+            ->label('audits.event', 'project.oauth2.[providerId].update')
+            ->label('audits.resource', 'project.oauth2/{response.$id}')
+            ->label('sdk', new Method(
+                namespace: 'project',
+                group: 'oauth2',
+                name: static::getProviderSDKMethod(),
+                description: 'Update the project OAuth2 ' . $providerLabel . ' configuration.',
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_OK,
+                        model: static::getResponseModel(),
+                    )
+                ],
+            ))
+            ->param(static::getClientIdParamName(), null, new Nullable(new Text(256, 0)), static::getClientIdDescription(), optional: true)
+            ->param(static::getClientSecretParamName(), null, new Nullable(new Text(512, 0)), static::getClientSecretDescription(), optional: true)
+            ->param('enabled', null, new Nullable(new Boolean()), 'OAuth2 sign-in method status. Set to true to enable new session creation. Setting to true will trigger end-to-end credentials validation, and will throw if the credentials are invalid.', true);
+
+        $prompt = !empty(static::getPromptValues());
+        if ($prompt) {
+            $this->param('prompt', null, static::getPromptValidator(), static::getPromptDescription(), optional: true, enum: static::getPromptEnum());
+        }
+
+        $this
+            ->inject('response')
+            ->inject('dbForPlatform')
+            ->inject('project')
+            ->inject('authorization')
+            ->inject('queueForEvents')
+            ->inject('clientForOAuth2')
+            ->callback($prompt ? $this->updateWithPrompt(...) : $this->action(...));
+    }
+
+    /**
+     * Registry of provider ID -> Update action class. Mirrors the OAuth2
+     * actions registered in Project\Services\Http. Used by the Get and XList
+     * read endpoints to dispatch per-provider response shaping.
+     *
+     * @return array<string, class-string<Base>>
+     */
+    public static function getProviderActions(): array
+    {
+        return [
+            'github' => GitHub\Update::class,
+            'discord' => Discord\Update::class,
+            'figma' => Figma\Update::class,
+            'dropbox' => Dropbox\Update::class,
+            'dailymotion' => Dailymotion\Update::class,
+            'bitbucket' => Bitbucket\Update::class,
+            'bitly' => Bitly\Update::class,
+            'box' => Box\Update::class,
+            'cloudflare' => Cloudflare\Update::class,
+            'autodesk' => Autodesk\Update::class,
+            'google' => Google\Update::class,
+            'zoom' => Zoom\Update::class,
+            'zoho' => Zoho\Update::class,
+            'yandex' => Yandex\Update::class,
+            'x' => X\Update::class,
+            'wordpress' => WordPress\Update::class,
+            'webflow' => Webflow\Update::class,
+            'twitch' => Twitch\Update::class,
+            'stripe' => Stripe\Update::class,
+            'spotify' => Spotify\Update::class,
+            'slack' => Slack\Update::class,
+            'podio' => Podio\Update::class,
+            'notion' => Notion\Update::class,
+            'salesforce' => Salesforce\Update::class,
+            'yahoo' => Yahoo\Update::class,
+            'huggingface' => HuggingFace\Update::class,
+            'linkedin' => Linkedin\Update::class,
+            'disqus' => Disqus\Update::class,
+            'amazon' => Amazon\Update::class,
+            'etsy' => Etsy\Update::class,
+            'facebook' => Facebook\Update::class,
+            'tradeshift' => Tradeshift\Update::class,
+            'tradeshiftBox' => TradeshiftSandbox\Update::class,
+            'paypal' => Paypal\Update::class,
+            'paypalSandbox' => PaypalSandbox\Update::class,
+            'gitlab' => Gitlab\Update::class,
+            'appwrite' => Appwrite\Update::class,
+            'authentik' => Authentik\Update::class,
+            'auth0' => Auth0\Update::class,
+            'fusionauth' => FusionAuth\Update::class,
+            'keycloak' => Keycloak\Update::class,
+            'oidc' => Oidc\Update::class,
+            'okta' => Okta\Update::class,
+            'kick' => Kick\Update::class,
+            'kakao' => Kakao\Update::class,
+            'tiktok' => TikTok\Update::class,
+            'naver' => Naver\Update::class,
+            'apple' => Apple\Update::class,
+            'microsoft' => Microsoft\Update::class,
+            'resend' => Resend\Update::class,
+            'vipps' => Vipps\Update::class,
+            'vippsSandbox' => VippsSandbox\Update::class,
+        ];
+    }
+
+    /**
+     * Build the read-only response document for this provider, with credential
+     * fields zeroed out (write-only). Default implementation handles providers
+     * that store a plain client ID + client secret. Special providers (Apple,
+     * Gitlab, Auth0, Authentik, Oidc, Okta) override to expose their
+     * non-secret extras (endpoint, domain, discovery URLs, ...) decoded from
+     * the JSON-encoded secret blob.
+     */
+    public function buildReadResponse(Document $project): Document
+    {
+        $providerId = static::getProviderId();
+        $oAuthProviders = $project->getAttribute('oAuthProviders', []);
+
+        $document = new Document([
+            '$id' => $providerId,
+            'enabled' => $oAuthProviders[$providerId . 'Enabled'] ?? false,
+            static::getClientIdParamName() => $oAuthProviders[$providerId . 'Appid'] ?? '',
+            static::getClientSecretParamName() => '',
+        ]);
+
+        if (!empty(static::getPromptValues())) {
+            $document->setAttribute('prompt', $this->decodeStoredSecret($project)['prompt'] ?? static::getPromptDefault());
+        }
+
+        return $document;
+    }
+
+    /**
+     * Throw when "none" is combined with other prompt values, since it means
+     * no screens at all.
+     */
+    protected function validatePrompt(?array $prompt): void
+    {
+        if ($prompt !== null && \in_array('none', $prompt) && \count($prompt) > 1) {
+            throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'When "none" is used as a prompt value, it must be the only element in the array.');
+        }
+    }
+
+    /**
+     * Decode the JSON-encoded secret blob stored under `{providerId}Secret`.
+     * Returns an empty array when the value is empty or not valid JSON.
+     */
+    protected function decodeStoredSecret(Document $project): array
+    {
+        $providerId = static::getProviderId();
+        $stored = $project->getAttribute('oAuthProviders', [])[$providerId . 'Secret'] ?? '';
+
+        if (empty($stored)) {
+            return [];
+        }
+
+        $decoded = \json_decode($stored, true);
+        return \is_array($decoded) ? $decoded : [];
+    }
+
+    /**
+     * A secret stored as JSON with a `clientSecret` key counts only when that
+     * key is set. Other secrets, plain or JSON (Apple), count when not empty.
+     */
+    protected function hasClientSecret(string $secret): bool
+    {
+        $decoded = \json_decode($secret, true);
+        if (\is_array($decoded) && \array_key_exists('clientSecret', $decoded)) {
+            return !empty($decoded['clientSecret']);
+        }
+
+        return !empty($secret);
+    }
+
+    /**
+     * The stored client secret is write-only, so it is only kept while every
+     * endpoint it is sent to stays the same. Changing one requires the secret
+     * again.
+     *
+     * @param array<string, mixed> $existing Decoded stored secret.
+     * @param array<string, ?string> $endpoints Stored key => new value, null when not provided.
+     */
+    protected function requireSecretOnEndpointChange(?string $clientSecret, array $existing, array $endpoints): void
+    {
+        if (!\is_null($clientSecret) || empty($existing['clientSecret'] ?? '')) {
+            return;
+        }
+
+        foreach ($endpoints as $key => $value) {
+            if (!\is_null($value) && $value !== ($existing[$key] ?? '')) {
+                throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'Param "' . static::getClientSecretParamName() . '" is required when changing the provider endpoint.');
+            }
+        }
+    }
+
+    /**
+     * Apply the provided credential changes to the project's oAuthProviders map,
+     * run the optional credential verification hook, persist the project, and
+     * return the updated project document.
+     *
+     * Providers that need to serialize multiple values into a single secret
+     * (e.g. GitLab, which stores `{clientSecret, endpoint}` as JSON) should
+     * encode those values into `$clientSecret` before calling this method.
+     *
+     * `$clientIds` are the additional client IDs accepted as ID token
+     * audiences by providers that support native ID token sign-in. Null
+     * leaves the stored list untouched; an empty array clears it.
+     *
+     * The two sign-in methods are switched on independently, because they need
+     * different things. The browser flow redeems an authorization code, so it
+     * cannot work without a client secret. Native ID token sign-in verifies a
+     * signature instead, so it needs no secret, only an audience to accept.
+     * Every credential param is optional; what a value is required for is
+     * decided by which method is being enabled.
+     */
+    protected function persistCredentials(
+        Document $project,
+        Database $dbForPlatform,
+        Authorization $authorization,
+        Client $clientForOAuth2,
+        ?string $clientId,
+        ?string $clientSecret,
+        ?bool $enabled,
+        ?array $clientIds = null,
+        ?bool $nativeEnabled = null
+    ): Document {
+        $providerId = static::getProviderId();
+        if (!(\in_array($providerId, \array_keys(Config::getParam('oAuthProviders'))))) {
+            throw new Exception(Exception::GENERAL_SERVER_ERROR, 'Provider ' . $providerId . ' is not supported by server configuration.');
+        }
+
+        $oAuthProviders = $project->getAttribute('oAuthProviders', []);
+
+        $appIdKey = $providerId . 'Appid';
+        $appSecretKey = $providerId . 'Secret';
+        $enabledKey = $providerId . 'Enabled';
+        $nativeEnabledKey = $providerId . 'NativeEnabled';
+
+        if (!\is_null($clientId)) {
+            $oAuthProviders[$appIdKey] = $clientId;
+        }
+
+        if (!\is_null($clientSecret)) {
+            $oAuthProviders[$appSecretKey] = $clientSecret;
+        }
+
+        if (!\is_null($clientIds)) {
+            $oAuthProviders[$providerId . 'ClientIds'] = \array_values($clientIds);
+        }
+
+        if (!\is_null($enabled)) {
+            $oAuthProviders[$enabledKey] = $enabled;
+        }
+
+        if (!\is_null($nativeEnabled)) {
+            $oAuthProviders[$nativeEnabledKey] = $nativeEnabled;
+        }
+
+        // Only ever validated on an explicit switch-on, so callers that touch
+        // other fields cannot trip over it.
+        if ($nativeEnabled === true) {
+            $audiences = \array_filter(\array_merge(
+                [$oAuthProviders[$appIdKey] ?? ''],
+                $oAuthProviders[$providerId . 'ClientIds'] ?? [],
+            ));
+            if (empty($audiences)) {
+                throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'A client ID or at least one native client ID is required when enabling native sign-in, so tokens can be matched to your app.');
+            }
+        }
+
+        // Browser sign-in is switched on implicitly when a request that says
+        // nothing about either method leaves complete credentials behind. A
+        // request that only touches native sign-in must leave it alone.
+        $implicitEnable = \is_null($enabled) && \is_null($nativeEnabled) && \is_null($clientIds);
+
+        if ($enabled === true || $implicitEnable) {
+            try {
+                if (empty($oAuthProviders[$appIdKey]) || !$this->hasClientSecret($oAuthProviders[$appSecretKey] ?? '')) {
+                    throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'Client ID and Client Secret are required when enabling OAuth2 provider.');
+                }
+
+                $providerClass = static::getProviderClass();
+                $providerInstance = new $providerClass(client: $clientForOAuth2, appId: $oAuthProviders[$appIdKey], appSecret: $oAuthProviders[$appSecretKey], callback: '', state: [], scopes: []);
+
+                // E2E integration check
+                if (\method_exists($providerInstance, 'verifyCredentials')) {
+                    $providerInstance->verifyCredentials();
+                }
+
+                $oAuthProviders[$enabledKey] = true;
+            } catch (\Throwable $err) {
+                if ($enabled === true) {
+                    throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'Could not enable OAuth2 provider: ' . $err->getMessage());
+                }
+            }
+        }
+
+        $updates = new Document([
+            'oAuthProviders' => $oAuthProviders
+        ]);
+
+        $project = $authorization->skip(fn () => $dbForPlatform->updateDocument('projects', $project->getId(), $updates));
+        $authorization->skip(fn () => $dbForPlatform->purgeCachedDocument('projects', $project->getId()));
+
+        return $project;
+    }
+
+    public function action(
+        ?string $clientId,
+        ?string $clientSecret,
+        ?bool $enabled,
+        Response $response,
+        Database $dbForPlatform,
+        Document $project,
+        Authorization $authorization,
+        QueueEvent $queueForEvents,
+        Client $clientForOAuth2
+    ): void {
+        $project = $this->persistCredentials($project, $dbForPlatform, $authorization, $clientForOAuth2, $clientId, $clientSecret, $enabled);
+
+        $queueForEvents->setParam('providerId', static::getProviderId());
+
+        // Reuse buildReadResponse to keep PATCH/GET shapes identical and
+        // guarantee the clientSecret is write-only on every response path.
+        $response->dynamic($this->buildReadResponse($project), static::getResponseModel());
+    }
+
+    /**
+     * Callback for providers with prompt values. Stores the client secret and
+     * prompt as JSON `{"clientSecret": "...", "prompt": [...]}`, reading a
+     * secret stored before prompt support as a plain client secret.
+     */
+    public function updateWithPrompt(
+        ?string $clientId,
+        ?string $clientSecret,
+        ?bool $enabled,
+        ?array $prompt,
+        Response $response,
+        Database $dbForPlatform,
+        Document $project,
+        Authorization $authorization,
+        QueueEvent $queueForEvents,
+        Client $clientForOAuth2
+    ): void {
+        $providerId = static::getProviderId();
+        $queueForEvents->setParam('providerId', $providerId);
+
+        $this->validatePrompt($prompt);
+
+        $encodedSecret = null;
+        if (!\is_null($clientSecret) || !\is_null($prompt)) {
+            $storedRaw = $project->getAttribute('oAuthProviders', [])[$providerId . 'Secret'] ?? '';
+            $existing = $this->decodeStoredSecret($project);
+            if (!empty($storedRaw) && empty($existing)) {
+                $existing = ['clientSecret' => $storedRaw];
+            }
+
+            $secret = [
+                'clientSecret' => $clientSecret ?? ($existing['clientSecret'] ?? ''),
+                'prompt' => $prompt ?? ($existing['prompt'] ?? []),
+            ];
+
+            $encodedSecret = \json_encode($secret);
+        }
+
+        $project = $this->persistCredentials($project, $dbForPlatform, $authorization, $clientForOAuth2, $clientId, $encodedSecret, $enabled);
+
+        $response->dynamic($this->buildReadResponse($project), static::getResponseModel());
+    }
+}

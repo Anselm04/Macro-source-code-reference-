@@ -1,0 +1,129 @@
+<?php
+
+namespace Appwrite\Platform\Modules\VCS\Http\Authorize;
+
+use Appwrite\Auth\EncryptionKey;
+use Appwrite\Auth\OAuth2;
+use Appwrite\Extend\Exception;
+use Appwrite\Platform\Action;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\MethodType;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Database\Documents\User;
+use Appwrite\Utopia\Response;
+use Appwrite\Vcs\State;
+use Utopia\Client\Adapter\Curl\Client as CurlAdapter;
+use Utopia\Client\Client;
+use Utopia\Database\Document;
+use Utopia\Platform\Scope\HTTP;
+use Utopia\System\System;
+
+/**
+ * Installation entry point for OAuth2-based VCS providers. Redirects to the
+ * provider's authorization page; the matching Callback action completes the
+ * flow. App-based providers (GitHub) have their own installation flow.
+ */
+abstract class Base extends Action
+{
+    use HTTP;
+
+    /**
+     * Provider key in the `vcs` config registry.
+     */
+    abstract public static function getProvider(): string;
+
+    /**
+     * Provider display name, used in SDK method names and error messages.
+     */
+    abstract public static function getProviderName(): string;
+
+    /**
+     * Builds this provider's OAuth2 client, pointed at the browser-facing
+     * endpoint (which may differ from the server-side API endpoint in
+     * containerized setups) since the login URL is opened by the browser.
+     */
+    abstract protected function createOAuth2(Client $client, string $callback, array $state): OAuth2;
+
+    public function __construct()
+    {
+        $key = static::getProvider();
+        $name = static::getProviderName();
+
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_GET)
+            ->setHttpPath('/v1/vcs/' . $key . '/authorize')
+            ->desc('Create ' . $name . ' installation')
+            ->groups(['api', 'vcs'])
+            ->label('scope', 'vcs.write')
+            ->label('error', APP_VIEWS_DIR . '/general/error.phtml')
+            ->label('sdk', new Method(
+                namespace: 'vcs',
+                group: 'installations',
+                name: 'create' . $name . 'Installation',
+                description: '/docs/references/vcs/create-' . $key . '-installation.md',
+                auth: [AuthType::ADMIN],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_MOVED_PERMANENTLY,
+                        model: Response::MODEL_NONE,
+                    )
+                ],
+                contentType: ContentType::HTML,
+                type: MethodType::WEBAUTH,
+                // Preview SDK builds show the whole surface, so they do not hide.
+                hide: System::getEnv('_APP_SDK_PREVIEW', 'disabled') !== 'enabled',
+            ))
+            ->param('success', '', fn ($redirectValidator) => $redirectValidator, 'URL to redirect back to console after a successful installation attempt.', true, ['redirectValidator'])
+            ->param('failure', '', fn ($redirectValidator) => $redirectValidator, 'URL to redirect back to console after a failed installation attempt.', true, ['redirectValidator'])
+            ->inject('vcsConfigured')
+            ->inject('response')
+            ->inject('project')
+            ->inject('platform')
+            ->inject('user')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        string $success,
+        string $failure,
+        callable $vcsConfigured,
+        Response $response,
+        Document $project,
+        array $platform,
+        User $user
+    ) {
+        $key = static::getProvider();
+
+        if (!$vcsConfigured($key)) {
+            throw new Exception(Exception::GENERAL_SERVER_ERROR, static::getProviderName() . ' provider is not configured. Please configure VCS (Version Control System) variables in .env file.');
+        }
+
+        $protocol = System::getEnv('_APP_OPTIONS_FORCE_HTTPS') === 'disabled' ? 'http' : 'https';
+        $hostname = $platform['consoleHostname'] ?? '';
+        $callback = $protocol . '://' . $hostname . '/v1/vcs/' . $key . '/callback';
+
+        $signingKey = EncryptionKey::current();
+
+        if (empty($signingKey)) {
+            throw new Exception(Exception::GENERAL_SERVER_ERROR, 'Signing key is not configured. Please configure _APP_OPENSSL_KEY_V' . EncryptionKey::version() . ' in .env file.');
+        }
+
+        // The callback endpoint is public, so it verifies this signature and
+        // that the console user who started the flow is the one finishing it.
+        $state = State::create($project->getId(), $user->getId(), $success, $failure)->sign($signingKey);
+
+        if (\strlen((string) \json_encode($state)) > APP_LIMIT_VCS_STATE) {
+            throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'Redirect URLs are too long to complete the installation. Please use shorter success and failure URLs.');
+        }
+
+        // The VCS endpoints are the operator's own (_APP_VCS_*), which may be on a private network
+        $oauth2 = $this->createOAuth2(new Client(new CurlAdapter()), $callback, $state);
+
+        $response
+            ->addHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+            ->addHeader('Pragma', 'no-cache')
+            ->redirect($oauth2->getLoginURL());
+    }
+}

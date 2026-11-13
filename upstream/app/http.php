@@ -1,0 +1,526 @@
+<?php
+
+require_once __DIR__ . '/init.php';
+require_once __DIR__ . '/init/span.php';
+
+$setRequestContext = require __DIR__ . '/init/resources/request.php';
+
+use Appwrite\Auth\EncryptionKey;
+use Appwrite\Geo\Geo;
+use Appwrite\Utopia\Request;
+use Appwrite\Utopia\Response;
+use Swoole\Constant;
+use Swoole\Process;
+use Swoole\Table;
+use Swoole\Timer;
+use Utopia\Compression\Compression;
+use Utopia\Config\Config;
+use Utopia\Console\Console;
+use Utopia\Database\Collection;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Id;
+use Utopia\Database\Permission;
+use Utopia\Database\Role;
+use Utopia\DI\Container;
+use Utopia\Http\Adapter\Swoole\Mode;
+use Utopia\Http\Adapter\Swoole\Server;
+use Utopia\Http\Files;
+use Utopia\Http\Http;
+use Utopia\Span\Span;
+use Utopia\System\System;
+
+try {
+    EncryptionKey::assertProduction(
+        System::getEnv('_APP_ENV', 'production'),
+        EncryptionKey::current()
+    );
+} catch (\RuntimeException $exception) {
+    Console::error($exception->getMessage());
+    exit(1);
+}
+
+if (EncryptionKey::isInsecure(System::getEnv('_APP_EXECUTOR_SECRET'))) {
+    Console::warning('_APP_EXECUTOR_SECRET is the public default "' . EncryptionKey::PLACEHOLDER . '". Set a unique secret.');
+}
+
+$files = new Files();
+$files->load(__DIR__ . '/../public');
+
+$certifiedDomains = new Table(100_000);
+$certifiedDomains->column('value', Table::TYPE_INT, 1);
+$certifiedDomains->create();
+
+$geoRecords = new Table(Geo::CACHE_SIZE);
+$geoRecords->column('value', Table::TYPE_STRING, Geo::CACHE_VALUE_SIZE);
+$geoRecords->create();
+
+global $container;
+$container->set('certifiedDomains', fn () => $certifiedDomains);
+$container->set('geoRecords', fn () => $geoRecords);
+$container->set('pools', function ($register) {
+    return $register->get('pools');
+}, ['register']);
+
+$payloadSize = 12 * (1024 * 1024); // 12MB - adding slight buffer for headers and other data that might be sent with the payload - update later with valid testing
+$totalWorkers = intval(System::getEnv('_APP_CPU_NUM', swoole_cpu_num())) * intval(System::getEnv('_APP_WORKER_PER_CORE', 6));
+
+if (\is_file(APP_READINESS_MARKER)) {
+    \unlink(APP_READINESS_MARKER);
+}
+
+$swoole = new Server(
+    host: "0.0.0.0",
+    port: System::getEnv('PORT', 80),
+    settings: [
+        // Apply Cloud's coroutine preset, retaining Appwrite's worker and payload limits.
+        ...Mode::HYPERLOOP_B->settings(),
+        Constant::OPTION_WORKER_NUM => $totalWorkers,
+        Constant::OPTION_PACKAGE_MAX_LENGTH => $payloadSize,
+        Constant::OPTION_OUTPUT_BUFFER_SIZE => $payloadSize,
+    ],
+    resources: $container,
+);
+
+$http = $swoole->getServer();
+
+$http->on(Constant::EVENT_WORKER_START, function ($server, $workerId) {
+});
+
+$http->on(Constant::EVENT_WORKER_STOP, function ($server, $workerId) {
+    Timer::clearAll();
+    Console::success('Worker ' . ++$workerId . ' stopped successfully');
+});
+
+$http->on(Constant::EVENT_BEFORE_RELOAD, function ($server) {
+    Console::success('Starting reload...');
+});
+
+$http->on(Constant::EVENT_AFTER_RELOAD, function ($server) {
+    Console::success('Reload completed...');
+});
+
+$container->set('bus', fn ($register) => $register->get('bus')->setResolver(fn (string $name) => $swoole->context()->get($name)), ['register']);
+
+include __DIR__ . '/controllers/general.php';
+
+function createDatabase(Container $resources, string $resourceKey, string $dbName, array $collections, mixed $pools, ?callable $extraSetup = null): void
+{
+    $max = 15;
+    $sleep = 2;
+    $attempts = 0;
+
+    while (true) {
+        try {
+            $attempts++;
+            $resource = $resources->get($resourceKey);
+            /* @var $database Database */
+            $database = is_callable($resource) ? $resource() : $resource;
+
+            // Building a handle reaches no backend, so this loop has to ask for
+            // a connection to learn whether one can be had. Without it the loop
+            // breaks on the first pass against a database still starting, and
+            // the wait it is here to perform falls to the create() retry below.
+            $database->ping();
+
+            break; // exit loop on success
+        } catch (\Throwable $e) {
+            Console::warning("  └── Database not ready ({$dbName}). Retrying connection ({$attempts}): " . $e->getMessage());
+            if ($attempts >= $max) {
+                throw new \Exception('  └── Failed to connect to database: ' . $e->getMessage());
+            }
+            sleep($sleep);
+        }
+    }
+
+    Span::init("database.setup");
+    Span::add('database.name', $dbName);
+
+    $attempts = 0;
+    while (true) {
+        try {
+            $attempts++;
+            Console::info("  └── Creating database: $dbName...");
+            $database->create();
+            break; // exit loop on success
+        } catch (\Exception $e) {
+            Console::warning("  └── Database create failed. Retrying ({$attempts})...");
+            if ($attempts >= $max) {
+                throw new \Exception('  └── Failed to create database: ' . $e->getMessage());
+            }
+
+            \sleep($sleep);
+        }
+    }
+
+    // Process collections
+    $collectionsCreated = 0;
+    foreach ($collections as $key => $collection) {
+        if (($collection['$collection'] ?? '') !== Database::METADATA) {
+            continue;
+        }
+
+        if ($database->findCollection($key) !== null) {
+            continue;
+        }
+
+        $attributes = $collection['attributes'];
+        $indexes = $collection['indexes'];
+
+        $database->createCollection(Collection::create(
+            id: $key,
+            attributes: $attributes,
+            indexes: $indexes,
+        ));
+        $collectionsCreated++;
+    }
+
+    Span::add('database.collections_created', $collectionsCreated);
+
+    if ($extraSetup) {
+        $extraSetup($database);
+    }
+
+    Span::current()?->finish();
+}
+
+$http->on(Constant::EVENT_START, function ($http) use ($payloadSize, $totalWorkers, $container) {
+    /** @var \Utopia\Pools\Group $pools */
+    $pools = $container->get('pools');
+
+    go(function () use ($container, $pools) {
+
+        /** @var array $collections */
+        $collections = Config::getParam('collections', []);
+
+        // create appwrite database, `dbForPlatform` is a direct access call.
+        createDatabase($container, 'dbForPlatform', 'appwrite', $collections['console'], $pools, function (Database $dbForPlatform) use ($collections, $container) {
+            $authorization = $container->get('authorization');
+
+            // Console users upload import files here; everything else goes through file permissions.
+            $defaultBucketPermissions = [
+                Permission::create(Role::users()),
+            ];
+
+            $defaultBucket = $authorization->skip(fn () => $dbForPlatform->getDocument('buckets', 'default'));
+            if (!$defaultBucket->isEmpty() && $defaultBucket->getPermissions() !== $defaultBucketPermissions) {
+                $authorization->skip(fn () => $dbForPlatform->updateDocument('buckets', 'default', new Document([
+                    '$permissions' => $defaultBucketPermissions,
+                ])));
+            }
+
+            if ($defaultBucket->isEmpty()) {
+                $authorization->skip(fn () => $dbForPlatform->createDocument('buckets', new Document([
+                    '$id' => Id::custom('default'),
+                    '$collection' => Id::custom('buckets'),
+                    'name' => 'Default',
+                    'maximumFileSize' => (int) System::getEnv('_APP_STORAGE_LIMIT', 0),
+                    'allowedFileExtensions' => [],
+                    'enabled' => true,
+                    'compression' => 'gzip',
+                    'encryption' => true,
+                    'antivirus' => true,
+                    'fileSecurity' => true,
+                    '$permissions' => $defaultBucketPermissions,
+                    'search' => 'buckets Default',
+                ])));
+
+                $bucket = $authorization->skip(fn () => $dbForPlatform->getDocument('buckets', 'default'));
+
+                $files = $collections['buckets']['files'] ?? [];
+                if (empty($files)) {
+                    throw new Exception('Files collection is not configured.');
+                }
+
+                $attributes = $files['attributes'];
+                $indexes = $files['indexes'];
+
+                $dbForPlatform->createCollection(Collection::create(
+                    id: 'bucket_' . $bucket->getSequence(),
+                    attributes: $attributes,
+                    indexes: $indexes,
+                ));
+            }
+
+            if ($authorization->skip(fn () => $dbForPlatform->getDocument('buckets', 'screenshots')->isEmpty())) {
+                $authorization->skip(fn () => $dbForPlatform->createDocument('buckets', new Document([
+                    '$id' => Id::custom('screenshots'),
+                    '$collection' => Id::custom('buckets'),
+                    'name' => 'Screenshots',
+                    'maximumFileSize' => 20000000, // ~20MB
+                    'allowedFileExtensions' => [ 'png' ],
+                    'enabled' => true,
+                    'compression' => Compression::GZIP,
+                    'encryption' => false,
+                    'antivirus' => false,
+                    'fileSecurity' => true,
+                    '$permissions' => [],
+                    'search' => 'buckets Screenshots',
+                ])));
+
+                $bucket = $authorization->skip(fn () => $dbForPlatform->getDocument('buckets', 'screenshots'));
+
+                $files = $collections['buckets']['files'] ?? [];
+                if (empty($files)) {
+                    throw new Exception('Files collection is not configured.');
+                }
+
+                $attributes = $files['attributes'];
+                $indexes = $files['indexes'];
+
+                $authorization->skip(fn () => $dbForPlatform->createCollection(Collection::create(
+                    id: 'bucket_' . $bucket->getSequence(),
+                    attributes: $attributes,
+                    indexes: $indexes,
+                )));
+            }
+        });
+
+        $projectCollections = $collections['projects'];
+
+        $sharedTables = \explode(',', System::getEnv('_APP_DATABASE_SHARED_TABLES', ''));
+        $documentsSharedTables = \explode(',', System::getEnv('_APP_DATABASE_DOCUMENTSDB_SHARED_TABLES', ''));
+        $vectorSharedTables = \explode(',', System::getEnv('_APP_DATABASE_VECTORSDB_SHARED_TABLES', ''));
+
+        /** @var \Appwrite\Database\Factory $databaseFactory */
+        $databaseFactory = $container->get('databaseFactory');
+
+        // All shared tables pools that need project metadata collections
+        $allSharedTables = \array_values(\array_unique(\array_filter([
+            ...$sharedTables,
+            ...$documentsSharedTables,
+            ...$vectorSharedTables,
+        ])));
+
+        foreach ($allSharedTables as $hostname) {
+            Span::init('database.setup');
+            Span::add('database.hostname', $hostname);
+
+            $dbForProject = $databaseFactory->setup($hostname);
+
+            $max = 15;
+            $sleep = 2;
+            $attempts = 0;
+            while (true) {
+                try {
+                    $attempts++;
+                    Console::success('[Setup] - Creating project database: ' . $hostname . '...');
+                    $dbForProject->create();
+                    break; // exit loop on success
+                } catch (\Throwable $e) {
+                    Console::warning("  └── Project database create failed. Retrying ({$attempts})...");
+                    if ($attempts >= $max) {
+                        throw new \Exception('  └── Failed to create project database: ' . $e->getMessage());
+                    }
+                    sleep($sleep);
+                }
+            }
+
+            $collectionsCreated = 0;
+            foreach ($projectCollections as $key => $collection) {
+                if (($collection['$collection'] ?? '') !== Database::METADATA) {
+                    continue;
+                }
+                if ($dbForProject->findCollection($key) !== null) {
+                    continue;
+                }
+
+                $attributes = $collection['attributes'];
+                $indexes = $collection['indexes'];
+
+                $dbForProject->createCollection(Collection::create(
+                    id: $key,
+                    attributes: $attributes,
+                    indexes: $indexes,
+                ));
+                $collectionsCreated++;
+            }
+
+            Span::add('database.collections_created', $collectionsCreated);
+            Span::current()?->finish();
+        }
+
+        // The container healthcheck gates on this file. The listener opens before this
+        // coroutine runs, so until the core schema exists every request that reaches a
+        // collection this loop has not created yet answers 500, not 404.
+        \touch(APP_READINESS_MARKER);
+
+        // Usage is in ClickHouse, not the primary database, so it sets itself up
+        // here. Giving up never blocks boot; reads and ingestion gate on
+        // Connection::isReady() and recover once the schema lands.
+        /** @var \Appwrite\Usage\Connection $usageConnection */
+        $usageConnection = $container->get('usageConnection');
+
+        if ($usageConnection->isEnabled()) {
+            Span::init('usage.setup');
+
+            $max = 15;
+            $sleep = 2;
+            $attempts = 0;
+
+            while (true) {
+                try {
+                    $attempts++;
+                    $usageConnection->setup();
+                    Console::success('[Setup] - Usage schema is ready');
+                    break;
+                } catch (\Throwable $e) {
+                    if ($attempts >= $max) {
+                        Span::add('usage.ready', false);
+                        Console::warning('[Setup] - Skip: usage schema is not ready: ' . $e->getMessage());
+                        break;
+                    }
+
+                    Console::warning("  └── Usage schema setup failed. Retrying ({$attempts})...");
+                    sleep($sleep);
+                }
+            }
+
+            Span::current()?->finish();
+        }
+
+        /** @var \Appwrite\Execution\Store $executionStore */
+        $executionStore = $container->get('executionStore');
+
+        Span::init('executions.setup');
+
+        $max = 15;
+        $sleep = 2;
+        $attempts = 0;
+
+        while (true) {
+            try {
+                $attempts++;
+                $executionStore->setup();
+                Console::success('[Setup] - Execution schema is ready');
+                break;
+            } catch (\Throwable $e) {
+                if ($attempts >= $max) {
+                    Span::add('executions.ready', false);
+                    Console::warning('[Setup] - Skip: execution schema is not ready: ' . $e->getMessage());
+                    break;
+                }
+
+                Console::warning("  └── Execution schema setup failed. Retrying ({$attempts})...");
+                sleep($sleep);
+            }
+        }
+
+        Span::current()?->finish();
+    });
+
+    Span::init('http.server.start');
+    Span::add('server.workers', $totalWorkers);
+    Span::add('server.payload_size', $payloadSize);
+    Span::add('server.master_pid', $http->master_pid);
+    Span::add('server.manager_pid', $http->manager_pid);
+    Span::current()?->finish();
+
+    // listen ctrl + c
+    Process::signal(2, function () use ($http) {
+        Console::log('Stop by Ctrl+C');
+        $http->shutdown();
+    });
+});
+
+$swoole->onRequest(function ($utopiaRequest, $utopiaResponse) use ($files, $swoole, $setRequestContext) {
+    Span::init('http.request');
+
+    $request = new Request($utopiaRequest->getSwooleRequest());
+    $response = new Response($utopiaResponse->getSwooleResponse());
+
+    Span::add('http.method', $request->getMethod());
+    Span::add('http.uri', $request->getURI());
+
+    if ($files->isFileLoaded($request->getURI())) {
+        $time = (60 * 60 * 24 * 45); // 45 days cache
+
+        $response
+            ->setContentType($files->getFileMimeType($request->getURI()))
+            ->addHeader('Cache-Control', 'public, max-age=' . $time)
+            ->addHeader('Expires', \date('D, d M Y H:i:s', \time() + $time) . ' GMT') // 45 days cache
+            ->send($files->getFileContents($request->getURI()));
+
+        return;
+    }
+
+    $app = new Http($swoole, 'UTC');
+    $app->context()->set('request', fn () => $request);
+    $app->context()->set('response', fn () => $response);
+    $app->context()->set('utopia', fn () => $app);
+
+    $setRequestContext($app->context());
+
+    $app->setCompression(System::getEnv('_APP_COMPRESSION_ENABLED', 'enabled') === 'enabled');
+    $app->setCompressionMinSize(intval(System::getEnv('_APP_COMPRESSION_MIN_SIZE_BYTES', '1024'))); // 1KB
+
+    $error = null;
+    try {
+        $authorization = $app->context()->get('authorization');
+
+        $request->setAuthorization($authorization);
+        $response->setAuthorization($authorization);
+        $authorization->cleanRoles();
+        $authorization->addRole(Role::any()->toString());
+
+        $app->run($request, $response);
+
+        $route = $app->match($request)?->route;
+        Span::add('http.path', $route?->getPath() ?? 'unknown');
+    } catch (\Throwable $th) {
+        $error = $th;
+
+        $version = System::getEnv('_APP_VERSION', 'UNKNOWN');
+
+        $route = $app->match($request)?->route;
+
+        try {
+            /** @var Utopia\Database\Document $user */
+            $user = $app->context()->get('user');
+            Span::add('user.id', $user->isEmpty() ? 'guest-' . hash('sha256', $request->getIP()) : $user->getId());
+        } catch (\Throwable $_th) {
+            // All good, user is optional information
+        }
+        Span::add('http.hostname', $request->getHostname());
+        $locale = (string) $request->getParam('locale', $request->getHeaderLine('x-appwrite-locale', ''));
+        $localeCodes = \array_map(
+            fn ($entry) => $entry['code'],
+            Config::getParam('locale-codes', []),
+        );
+        if (\in_array($locale, $localeCodes, true)) {
+            Span::add('http.locale', $locale);
+        }
+
+        $sdk = $route?->getLabel("sdk", false);
+        if (!empty($sdk)) {
+            if (\is_array($sdk)) {
+                $sdk = $sdk[0];
+            }
+            /** @var Appwrite\SDK\Method $sdk */
+            Span::add('http.service', $sdk->getNamespace() . '.' . $sdk->getMethodName());
+        }
+
+        $swooleResponse = $utopiaResponse->getSwooleResponse();
+        $swooleResponse->setStatusCode(500);
+
+        $output = ((Http::isDevelopment())) ? [
+            'message' => 'Error: ' . $th->getMessage(),
+            'code' => 500,
+            'file' => $th->getFile(),
+            'line' => $th->getLine(),
+            'trace' => $th->getTrace(),
+            'version' => $version,
+        ] : [
+            'message' => 'Error: Server Error',
+            'code' => 500,
+            'version' => $version,
+        ];
+
+        $swooleResponse->end(\json_encode($output));
+    } finally {
+        Span::add('http.response.code', $response->getStatusCode());
+        Span::current()?->finish(error: $error);
+    }
+});
+
+$swoole->start();

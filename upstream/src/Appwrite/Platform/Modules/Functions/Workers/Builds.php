@@ -1,0 +1,700 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Functions\Workers;
+
+use Appwrite\Deployment\Deployments;
+use Appwrite\Deployment\GitAction;
+use Appwrite\Event\Publisher\Usage as UsagePublisher;
+use Appwrite\Event\Realtime;
+use Appwrite\Extend\Exception as AppwriteException;
+use Appwrite\Usage\Build as BuildUsage;
+use Appwrite\Usage\Context;
+use Appwrite\Vcs\Checkout;
+use Appwrite\Vcs\Checkout\Exception as CheckoutException;
+use Appwrite\Vcs\Factory as VcsFactory;
+use Appwrite\Vcs\Validator\Directory;
+use Exception;
+use Utopia\Config\Config;
+use Utopia\Console\Command;
+use Utopia\Console\Console;
+use Utopia\Database\Database;
+use Utopia\Database\DateTime;
+use Utopia\Database\Document;
+use Utopia\Database\Exception\Conflict;
+use Utopia\Database\Exception\Restricted;
+use Utopia\Database\Exception\Structure;
+use Utopia\Database\Exception\Transaction as TransactionException;
+use Utopia\Database\Query;
+use Utopia\Platform\Action;
+use Utopia\Queue\Message;
+use Utopia\Span\Span;
+use Utopia\System\System;
+use Utopia\VCS\Adapter\Git;
+use Utopia\VCS\Exception\RepositoryNotFound;
+
+class Builds extends Action
+{
+    public static function getName(): string
+    {
+        return 'builds';
+    }
+
+    /**
+     * Truncate build logs to the length allowed by the deployments "buildLogs"
+     * attribute. Large site builds (heavy prerender/bundle output) can exceed
+     * it, which makes persisting the deployment throw a Structure exception and
+     * report the build as failed even though it actually succeeded. Keep the
+     * tail — it holds the build result and any error — mirroring how execution
+     * logs are trimmed elsewhere in this codebase.
+     */
+    private function truncateBuildLogs(string $logs): string
+    {
+        $limit = APP_LOG_LENGTH_LIMIT;
+        if (\strlen($logs) <= $limit) {
+            return $logs;
+        }
+
+        $warning = "[WARNING] Logs truncated. The output exceeded {$limit} characters.\n";
+
+        return $warning . \substr($logs, -($limit - \strlen($warning)));
+    }
+
+    /**
+     * @throws BuildException
+     */
+    private function confine(string $checkout, string $directory, bool $create = false): string
+    {
+        try {
+            return (new Checkout($checkout))->resolve($directory, $create);
+        } catch (CheckoutException $exception) {
+            throw new BuildException($exception->getMessage(), previous: $exception);
+        }
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function __construct()
+    {
+        $this
+            ->desc('Builds worker')
+            ->groups(['builds'])
+            ->inject('message')
+            ->inject('project')
+            ->inject('dbForPlatform')
+            ->inject('queueForRealtime')
+            ->inject('usage')
+            ->inject('publisherForUsage')
+            ->inject('vcsFactory')
+            ->inject('dbForProject')
+            ->inject('getIsResourceBlocked')
+            ->inject('deployments')
+            ->callback($this->action(...));
+    }
+
+    /**
+     * @throws \Utopia\Database\Exception
+     */
+    public function action(
+        Message $message,
+        Document $project,
+        Database $dbForPlatform,
+        Realtime $queueForRealtime,
+        Context $usage,
+        UsagePublisher $publisherForUsage,
+        VcsFactory $vcsFactory,
+        Database $dbForProject,
+        callable $getIsResourceBlocked,
+        Deployments $deployments,
+    ): void {
+        $payload = $message->getPayload();
+
+        if (empty($payload)) {
+            throw new \Exception('Missing payload');
+        }
+
+        $type = $payload['type'] ?? '';
+        Span::add('build.type', $type);
+
+        $resource = new Document($payload['resource'] ?? []);
+        $deployment = new Document($payload['deployment'] ?? []);
+        $template = new Document($payload['template'] ?? []);
+        $platform = $payload['platform'] ?? Config::getParam('platform', []);
+
+        Span::add('project.id', $project->getId());
+        Span::add('type', $type);
+
+        switch ($type) {
+            case BUILD_TYPE_DEPLOYMENT:
+            case BUILD_TYPE_RETRY:
+                $templateVcs = $vcsFactory->fromProvider('github');
+                $this->buildDeployment(
+                    $queueForRealtime,
+                    $usage,
+                    $publisherForUsage,
+                    $dbForPlatform,
+                    $dbForProject,
+                    $templateVcs,
+                    $vcsFactory,
+                    $project,
+                    $resource,
+                    $deployment,
+                    $template,
+                    $getIsResourceBlocked,
+                    $deployments,
+                    $platform,
+                    (int) ($payload['timeout'] ?? System::getEnv('_APP_COMPUTE_BUILD_TIMEOUT', 900))
+                );
+                break;
+
+            default:
+                throw new \Exception('Invalid build type');
+        }
+    }
+
+    /**
+     * @throws \Utopia\Database\Exception
+     * @throws Exception
+     */
+    protected function buildDeployment(
+        Realtime $queueForRealtime,
+        Context $usage,
+        UsagePublisher $publisherForUsage,
+        Database $dbForPlatform,
+        Database $dbForProject,
+        Git $templateVcs,
+        VcsFactory $vcsFactory,
+        Document $project,
+        Document $resource,
+        Document $deployment,
+        Document $template,
+        callable $getIsResourceBlocked,
+        Deployments $deployments,
+        array $platform,
+        int $timeout
+    ): void {
+        Span::add('project.id', $project->getId());
+        Span::add('resource.id', $resource->getId());
+        Span::add('resource.type', $resource->getCollection());
+        Span::add('deployment.id', $deployment->getId());
+        Span::add('build.timeout', $timeout);
+
+        $startTime = DateTime::now();
+        $durationStart = \microtime(true);
+        $phaseStart = $durationStart;
+
+        $resourceKey = match ($resource->getCollection()) {
+            'functions' => 'functionId',
+            'sites' => 'siteId',
+            default => throw new \Exception('Invalid resource type')
+        };
+
+        Span::add($resourceKey, $resource->getId());
+
+        $resource = $dbForProject->getDocument($resource->getCollection(), $resource->getId());
+        if ($resource->isEmpty()) {
+            throw new \Exception('Resource not found');
+        }
+
+        if ($getIsResourceBlocked($project, $resource->getCollection() === 'functions' ? RESOURCE_TYPE_FUNCTIONS : RESOURCE_TYPE_SITES, $resource->getId())) {
+            throw new BuildException('Resource is blocked');
+        }
+
+        Span::add('deployment.id', $deployment->getId());
+
+        $deployment = $dbForProject->getDocument('deployments', $deployment->getId());
+        if ($deployment->isEmpty()) {
+            throw new \Exception('Deployment not found');
+        }
+
+        if ($resource->getCollection() === 'functions' && empty($deployment->getAttribute('entrypoint', ''))) {
+            throw new BuildException('Entrypoint for your Appwrite Function is missing. Please specify it when making deployment or update the entrypoint under your function\'s "Settings" > "Configuration" > "Entrypoint".');
+        }
+
+        $version = $this->getVersion($resource);
+        Span::add('build.runtime', $resource->getAttribute($resource->getCollection() === 'sites' ? 'buildRuntime' : 'runtime', ''));
+        Span::add('build.version', $version);
+
+        $spec = Config::getParam('specifications')[$resource->getAttribute('buildSpecification', APP_COMPUTE_SPECIFICATION_DEFAULT)];
+        Span::add('build.cpus', (float) ($spec['cpus'] ?? APP_COMPUTE_CPUS_DEFAULT));
+        Span::add('build.memory', (int) ($spec['memory'] ?? APP_COMPUTE_MEMORY_DEFAULT));
+
+        // Realtime preparation
+        $event = "{$resource->getCollection()}.[{$resourceKey}].deployments.[deploymentId].update";
+        $queueForRealtime
+            ->setSubscribers(['console'])
+            ->setProject($project)
+            ->setEvent($event)
+            ->setParam($resourceKey, $resource->getId())
+            ->setParam('deploymentId', $deployment->getId());
+
+        if ($deployment->getAttribute('status') === 'canceled') {
+            $resource = $this->updateLatestDeployment($dbForProject, $resource);
+            $this->finalizeCanceledDeployment($deployment->getId(), $dbForProject, $queueForRealtime);
+
+            return;
+        }
+
+        $deploymentId = $deployment->getId();
+
+        $updated = $dbForProject->updateDocuments('deployments', new Document([
+            'buildStartedAt' => $startTime,
+            'status' => 'processing',
+        ]), [
+            Query::equal('$id', [$deploymentId]),
+            Query::notEqual('status', 'canceled'),
+        ]);
+
+        if ($updated === 0) {
+            $resource = $this->updateLatestDeployment($dbForProject, $resource);
+            $this->finalizeCanceledDeployment($deploymentId, $dbForProject, $queueForRealtime);
+            return;
+        }
+
+        $deployment = $dbForProject->getDocument('deployments', $deploymentId);
+
+        $resource = $this->updateLatestDeployment($dbForProject, $resource);
+
+        Span::add('deployment.status', 'processing');
+
+        $queueForRealtime
+            ->setPayload($deployment->getArrayCopy())
+            ->trigger();
+
+        $installationId = $deployment->getAttribute('installationId', '');
+        $providerRepositoryId = $deployment->getAttribute('providerRepositoryId', '');
+        $providerCommitHash = $deployment->getAttribute('providerCommitHash', '');
+        $owner = '';
+        $repositoryName = '';
+
+        // Every other build flow submits its job straight from the request, so
+        // only a deployment with a repository to clone - to push a template
+        // into, or because only this worker can fetch it - belongs here.
+        if (empty($providerRepositoryId)) {
+            throw new \Exception('Only repository deployments build through this worker');
+        }
+
+        $installation = $dbForPlatform->getDocument('installations', $installationId);
+        $providerInstallationId = $installation->getAttribute('providerInstallationId');
+
+        try {
+            $providerAdapter = $vcsFactory->fromInstallation($installation);
+        } catch (\Exception $e) {
+            if ($e->getCode() === 404
+                && $resource->getAttribute('installationId', '') === $installationId) {
+                $this->disconnectVcs($resource, $dbForProject, $dbForPlatform);
+            }
+            throw $e;
+        }
+
+        Span::add('timings.setup', \round(\microtime(true) - $phaseStart, 3));
+        $phaseStart = \microtime(true);
+
+        try {
+            // VCS and VCS+Temaplte
+            $tmpDirectory = '/tmp/builds/' . $deploymentId . '/code';
+            $rootDirectory = $resource->getAttribute('providerRootDirectory', '');
+            if (!(new Directory(\PHP_INT_MAX))->isValid($rootDirectory)) {
+                throw new BuildException('Root directory must stay inside the repository.');
+            }
+            $rootDirectory = \rtrim($rootDirectory, '/');
+            $rootDirectory = \ltrim($rootDirectory, '.');
+            $rootDirectory = \ltrim($rootDirectory, '/');
+
+            try {
+                $owner = $providerAdapter->getOwnerName($providerInstallationId, (int) $providerRepositoryId);
+                $repositoryName = $providerAdapter->getRepositoryName($providerRepositoryId);
+            } catch (RepositoryNotFound $e) {
+                // The repository moved, was deleted, or left the installation's selection
+                $type = $resource->getCollection() === 'sites' ? 'site' : 'function';
+                throw new BuildException("The repository is no longer available to the Git installation this {$type} deploys from. Reconnect the repository in the {$type}'s Git settings.", previous: $e);
+            }
+
+            $cloneOwner = $deployment->getAttribute('providerRepositoryOwner', $owner);
+            $cloneRepository = $deployment->getAttribute('providerRepositoryName', $repositoryName);
+
+            $branchName = $deployment->getAttribute('providerBranch');
+            $commitHash = $deployment->getAttribute('providerCommitHash', '');
+
+            $cloneVersion = $branchName;
+            $cloneType = Git::CLONE_TYPE_BRANCH;
+            if (! empty($commitHash)) {
+                $cloneVersion = $commitHash;
+                $cloneType = Git::CLONE_TYPE_COMMIT;
+            }
+
+            $gitCloneCommand = $providerAdapter->generateCloneCommand($cloneOwner, $cloneRepository, $cloneVersion, $cloneType, $tmpDirectory, $rootDirectory);
+            $stdout = '';
+            $stderr = '';
+
+            Console::execute((new Command('mkdir'))->flag('-p')->argument('/tmp/builds/' . $deploymentId), '', $stdout, $stderr);
+
+            if ($dbForProject->getDocument('deployments', $deploymentId)->getAttribute('status') === 'canceled') {
+                $this->finalizeCanceledDeployment($deployment->getId(), $dbForProject, $queueForRealtime);
+
+                return;
+            }
+
+            $exit = Console::execute($gitCloneCommand, '', $stdout, $stderr);
+
+            if ($exit !== 0) {
+                throw new BuildException('Unable to clone code repository: ' . $stderr);
+            }
+
+            // Local refactoring for function folder with spaces
+            if (str_contains($rootDirectory, ' ')) {
+                $rootDirectoryWithoutSpaces = str_replace(' ', '', $rootDirectory);
+                $from = $this->confine($tmpDirectory, $rootDirectory);
+                $to = $this->confine($tmpDirectory, \dirname($rootDirectoryWithoutSpaces)) . '/' . \basename($rootDirectoryWithoutSpaces);
+                if (\file_exists($to) || \is_link($to)) {
+                    throw new BuildException('Root directory "' . $rootDirectoryWithoutSpaces . '" already exists in the repository.');
+                }
+                $exit = Console::execute((new Command('mv'))->argument($from)->argument($to), '', $stdout, $stderr);
+
+                if ($exit !== 0) {
+                    throw new \Exception('Unable to move function with spaces' . $stderr);
+                }
+                $rootDirectory = $rootDirectoryWithoutSpaces;
+            }
+
+            // Build from template
+            $templateRepositoryName = $template->getAttribute('repositoryName', '');
+            $templateOwnerName = $template->getAttribute('ownerName', '');
+            $templateReferenceType = $template->getAttribute('referenceType', '');
+            $templateReferenceValue = $template->getAttribute('referenceValue', '');
+
+            $templateRootDirectory = $template->getAttribute('rootDirectory', '');
+            if (!(new Directory(\PHP_INT_MAX))->isValid($templateRootDirectory)) {
+                throw new BuildException('Template root directory must stay inside the template repository.');
+            }
+            $templateRootDirectory = \rtrim($templateRootDirectory, '/');
+            $templateRootDirectory = \ltrim($templateRootDirectory, '.');
+            $templateRootDirectory = \ltrim($templateRootDirectory, '/');
+
+            if (! empty($templateRepositoryName) && ! empty($templateOwnerName) && ! empty($templateReferenceType) && ! empty($templateReferenceValue)) {
+                // Clone template repo
+                $tmpTemplateDirectory = '/tmp/builds/' . $deploymentId . '/template';
+
+                $gitCloneCommandForTemplate = $templateVcs->generateCloneCommand($templateOwnerName, $templateRepositoryName, $templateReferenceValue, $templateReferenceType, $tmpTemplateDirectory, $templateRootDirectory);
+                $exit = Console::execute($gitCloneCommandForTemplate, '', $stdout, $stderr);
+
+                if ($exit !== 0) {
+                    throw new \Exception('Unable to clone code repository: ' . $stderr);
+                }
+
+                $source = $this->confine($tmpTemplateDirectory, $templateRootDirectory, true);
+                $destination = $this->confine($tmpDirectory, $rootDirectory, true);
+
+                // Merge template into user repo, keeping only links that stay inside the template
+                $rsync = (new Command('rsync'))
+                    ->flag('-av')
+                    ->flag('--safe-links')
+                    ->option('--exclude', '.git')
+                    ->argument($source . '/')
+                    ->argument($destination);
+                $exit = Console::execute($rsync, '', $stdout, $stderr);
+
+                if ($exit !== 0) {
+                    throw new \Exception('Unable to merge template into repository: ' . $stderr);
+                }
+
+                // Commit and push
+                $commitMessage = 'Create ' . $resource->getAttribute('name', '') . ' ' . ($resource->getCollection() === 'sites' ? 'site' : 'function');
+                $push = Command::and(
+                    // A branch clone already has the branch; a commit clone is detached
+                    (new Command('git'))->option('-C', $tmpDirectory)->argument('checkout')->flag('-B')->argument($branchName),
+                    (new Command('git'))->option('-C', $tmpDirectory)->argument('add')->argument('.'),
+                    // The author is set for this commit only: concurrent builds writing the global config fail on each other's lock
+                    (new Command('git'))->option('-C', $tmpDirectory)->option('-c', 'user.email=' . APP_VCS_GITHUB_EMAIL)->option('-c', 'user.name=' . APP_VCS_GITHUB_USERNAME)->argument('commit')->option('-m', $commitMessage),
+                    // The provider's remote may need more than the clone URL carries
+                    $providerAdapter->generatePushCommand($cloneOwner, $cloneRepository, $tmpDirectory, $branchName),
+                );
+                $exit = Console::execute($push, '', $stdout, $stderr);
+
+                if ($exit !== 0) {
+                    throw new \Exception('Unable to push code repository: ' . $stderr);
+                }
+
+                $exit = Console::execute((new Command('git'))->option('-C', $tmpDirectory)->argument('rev-parse')->argument('HEAD'), '', $stdout, $stderr);
+
+                if ($exit !== 0) {
+                    throw new \Exception('Unable to get vcs commit SHA: ' . $stderr);
+                }
+
+                $providerCommitHash = \trim($stdout);
+
+                $deployment->setAttribute('providerCommitHash', $providerCommitHash);
+                $deployment->setAttribute('providerCommitAuthorUrl', APP_VCS_GITHUB_URL);
+                $deployment->setAttribute('providerCommitAuthor', APP_VCS_GITHUB_USERNAME);
+                $deployment->setAttribute('providerCommitMessage', $commitMessage);
+                $deployment->setAttribute('providerCommitUrl', $providerAdapter->getCommitUrl($cloneOwner, $cloneRepository, $providerCommitHash));
+                $deployment = $dbForProject->updateDocument('deployments', $deployment->getId(), new Document([
+                    'providerCommitHash' => $deployment->getAttribute('providerCommitHash'),
+                    'providerCommitAuthorUrl' => $deployment->getAttribute('providerCommitAuthorUrl'),
+                    'providerCommitAuthor' => $deployment->getAttribute('providerCommitAuthor'),
+                    'providerCommitMessage' => $deployment->getAttribute('providerCommitMessage'),
+                    'providerCommitUrl' => $deployment->getAttribute('providerCommitUrl'),
+                ]));
+
+                $queueForRealtime
+                    ->setPayload($deployment->getArrayCopy())
+                    ->trigger();
+            }
+
+            // A build reaches this worker for a git operation the jobs-service
+            // artifact system has no primitive for: the template-into-repo push
+            // above, or a clone only the provider's own tooling can make. With
+            // the commit pushed, hand the build to the jobs-service like any
+            // other VCS commit, via the same Deployments service the HTTP
+            // endpoints use - or, when the jobs-service cannot clone the
+            // provider itself, build the tree checked out here.
+            if ($providerAdapter->supportsRepositoryArchives() || $providerAdapter->supportsRepositoryCloneUrl()) {
+                $ref = $deployment->getAttribute('providerCommitHash') ?: $branchName;
+                $deployments->createFromVcs(
+                    $resource,
+                    $deployment,
+                    $timeout,
+                    $providerAdapter,
+                    $cloneOwner,
+                    $cloneRepository,
+                    $ref,
+                    $resource->getAttribute('providerRootDirectory', ''),
+                );
+            } else {
+                $deployment->setAttribute('providerRootDirectory', $resource->getAttribute('providerRootDirectory', ''));
+                $deployments->createFromDirectory(
+                    $resource,
+                    $deployment,
+                    $timeout,
+                    $this->confine($tmpDirectory, $rootDirectory),
+                );
+            }
+
+            Console::execute((new Command('rm'))->flag('-rf')->argument('/tmp/builds/' . $deploymentId), '', $stdout, $stderr);
+        } catch (\Throwable $th) {
+            $deployment = $dbForProject->getDocument('deployments', $deploymentId);
+            if ($deployment->getAttribute('status') === 'canceled') {
+                $this->finalizeCanceledDeployment($deployment->getId(), $dbForProject, $queueForRealtime);
+
+                return;
+            }
+
+            // A BuildException, or a deployment Deployments::submit() refused, is
+            // the owner's to fix: its message is safe to show and a retry would
+            // fail the same way.
+            $isUserFacing = $th instanceof AppwriteException && $th->getCode() < 500;
+
+            // Record user-facing failures on the span here, since they're not
+            // re-raised to the harness (which records internal errors via setError).
+            if ($isUserFacing) {
+                Span::add('build.exception.type', $th->getType());
+                Span::add('build.exception.message', $th->getMessage());
+            }
+
+            $durationEnd = \microtime(true);
+            $deployment->setAttribute('buildDuration', \intval(\ceil($durationEnd - $durationStart)));
+            $updates = ['buildDuration' => $deployment->getAttribute('buildDuration')];
+
+            // Deployments::submit() fails a deployment it refuses or cannot queue,
+            // and has already written why to its build logs.
+            if ($deployment->getAttribute('status') !== 'failed') {
+                $message = $isUserFacing
+                    ? $th->getMessage()
+                    : 'An internal error occurred while building. Please try again, and contact support if the problem persists.';
+
+                // Color message red
+                if (! \str_contains($message, '')) {
+                    $message = '[31m' . $message;
+                }
+
+                $message = \str_replace('{APPWRITE_DETECTION_SEPARATOR_START}', '', $message);
+                $message = \str_replace('{APPWRITE_DETECTION_SEPARATOR_END}', '', $message);
+
+                // Append error to whatever build logs were already streamed
+                $previousLogs = $deployment->getAttribute('buildLogs', '');
+                if (! empty($previousLogs)) {
+                    $message = $previousLogs . "\n" . $message;
+                }
+
+                $updates['buildEndedAt'] = DateTime::now();
+                $updates['status'] = 'failed';
+                $updates['buildLogs'] = $this->truncateBuildLogs($message);
+            }
+
+            Span::add('deployment.status', 'failed');
+            Span::add('build.duration', $deployment->getAttribute('buildDuration'));
+
+            $deployment = $dbForProject->updateDocument('deployments', $deploymentId, new Document($updates));
+
+            $resource = $this->updateLatestDeployment($dbForProject, $resource);
+
+            $queueForRealtime
+                ->setPayload($deployment->getArrayCopy())
+                ->trigger();
+
+            $this->runGitAction('failed', $providerAdapter, $providerCommitHash, $owner, $repositoryName, $project, $resource, $deployment->getId(), $dbForProject, $dbForPlatform, $queueForRealtime, $platform, true);
+
+            // Let the worker harness record internal errors via the span and logger.
+            if (! $isUserFacing) {
+                throw $th;
+            }
+        } finally {
+            $queueForRealtime
+                ->setPayload($deployment->getArrayCopy())
+                ->trigger();
+
+            $this->sendUsage(
+                resource: $resource,
+                deployment: $deployment,
+                project: $project,
+                usage: $usage,
+                publisherForUsage: $publisherForUsage
+            );
+        }
+    }
+
+    protected function sendUsage(Document $resource, Document $deployment, Document $project, Context $usage, UsagePublisher $publisherForUsage): void
+    {
+        BuildUsage::publish($usage, $resource, $deployment, $project, $publisherForUsage);
+    }
+
+    protected function getVersion(Document $resource): string
+    {
+        return match ($resource->getCollection()) {
+            'functions' => $resource->getAttribute('version', 'v2'),
+            'sites' => 'v5',
+            default => throw new \Exception('Unsupported resource type "' . $resource->getCollection() . '".'),
+        };
+    }
+
+    /**
+     * @throws Structure
+     * @throws \Utopia\Database\Exception
+     * @throws Conflict
+     * @throws Restricted
+     */
+    protected function runGitAction(
+        string $status,
+        Git $vcs,
+        string $providerCommitHash,
+        string $owner,
+        string $repositoryName,
+        Document $project,
+        Document $resource,
+        string $deploymentId,
+        Database $dbForProject,
+        Database $dbForPlatform,
+        Realtime $queueForRealtime,
+        array $platform,
+        bool $secondaryError = false
+    ): void {
+        $deployment = new Document();
+
+        try {
+            $deployment = $dbForProject->getDocument('deployments', $deploymentId);
+
+            GitAction::run($status, $vcs, $providerCommitHash, $owner, $repositoryName, $project, $resource, $deployment, $dbForPlatform, $platform);
+        } catch (\Throwable $th) {
+            $span = Span::current();
+            $errorPrefix = $secondaryError ? 'build.error.secondary' : 'build.git_action.error';
+            $span?->set("{$errorPrefix}.stage", 'git_action');
+            $span?->set("{$errorPrefix}.status", $status);
+            $span?->set("{$errorPrefix}.type", $th::class);
+            $span?->set("{$errorPrefix}.message", $th->getMessage());
+            $span?->set("{$errorPrefix}.file", $th->getFile());
+            $span?->set("{$errorPrefix}.line", $th->getLine());
+
+            $logs = $deployment->getAttribute('buildLogs', '');
+            $date = \date('H:i:s');
+            $logs .= "[90m[$date] [90m[[0mappwrite[90m][33m Git action failed. Deployment will continue. [0m\n";
+
+            $deployment->setAttribute('buildLogs', $this->truncateBuildLogs($logs));
+            $deployment = $dbForProject->updateDocument('deployments', $deployment->getId(), new Document([
+                'buildLogs' => $deployment->getAttribute('buildLogs'),
+            ]));
+
+            $queueForRealtime
+                ->setPayload($deployment->getArrayCopy())
+                ->trigger();
+        }
+    }
+
+    protected function disconnectVcs(Document $resource, Database $dbForProject, Database $dbForPlatform): void
+    {
+        $repositoryId = $resource->getAttribute('repositoryId', '');
+        if (!empty($repositoryId)) {
+            $dbForPlatform->deleteDocument('repositories', $repositoryId);
+        }
+        $dbForProject->updateDocument($resource->getCollection(), $resource->getId(), new Document([
+            'installationId' => '',
+            'installationInternalId' => '',
+            'providerRepositoryId' => '',
+            'providerBranch' => '',
+            'providerSilentMode' => false,
+            'providerRootDirectory' => '',
+            'repositoryId' => '',
+            'repositoryInternalId' => '',
+        ]));
+    }
+
+    private function updateLatestDeployment(Database $dbForProject, Document $resource): Document
+    {
+        $latestDeployment = $dbForProject->findOne('deployments', [
+            Query::equal('resourceType', [$resource->getCollection()]),
+            Query::equal('resourceInternalId', [$resource->getSequence()]),
+            Query::orderDesc('$createdAt'),
+        ]);
+
+        $updates = $latestDeployment->isEmpty()
+            ? [
+                'latestDeploymentCreatedAt' => '',
+                'latestDeploymentInternalId' => '',
+                'latestDeploymentId' => '',
+                'latestDeploymentStatus' => '',
+            ]
+            : [
+                'latestDeploymentCreatedAt' => $latestDeployment->getCreatedAt(),
+                'latestDeploymentInternalId' => $latestDeployment->getSequence(),
+                'latestDeploymentId' => $latestDeployment->getId(),
+                'latestDeploymentStatus' => $latestDeployment->getAttribute('status', ''),
+            ];
+
+        return $dbForProject->updateDocument(
+            $resource->getCollection(),
+            $resource->getId(),
+            new Document($updates)
+        );
+    }
+
+    private function finalizeCanceledDeployment(string $deploymentId, Database $dbForProject, Realtime $queueForRealtime)
+    {
+        Span::add('deployment.status', 'canceled');
+
+        $attempts = 0;
+
+        while (true) {
+            try {
+                $deployment = $dbForProject->getDocument('deployments', $deploymentId);
+
+                $logs = $deployment->getAttribute('buildLogs', '');
+                $date = \date('H:i:s');
+                $logs .= "\033[90m[$date] \033[90m[\033[0mappwrite\033[90m]\033[33m Build has been canceled. \033[0m\n";
+
+                $deployment->setAttribute('buildLogs', $this->truncateBuildLogs($logs));
+                $deployment = $dbForProject->updateDocument('deployments', $deployment->getId(), new Document([
+                    'buildLogs' => $deployment->getAttribute('buildLogs'),
+                ]));
+
+                break;
+            } catch (TransactionException $exception) {
+                if (++$attempts >= 5) {
+                    throw $exception;
+                }
+            }
+        }
+
+        $queueForRealtime
+            ->setPayload($deployment->getArrayCopy())
+            ->trigger();
+    }
+}

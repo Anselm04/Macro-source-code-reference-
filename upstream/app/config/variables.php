@@ -1,0 +1,2324 @@
+<?php
+
+use Appwrite\Network\TrustedProxies;
+use Utopia\Config\Config;
+
+return [
+    [
+        'category' => 'General',
+        'description' => '',
+        'variables' => [
+            [
+                'name' => '_APP_ENV',
+                'description' => 'Set your server running environment. By default, the var is set to \'development\'. When deploying to production, change it to: \'production\'.',
+                'introduction' => '',
+                'default' => 'production',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_EDITION',
+                'description' => 'Identifies the edition of the server. Defaults to \'self-hosted\'. Self-hosted deployments do not consume the audit, usage and stats-resources queues, so their producers are disabled for this edition.',
+                'introduction' => '',
+                'default' => 'self-hosted',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_LOCALE',
+                'description' => 'Set your Appwrite\'s locale. By default, the locale is set to \'en\'.',
+                'introduction' => '',
+                'default' => 'en',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_OPTIONS_ABUSE',
+                'description' => 'Allows you to disable abuse checks and API rate limiting. By default, set to \'enabled\'. To cancel the abuse checking, set to \'disabled\'. It is not recommended to disable this check-in a production environment.',
+                'introduction' => '',
+                'default' => 'enabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_OPTIONS_ABUSE_INCREASED_LIMIT_PROJECTS',
+                'description' => 'Comma-separated list of project IDs that get increased API rate limits. Every endpoint rate limit is multiplied by 100 for the listed projects. By default, empty, so all projects use the standard rate limits.',
+                'introduction' => '1.9.7',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_LOCKING_ENABLED',
+                'description' => 'Enable distributed locking for platform writes. Locks coordinate concurrent updates across API pods so read-modify-write operations on shared documents do not lose updates. By default, set to \'enabled\'. Set to \'disabled\' as an emergency kill switch; locks become no-ops and concurrent writes will race.',
+                'introduction' => '1.9.3',
+                'default' => 'enabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_OPTIONS_FORCE_HTTPS',
+                'description' => 'Controls whether Appwrite generates HTTPS API URLs and enforces HTTPS for incoming API requests. Set to \'enabled\' whenever the public API is served over HTTPS, including when TLS is terminated by a reverse proxy. When enabled, HTTP GET requests are redirected to HTTPS and other HTTP requests are rejected. The default value is \'disabled\' to support local and plain HTTP installations.',
+                'introduction' => '',
+                'default' => 'disabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_OPTIONS_FUNCTIONS_FORCE_HTTPS',
+                'description' => 'Deprecated since 1.7.0. Allows you to force HTTPS connection to function domains. This feature redirects any HTTP call to HTTPS and adds the \'Strict-Transport-Security\' header to all HTTP responses. By default, set to \'enabled\'. To disable, set to \'disabled\'. This feature will work only when your ports are set to default 80 and 443.',
+                'introduction' => '',
+                'default' => 'disabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_OPTIONS_ROUTER_FORCE_HTTPS',
+                'description' => 'Allows you to force HTTPS connection to function and site domains. This feature redirects any HTTP call to HTTPS and adds the \'Strict-Transport-Security\' header to all HTTP responses. By default, set to \'enabled\'. To disable, set to \'disabled\'. This feature will work only when your ports are set to default 80 and 443.',
+                'introduction' => '',
+                'default' => 'disabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_OPTIONS_ROUTER_PROTECTION',
+                'description' => 'Protects server from serving requests from unknown hostnames, and from serving Console for custom project domains. By default, set to \'disabled\'. To start router protection, set to \'enabled\'. It is recommended to enable this variable on production environment.',
+                'introduction' => '1.4.4',
+                'default' => 'disabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_ROUTER_AUTO_CERTIFICATES',
+                'description' => 'Allows Appwrite to automatically issue TLS certificates for function and site domains. By default, set to \'enabled\'. Set to \'disabled\' when a wildcard TLS certificate already covers those domains, for example one issued through Traefik\'s DNS challenge.',
+                'introduction' => '',
+                'default' => 'enabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_OPENSSL_KEY_V1',
+                'description' => 'This is your server private secret key that is used to encrypt all sensitive data on your server. Appwrite server encrypts all secret data on your server like webhooks, HTTP passwords, user sessions, and storage files. The installer generates a unique value. Production refuses to start when this is empty, and warns when it is the public `your-secret-key` placeholder. Changing it makes existing encrypted data unreadable. **Keep it a secret and have a backup for it**.',
+                'introduction' => '',
+                'default' => '',
+                'required' => true,
+                'question' => 'Choose a secret API key, make sure to make a backup of your key in a secure location',
+                'filter' => 'token'
+            ],
+            [
+                'name' => '_APP_OPENSSL_KEY_V2',
+                'description' => 'The next server secret key, used once `_APP_OPENSSL_KEY_CURRENT` is set to 2. Rotate by adding the next version, making it current, re-encrypting stored data with the `encryption` task, then raising `_APP_OPENSSL_KEY_OLDEST`. Keep every version that still encrypts stored data or files.',
+                'introduction' => '2.7.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_OPENSSL_KEY_CURRENT',
+                'description' => 'Version of `_APP_OPENSSL_KEY_V{version}` that signs new tokens and encrypts new data. Defaults to 1.',
+                'introduction' => '2.7.0',
+                'default' => '1',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_OPENSSL_KEY_OLDEST',
+                'description' => 'Oldest key version still accepted when verifying tokens and signatures, such as JWTs and ephemeral API keys. Every configured version from this one up is accepted. Raise it to retire a key. Stored data keeps decrypting with the version it records. Defaults to 1.',
+                'introduction' => '2.7.0',
+                'default' => '1',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_NOTIFICATIONS_TRACKING_SECRET',
+                'description' => 'Secret key used to sign notification logo tracking tokens. This must be the same value for API containers and notification workers. Change it from the default value before running in production.',
+                'introduction' => '1.9.0',
+                'default' => 'your-secret-key',
+                'required' => true,
+                'question' => '',
+                'filter' => 'token'
+            ],
+            [
+                'name' => '_APP_NOTIFICATIONS_PUSH_APNS',
+                'description' => "Push service that delivers alerts to the iOS devices console users sign in on. Use the following format: 'apns://[KEY_ID]:[TEAM_ID]@[BUNDLE_ID]', adding '?sandbox=true' for development builds, with the APNs auth key (.p8) in _APP_NOTIFICATIONS_PUSH_APNS_KEY. Leave empty to disable alert pushes.",
+                'introduction' => '2.7.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_NOTIFICATIONS_PUSH_APNS_KEY',
+                'description' => 'APNs auth key (.p8 contents) that _APP_NOTIFICATIONS_PUSH_APNS signs with.',
+                'introduction' => '2.7.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_NOTIFICATIONS_PUSH_FCM',
+                'description' => "Push service that delivers alerts to the Android devices console users sign in on. Use the following format: 'fcm://[FIREBASE_PROJECT_ID]', with the service account JSON in _APP_NOTIFICATIONS_PUSH_FCM_KEY. Leave empty to disable alert pushes to Android.",
+                'introduction' => '2.7.1',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_NOTIFICATIONS_PUSH_FCM_KEY',
+                'description' => 'Firebase service account JSON that _APP_NOTIFICATIONS_PUSH_FCM signs with; it has to belong to the project _APP_NOTIFICATIONS_PUSH_FCM names.',
+                'introduction' => '2.7.1',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOMAIN',
+                'description' => 'Your Appwrite domain address. When setting a public suffix domain, Appwrite will attempt to issue a valid SSL certificate automatically. When used with a dev domain, Appwrite will assign a self-signed SSL certificate. The default value is \'localhost\'. Multiple domains can be separated by commas.',
+                'introduction' => '',
+                'default' => 'localhost',
+                'required' => true,
+                'question' => 'Enter your Appwrite hostname',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CUSTOM_DOMAIN_DENY_LIST',
+                'description' => 'List of reserved or prohibited domains when configuring custom domains.',
+                'introduction' => '',
+                'default' => 'example.com,test.com,app.example.com',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOMAIN_FUNCTIONS',
+                'description' => 'A domain to use for function preview URLs. Setting to empty turns off function preview URLs.',
+                'introduction' => '',
+                'default' => 'functions.localhost',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOMAIN_FUNCTIONS_FALLBACK',
+                'description' => 'Comma-separated list of additional domains that serve function preview URLs, for example a previous value of _APP_DOMAIN_FUNCTIONS. Rules cannot claim these domains.',
+                'introduction' => '2.7.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOMAIN_SITES',
+                'description' => 'A domain to use for site preview URLs.',
+                'introduction' => '',
+                'default' => 'sites.localhost',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOMAIN_TARGET',
+                'description' => 'Deprecated since 1.7.0. A DNS A record hostname to serve as a CNAME target for your Appwrite custom domains. You can use the same value as used for the Appwrite \'_APP_DOMAIN\' variable. The default value is \'localhost\'.',
+                'introduction' => '',
+                'default' => 'localhost',
+                'required' => true,
+                'question' => 'Enter a DNS A record hostname to serve as a CNAME for your custom domains.' . PHP_EOL . 'You can use the same value as used for the Appwrite hostname.',
+                'filter' => 'domainTarget'
+            ],
+            [
+                'name' => '_APP_DOMAIN_TARGET_CNAME',
+                'description' => 'A domain that can be used as DNS CNAME record to point to instance of Appwrite server.',
+                'introduction' => '',
+                'default' => 'localhost',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOMAIN_TARGET_AAAA',
+                'description' => 'An IPv6 that can be used as DNS AAAA record to point to instance of Appwrite server.',
+                'introduction' => '',
+                'default' => '::1',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOMAIN_TARGET_A',
+                'description' => 'An IPV4 that can be used as DNS A record to point to instance of Appwrite server.',
+                'introduction' => '',
+                'default' => '127.0.0.1',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOMAIN_TARGET_CAA',
+                'description' => 'A CAA record domain that can be used to validate custom domains. Value should be domain\'s hostname.',
+                'introduction' => '',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DNS',
+                'description' => 'DNS server to use for domain validation. Default: 8.8.8.8',
+                'introduction' => '',
+                'default' => '8.8.8.8',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DNS_EXTERNAL',
+                'description' => 'Comma-separated DNS servers used, instead of the container\'s own resolver, to check the host of a migration source, an avatar URL or a project\'s SMTP server before Appwrite connects to it. Other fetches (OAuth2 and OIDC providers, webhooks) resolve normally and are checked on the address they connect to. By default, the value of _APP_DNS.',
+                'introduction' => '2.4.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_ALLOWED_INTERNAL_ADDRESSES',
+                'description' => 'Comma-separated IP addresses or CIDR ranges that Appwrite may reach even though they are private or reserved, when fetching a user-supplied URL (OAuth2 and OIDC providers, webhooks, messaging webhooks, migration sources, avatars) or connecting to a project\'s SMTP server (project SMTP and messaging SMTP providers). Every other private or reserved address is refused. Set it per container, for example to reach an internal identity provider. By default, empty.',
+                'introduction' => '2.4.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_WHITELIST_ROOT',
+                'description' => 'This option allows you to disable the creation of new users on the Appwrite console. When enabled only 1 user will be able to use the registration form. New users can be added by inviting them to your project. By default this option is enabled.',
+                'introduction' => '0.8.0',
+                'default' => 'enabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_WHITELIST_EMAILS',
+                'description' => 'This option allows you to limit creation of new users on the Appwrite console. This option is very useful for small teams or sole developers. To enable it, pass a list of allowed email addresses or wildcard domains, such as *@appwrite.io, separated by a comma.',
+                'introduction' => '',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_WHITELIST_IPS',
+                'description' => "This last option allows you to limit creation of users in Appwrite console for users sharing the same set of IP addresses. This option is very useful for team working with a VPN service or a company IP.\n\nTo enable/activate this option, pass a list of allowed IP addresses separated by a comma.",
+                'introduction' => '',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_URL',
+                'description' => 'Origin of the Appwrite console web app, such as https://console.example.com, used when the backend generates links to the console (OAuth callbacks, emails, error page CTAs, VCS comments and commit statuses). Set it when the console is served on a different host than the API. When empty, links use _APP_CONSOLE_DOMAIN (or _APP_DOMAIN) over https, or over http when _APP_OPTIONS_FORCE_HTTPS is disabled.',
+                'introduction' => '2.3.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_HOSTNAMES',
+                'description' => 'This option allows you to add additional hostnames to your Appwrite console. This option is very useful for allowing access to the console project from additional domains. To enable it, pass a list of allowed hostnames separated by a comma.',
+                'introduction' => '1.5.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_GITHUB_APP_ID',
+                'description' => 'GitHub OAuth app client ID used for signing in to the Appwrite console. You can find it in your GitHub OAuth application details. This is separate from _APP_VCS_GITHUB_APP_ID, which powers repository integration rather than console sign-in and holds the numeric GitHub App ID instead of an OAuth client ID.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_GITHUB_SECRET',
+                'description' => 'GitHub OAuth app client secret used for signing in to the Appwrite console. You can generate secrets in your GitHub OAuth application settings. This is separate from _APP_VCS_GITHUB_CLIENT_SECRET, which powers repository integration rather than console sign-in.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_GITLAB_APP_ID',
+                'description' => 'GitLab OAuth application ID used for signing in to the Appwrite console. You can find it in your GitLab application details. This is separate from _APP_VCS_GITLAB_CLIENT_ID, which powers repository integration rather than console sign-in.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_GITLAB_SECRET',
+                'description' => 'GitLab OAuth application secret used for signing in to the Appwrite console. You can generate one in your GitLab application settings. This is separate from _APP_VCS_GITLAB_CLIENT_SECRET, which powers repository integration rather than console sign-in.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_GITLAB_ENDPOINT',
+                'description' => 'URL of the GitLab instance used for signing in to the Appwrite console, for self-hosted GitLab. Defaults to https://gitlab.com when unset. This is separate from _APP_VCS_GITLAB_ENDPOINT, which powers repository integration rather than console sign-in.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_BITBUCKET_APP_ID',
+                'description' => 'Bitbucket OAuth consumer key used for signing in to the Appwrite console. You can find it in your Bitbucket workspace settings under OAuth consumers. This is separate from _APP_VCS_BITBUCKET_CLIENT_ID, which powers repository integration rather than console sign-in.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_BITBUCKET_SECRET',
+                'description' => 'Bitbucket OAuth consumer secret used for signing in to the Appwrite console. You can find it alongside the consumer key in your Bitbucket workspace settings under OAuth consumers. This is separate from _APP_VCS_BITBUCKET_CLIENT_SECRET, which powers repository integration rather than console sign-in.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_GOOGLE_APP_ID',
+                'description' => 'Google OAuth 2.0 client ID used for signing in to the Appwrite console. You can create one in the Google Cloud Console under APIs & Services > Credentials. Unlike the other console sign-in providers, Google has no _APP_VCS_ counterpart, as it is not a repository host.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_GOOGLE_SECRET',
+                'description' => 'Google OAuth 2.0 client secret used for signing in to the Appwrite console. You can find it alongside the client ID in the Google Cloud Console under APIs & Services > Credentials.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SYSTEM_EMAIL_NAME',
+                'description' => 'This is the sender name value that will appear on email messages sent to developers from the Appwrite console. The default value is: \'Appwrite\'. You can use url encoded strings for spaces and special chars.',
+                'introduction' => '0.7.0',
+                'default' => 'Appwrite',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SYSTEM_EMAIL_ADDRESS',
+                'description' => 'This is the sender email address that will appear on email messages sent to developers from the Appwrite console. The default value is \'noreply@appwrite.io\'. You should choose an email address that is allowed to be used from your SMTP server to avoid the server email ending in the users\' SPAM folders.',
+                'introduction' => '0.7.0',
+                'default' => 'noreply@appwrite.io',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SYSTEM_TEAM_EMAIL',
+                'description' => 'This is the sender email address that will appear in the generated specs. The default value is \'team@appwrite.io\'.',
+                'introduction' => '1.6.0',
+                'default' => 'team@appwrite.io',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SYSTEM_RESPONSE_FORMAT',
+                'description' => 'Use this environment variable to set the default Appwrite HTTP response format to support an older version of Appwrite. This option is useful to overcome breaking changes between versions. You can also use the `X-Appwrite-Response-Format` HTTP request header to overwrite the response for a specific request. This variable accepts any valid Appwrite version. To use the current version format, leave the value of the variable empty.',
+                'introduction' => '0.7.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SYSTEM_SECURITY_EMAIL_ADDRESS',
+                'description' => 'Deprecated since 1.5.1 use _APP_EMAIL_SECURITY and _APP_EMAIL_CERTIFICATES instead',
+                'introduction' => '0.7.0',
+                'default' => 'certs@appwrite.io',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_EMAIL_SECURITY',
+                'description' => 'This is the email address used as the user agent in your webhooks payload.',
+                'introduction' => '1.5.1',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_EMAIL_CERTIFICATES',
+                'description' => 'This is the email address used to issue SSL certificates for custom domains',
+                'introduction' => '1.5.1',
+                'default' => '',
+                'required' => true,
+                'question' => 'Enter an email that will be used when registering for SSL certificates',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_LOGGING_CONFIG',
+                'description' => 'This variable allows you to report server errors to Sentry. This value is empty by default, set a DSN value `sentry://PROJECT_ID:SENTRY_API_KEY@SENTRY_HOST/` to enable it. Sentry is the only supported provider; other DSN schemes are rejected at startup and disable reporting. The same DSN is used by the API, workers, CLI tasks and the realtime server. Errors are exported as spans, so every attribute added with `Span::add()` during the request or job is attached to the Sentry event.',
+                'introduction' => '0.12.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_LOGGING_FORMAT',
+                'description' => 'Controls how Appwrite writes span/trace logs to container stdout/stderr. Use `pretty` (default) for multi-line terminal output, or `json` for newline-delimited JSON (NDJSON) that log aggregators such as Better Stack, Loki, or CloudWatch can ingest as a single entry per span.',
+                'introduction' => '1.9.6',
+                'default' => 'pretty',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_WORKER_PER_CORE',
+                'description' => 'Internal Worker per core for the API and Executor containers. Can be configured to optimize performance. Realtime ignores this and runs a single worker per container; use _APP_WORKERS_NUM to override.',
+                'introduction' => '0.13.0',
+                'default' => 6,
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MEMORY_LIMIT',
+                'description' => 'PHP memory limit of each Appwrite process, including the API, Realtime, workers and tasks. Accepts any PHP memory_limit value, such as \'2G\', or \'-1\' for no limit. Raise it when a Realtime container holds thousands of connections. By default, set to \'512M\'.',
+                'introduction' => '2.6.2',
+                'default' => '512M',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONSOLE_SESSION_ALERTS',
+                'description' => 'This option allows you configure if a new login in the Appwrite Console should send an alert email to the user. It\'s disabled by default with value "disabled", and to enable it, pass value "enabled".',
+                'introduction' => '1.6.0',
+                'default' => 'disabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPRESSION_ENABLED',
+                'description' => 'This option allows you to enable or disable the response compression for the Appwrite API. It\'s enabled by default with value "enabled", and to disable it, pass value "disabled".',
+                'introduction' => '1.6.0',
+                'default' => 'enabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPRESSION_MIN_SIZE_BYTES',
+                'description' => 'This option allows you to set the minimum size in bytes for the response compression to be applied. The default value is 1024 bytes.',
+                'introduction' => '1.6.0',
+                'default' => 1024,
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_TRUSTED_HEADERS',
+                'description' => 'This option allows you to set the list of trusted headers, the value is a comma‑separated list of HTTP header names, evaluated left-to-right for the first valid IP. Header names are treated case-insensitively. These headers are only read when the connection address is listed in `_APP_TRUSTED_PROXIES`.',
+                'introduction' => '1.8.0',
+                'default' => 'x-forwarded-for',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_TRUSTED_PROXIES',
+                'description' => 'Comma-separated CIDRs (or exact IPs) of reverse proxies that may set `_APP_TRUSTED_HEADERS` such as X-Forwarded-For. The default covers loopback, RFC1918 and RFC 6598 (100.64.0.0/10) ranges used by Docker, Traefik and Kubernetes. When the connection comes from a trusted proxy, the client IP is the rightmost header entry that is not itself a trusted proxy. Direct clients whose connection address is not in this list are not trusted — their X-Forwarded-For is ignored. Set it to an empty value to always use the connection IP. If your load balancer has a public address, add that CIDR.',
+                'introduction' => '2.4.0',
+                'default' => TrustedProxies::DEFAULT,
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_GEO_ENDPOINT',
+                'description' => 'Internal endpoint of the geo service used to resolve IP geolocation for locale and session enrichment. Leave empty to disable geolocation lookups. Defaults to the bundled `appwrite-geo` container.',
+                'introduction' => '2.0.0',
+                'default' => 'http://appwrite-geo/v1',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_GEO_SECRET',
+                'description' => 'Bearer token used to authenticate requests from the Appwrite server to the geo service. Must match the `GEO_SECRET` configured on the `appwrite-geo` container. Change it from the default value before running in production.',
+                'introduction' => '2.0.0',
+                'default' => 'your-secret-key',
+                'required' => false,
+                'question' => '',
+                'filter' => 'token'
+            ],
+            [
+                'name' => '_APP_PWNED_PASSWORDS_DSN',
+                'description' => "DSN of the service the password pwned project policy asks whether a password has been breached. The scheme picks the adapter. Nothing is asked until you set it: the default, `none://localhost`, reports every password as safe, so the policy protects nothing until this points at a service.\n\nOptions:\n- None: `none://localhost` — the default. Reports every password as safe without asking anyone, for a server that must not or cannot reach a breach service\n- Have I Been Pwned: `hibp://localhost` — the public range API, which only ever receives the first five characters of the password SHA-1 hash. No other detail is read from the DSN\n- [Appwrite Pwned](https://github.com/appwrite-labs/pwned): `appwrite://SECRET@appwrite-pwned/v1/detection` — a service you run yourself, which answers from its own copy of the Have I Been Pwned corpus, so nothing about the password leaves your network. It receives only the SHA-1 hash of the password, never the password itself, authenticated with `SECRET` as a Bearer token, which must match the service's `APPWRITE_PWNED_SECRET`. That hash is unsalted, so only point it at a service on your own network or behind TLS. The path defaults to `v1/detection` and the connection is plain HTTP unless you add `?tls=true`\n- Testing: `mock://localhost` — reports a fixed list of passwords as breached without leaving the process. Refused on a production server, since it would report every real password as safe",
+                'introduction' => '2.3.0',
+                'default' => 'none://localhost',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_LIMIT_REALTIME_SUBSCRIPTIONS',
+                'description' => 'Maximum number of subscriptions one realtime connection can hold. Raising it lets one connection use more of the realtime server memory. Default value is: 100.',
+                'introduction' => '2.7.0',
+                'default' => '100',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_LIMIT_REALTIME_CHANNELS',
+                'description' => 'Maximum number of channels one realtime connection can subscribe to, counted across all of its subscriptions. Raising it lets one connection use more of the realtime server memory. Default value is: 100.',
+                'introduction' => '2.7.0',
+                'default' => '100',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_LIMIT_REALTIME_QUERIES',
+                'description' => 'Maximum number of queries one realtime connection can hold, counted across all of its subscriptions and including queries nested in and/or. Raising it lets one connection use more of the realtime server memory. Default value is: 100.',
+                'introduction' => '2.7.0',
+                'default' => '100',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ]
+        ],
+    ],
+    [
+        'category' => 'Database',
+        'description' => 'Appwrite uses a database for storing user and meta data. You can choose between PostgreSQL, MariaDB or MongoDB.',
+        'variables' => [
+            [
+                'name' => '_APP_DB_ADAPTER',
+                'description' => 'Which database to use. Must be one of: PostgreSQL, MariaDB, or MongoDB',
+                'introduction' => '1.9.0',
+                'default' => 'postgresql',
+                'required' => true,
+                'question' => 'Choose your database (postgresql|mariadb|mongodb)',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_REALTIME_BOOT_TIMEOUT',
+                'description' => 'Seconds a realtime server waits at boot for the cleanup of presences left by stopped realtime servers. Presence updates wait for the cleanup until this passes, then go ahead, and the cleanup carries on in the background. Set it to 0 to never wait; a user who reconnects during the cleanup may then keep showing as online until the next cleanup. Applies to self-hosted only. Default value is: 30.',
+                'introduction' => '2.7.0',
+                'default' => '30',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_HOST',
+                'description' => 'Database server host name address. Default value is: \'postgresql\'.',
+                'introduction' => '',
+                'default' => 'postgresql',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_PORT',
+                'description' => 'Database server TCP port. Default value is: \'5432\'.',
+                'introduction' => '',
+                'default' => '5432',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_SCHEMA',
+                'description' => 'Database server database schema. Default value is: \'appwrite\'.',
+                'introduction' => '',
+                'default' => 'appwrite',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_USER',
+                'description' => 'Database server user name. Default value is: \'user\'.',
+                'introduction' => '',
+                'default' => 'user',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_PASS',
+                'description' => 'Database server user password. Default value is: \'password\'.',
+                'introduction' => '',
+                'default' => 'password',
+                'required' => false,
+                'question' => '',
+                'filter' => 'password'
+            ],
+            [
+                'name' => '_APP_DB_ROOT_PASS',
+                'description' => 'Database server root password. Default value is: \'rootsecretpassword\'.',
+                'introduction' => '',
+                'default' => 'rootsecretpassword',
+                'required' => false,
+                'question' => '',
+                'filter' => 'password'
+            ],
+            [
+                'name' => '_APP_DB_MAX_CONNECTIONS',
+                'description' => 'Maximum number of connections the bundled PostgreSQL server accepts. Every API worker and worker coroutine holds its own connections, so raise it on hosts with many cores. Default value is: 500.',
+                'introduction' => '2.7.0',
+                'default' => '500',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_ADAPTER_DOCUMENTSDB',
+                'description' => 'Engine backing DocumentsDB. Only MongoDB is supported. Default value is: mongodb.',
+                'introduction' => '2.0.0',
+                'default' => 'mongodb',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_HOST_DOCUMENTSDB',
+                'description' => 'DocumentsDB server host name address. Requires a reachable MongoDB. Default value is: mongodb.',
+                'introduction' => '2.0.0',
+                'default' => 'mongodb',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_PORT_DOCUMENTSDB',
+                'description' => 'DocumentsDB server TCP port. Default value is: 27017.',
+                'introduction' => '2.0.0',
+                'default' => '27017',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_SCHEMA_DOCUMENTSDB',
+                'description' => 'DocumentsDB schema name. Falls back to _APP_DB_SCHEMA when empty.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_USER_DOCUMENTSDB',
+                'description' => 'DocumentsDB server user name. Falls back to _APP_DB_USER when empty.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_PASS_DOCUMENTSDB',
+                'description' => 'DocumentsDB server user password. Falls back to _APP_DB_PASS when empty.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_ADAPTER_VECTORSDB',
+                'description' => 'Engine backing VectorsDB. Only PostgreSQL is supported. Default value is: postgresql.',
+                'introduction' => '2.0.0',
+                'default' => 'postgresql',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_HOST_VECTORSDB',
+                'description' => 'VectorsDB server host name address. Requires a reachable PostgreSQL. Default value is: postgresql.',
+                'introduction' => '2.0.0',
+                'default' => 'postgresql',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_PORT_VECTORSDB',
+                'description' => 'VectorsDB server TCP port. Default value is: 5432.',
+                'introduction' => '2.0.0',
+                'default' => '5432',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_SCHEMA_VECTORSDB',
+                'description' => 'VectorsDB schema name. Falls back to _APP_DB_SCHEMA when empty.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_USER_VECTORSDB',
+                'description' => 'VectorsDB server user name. Falls back to _APP_DB_USER when empty.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DB_PASS_VECTORSDB',
+                'description' => 'VectorsDB server user password. Falls back to _APP_DB_PASS when empty.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONNECTIONS_DATABASE_DOCUMENTSDB',
+                'description' => 'Full DocumentsDB connection string, overriding the _APP_DB_*_DOCUMENTSDB values. Format: db_main=mongodb://user:pass@host:port/schema.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONNECTIONS_DATABASE_VECTORSDB',
+                'description' => 'Full VectorsDB connection string, overriding the _APP_DB_*_VECTORSDB values. Format: db_main=postgresql://user:pass@host:port/schema.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_LIMIT_DATABASE_BATCH',
+                'description' => 'Maximum number of rows or documents accepted by a single bulk database operation (createRows, upsertRows, updateRows, deleteRows and their document equivalents). Raising it increases memory use and query size per request, so tune it to what your database can handle. Default value is: 100.',
+                'introduction' => '2.0.0',
+                'default' => '100',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOCUMENTSDB',
+                'description' => 'Enables the DocumentsDB API, which runs on MongoDB. The installer does not deploy MongoDB, so provision one and point the _APP_DB_*_DOCUMENTSDB variables at it before enabling this; until then the /v1/documentsdb routes return a service disabled error. Default value is: disabled.',
+                'introduction' => '2.0.0',
+                'default' => 'disabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VECTORSDB',
+                'description' => 'Enables the VectorsDB API, which runs on PostgreSQL. The installer does not deploy a PostgreSQL for it, so provision one and point the _APP_DB_*_VECTORSDB variables at it before enabling this; until then the /v1/vectorsdb routes return a service disabled error. Default value is: disabled.',
+                'introduction' => '2.0.0',
+                'default' => 'disabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_EMBEDDING',
+                'description' => 'Enables the embeddings API, backed by the resource-heavy appwrite-embedding container. That container sits behind the "embedding" Compose profile, so add "embedding" to COMPOSE_PROFILES to start it. Set this to "disabled" to have the /v1/embeddings routes return a service disabled error instead of reaching for the container. Default value is: enabled.',
+                'introduction' => '2.0.0',
+                'default' => 'enabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'Redis',
+        'description' => 'Appwrite uses a Redis server for managing cache, queues and scheduled tasks. The Redis env vars are used to allow Appwrite server to connect to the Redis container.',
+        'variables' => [
+            [
+                'name' => '_APP_REDIS_HOST',
+                'description' => 'Redis server hostname address. Default value is: \'redis\'.',
+                'introduction' => '',
+                'default' => 'redis',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_REDIS_PORT',
+                'description' => 'Redis server TCP port. Default value is: \'6379\'.',
+                'introduction' => '',
+                'default' => '6379',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_REDIS_USER',
+                'description' => 'Redis server user. This is an optional variable. Default value is an empty string.',
+                'introduction' => '0.7',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_REDIS_PASS',
+                'description' => 'Redis server password. This is an optional variable. Default value is an empty string.',
+                'introduction' => '0.7',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'MQTT',
+        'description' => 'Appwrite runs an MQTT broker that delivers push notifications to devices. Traefik terminates TLS for MQTT (mqtts) and MQTT over WebSocket (wss) and forwards both to the appwrite-mqtt container.',
+        'variables' => [
+            [
+                'name' => '_APP_MQTT_PORT',
+                'description' => 'Host port Traefik publishes for MQTT over TLS (mqtts). Change it when the port is already taken on the host. Default value is: \'8883\'.',
+                'introduction' => '2.3.0',
+                'default' => '8883',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MQTT_WSS_PORT',
+                'description' => 'Host port Traefik publishes for MQTT over secure WebSocket (wss), used by browser clients. Change it when the port is already taken on the host. Default value is: \'8084\'.',
+                'introduction' => '2.3.0',
+                'default' => '8084',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MQTT_REPLAY_DEPTH',
+                'description' => 'Maximum number of missed QoS 1 messages the broker replays per topic when a device resubscribes after being offline. Minimum 1. Default value is: \'5\'.',
+                'introduction' => '2.3.0',
+                'default' => '5',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MQTT_MAX_PACKET_SIZE',
+                'description' => 'Maximum size in bytes of a single MQTT packet the broker accepts. Default value is: \'64000\'.',
+                'introduction' => '2.3.0',
+                'default' => '64000',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'InfluxDB',
+        'description' => 'Deprecated since 1.4.8.',
+        'variables' => [
+            [
+                'name' => '_APP_INFLUXDB_HOST',
+                'description' => 'InfluxDB server host name address. Default value is: \'influxdb\'.',
+                'introduction' => '',
+                'default' => 'influxdb',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_INFLUXDB_PORT',
+                'description' => 'InfluxDB server TCP port. Default value is: \'8086\'.',
+                'introduction' => '',
+                'default' => '8086',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'StatsD',
+        'description' => 'Deprecated since 1.4.8.',
+        'variables' => [
+            [
+                'name' => '_APP_STATSD_HOST',
+                'description' => 'StatsD server host name address. Default value is: \'telegraf\'.',
+                'introduction' => '',
+                'default' => 'telegraf',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_STATSD_PORT',
+                'description' => 'StatsD server TCP port. Default value is: \'8125\'.',
+                'introduction' => '',
+                'default' => '8125',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'SMTP',
+        'description' => "Appwrite is using an SMTP server for emailing your projects users and server admins. The SMTP env vars are used to allow Appwrite server to connect to the SMTP container.\n\nIf running in production, it might be easier to use a 3rd party SMTP server as it might be a little more difficult to set up a production SMTP server that will not send all your emails into your user\'s SPAM folder.",
+        'variables' => [
+            [
+                'name' => '_APP_SMTP_HOST',
+                'description' => 'SMTP server host name address. Use an empty string to disable all mail sending from the server. The default value for this variable is an empty string',
+                'introduction' => '',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SMTP_PORT',
+                'description' => 'SMTP server TCP port. Empty by default.',
+                'introduction' => '',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SMTP_SECURE',
+                'description' => 'SMTP secure connection protocol. Empty by default, change to \'tls\' or \'ssl\' if running on a secure connection.',
+                'introduction' => '',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SMTP_USERNAME',
+                'description' => 'SMTP server user name. Empty by default.',
+                'introduction' => '',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SMTP_PASSWORD',
+                'description' => 'SMTP server user password. Empty by default.',
+                'introduction' => '',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'Phone',
+        'description' => '',
+        'variables' => [
+            [
+                'name' => '_APP_SMS_PROVIDER',
+                'description' => "Provider used for delivering SMS for Phone authentication. Use the following format: 'sms://[USER]:[SECRET]@[PROVIDER]'.\n\nEnsure `[USER]` and `[SECRET]` are URL encoded if they contain any non-alphanumeric characters.\n\nAvailable providers are twilio, Textmagic, telesign, msg91, and vonage.",
+                'introduction' => '0.15.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SMS_FROM',
+                'description' => 'Phone number, or an alphanumeric sender ID where the provider supports it, used for sending out messages. A phone number must start with a leading \'+\' and have a maximum of 15 digits without spaces (+123456789). If using Twilio, this may also be a Messaging Service SID, starting with MG.',
+                'introduction' => '0.15.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'Storage',
+        'description' => '',
+        'variables' => [
+            [
+                'name' => '_APP_STORAGE_LIMIT',
+                'description' => 'Maximum file size allowed for file upload. The default value is 30MB. You should pass your size limit value in bytes.',
+                'introduction' => '0.7.0',
+                'default' => '30000000',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_STORAGE_PREVIEW_LIMIT',
+                'description' => 'Maximum file size allowed for file image preview. The default value is 20MB. You should pass your size limit value in bytes.',
+                'introduction' => '0.13.4',
+                'default' => '20000000',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_AUTOGRAVITY_HOST',
+                'description' => 'The host of the Autogravity service (for example `http://appwrite-autogravity:8080`) used to detect the focal point when a file preview requests `gravity=auto`. Leave empty to disable automatic gravity; the other gravity values keep working.',
+                'introduction' => '2.1.0',
+                'default' => '',
+                'required' => false,
+                'overwrite' => true,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_EXIFTOOL_HOST',
+                'description' => 'The host of the ExifTool service (for example `http://appwrite-exiftool:8080`) used to remove metadata from images uploaded to buckets with `stripMetadata` enabled. Leave empty to disable stripping; those images are then stored as uploaded.',
+                'introduction' => '2.6.0',
+                'default' => '',
+                'required' => false,
+                'overwrite' => true,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_STORAGE_ANTIVIRUS',
+                'description' => 'This variable allows you to disable the internal anti-virus scans. This value is set to \'disabled\' by default, to enable the scans set the value to \'enabled\'. Before enabling, you must add the ClamAV service and depend on it on main Appwrite service.',
+                'introduction' => '',
+                'default' => 'disabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_STORAGE_ANTIVIRUS_HOST',
+                'description' => 'ClamAV server host name address. Default value is: \'clamav\'.',
+                'introduction' => '0.7.0',
+                'default' => 'clamav',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_STORAGE_ANTIVIRUS_PORT',
+                'description' => 'ClamAV server TCP port. Default value is: \'3310\'.',
+                'introduction' => '0.7.0',
+                'default' => '3310',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_STORAGE_DEVICE',
+                'description' => 'Select the default storage device. Supported adapters are \'local\', \'s3\', \'dospaces\', \'backblaze\', \'linode\', and \'wasabi\'. Configure object storage with _APP_STORAGE_S3_* variables. Deprecated provider-specific variables remain available as fallbacks for backward compatibility, but Open Runtimes Orchestrator does not support those fallback variables.',
+                'introduction' => '0.13.0',
+                'default' => 'local',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_S3_ACCESS_KEY',
+                'description' => 'S3 storage access key. Required when the storage adapter is set to S3. You can get your access key from your S3 storage provider',
+                'introduction' => '0.13.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_S3_SECRET',
+                'description' => 'S3 storage secret key. Required when the storage adapter is set to S3. You can get your secret key from your S3 storage provider.',
+                'introduction' => '0.13.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_S3_REGION',
+                'description' => 'S3 storage region. Required when storage adapter is set to S3. You can find your region info for your bucket from your S3 storage provider.',
+                'introduction' => '0.13.0',
+                'default' => 'us-east-1',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_S3_BUCKET',
+                'description' => 'S3 storage bucket. Required when storage adapter is set to S3. You can create buckets in your S3 storage provider.',
+                'introduction' => '0.13.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_S3_ENDPOINT',
+                'description' => 'S3 storage endpoint. Required when using S3 storage providers other than AWS.',
+                'introduction' => '0.16.2',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_S3_PATH_STYLE',
+                'description' => 'Whether requests to _APP_STORAGE_S3_ENDPOINT name the bucket in the path. Set to \'enabled\' when the endpoint is the bare service, or \'disabled\' when it already addresses the bucket. Leave empty to infer it: the endpoint addresses the bucket when its host is the bucket name (a dotted domain), its host begins with the bucket name followed by a dot, or its path ends with the bucket name. A custom domain or CNAME pointing at the bucket is not detected; set \'disabled\'.',
+                'introduction' => '2.6.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_DO_SPACES_ACCESS_KEY',
+                'description' => 'Deprecated. DigitalOcean Spaces access key retained for backward compatibility. Use _APP_STORAGE_S3_ACCESS_KEY instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.13.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_DO_SPACES_SECRET',
+                'description' => 'Deprecated. DigitalOcean Spaces secret key retained for backward compatibility. Use _APP_STORAGE_S3_SECRET instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.13.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_DO_SPACES_REGION',
+                'description' => 'Deprecated. DigitalOcean Spaces region retained for backward compatibility. Use _APP_STORAGE_S3_REGION instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.13.0',
+                'default' => 'us-east-1',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_DO_SPACES_BUCKET',
+                'description' => 'Deprecated. DigitalOcean Spaces bucket retained for backward compatibility. Use _APP_STORAGE_S3_BUCKET instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.13.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_BACKBLAZE_ACCESS_KEY',
+                'description' => 'Deprecated. Backblaze access key retained for backward compatibility. Use _APP_STORAGE_S3_ACCESS_KEY instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_BACKBLAZE_SECRET',
+                'description' => 'Deprecated. Backblaze secret key retained for backward compatibility. Use _APP_STORAGE_S3_SECRET instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_BACKBLAZE_REGION',
+                'description' => 'Deprecated. Backblaze region retained for backward compatibility. Use _APP_STORAGE_S3_REGION instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => 'us-west-004',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_BACKBLAZE_BUCKET',
+                'description' => 'Deprecated. Backblaze bucket retained for backward compatibility. Use _APP_STORAGE_S3_BUCKET instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_LINODE_ACCESS_KEY',
+                'description' => 'Deprecated. Linode Object Storage access key retained for backward compatibility. Use _APP_STORAGE_S3_ACCESS_KEY instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_LINODE_SECRET',
+                'description' => 'Deprecated. Linode Object Storage secret key retained for backward compatibility. Use _APP_STORAGE_S3_SECRET instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_LINODE_REGION',
+                'description' => 'Deprecated. Linode Object Storage region retained for backward compatibility. Use _APP_STORAGE_S3_REGION instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => 'eu-central-1',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_LINODE_BUCKET',
+                'description' => 'Deprecated. Linode Object Storage bucket retained for backward compatibility. Use _APP_STORAGE_S3_BUCKET instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_WASABI_ACCESS_KEY',
+                'description' => 'Deprecated. Wasabi access key retained for backward compatibility. Use _APP_STORAGE_S3_ACCESS_KEY instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_WASABI_SECRET',
+                'description' => 'Deprecated. Wasabi secret key retained for backward compatibility. Use _APP_STORAGE_S3_SECRET instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_WASABI_REGION',
+                'description' => 'Deprecated. Wasabi region retained for backward compatibility. Use _APP_STORAGE_S3_REGION instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => 'eu-central-1',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_WASABI_BUCKET',
+                'description' => 'Deprecated. Wasabi bucket retained for backward compatibility. Use _APP_STORAGE_S3_BUCKET instead; Open Runtimes Orchestrator does not support this provider-specific variable.',
+                'introduction' => '0.14.2',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_CONNECTIONS_STORAGE_CACHE',
+                'description' => 'DSN of the storage device for cached API responses, such as s3://key:secret@host/bucket?region=us-east-1. Empty keeps them on the local filesystem. Takes effect with _APP_STORAGE_CACHE_PERCENT.',
+                'introduction' => '2.8.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+            ],
+            [
+                'name' => '_APP_STORAGE_CACHE_PERCENT',
+                'description' => 'Percentage of cached API responses, from 0 to 100, stored on the _APP_CONNECTIONS_STORAGE_CACHE device. The rest stay on the local filesystem.',
+                'introduction' => '2.8.0',
+                'default' => '0',
+                'required' => false,
+                'question' => '',
+            ],
+        ],
+    ],
+    [
+        'category' => 'Functions',
+        'description' => '',
+        'variables' => [
+            [
+                'name' => '_APP_FUNCTIONS_SIZE_LIMIT',
+                'description' => 'Deprecated since 1.7.0. The maximum size of a function in bytes. The default value is 30MB.',
+                'introduction' => '0.13.0',
+                'default' => '30000000',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPUTE_SIZE_LIMIT',
+                'description' => 'The maximum size of a function and site deployments in bytes. The default value is 30MB.',
+                'introduction' => '1.7.0',
+                'default' => '30000000',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_BUILD_SIZE_LIMIT',
+                'description' => 'Deprecated since 1.7.0, use _APP_COMPUTE_BUILD_SIZE_LIMIT instead. The maximum size of a built deployment in bytes. The default value is 2,000,000,000 (2GB), and the maximum value is 4,294,967,295 (4.2GB).',
+                'introduction' => '1.6.0',
+                'default' => '2000000000',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPUTE_BUILD_SIZE_LIMIT',
+                'description' => 'The maximum size of a built function or site deployment in bytes. The default value is 2,000,000,000 (2GB), and the maximum value is 4,294,967,295 (4.2GB).',
+                'introduction' => '1.7.0',
+                'default' => '2000000000',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_TIMEOUT',
+                'description' => 'The maximum number of seconds allowed as a timeout value when creating a new function. The default value is 900 seconds. This is the global limit, timeout for individual functions are configured in the function\'s settings or in appwrite.config.json.',
+                'introduction' => '0.7.0',
+                'default' => '900',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_BUILD_TIMEOUT',
+                'description' => 'Deprecated since 1.7.0. The maximum number of seconds allowed as a timeout value when building a new function. The default value is 2700 seconds.',
+                'introduction' => '0.13.0',
+                'default' => '2700',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPUTE_BUILD_TIMEOUT',
+                'description' => 'The maximum number of seconds allowed as a timeout value when building a new function or site. The default value is 2700 seconds.',
+                'introduction' => '1.7.0',
+                'default' => '2700',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_CONTAINERS',
+                'description' => 'Deprecated since 1.2.0. Runtimes now timeout by inactivity using \'_APP_FUNCTIONS_INACTIVE_THRESHOLD\'.',
+                'introduction' => '0.7.0',
+                'default' => '10',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_CPUS',
+                'description' => 'Deprecated since 1.7.0. The maximum number of CPU core a single cloud function is allowed to use. Please note that setting a value higher than available cores will result in a function error, which might result in an error. The default value is empty. When it\'s empty or 0, CPU limit will be disabled',
+                'introduction' => '0.7.0',
+                'default' => '0',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPUTE_CPUS',
+                'description' => 'The maximum number of CPU core a single cloud function or a site is allowed to use. Please note that setting a value higher than available cores might result in an error. The default value is empty. When it\'s empty, CPU limit will be disabled.',
+                'introduction' => '1.7.0',
+                'default' => '0',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_MEMORY',
+                'description' => 'Deprecated since 1.7.0. The maximum amount of memory a single cloud function is allowed to use in megabytes. The default value is  empty. When it\'s empty or 0, memory limit will be disabled.',
+                'introduction' => '0.7.0',
+                'default' => '0',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPUTE_MEMORY',
+                'description' => 'The maximum amount of memory a single function or site is allowed to use in megabytes. The default value is  empty. When it\'s empty, memory limit will be disabled.',
+                'introduction' => '1.7.0',
+                'default' => '0',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_MEMORY_SWAP',
+                'description' => 'Deprecated since 1.2.0. High use of swap memory is not recommended to preserve harddrive health.',
+                'introduction' => '0.7.0',
+                'default' => '0',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_RUNTIMES',
+                'description' => "This option allows you to enable or disable runtime environments for cloud functions. Disable unused runtimes to save disk space.\n\nTo enable cloud function runtimes, pass a list of enabled environments separated by a comma.\n\nCurrently, supported environments are: " . \implode(', ', \array_keys(Config::getParam('runtimes'))),
+                'introduction' => '0.8.0',
+                'default' => 'node-16.0,node-22,php-8.0,python-3.9,ruby-3.0',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_EXECUTOR_SECRET',
+                'description' => 'The secret key used by Appwrite to communicate with the function executor. Make sure to change this.',
+                'introduction' => '0.13.0',
+                'default' => 'your-secret-key',
+                'required' => false,
+                'question' => '',
+                'filter' => 'token'
+            ],
+            [
+                'name' => '_APP_EXECUTOR_HOST',
+                'description' => 'The host used by Appwrite to communicate with the function executor.',
+                'introduction' => '0.13.0',
+                'default' => 'http://exc1/v1',
+                'required' => false,
+                'overwrite' => true,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_EXECUTOR_CONNECTION_STORAGE',
+                'description' => "DSN for Open Runtimes executor storage. When `_APP_STORAGE_DEVICE` is not local, point this at the same backend so the executor can read deployment artifacts. Defaults to `local://localhost`.\n\nExamples:\n- Local: `local://localhost`\n- AWS S3: `s3://ACCESS_KEY:SECRET@BUCKET.s3.REGION.amazonaws.com?region=REGION`\n- S3-compatible (`_APP_STORAGE_S3_ENDPOINT` set): `s3://ACCESS_KEY:SECRET@localhost?region=REGION&url=http%3A%2F%2Fminio%3A9000` — leave the bucket out of the DSN path; Appwrite keys objects under `BUCKET/` already, so the executor must not add it to the endpoint",
+                'introduction' => '1.9.5',
+                'default' => 'local://localhost',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_BUILDS_VOLUME',
+                'description' => 'The Docker volume (or Kubernetes PersistentVolumeClaim) holding build storage. Jobs-service build workers attach only the current project\'s subdirectory (`app-<projectId>`) so they write output directly onto it without seeing other projects. Must match the storage the "builds" device is backed by.',
+                'introduction' => '1.9.0',
+                'default' => 'appwrite-builds',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_JOBS_HOST',
+                'description' => 'The host used by Appwrite to communicate with the open-runtimes orchestrator that builds manual-upload function deployments.',
+                'introduction' => '1.9.0',
+                'default' => 'http://orchestrator:8080',
+                'required' => false,
+                'overwrite' => true,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_JOBS_SECRET',
+                'description' => 'The secret used to authenticate with the jobs-service and to sign/verify job callback (HMAC) requests. The installer generates a unique value. `/v1/jobs/event` rejects signatures when this is empty or the public `your-secret-key` placeholder. **Keep it a secret**.',
+                'introduction' => '1.9.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => 'token'
+            ],
+            [
+                'name' => '_APP_JOBS_ENDPOINT',
+                'description' => 'Internal Appwrite endpoint the jobs-service (and the containers it spawns) use to reach the API over the Docker network for presigned artifact + callback URLs.',
+                'introduction' => '1.9.0',
+                'default' => 'http://appwrite',
+                'required' => false,
+                'overwrite' => true,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_BROWSER_HOST',
+                'description' => 'The host used by Appwrite to communicate with the browser service for screenshots.',
+                'introduction' => '1.8.0',
+                'default' => 'http://appwrite-browser:3000/v1',
+                'required' => false,
+                'overwrite' => true,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_EXECUTOR_RUNTIME_NETWORK',
+                'description' => 'Deprecated with 0.14.0, use \'OPEN_RUNTIMES_NETWORK\' instead.',
+                'introduction' => '0.13.0',
+                'default' => 'appwrite_runtimes',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_ENVS',
+                'description' => 'Deprecated with 0.8.0, use \'_APP_FUNCTIONS_RUNTIMES\' instead.',
+                'introduction' => '0.7.0',
+                'default' => 'node-16.0,php-7.4,python-3.9,ruby-3.0',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_INACTIVE_THRESHOLD',
+                'description' => 'Deprecated since 1.7.0. The minimum time a function must be inactive before it can be shut down and cleaned up. This feature is intended to clean up unused containers. Containers may remain active for longer than the interval before being shut down, as Appwrite only cleans up unused containers every hour. If no value is provided, the default is 60 seconds.',
+                'introduction' => '0.13.0',
+                'default' => '60',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPUTE_INACTIVE_THRESHOLD',
+                'description' => 'The minimum time a function or site must be inactive before it can be shut down and cleaned up. This feature is intended to clean up unused containers. Containers may remain active for longer than the interval before being shut down, as Appwrite only cleans up unused containers every hour. If no value is provided, the default is 60 seconds.',
+                'introduction' => '1.7.0',
+                'default' => '60',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => 'DOCKERHUB_PULL_USERNAME',
+                'description' => 'Deprecated with 1.2.0, use \'_APP_DOCKER_HUB_USERNAME\' instead.',
+                'introduction' => '0.10.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => 'DOCKERHUB_PULL_PASSWORD',
+                'description' => 'Deprecated with 1.2.0, use \'_APP_DOCKER_HUB_PASSWORD\' instead.',
+                'introduction' => '0.10.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => 'DOCKERHUB_PULL_EMAIL',
+                'description' => 'Deprecated since 1.2.0. Email is no longer needed.',
+                'introduction' => '0.10.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => 'OPEN_RUNTIMES_NETWORK',
+                'description' => 'Deprecated with 1.2.0, use \'_APP_FUNCTIONS_RUNTIMES_NETWORK\' instead.',
+                'introduction' => '0.13.0',
+                'default' => 'appwrite_runtimes',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_RUNTIMES_NETWORK',
+                'description' => 'Deprecated since 1.7.0. The docker network used for communication between the executor and runtimes.',
+                'introduction' => '1.2.0',
+                'default' => 'runtimes',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPUTE_RUNTIMES_NETWORK',
+                'description' => 'The docker network used for communication between the executor and runtimes for sites and functions.',
+                'introduction' => '1.7.0',
+                'default' => 'runtimes',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_OPEN_RUNTIMES_NFT',
+                'description' => 'Enables dependency tracing for Open Runtimes build artifacts. When enabled, supported SSR site builds prune unused node_modules files before packaging the build output.',
+                'introduction' => '1.9.0',
+                'default' => 'enabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOCKER_HUB_USERNAME',
+                'description' => 'The username for hub.docker.com. This variable is used to pull images from hub.docker.com.',
+                'introduction' => '1.2.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_DOCKER_HUB_PASSWORD',
+                'description' => 'The password for hub.docker.com. This variable is used to pull images from hub.docker.com.',
+                'introduction' => '1.2.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_MAINTENANCE_INTERVAL',
+                'description' => 'Deprecated since 1.7.0. Interval value containing the number of seconds that the executor should wait before checking for inactive runtimes. The default value is 3600 seconds (1 hour).',
+                'introduction' => '1.4.0',
+                'default' => '3600',
+                'required' => false,
+                'overwrite' => true,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPUTE_MAINTENANCE_INTERVAL',
+                'description' => 'Interval value containing the number of seconds that the executor should wait before checking for inactive runtimes of functions and sites. The default value is 3600 seconds (1 hour).',
+                'introduction' => '1.7.0',
+                'default' => '3600',
+                'required' => false,
+                'overwrite' => true,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_COMPUTE_STREAMING',
+                'description' => 'Allows a function or site served on its domain to send its response in chunks as the runtime produces it, so a progressively rendered page or an event stream reaches the client before it has finished. By default, set to \'enabled\'. Set to \'disabled\' to send each response only once it is complete. Requires an executor that supports response format 0.12.0.',
+                'introduction' => '2.7.0',
+                'default' => 'enabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_FUNCTIONS_SCHEDULE_SPREAD',
+                'description' => 'Number of seconds over which scheduled executions sharing the same cron slot are spread, using a stable per-function offset, so they don\'t all start in the same second. Each function keeps a consistent slot within the window, preserving exact run intervals. The default value is 0 (disabled): every execution is enqueued at the exact cron time.',
+                'introduction' => '2.0.0',
+                'default' => '0',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'Sites',
+        'description' => '',
+        'variables' => [
+            [
+                'name' => '_APP_SITES_TIMEOUT',
+                'description' => 'The maximum number of seconds allowed as a timeout value when creating a new site. The default value is 900 seconds. This is the global limit, timeout for individual functions are configured in the sites\'s settings or in appwrite.config.json.',
+                'introduction' => '1.7.0',
+                'default' => '900',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_SITES_RUNTIMES',
+                'description' => "This option allows you to enable or disable runtime environments for Sites. Disable unused runtimes to save disk space.\n\nTo enable cloud site runtimes, pass a list of enabled environments separated by a comma.\n\nCurrently, supported environments are: " . \implode(', ', \array_keys(Config::getParam('runtimes'))),
+                'introduction' => '1.7.0',
+                'default' => 'static-1,node-22,flutter-3.29',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ]
+    ],
+    [
+        'category' => 'VCS (Version Control System)',
+        'description' => '',
+        'variables' => [
+            [
+                'name' => '_APP_VCS_GITHUB_APP_NAME',
+                'description' => 'Name of your GitHub app. This value should be set to your GitHub application\'s URL.',
+                'introduction' => '1.4.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITHUB_PRIVATE_KEY',
+                'description' => 'GitHub app RSA private key. You can generate private keys from GitHub application settings.',
+                'introduction' => '1.4.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITHUB_APP_ID',
+                'description' => 'GitHub application ID. You can find it in your GitHub application details.',
+                'introduction' => '1.4.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITHUB_CLIENT_ID',
+                'description' => 'GitHub client ID. You can find it in your GitHub application details.',
+                'introduction' => '1.4.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITHUB_CLIENT_SECRET',
+                'description' => 'GitHub client secret. You can generate secrets in your GitHub application settings.',
+                'introduction' => '1.4.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITHUB_WEBHOOK_SECRET',
+                'description' => 'GitHub webhook secret. You can configure it in your GitHub application settings under webhook section.',
+                'introduction' => '1.4.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITEA_ENDPOINT',
+                'description' => 'URL of your self-hosted Gitea instance, reachable from the Appwrite server (e.g. for API calls and webhook token exchange).',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITEA_BROWSER_ENDPOINT',
+                'description' => 'URL of your Gitea instance reachable from the browser, if different from _APP_VCS_GITEA_ENDPOINT (e.g. when Appwrite and Gitea are on the same Docker network but Gitea is exposed to the browser on a different host). Falls back to _APP_VCS_GITEA_ENDPOINT when unset.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITEA_CLIENT_ID',
+                'description' => 'Gitea OAuth2 application client ID. You can generate one in your Gitea instance under Settings > Applications.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITEA_CLIENT_SECRET',
+                'description' => 'Gitea OAuth2 application client secret. You can generate one in your Gitea instance under Settings > Applications.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITEA_WEBHOOK_SECRET',
+                'description' => 'Secret used to validate incoming Gitea webhook payloads.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITLAB_ENDPOINT',
+                'description' => 'URL of your self-hosted GitLab instance, reachable from the Appwrite server and the browser. Defaults to https://gitlab.com when unset.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITLAB_CLIENT_ID',
+                'description' => 'GitLab OAuth2 application client ID. You can generate one in your GitLab instance under Settings > Applications.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITLAB_CLIENT_SECRET',
+                'description' => 'GitLab OAuth2 application client secret. You can generate one in your GitLab instance under Settings > Applications.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_GITLAB_WEBHOOK_SECRET',
+                'description' => 'Secret used to validate incoming GitLab webhook payloads.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_BITBUCKET_CLIENT_ID',
+                'description' => 'Bitbucket OAuth2 consumer key. You can generate one in your Bitbucket workspace under Settings > OAuth consumers.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_BITBUCKET_CLIENT_SECRET',
+                'description' => 'Bitbucket OAuth2 consumer secret. You can generate one in your Bitbucket workspace under Settings > OAuth consumers.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_BITBUCKET_WEBHOOK_SECRET',
+                'description' => 'Secret used to validate incoming Bitbucket webhook payloads.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_ORIGIN_CLIENT_ID',
+                'description' => 'Origin app client ID. You can find it in your Origin app details on Cursor.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_ORIGIN_PRIVATE_KEY',
+                'description' => 'Origin app private key. You can generate private keys from your Origin app settings on Cursor.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_ENTIRE_PLUGIN',
+                'description' => 'Entire plugin slug, as registered with Entire. It names the plugin in Entire\'s API and is the audience of the webhook tokens Entire signs for it.',
+                'introduction' => '2.6.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_ENTIRE_PRIVATE_KEY',
+                'description' => 'Entire plugin private key: the Ed25519 key whose public half is registered on the plugin, as a PKCS#8 PEM.',
+                'introduction' => '2.6.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_ENTIRE_ISSUER',
+                'description' => 'Issuer registered on the Entire plugin: the iss claim of the JWTs Appwrite signs for it and the audience of the install receipts Entire signs back. Usually this server\'s public URL.',
+                'introduction' => '2.6.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_ENTIRE_ENDPOINT',
+                'description' => 'URL of the Entire core (control plane) Appwrite talks to. Any core serves any installation; defaults to https://us.auth.entire.io when unset, set it to a nearer jurisdiction such as https://eu.auth.entire.io.',
+                'introduction' => '2.6.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_VCS_WEBHOOK_URL',
+                'description' => 'Base URL Appwrite advertises to self-hosted VCS providers when registering repository webhooks, if different from the public domain (e.g. a Docker-internal address). Falls back to the public domain when unset.',
+                'introduction' => '2.0.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'Reviews',
+        'description' => 'AI code review for GitHub pull requests, run by the appwrite/hansi service. Optional: reviews stay off until `_APP_REVIEWS_SECRET` is set, and the installer adds the service only then. The service reads jobs from the Redis queue at `_APP_REDIS_HOST` and `_APP_REDIS_PORT`, with `_APP_REDIS_USER` and `_APP_REDIS_PASS`. It runs reviews read-only, without sandboxes. The GitHub App needs these repository permissions: Contents and Metadata (read), Pull requests, Issues and Checks (read and write). It must also subscribe to the "Pull request", "Issue comment" and "Pull request review comment" events. Comments that mention the app (`_APP_VCS_GITHUB_APP_NAME`) are answered, and "@app review" asks for a review.',
+        'variables' => [
+            [
+                'name' => '_APP_REVIEWS_SECRET',
+                'description' => 'Enables code reviews. The secret the code review service sends in the `X-Appwrite-Reviews-Secret` header to report results and request installation tokens. Leave it empty to keep reviews disabled: repositories cannot be enrolled, pull requests queue no reviews and the internal review routes reject every call. **Keep it a secret**.',
+                'introduction' => '2.7.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_REVIEWS_MODEL',
+                'description' => 'The model that reviews pull requests, as an AI Gateway model ID such as `anthropic/claude-sonnet-5.5`. Required when reviews are enabled.',
+                'introduction' => '2.7.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_REVIEWS_VERIFY_MODEL',
+                'description' => 'The model that double-checks findings before they are posted, as an AI Gateway model ID. Empty uses `_APP_REVIEWS_MODEL`.',
+                'introduction' => '2.7.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_REVIEWS_AI_GATEWAY_KEY',
+                'description' => 'API key for the Vercel AI Gateway, which serves the review models. **Keep it a secret**.',
+                'introduction' => '2.7.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'Maintenance',
+        'description' => '',
+        'variables' => [
+            [
+                'name' => '_APP_MAINTENANCE_INTERVAL',
+                'description' => 'How often, in seconds, the maintenance process runs system cleanups, and how often the scheduler runs maintenance for each project accessed in the last 30 days. Those projects are spread across five-minute slices like inactive ones, so use a multiple of 300. The default value is 86400 seconds (1 day).',
+                'introduction' => '0.7.0',
+                'default' => '86400',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_QUEUE_NAME',
+                'description' => 'Queue used for scheduled maintenance slices. Set the same value on the maintenance scheduler and workers. Defaults to v1-maintenance.',
+                'introduction' => '2.6.0',
+                'default' => 'v1-maintenance',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_INACTIVE_INTERVAL',
+                'description' => 'How often, in seconds, the scheduler runs maintenance for each project not accessed in the last 30 days or never accessed. Projects are spread across five-minute slices, so use a multiple of 300; a value under 600 gives a single slice that reaches every inactive project on each run. The scheduler dispatches each slice to the maintenance worker, which defers a slice while the deletes queue is backed up; a slice still deferred after a full interval gives way to its next run. The default value is 604800 seconds (7 days).',
+                'introduction' => '2.6.0',
+                'default' => '604800',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_DELAY',
+                'description' => 'Deprecated with 1.6.2 use _APP_MAINTENANCE_START_TIME instead to run the maintenance at a specific time per day.',
+                'introduction' => '1.5.0',
+                'default' => '0',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_START_TIME',
+                'description' => 'The time of day (in 24-hour format) when the maintenance process should start its system cleanups. Project maintenance runs in slices around the clock. The default value is 00:00.',
+                'introduction' => '1.6.2',
+                'default' => '00:00',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_RETENTION_CACHE',
+                'description' => 'The maximum duration (in seconds) upto which to retain cached files. The default value is 2592000 seconds (30 days).',
+                'introduction' => '1.0.0',
+                'default' => '2592000',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_RETENTION_EXECUTION',
+                'description' => 'The maximum duration (in seconds) upto which to retain execution logs. The default value is 1209600 seconds (14 days).',
+                'introduction' => '0.7.0',
+                'default' => '1209600',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_RETENTION_AUDIT',
+                'description' => 'The maximum duration (in seconds) upto which to retain audit logs. The default value is 1209600 seconds (14 days).',
+                'introduction' => '0.7.0',
+                'default' => '1209600',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_RETENTION_AUDIT_CONSOLE',
+                'description' => 'The maximum duration (in seconds) upto which to retain console audit logs. The default value is 15778800 seconds (6 months).',
+                'introduction' => '1.6.2',
+                'default' => '15778800',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_RETENTION_ABUSE',
+                'description' => 'The maximum duration (in seconds) upto which to retain abuse logs. The default value is 86400 seconds (1 day).',
+                'introduction' => '0.7.0',
+                'default' => '86400',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_RETENTION_SCHEDULES',
+                'description' => 'Schedules deletion interval ( in seconds ) ',
+                'introduction' => '2.0.0',
+                'default' => '86400',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_RETENTION_ALERTS',
+                'description' => 'How long a resolved alert is kept, in seconds. A firing alert is always kept. The default value is 7776000 seconds (90 days).',
+                'introduction' => '2.7.0',
+                'default' => '7776000',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ]
+        ],
+    ],
+    [
+        'category' => 'Usage',
+        'description' => 'Usage events and resource gauges stored in ClickHouse.',
+        'variables' => [
+            [
+                'name' => '_APP_USAGE_STATS',
+                'description' => 'Enable or disable usage statistics collection and APIs.',
+                'introduction' => '',
+                'default' => 'enabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONNECTIONS_DB_USAGE',
+                'description' => 'ClickHouse HTTP DSN used for usage storage. Set this to an external private ClickHouse DSN to replace the bundled service.',
+                'introduction' => '',
+                'default' => 'http://appwrite:appwrite@clickhouse:8123/appwrite',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_USAGE_PASS',
+                'description' => 'Password used only when creating the bundled ClickHouse appwrite user. On an existing volume, rotate the ClickHouse user with ALTER USER before updating this value and _APP_CONNECTIONS_DB_USAGE.',
+                'introduction' => '',
+                'default' => 'appwrite',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_POOL_SIZE_USAGE',
+                'description' => 'Maximum number of pooled ClickHouse HTTP clients per process.',
+                'introduction' => '',
+                'default' => '2',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_CONNECTIONS_DB_EXECUTIONS',
+                'description' => 'ClickHouse HTTP DSN used for execution storage. Defaults to _APP_CONNECTIONS_DB_USAGE.',
+                'introduction' => '',
+                'default' => 'http://appwrite:appwrite@clickhouse:8123/appwrite',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_POOL_SIZE_EXECUTIONS',
+                'description' => 'Maximum number of pooled ClickHouse HTTP clients per process for execution CRUD.',
+                'introduction' => '',
+                'default' => '2',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MAINTENANCE_RETENTION_USAGE_TTL',
+                'description' => 'Retention in days for raw and daily usage events. Gauges have no TTL. Set to 0 to disable event TTLs.',
+                'introduction' => '',
+                'default' => '180',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_STATS_USAGE_QUEUE_NAME',
+                'description' => 'Queue name for usage event ingestion.',
+                'introduction' => '',
+                'default' => 'v1-stats-usage',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_STATS_RESOURCES_QUEUE_NAME',
+                'description' => 'Queue name for usage resource gauge ingestion.',
+                'introduction' => '',
+                'default' => 'v1-stats-resources',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_STATS_RESOURCES_INTERVAL',
+                'description' => 'Interval in seconds between resource-count snapshots. Each active project is counted once per interval, at a slot spread across it.',
+                'introduction' => '',
+                'default' => '3600',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_ALERTS_INTERVAL',
+                'description' => 'Interval in seconds between two evaluations of each alert rule. Each rule is evaluated once per interval, at a slot spread across it. The default value is 60 seconds.',
+                'introduction' => '2.7.0',
+                'default' => '60',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_ALERTS_USAGE_LAG',
+                'description' => 'Seconds behind the evaluation time that usage monitors read usage, so events still being written are counted by a later evaluation instead of missed. The default value is 120 seconds.',
+                'introduction' => '2.7.0',
+                'default' => '120',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ]
+        ],
+    ],
+    [
+        'category' => 'GraphQL',
+        'description' => '',
+        'variables' => [
+            [
+                'name' => '_APP_GRAPHQL_INTROSPECTION',
+                'description' => 'Enable or disable GraphQL introspection. Set to \'enabled\' to allow schema introspection, or \'disabled\' to block it. The default value is \'enabled\'.',
+                'introduction' => '',
+                'default' => 'enabled',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_GRAPHQL_MAX_BATCH_SIZE',
+                'description' => 'Maximum number of batched queries per request. The default value is 10.',
+                'introduction' => '1.2.0',
+                'default' => '10',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_GRAPHQL_MAX_COMPLEXITY',
+                'description' => 'Maximum complexity of a GraphQL query. One field adds one to query complexity. Lists multiply the complexity by the number of items requested. The default value is 250.',
+                'introduction' => '1.2.0',
+                'default' => '250',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_GRAPHQL_MAX_DEPTH',
+                'description' => 'Maximum depth of a GraphQL query. One nested field level adds one to query depth. The default value is 3.',
+                'introduction' => '1.2.0',
+                'default' => '3',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+        ],
+    ],
+    [
+        'category' => 'Migrations',
+        'description' => '',
+        'variables' => [
+            [
+                'name' => '_APP_MIGRATION_HOST',
+                'description' => 'Internal hostname the migrations worker uses to reach this instance\'s API (for migrations and CSV/JSON imports & exports). Defaults to \'appwrite\', the API service name in the standard Docker Compose setup. Only change this for non-standard deployments.',
+                'introduction' => '1.9.0',
+                'default' => 'appwrite',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MIGRATIONS_FIREBASE_CLIENT_ID',
+                'description' => 'Google OAuth client ID. You can find it in your GCP application settings.',
+                'introduction' => '1.4.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ],
+            [
+                'name' => '_APP_MIGRATIONS_FIREBASE_CLIENT_SECRET',
+                'description' => 'Google OAuth client secret. You can generate secrets in your GCP application settings.',
+                'introduction' => '1.4.0',
+                'default' => '',
+                'required' => false,
+                'question' => '',
+                'filter' => ''
+            ]
+        ]
+    ]
+];

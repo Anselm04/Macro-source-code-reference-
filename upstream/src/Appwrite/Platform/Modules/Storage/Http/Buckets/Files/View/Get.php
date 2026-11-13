@@ -1,0 +1,279 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Storage\Http\Buckets\Files\View;
+
+use Appwrite\Extend\Exception;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\MethodType;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Storage\Encryption;
+use Appwrite\Utopia\Database\Documents\User;
+use Appwrite\Utopia\Response;
+use Utopia\Compression\Algorithms\GZIP;
+use Utopia\Compression\Algorithms\Zstd;
+use Utopia\Compression\Compression;
+use Utopia\Config\Config;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\PermissionType;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\Authorization\Input;
+use Utopia\Database\Validator\UID;
+use Utopia\Http\Adapter\Swoole\Request;
+use Utopia\Platform\Action;
+use Utopia\Platform\Scope\HTTP;
+use Utopia\Storage\Device;
+use Utopia\Validator\Text;
+
+class Get extends Action
+{
+    use HTTP;
+
+    public static function getName()
+    {
+        return 'getFileView';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_GET)
+            ->setHttpPath('/v1/storage/buckets/:bucketId/files/:fileId/view')
+            ->desc('Get file for view')
+            ->groups(['api', 'storage'])
+            ->label('scope', 'files.read')
+            ->label('usage.resource', 'bucket/{request.bucketId}/file/{request.fileId}')
+            ->label('resourceType', RESOURCE_TYPE_BUCKETS)
+            ->label('sdk', new Method(
+                namespace: 'storage',
+                group: 'files',
+                name: 'getFileView',
+                description: '/docs/references/storage/get-file-view.md',
+                auth: [AuthType::ADMIN, AuthType::SESSION, AuthType::KEY, AuthType::JWT],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_OK,
+                        model: Response::MODEL_NONE,
+                    )
+                ],
+                contentType: ContentType::ANY,
+                type: MethodType::LOCATION,
+                locationAuth: ['Project', 'Environment', 'ImpersonateUserId'],
+            ))
+            ->param('bucketId', '', new UID(), 'Storage bucket unique ID. You can create a new storage bucket using the Storage service [server integration](https://appwrite.io/docs/server/storage#createBucket).')
+            ->param('fileId', '', new UID(), 'File ID.')
+            // NOTE: this is only for the sdk generator and is not used in the action below and is utilised in `resources.php` for `resourceToken`.
+            ->param('token', '', new Text(512), 'File token for accessing this file.', true)
+            ->inject('response')
+            ->inject('request')
+            ->inject('dbForProject')
+            ->inject('mode')
+            ->inject('resourceToken')
+            ->inject('deviceForFiles')
+            ->inject('authorization')
+            ->inject('user')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        string $bucketId,
+        string $fileId,
+        ?string $token,
+        Response $response,
+        Request $request,
+        Database $dbForProject,
+        string $mode,
+        Document $resourceToken,
+        Device $deviceForFiles,
+        Authorization $authorization,
+        User $user
+    ) {
+        /* @type Document $bucket */
+        $bucket = $authorization->skip(fn () => $dbForProject->getDocument('buckets', $bucketId));
+
+        $isAPIKey = $user->isKey($authorization->getRoles());
+        $isPrivilegedUser = $user->isPrivileged($authorization->getRoles());
+
+        if ($bucket->isEmpty() || (!$bucket->getAttribute('enabled') && !$isAPIKey && !$isPrivilegedUser)) {
+            throw new Exception(Exception::STORAGE_BUCKET_NOT_FOUND);
+        }
+
+        $isToken = !$resourceToken->isEmpty() && $resourceToken->getAttribute('bucketInternalId') === $bucket->getSequence();
+        $fileSecurity = $bucket->getAttribute('fileSecurity', false);
+        $valid = $authorization->isValid(new Input(PermissionType::Read, $bucket->getPermissionsByType(PermissionType::Read)));
+        if (!$fileSecurity && !$valid && !$isToken) {
+            throw new Exception(Exception::USER_UNAUTHORIZED, $authorization->getDescription());
+        }
+
+        if ($fileSecurity && !$valid && !$isToken) {
+            $file = $dbForProject->getDocument('bucket_' . $bucket->getSequence(), $fileId);
+        } else {
+            /* @type Document $file */
+            $file = $authorization->skip(fn () => $dbForProject->getDocument('bucket_' . $bucket->getSequence(), $fileId));
+        }
+
+        if (!$resourceToken->isEmpty() && $resourceToken->getAttribute('fileInternalId') !== $file->getSequence()) {
+            throw new Exception(Exception::USER_UNAUTHORIZED);
+        }
+
+        // A file stays incomplete until its final chunk is joined and scanned.
+        if ($file->isEmpty() || $file->getAttribute('chunksUploaded', 0) < $file->getAttribute('chunksTotal', 1)) {
+            throw new Exception(Exception::STORAGE_FILE_NOT_FOUND);
+        }
+
+        $mimes = Config::getParam('storage-mimes');
+
+        $path = $file->getAttribute('path', '');
+
+        if (!$deviceForFiles->exists($path)) {
+            throw new Exception(Exception::STORAGE_FILE_NOT_FOUND, 'File not found in ' . $path);
+        }
+
+        $contentType = 'text/plain';
+
+        if (\in_array($file->getAttribute('mimeType'), $mimes)) {
+            $contentType = $file->getAttribute('mimeType');
+        }
+
+        // SVG is an executable document, not a passive image: a browser that
+        // navigates to it will run any embedded script in this origin. Forcing
+        // a download means it is never rendered as a top-level document.
+        // Embedding through <img src> still works and is safe (browsers load
+        // SVG there in a restricted mode with no scripting).
+        $disposition = $contentType === 'image/svg+xml' ? Response::DISPOSITION_ATTACHMENT : Response::DISPOSITION_INLINE;
+
+        $size = $file->getAttribute('sizeOriginal', 0);
+
+        $rangeHeader = $request->getHeaderLine('range');
+        if (!empty($rangeHeader)) {
+            $start = $request->getRangeStart();
+            $end = $request->getRangeEnd();
+            $unit = $request->getRangeUnit();
+
+            if ($end === null || $end - $start > APP_STORAGE_READ_BUFFER) {
+                $end = $start + APP_STORAGE_READ_BUFFER - 1;
+            }
+
+            // RFC 9110: a last-byte-pos past the end of the file is clamped, not rejected.
+            $end = min($end, $size - 1);
+
+            if ($unit !== 'bytes' || $start > $end) {
+                throw new Exception(Exception::STORAGE_INVALID_RANGE);
+            }
+
+            $response
+                ->addHeader('Accept-Ranges', 'bytes')
+                ->addHeader('Content-Range', "bytes $start-$end/$size")
+                ->addHeader('Content-Length', $end - $start + 1)
+                ->setStatusCode(Response::STATUS_CODE_PARTIALCONTENT);
+        }
+
+        $response
+            ->setContentType($contentType)
+            ->addHeader('Content-Security-Policy', "script-src 'none';")
+            ->addHeader('X-Content-Type-Options', 'nosniff')
+            ->setContentDisposition($disposition, (string) $file->getAttribute('name', ''))
+            ->addHeader('Cache-Control', 'private, max-age=3888000') // 45 days
+            ->addHeader('X-Peak', \memory_get_peak_usage())
+        ;
+
+        $encryption = new Encryption($file);
+        // Segmented files are read by range and streamed, never held whole.
+        if ($encryption->isSegmented()) {
+            if (!empty($rangeHeader)) {
+                $response->send($encryption->range($deviceForFiles, $start, $end));
+                return;
+            }
+
+            if ($size > APP_STORAGE_READ_BUFFER) {
+                $started = false;
+                try {
+                    $encryption->stream($deviceForFiles, static function (string $chunk) use ($response, &$started): void {
+                        $started = true;
+                        $response->chunk($chunk, false);
+                    });
+                    $response->chunk('', true);
+                } catch (\Throwable $error) {
+                    if ($started) {
+                        $response->abort();
+                    }
+                    throw $error;
+                }
+                return;
+            }
+
+            // Sent from here even when empty, so a zero-byte file never falls through to the stored bytes.
+            $response->send($encryption->decrypt((string) $deviceForFiles->read($path)));
+            return;
+        }
+
+        $source = '';
+        if (!empty($file->getAttribute('openSSLCipher'))) { // Decrypt
+            $source = $encryption->decrypt((string) $deviceForFiles->read($path));
+        }
+
+        switch ($file->getAttribute('algorithm', Compression::NONE)) {
+            case Compression::ZSTD:
+                if (empty($source)) {
+                    $source = (string) $deviceForFiles->read($path);
+                }
+                $compressor = new Zstd();
+                $source = $compressor->decompress($source);
+                break;
+            case Compression::GZIP:
+                if (empty($source)) {
+                    $source = (string) $deviceForFiles->read($path);
+                }
+                $compressor = new GZIP();
+                $source = $compressor->decompress($source);
+                break;
+        }
+
+        if (!empty($source)) {
+            if (!empty($rangeHeader)) {
+                $response->send(substr($source, $start, ($end - $start + 1)));
+                return;
+            }
+            $response->send($source);
+            return;
+        }
+
+        if (!empty($rangeHeader)) {
+            $response->send((string) $deviceForFiles->read($path, $start, ($end - $start + 1)));
+            return;
+        }
+
+        if ($size <= APP_STORAGE_READ_BUFFER) {
+            $response->send((string) $deviceForFiles->read($path));
+            return;
+        }
+
+        // One backend read pins the representation, even if an S3 writer replaces
+        // and deletes its path while this response is still being delivered.
+        $remaining = $size;
+        $started = false;
+        try {
+            $deviceForFiles->stream($path, static function (string $chunk) use ($response, &$remaining, &$started): void {
+                $remaining -= \strlen($chunk);
+                if ($remaining < 0) {
+                    throw new Exception(Exception::GENERAL_SERVER_ERROR, 'File read exceeded its captured size.');
+                }
+                if ($chunk !== '') {
+                    $started = true;
+                    $response->chunk($chunk, false);
+                }
+            });
+            if ($remaining !== 0) {
+                throw new Exception(Exception::GENERAL_SERVER_ERROR, 'Incomplete file read.');
+            }
+            $response->chunk('', true);
+        } catch (\Throwable $error) {
+            if ($started) {
+                $response->abort();
+            }
+            throw $error;
+        }
+    }
+}

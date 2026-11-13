@@ -1,0 +1,426 @@
+<?php
+
+namespace Appwrite\Utopia;
+
+use Appwrite\Network\TrustedProxies;
+use Appwrite\SDK\Method;
+use Appwrite\Utopia\Database\Documents\User;
+use Appwrite\Utopia\Request\Filter;
+use Swoole\Http\Request as SwooleRequest;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Http\Adapter\Swoole\Request as UtopiaRequest;
+use Utopia\Http\Route;
+use Utopia\Http\TrustedHeaders;
+use Utopia\System\System;
+
+class Request extends UtopiaRequest
+{
+    /**
+     * Value of a param listed in the route's `cache.negotiate` label that asks the server to pick it from the Accept header.
+     */
+    public const string NEGOTIATE_AUTO = 'auto';
+
+    /**
+     * @var array<Filter>
+     */
+    private array $filters = [];
+    private ?Route $route = null;
+    private ?array $filteredParams = null;
+    private readonly TrustedProxies $trustedProxies;
+
+    public function __construct(SwooleRequest $request)
+    {
+        $trustedHeaders = System::getEnv('_APP_TRUSTED_HEADERS', 'x-forwarded-for');
+        $this->trustedProxies = TrustedProxies::fromEnvironment();
+        $fromProxy = $this->trustedProxies->contains($request->server['remote_addr'] ?? '0.0.0.0');
+
+        parent::__construct($request, new TrustedHeaders(
+            ip: explode(',', $trustedHeaders),
+            host: $fromProxy ? ['x-forwarded-host'] : [],
+            port: $fromProxy ? ['x-forwarded-port'] : [],
+        ));
+    }
+
+    #[\Override]
+    public function getIP(): string
+    {
+        $remoteAddr = $this->getServer('remote_addr') ?? '0.0.0.0';
+
+        if (!$this->trustedProxies->contains($remoteAddr)) {
+            return $remoteAddr;
+        }
+
+        foreach ($this->trusted->ip as $header) {
+            $ips = [];
+            foreach (explode(',', $this->getHeaderLine($header)) as $ip) {
+                $ip = trim($ip);
+                if (filter_var($ip, FILTER_VALIDATE_IP) !== false) {
+                    $ips[] = $ip;
+                }
+            }
+
+            if ($ips === []) {
+                continue;
+            }
+
+            // Proxies that append keep client-supplied entries on the left, so the rightmost untrusted hop is the client.
+            foreach (array_reverse($ips) as $ip) {
+                if (!$this->trustedProxies->contains($ip)) {
+                    return $ip;
+                }
+            }
+
+            return $ips[0];
+        }
+
+        return $remoteAddr;
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getParams(): array
+    {
+        if ($this->filteredParams !== null) {
+            return $this->filteredParams;
+        }
+
+        $parameters = parent::getParams();
+
+        if (!$this->hasFilters() || !$this->hasRoute()) {
+            return $parameters;
+        }
+
+        $methods = $this->getRoute()?->getLabel('sdk', null);
+
+        if (empty($methods)) {
+            return $parameters;
+        }
+
+        if (!\is_array($methods)) {
+            $id = $methods->getNamespace() . '.' . $methods->getMethodName();
+        } else {
+            $matched = null;
+            foreach ($methods as $method) {
+                /** @var Method|null $method */
+                if ($method === null) {
+                    continue;
+                }
+
+                // Find the method that matches the parameters passed
+                $methodParamNames = \array_map(fn ($param) => $param->getName(), $method->getParameters());
+                $invalidParams = \array_diff(\array_keys($parameters), $methodParamNames);
+
+                // No params defined, or all params are valid
+                if (empty($methodParamNames) || empty($invalidParams)) {
+                    $matched = $method;
+                    break;
+                }
+            }
+
+            $id = $matched !== null
+                ? $matched->getNamespace() . '.' . $matched->getMethodName()
+                : 'unknown.unknown';
+        }
+
+        try {
+            foreach ($this->getFilters() as $filter) {
+                $parameters = $filter->parse($parameters, $id);
+            }
+        } catch (\Throwable $e) {
+            /*
+            * 4xx filter throws are user-input errors that the action layer
+            * revalidates and reports. Cache the raw, pre-filter parameters
+            * so a subsequent getParams() — e.g. when the framework builds
+            * arguments for an error hook — returns without re-running
+            * filters. Otherwise the second throw gets wrapped as
+            * "Error handler had an error: ..." (HTTP 500), masking the
+            * intended 400.
+            */
+            $code = $e->getCode();
+            if (\is_int($code) && $code >= 400 && $code < 500) {
+                $this->filteredParams = $parameters;
+            }
+            throw $e;
+        }
+
+        $this->filteredParams = $parameters;
+        return $parameters;
+    }
+
+    /**
+     * Function to add a response filter, the order of filters are first in - first out.
+     *
+     * @param Filter $filter the response filter to set
+     *
+     * @return void
+     */
+    public function addFilter(Filter $filter): void
+    {
+        $this->filters[] = $filter;
+        $this->filteredParams = null;
+    }
+
+    /**
+     * Return the currently set filter
+     *
+     * @return array<Filter>
+     */
+    public function getFilters(): array
+    {
+        return $this->filters;
+    }
+
+    /**
+     * Check if a filter has been set
+     *
+     * @return bool
+     */
+    public function hasFilters(): bool
+    {
+        return !empty($this->filters);
+    }
+
+    /**
+     * Function to set a request route
+     *
+     * @param Route|null $route the request route to set
+     *
+     * @return void
+     */
+    public function setRoute(?Route $route): void
+    {
+        $this->route = $route;
+        $this->filteredParams = null;
+    }
+
+    /**
+     * Return the current route
+     *
+     * @return Route|null
+     */
+    public function getRoute(): ?Route
+    {
+        return $this->route;
+    }
+
+    /**
+     * Check if a route has been set
+     *
+     * @return bool
+     */
+    public function hasRoute(): bool
+    {
+        return $this->route !== null;
+    }
+
+    /**
+     * Get headers
+     *
+     * Method for getting all HTTP headers, including a synthesized `cookie`
+     * header. Swoole parses the incoming Cookie header into its own cookie jar,
+     * so it is absent from the raw header map; rebuild it here so consumers that
+     * forward request headers (e.g. function/site executions) still receive it.
+     *
+     * @return array<string, array<int, string>>
+     */
+    public function getHeaders(): array
+    {
+        return $this->getHeadersWithoutCookies([]);
+    }
+
+    /**
+     * Get all headers like getHeaders(), leaving the named cookies out of the synthesized `cookie` header.
+     *
+     * @param list<string> $names
+     * @return array<string, array<int, string>>
+     */
+    public function getHeadersWithoutCookies(array $names): array
+    {
+        $headers = parent::getHeaders();
+        unset($headers['cookie']);
+
+        $cookies = \array_diff_key($this->getCookieParams(), \array_flip($names));
+        if (!empty($cookies)) {
+            $pairs = [];
+            foreach ($cookies as $key => $value) {
+                $pairs[] = "{$key}={$value}";
+            }
+            $headers['cookie'] = [\implode('; ', $pairs)];
+        }
+
+        return $headers;
+    }
+
+    /**
+     * Get User Agent
+     *
+     * Method for getting User Agent. Preferring forwarded agent for privileged users; otherwise returns default.
+     *
+     * @param  string  $default
+     * @return string
+     */
+    public function getUserAgent(string $default = ''): string
+    {
+        $forwardedUserAgent = $this->getHeaderLine('x-forwarded-user-agent');
+        if (!empty($forwardedUserAgent)) {
+            $roles = $this->authorization->getRoles();
+            $isAppUser = $this->user?->isKey($roles) ?? false;
+
+            if ($isAppUser) {
+                return $forwardedUserAgent;
+            }
+        }
+
+        return UtopiaRequest::getUserAgent($default);
+    }
+
+    /**
+     * Index of the chunk this range starts in, for chunks of the given size. 0 without a valid range.
+     */
+    public function getContentRangeChunk(int $size): int
+    {
+        $start = $this->getContentRangeStart();
+
+        if ($start === null) {
+            return 0;
+        }
+
+        return \intdiv($start, $size);
+    }
+
+    /**
+     * @return array{unit: string, size: int, start: int, end: int}|null
+     */
+    #[\Override]
+    protected function parseContentRange(): ?array
+    {
+        $data = parent::parseContentRange();
+
+        // Bounds past PHP_INT_MAX saturate to it, and end + 1 must stay an integer.
+        if ($data === null || $data['size'] >= PHP_INT_MAX) {
+            return null;
+        }
+
+        return $data;
+    }
+
+    /**
+     * Returns the first of the given MIME types the client lists in its Accept header with a non-zero quality.
+     * Only exact entries count: wildcard ranges (`image/*`, any type) do not promise the client decodes a given format.
+     *
+     * @param array<string> $types MIME types in server preference order
+     */
+    public function getAcceptedType(array $types): ?string
+    {
+        $accepted = [];
+        foreach (\explode(',', $this->getHeaderLine('accept')) as $entry) {
+            $parts = \explode(';', $entry);
+            $type = \strtolower(\trim($parts[0]));
+            $quality = 1.0;
+            foreach (\array_slice($parts, 1) as $parameter) {
+                [$name, $value] = \array_pad(\explode('=', $parameter, 2), 2, '');
+                if (\strtolower(\trim($name)) === 'q') {
+                    $quality = (float) \trim($value);
+                }
+            }
+            if ($type !== '' && $quality > 0) {
+                $accepted[$type] = true;
+            }
+        }
+
+        foreach ($types as $type) {
+            if (isset($accepted[\strtolower($type)])) {
+                return $type;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolves params set to `auto` that the route negotiates from the Accept header.
+     *
+     * The route's `cache.negotiate` label maps a param to `[value => MIME type]` in preference order.
+     * An `auto` param resolves to the first value whose type the client accepts, or to an empty string when none is.
+     *
+     * @return array<string, string> resolved values keyed by param, only for params set to `auto`
+     */
+    public function getNegotiatedParams(): array
+    {
+        $negotiate = $this->getRoute()?->getLabel('cache.negotiate', []) ?? [];
+        $params = $this->getParams();
+        $resolved = [];
+        foreach ($negotiate as $param => $types) {
+            if (($params[$param] ?? null) !== self::NEGOTIATE_AUTO) {
+                continue;
+            }
+            $type = $this->getAcceptedType(\array_values($types));
+            $resolved[$param] = $type === null ? '' : (string) \array_search($type, $types, true);
+        }
+
+        return $resolved;
+    }
+
+    /**
+     * Creates a unique stable cache identifier for this GET request.
+     * Stable-sorts query params, use `serialize` to ensure key&value are part of cache keys.
+     * Negotiated `auto` params are keyed by their resolved value, so they share entries with explicit requests.
+     *
+     * @return string
+     */
+    public function cacheIdentifier(): string
+    {
+        $params = $this->getParams();
+        foreach ($this->getNegotiatedParams() as $param => $value) {
+            if ($value === '') {
+                unset($params[$param]);
+            } else {
+                $params[$param] = $value;
+            }
+        }
+        $allowedParams = $this->getRoute()?->getLabel('cache.params', null);
+        if ($allowedParams !== null) {
+            $params = array_intersect_key($params, array_flip($allowedParams));
+        }
+        if (!isset($params['project'])) {
+            $params['project'] = $this->getHeaderLine('x-appwrite-project', '');
+        }
+        ksort($params);
+        return md5($this->getURI() . '*' . serialize($params) . '*' . APP_CACHE_BUSTER);
+    }
+
+    private ?Authorization $authorization = null;
+    private ?User $user = null;
+
+    /**
+     * @var array<string> Scopes the caller holds, set once the request is authorized
+     */
+    private array $scopes = [];
+
+    public function setAuthorization(Authorization $authorization): void
+    {
+        $this->authorization = $authorization;
+    }
+
+    public function setUser(User $user): void
+    {
+        $this->user = $user;
+    }
+
+    /**
+     * @param array<string> $scopes
+     */
+    public function setScopes(array $scopes): void
+    {
+        $this->scopes = $scopes;
+    }
+
+    /**
+     * @return array<string>
+     */
+    public function getScopes(): array
+    {
+        return $this->scopes;
+    }
+}

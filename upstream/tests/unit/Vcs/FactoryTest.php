@@ -1,0 +1,262 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Unit\Vcs;
+
+use Appwrite\Auth\OAuth2\Github as OAuth2Github;
+use Appwrite\Extend\Exception;
+use Appwrite\Vcs\Factory;
+use PHPUnit\Framework\TestCase;
+use Utopia\Cache\Adapter\None;
+use Utopia\Cache\Cache;
+use Utopia\Client\Adapter\Curl\Client as CurlAdapter;
+use Utopia\Client\Client;
+use Utopia\Config\Config;
+use Utopia\Database\Document;
+use Utopia\VCS\Adapter\Git;
+use Utopia\VCS\Adapter\Git\Entire;
+use Utopia\VCS\Adapter\Git\Gitea;
+use Utopia\VCS\Adapter\Git\GitHub;
+use Utopia\VCS\Adapter\Git\GitLab;
+
+final class FactoryTest extends TestCase
+{
+    protected function tearDown(): void
+    {
+        \putenv('_APP_VCS_TEST_TOKEN');
+        \putenv('_APP_VCS_TEST_ENDPOINT');
+    }
+
+    public function testRegistryEntries(): void
+    {
+        $registry = Config::getParam('vcs', []);
+        $this->assertNotEmpty($registry);
+
+        foreach ($registry as $key => $entry) {
+            $this->assertTrue(\is_subclass_of($entry['adapter'], Git::class), "Adapter for '{$key}' must extend Git");
+            // A provider with an OAuth2 user flow registers a builder; an
+            // app-only provider (Origin) deliberately registers none.
+            if (isset($entry['oauth2'])) {
+                $this->assertIsCallable($entry['oauth2'], "OAuth2 builder for '{$key}' must be callable");
+            }
+            $this->assertNotEmpty($entry['variables'], "Variables missing for '{$key}'");
+            foreach ($entry['variables'] as $name => $variable) {
+                $this->assertStringStartsWith('_APP_VCS_', $variable['envVariable'] ?? '', "Env variable for '{$name}' missing or invalid for '{$key}'");
+            }
+        }
+    }
+
+    public function testOriginRegistersNoOAuth2(): void
+    {
+        // Origin has no OAuth2 user flow: installs are approved on Cursor and
+        // confirmed by a signed receipt the adapter verifies itself, so the
+        // registry deliberately carries no builder and oauth2FromProvider()
+        // fails loudly instead of handing out a half-configured client.
+        $registry = Config::getParam('vcs', []);
+        $this->assertArrayHasKey('origin', $registry);
+        $this->assertArrayNotHasKey('oauth2', $registry['origin']);
+
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), $registry);
+        $this->expectException(Exception::class);
+        $factory->oauth2FromProvider('origin');
+    }
+
+    public function testEntireRegistersNoOAuth2(): void
+    {
+        // Entire installs are approved on entire.io and confirmed by a signed
+        // receipt, like Origin's, so there is no OAuth2 client to build.
+        $registry = Config::getParam('vcs', []);
+        $this->assertArrayHasKey('entire', $registry);
+        $this->assertArrayNotHasKey('oauth2', $registry['entire']);
+        $this->assertSame('https://us.auth.entire.io', $registry['entire']['endpoint']);
+        $this->assertSame('_APP_VCS_ENTIRE_ISSUER', $registry['entire']['variables']['issuer']['envVariable']);
+
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), $registry);
+        $this->assertInstanceOf(Entire::class, $factory->fromProvider('entire'));
+        $this->assertSame('https://entire.com/et/acme', $factory->fromProvider('entire')->getOrganizationUrl('acme'));
+
+        $this->expectException(Exception::class);
+        $factory->oauth2FromProvider('entire');
+    }
+
+    public function testOauth2FromProviderUnknownThrows(): void
+    {
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['github' => $this->githubEntry()]);
+
+        $this->expectException(Exception::class);
+        $factory->oauth2FromProvider('bitbucket');
+    }
+
+    public function testOauth2FromProviderBuildsClient(): void
+    {
+        \putenv('_APP_VCS_GITHUB_CLIENT_ID=client-id');
+        \putenv('_APP_VCS_GITHUB_CLIENT_SECRET=client-secret');
+
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['github' => $this->githubEntry()]);
+        $oauth2 = $factory->oauth2FromProvider('github');
+
+        $this->assertInstanceOf(OAuth2Github::class, $oauth2);
+
+        \putenv('_APP_VCS_GITHUB_CLIENT_ID');
+        \putenv('_APP_VCS_GITHUB_CLIENT_SECRET');
+    }
+
+    public function testFromProviderUnknownThrows(): void
+    {
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['github' => $this->githubEntry()]);
+
+        $this->expectException(Exception::class);
+        $factory->fromProvider('bitbucket');
+    }
+
+    public function testFromProviderBuildsAdapter(): void
+    {
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['github' => $this->githubEntry()]);
+
+        $this->assertInstanceOf(GitHub::class, $factory->fromProvider('github'));
+    }
+
+    public function testFromInstallationEmptyDocumentThrows(): void
+    {
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['github' => $this->githubEntry()]);
+
+        $this->expectException(Exception::class);
+        $factory->fromInstallation(new Document());
+    }
+
+    public function testFromInstallationMissingProviderThrows(): void
+    {
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['github' => $this->githubEntry()]);
+
+        $this->expectException(Exception::class);
+        $this->expectExceptionMessage('Missing VCS provider');
+
+        $factory->fromInstallation(new Document([
+            '$id' => 'installation',
+        ]));
+    }
+
+    public function testIsConfigured(): void
+    {
+        $entry = [
+            'adapter' => GitHub::class,
+            'variables' => [
+                'token' => ['required' => true, 'envVariable' => '_APP_VCS_TEST_TOKEN'],
+            ],
+        ];
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['test' => $entry]);
+
+        $this->assertFalse($factory->isConfigured('test'));
+        $this->assertFalse($factory->isConfigured('unknown'));
+        $this->assertSame([], $factory->getProviders());
+
+        \putenv('_APP_VCS_TEST_TOKEN=secret');
+        $this->assertTrue($factory->isConfigured('test'));
+        $this->assertSame(['test'], $factory->getProviders());
+    }
+
+    public function testFromProviderAppliesFixedEndpoint(): void
+    {
+        $entry = [
+            'adapter' => GitLab::class,
+            'endpoint' => 'https://gitlab.com',
+            'variables' => [],
+        ];
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['gitlab' => $entry]);
+
+        $adapter = $factory->fromProvider('gitlab');
+        $this->assertSame('https://gitlab.com/owner/repo', $adapter->getRepositoryUrl('owner', 'repo'));
+    }
+
+    public function testFromProviderFixedEndpointIgnoresEnv(): void
+    {
+        $entry = [
+            'adapter' => GitLab::class,
+            'endpoint' => 'https://gitlab.com',
+            'variables' => [],
+        ];
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['gitlab' => $entry]);
+
+        \putenv('_APP_VCS_TEST_ENDPOINT=https://gitlab.example.com');
+        $adapter = $factory->fromProvider('gitlab');
+        $this->assertSame('https://gitlab.com/owner/repo', $adapter->getRepositoryUrl('owner', 'repo'));
+    }
+
+    public function testFromProviderForBrowserPrefersBrowserEndpoint(): void
+    {
+        $entry = [
+            'adapter' => Gitea::class,
+            'browserEndpoint' => 'https://git.example.com',
+            'variables' => ['endpoint' => ['required' => true, 'envVariable' => '_APP_VCS_TEST_ENDPOINT']],
+        ];
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['gitea' => $entry]);
+
+        \putenv('_APP_VCS_TEST_ENDPOINT=http://gitea:3000');
+
+        // The server reaches Gitea on the internal host; a browser cannot
+        $this->assertSame('http://gitea:3000/owner', $factory->fromProvider('gitea')->getOrganizationUrl('owner'));
+        $this->assertSame('https://git.example.com/owner', $factory->fromProviderForBrowser('gitea')->getOrganizationUrl('owner'));
+    }
+
+    public function testFromProviderForBrowserFallsBackToTheApiEndpoint(): void
+    {
+        $entry = [
+            'adapter' => GitLab::class,
+            'endpoint' => 'https://gitlab.example.com',
+            'variables' => [],
+        ];
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['gitlab' => $entry]);
+
+        $this->assertSame('https://gitlab.example.com/owner', $factory->fromProviderForBrowser('gitlab')->getOrganizationUrl('owner'));
+    }
+
+    public function testFromProviderVerifiesCertificatesByDefault(): void
+    {
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), Config::getParam('vcs', []));
+
+        foreach (['github', 'gitea', 'gitlab', 'bitbucket', 'origin', 'entire'] as $key) {
+            $this->assertFalse($factory->fromProvider($key)->isSelfSigned(), "'{$key}' must verify certificates by default");
+        }
+    }
+
+    public function testGetWebhookSecret(): void
+    {
+        $entry = [
+            'adapter' => GitHub::class,
+            'variables' => [
+                'webhookSecret' => ['required' => true, 'envVariable' => '_APP_VCS_TEST_TOKEN'],
+            ],
+        ];
+        $factory = new Factory($this->cache(), new Client(new CurlAdapter()), ['github' => $entry]);
+
+        $this->assertSame('', $factory->getWebhookSecret('github'));
+
+        \putenv('_APP_VCS_TEST_TOKEN=hunter2');
+        $this->assertSame('hunter2', $factory->getWebhookSecret('github'));
+    }
+
+    protected function cache(): Cache
+    {
+        return new Cache(new None());
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function githubEntry(): array
+    {
+        return [
+            'adapter' => GitHub::class,
+            'oauth2' => fn (Client $client, string $clientId, string $clientSecret, string $endpoint) => new OAuth2Github($client, $clientId, $clientSecret, ''),
+            'variables' => [
+                'appName' => ['required' => true, 'envVariable' => '_APP_VCS_GITHUB_APP_NAME'],
+                'privateKey' => ['required' => true, 'envVariable' => '_APP_VCS_GITHUB_PRIVATE_KEY'],
+                'appId' => ['required' => true, 'envVariable' => '_APP_VCS_GITHUB_APP_ID'],
+                'clientId' => ['required' => true, 'envVariable' => '_APP_VCS_GITHUB_CLIENT_ID'],
+                'clientSecret' => ['required' => true, 'envVariable' => '_APP_VCS_GITHUB_CLIENT_SECRET'],
+                'webhookSecret' => ['required' => true, 'envVariable' => '_APP_VCS_GITHUB_WEBHOOK_SECRET'],
+            ],
+        ];
+    }
+}

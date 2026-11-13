@@ -1,0 +1,135 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Project\Http\Project\Keys;
+
+use Appwrite\Auth\Key;
+use Appwrite\Event\Event as QueueEvent;
+use Appwrite\Extend\Exception;
+use Appwrite\Platform\Action;
+use Appwrite\Platform\Modules\Compute\Base;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Request;
+use Appwrite\Utopia\Response;
+use Utopia\Config\Config;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Exception\Duplicate;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\Datetime;
+use Utopia\Database\Validator\UID;
+use Utopia\Platform\Enum;
+use Utopia\Platform\Scope\HTTP;
+use Utopia\Validator\ArrayList;
+use Utopia\Validator\Nullable;
+use Utopia\Validator\Text;
+use Utopia\Validator\WhiteList;
+
+/**
+ * TODO: Remove once the Console, CLI and SDKs use the Organization API
+ * (/v1/organization/projects/:projectId/keys) instead of this project-scoped route.
+ */
+class Update extends Base
+{
+    use HTTP;
+
+    public static function getName()
+    {
+        return 'updateProjectKey';
+    }
+
+    public function __construct()
+    {
+        $this->setHttpMethod(Action::HTTP_REQUEST_METHOD_PUT)
+            ->setHttpPath('/v1/project/keys/:keyId')
+            ->httpAlias('/v1/projects/:projectId/keys/:keyId')
+            ->desc('Update project key')
+            ->groups(['api', 'project'])
+            ->label('scope', 'keys.write')
+            ->label('event', 'keys.[keyId].update')
+            ->label('audits.event', 'project.key.update')
+            ->label('audits.resource', 'project.key/{response.$id}')
+            ->label('sdk', new Method(
+                namespace: 'project',
+                group: 'keys',
+                name: 'updateKey',
+                description: <<<EOT
+                Update a key by its unique ID. Use this endpoint to update the name, scopes, or expiration time of an API key.
+                EOT,
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_OK,
+                        model: Response::MODEL_KEY,
+                    )
+                ]
+            ))
+            ->param('keyId', '', fn (Database $dbForPlatform) => new UID($dbForPlatform->getMaxUidLength()), 'Key ID.', false, ['dbForPlatform'])
+            ->param('name', null, new Text(128), 'Key name. Max length: 128 chars.')
+            ->param('scopes', [], new ArrayList(new WhiteList(array_keys(Config::getParam('projectScopes')), true), APP_LIMIT_ARRAY_SCOPES_SIZE), 'Key scopes list. Maximum of ' . APP_LIMIT_ARRAY_SCOPES_SIZE . ' scopes are allowed.', optional: false, example: '["users.read"]', enum: new Enum(name: 'ProjectKeyScopes'))
+            ->param('expire', null, new Nullable(new Datetime()), 'Expiration time in [ISO 8601](https://www.iso.org/iso-8601-date-and-time-format.html) format. Use null for unlimited expiration.', true)
+            ->param('description', null, new Nullable(new Text(1024, 0)), 'Optional description for the key.', true)
+            ->inject('response')
+            ->inject('queueForEvents')
+            ->inject('dbForPlatform')
+            ->inject('project')
+            ->inject('authorization')
+            ->inject('apiKey')
+            ->inject('request')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        string $keyId,
+        string $name,
+        array $scopes,
+        ?string $expire,
+        ?string $description,
+        Response $response,
+        QueueEvent $queueForEvents,
+        Database $dbForPlatform,
+        Document $project,
+        Authorization $authorization,
+        ?Key $apiKey,
+        Request $request,
+    ) {
+        // A JWT stands in for its session for a few minutes; a key it left behind would outlive it
+        if ($request->getHeaderLine('x-appwrite-jwt', '') !== '') {
+            throw new Exception(Exception::KEY_CREATION_DENIED);
+        }
+
+        // A key hands out no more than it holds: no broader scopes and no later expiry
+        if ($apiKey !== null && !$apiKey->mayCreate(API_KEY_STANDARD, $scopes, $expire)) {
+            throw new Exception(Exception::KEY_CREATION_DENIED);
+        }
+
+        $key = $authorization->skip(fn () => $dbForPlatform->getDocument('keys', $keyId));
+
+        if ($key->isEmpty() || $key->getAttribute('resourceType', '') !== 'projects' || $key->getAttribute('resourceInternalId', '') !== $project->getSequence()) {
+            throw new Exception(Exception::KEY_NOT_FOUND);
+        }
+
+        $updates = new Document([
+            'name' => $name,
+            'scopes' => $scopes,
+            'expire' => $expire,
+        ]);
+
+        if (!\is_null($description)) {
+            $updates->setAttribute('description', $description);
+        }
+
+        try {
+            $key = $authorization->skip(fn () => $dbForPlatform->updateDocument('keys', $key->getId(), $updates));
+        } catch (Duplicate) {
+            throw new Exception(Exception::KEY_ALREADY_EXISTS);
+        }
+
+        $authorization->skip(fn () => $dbForPlatform->purgeCachedDocument('projects', $project->getId()));
+
+        $queueForEvents->setParam('keyId', $key->getId());
+
+        $response->dynamic($key, Response::MODEL_KEY);
+    }
+}

@@ -1,0 +1,17 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Usage\Services;
+
+use Appwrite\Platform\Workers\StatsResources;
+use Appwrite\Platform\Workers\StatsUsage;
+use Utopia\Platform\Service;
+
+class Workers extends Service
+{
+    public function __construct()
+    {
+        $this->type = Service::TYPE_WORKER;
+        $this->addAction('stats-usage', StatsUsage::class);
+        $this->addAction('stats-resources', StatsResources::class);
+    }
+}

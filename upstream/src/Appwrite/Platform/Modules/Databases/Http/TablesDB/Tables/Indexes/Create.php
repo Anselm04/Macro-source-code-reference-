@@ -1,0 +1,87 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\TablesDB\Tables\Indexes;
+
+use Appwrite\Event\Event;
+use Appwrite\Event\Publisher\Database as DatabasePublisher;
+use Appwrite\Platform\Modules\Databases\Http\Databases\Collections\Indexes\Create as IndexCreate;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response as UtopiaResponse;
+use Utopia\Database\Database;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\Key;
+use Utopia\Database\Validator\UID;
+use Utopia\Http\Adapter\Swoole\Response as SwooleResponse;
+use Utopia\Platform\Enum;
+use Utopia\Query\Schema\ColumnType;
+use Utopia\Query\Schema\IndexType;
+use Utopia\Validator\ArrayList;
+use Utopia\Validator\Integer;
+use Utopia\Validator\Nullable;
+use Utopia\Validator\Text;
+use Utopia\Validator\WhiteList;
+
+class Create extends IndexCreate
+{
+    public static function getName(): string
+    {
+        return 'createColumnIndex';
+    }
+
+    protected function getResponseModel(): string
+    {
+        return UtopiaResponse::MODEL_COLUMN_INDEX;
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(self::HTTP_REQUEST_METHOD_POST)
+            ->setHttpPath('/v1/tablesdb/:databaseId/tables/:tableId/indexes')
+            ->desc('Create index')
+            ->groups(['api', 'database'])
+            ->label('event', 'databases.[databaseId].tables.[tableId].indexes.[indexId].create')
+            ->label('scope', ['tables.write', 'collections.write', 'indexes.write'])
+            ->label('resourceType', RESOURCE_TYPE_DATABASES)
+            ->label('audits.event', 'index.create')
+            ->label('audits.resource', 'database/{request.databaseId}/table/{request.tableId}')
+            ->label('usage.resource', 'database/{request.databaseId}/table/{request.tableId}')
+            ->label('sdk', new Method(
+                namespace: $this->getSDKNamespace(),
+                group: $this->getSDKGroup(),
+                name: 'createIndex', // getName needs to be different from parent action to avoid conflict in path name
+                description: '/docs/references/tablesdb/create-index.md',
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: SwooleResponse::STATUS_CODE_ACCEPTED,
+                        model: $this->getResponseModel(),
+                    )
+                ],
+                contentType: ContentType::JSON
+            ))
+            ->param('databaseId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Database ID.', false, ['dbForProject'])
+            ->param('tableId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Table ID. You can create a new table using the Database service [server integration](https://appwrite.io/docs/references/cloud/server-dart/tablesDB#createTable).', false, ['dbForProject'])
+            ->param('key', null, fn (Database $dbForProject) => new Key(false, $dbForProject->getMaxUidLength()), 'Index Key.', false, ['dbForProject'])
+            ->param('type', null, new WhiteList([IndexType::Key->value, IndexType::Fulltext->value, IndexType::Unique->value, IndexType::Spatial->value, IndexType::Trigram->value]), 'Index type.', enum: new Enum(name: 'TablesDBIndexType'))
+            ->param('columns', null, fn (Database $dbForProject) => new ArrayList(new Key(true, $dbForProject->getMaxUidLength()), APP_LIMIT_ARRAY_PARAMS_SIZE), 'Array of columns to index. Maximum of ' . APP_LIMIT_ARRAY_PARAMS_SIZE . ' columns are allowed, each 32 characters long.', false, ['dbForProject'], example: '["username"]')
+            ->param('orders', [], new ArrayList(new WhiteList(['ASC', 'DESC'], false, ColumnType::String->value), APP_LIMIT_ARRAY_PARAMS_SIZE), 'Array of index orders. Maximum of ' . APP_LIMIT_ARRAY_PARAMS_SIZE . ' orders are allowed.', true, enum: new Enum(name: 'OrderBy'))
+            ->param('lengths', [], new ArrayList(new Nullable(new Integer()), APP_LIMIT_ARRAY_PARAMS_SIZE), 'Length of index. Maximum of ' . APP_LIMIT_ARRAY_PARAMS_SIZE, optional: true)
+            ->param('description', '', new Text(1024, 0), 'Optional description for the index.', true)
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('getDatabasesDB')
+            ->inject('publisherForDatabase')
+            ->inject('queueForEvents')
+            ->inject('authorization')
+            ->callback($this->action(...));
+    }
+
+    public function action(string $databaseId, string $tableId, string $key, string $type, array $columns, array $orders, array $lengths, string $description, UtopiaResponse $response, Database $dbForProject, callable $getDatabasesDB, DatabasePublisher $publisherForDatabase, Event $queueForEvents, Authorization $authorization): void
+    {
+        parent::action($databaseId, $tableId, $key, $type, $columns, $orders, $lengths, $description, $response, $dbForProject, $getDatabasesDB, $publisherForDatabase, $queueForEvents, $authorization);
+    }
+}

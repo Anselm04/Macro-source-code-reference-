@@ -1,0 +1,842 @@
+<?php
+
+namespace Appwrite\Platform\Workers;
+
+use Appwrite\Bus\Events\RuleUpdated;
+use Appwrite\Event\Event;
+use Appwrite\Event\Message\Func as FunctionMessage;
+use Appwrite\Event\Message\Mail as MailMessage;
+use Appwrite\Event\Message\Notification as NotificationMessage;
+use Appwrite\Event\Publisher\Certificate;
+use Appwrite\Event\Publisher\Func as FunctionPublisher;
+use Appwrite\Event\Publisher\Mail as MailPublisher;
+use Appwrite\Event\Publisher\Notification as NotificationPublisher;
+use Appwrite\Event\Realtime;
+use Appwrite\Event\Webhook;
+use Appwrite\Extend\Exception as AppwriteException;
+use Appwrite\Platform\Modules\Proxy\Action;
+use Appwrite\Template\Template;
+use Appwrite\Utopia\Response\Model\Rule;
+use Exception;
+use Throwable;
+use Utopia\Bus\Bus;
+use Utopia\Cdn\Certificates\Provider;
+use Utopia\Cdn\Certificates\Status;
+use Utopia\Cdn\Exception\Certificate as CertificateException;
+use Utopia\Console\Console;
+use Utopia\Database\Database;
+use Utopia\Database\DateTime;
+use Utopia\Database\Document;
+use Utopia\Database\Exception\Authorization;
+use Utopia\Database\Exception\Conflict;
+use Utopia\Database\Exception\NotFound;
+use Utopia\Database\Exception\Structure;
+use Utopia\Database\Id;
+use Utopia\Database\Query;
+use Utopia\Database\Validator\Authorization as ValidatorAuthorization;
+use Utopia\Domains\Domain;
+use Utopia\Locale\Locale;
+use Utopia\Queue\Message;
+use Utopia\Span\Span;
+use Utopia\System\System;
+
+class Certificates extends Action
+{
+    private const MAX_GENERATION_ATTEMPTS = 5;
+
+    /**
+     * How soon a certificate a delayed provider has not issued yet is checked
+     * again. Without a renew date, maintenance never selects it again.
+     */
+    private const PROVIDER_CHECK_INTERVAL = 60 * 60 * 24;
+
+    public static function getName(): string
+    {
+        return 'certificates';
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function __construct(...$params)
+    {
+        parent::__construct(...$params);
+
+        $this
+            ->desc('Certificates worker')
+            ->inject('message')
+            ->inject('dbForPlatform')
+            ->inject('publisherForMails')
+            ->inject('publisherForNotifications')
+            ->inject('queueForEvents')
+            ->inject('queueForWebhooks')
+            ->inject('publisherForFunctions')
+            ->inject('queueForRealtime')
+            ->inject('publisherForCertificates')
+            ->inject('certificates')
+            ->inject('plan')
+            ->inject('platform')
+            ->inject('authorization')
+            ->inject('bus')
+            ->callback($this->action(...));
+    }
+
+    /**
+     * @param Message $message
+     * @param Database $dbForPlatform
+     * @param MailPublisher $publisherForMails
+     * @param NotificationPublisher $publisherForNotifications
+     * @param Event $queueForEvents
+     * @param Webhook $queueForWebhooks
+     * @param FunctionPublisher $publisherForFunctions
+     * @param Realtime $queueForRealtime
+     * @param Certificate $publisherForCertificates
+     * @param Provider $certificates
+     * @param array $plan
+     * @param array $platform
+     * @param ValidatorAuthorization $authorization
+     * @return void
+     * @throws Throwable
+     * @throws \Utopia\Database\Exception
+     */
+    public function action(
+        Message $message,
+        Database $dbForPlatform,
+        MailPublisher $publisherForMails,
+        NotificationPublisher $publisherForNotifications,
+        Event $queueForEvents,
+        Webhook $queueForWebhooks,
+        FunctionPublisher $publisherForFunctions,
+        Realtime $queueForRealtime,
+        Certificate $publisherForCertificates,
+        Provider $certificates,
+        array $plan,
+        array $platform,
+        ValidatorAuthorization $authorization,
+        Bus $bus,
+    ): void {
+        $payload = $message->getPayload();
+
+        if (empty($payload)) {
+            throw new Exception('Missing payload');
+        }
+
+        $certificateMessage = \Appwrite\Event\Message\Certificate::fromArray($payload);
+        $document = $certificateMessage->domain;
+        $domain   = new Domain($document->getAttribute('domain', ''));
+        $domainType = $document->getAttribute('domainType');
+        $skipRenewCheck = $certificateMessage->skipRenewCheck;
+        $skipDomainValidation = $certificateMessage->skipDomainValidation;
+        $validationDomain = $certificateMessage->validationDomain;
+        $action = $certificateMessage->action;
+
+        Span::add('domain', $domain->get());
+
+        switch ($action) {
+            case \Appwrite\Event\Certificate::ACTION_DOMAIN_VERIFICATION:
+                $this->handleDomainVerificationAction($domain, $dbForPlatform, $queueForEvents, $queueForWebhooks, $publisherForFunctions, $queueForRealtime, $publisherForCertificates, $authorization, $bus, $validationDomain);
+                break;
+
+            case \Appwrite\Event\Certificate::ACTION_GENERATION:
+                $this->handleCertificateGenerationAction($domain, $domainType, $dbForPlatform, $publisherForMails, $publisherForNotifications, $queueForEvents, $queueForWebhooks, $publisherForFunctions, $queueForRealtime, $certificates, $authorization, $bus, $skipRenewCheck, $plan, $platform, $validationDomain, $skipDomainValidation);
+                break;
+
+            default:
+                throw new Exception('Invalid action: ' . $action);
+        }
+    }
+
+    /**
+     * @param Domain $domain
+     * @param Database $dbForPlatform
+     * @param Event $queueForEvents
+     * @param Webhook $queueForWebhooks
+     * @param FunctionPublisher $publisherForFunctions
+     * @param Realtime $queueForRealtime
+     * @param Certificate $publisherForCertificates
+     * @param ValidatorAuthorization $authorization
+     * @param string|null $validationDomain
+     * @return void
+     * @throws \Utopia\Database\Exception
+     * @throws NotFound
+     * @throws \Utopia\Database\Exception\Query
+     */
+    private function handleDomainVerificationAction(
+        Domain $domain,
+        Database $dbForPlatform,
+        Event $queueForEvents,
+        Webhook $queueForWebhooks,
+        FunctionPublisher $publisherForFunctions,
+        Realtime $queueForRealtime,
+        Certificate $publisherForCertificates,
+        ValidatorAuthorization $authorization,
+        Bus $bus,
+        ?string $validationDomain = null
+    ): void {
+        // Get rule
+        $rule = System::getEnv('_APP_RULES_FORMAT') === 'md5'
+            ? $dbForPlatform->getDocument('rules', md5($domain->get()))
+            : $dbForPlatform->findOne('rules', [
+                Query::equal('domain', [$domain->get()]),
+                Query::limit(1),
+            ]);
+
+        // Skip if rule is not desired state (created but not verified yet).
+        if ($rule->getAttribute('status', '') !== RULE_STATUS_CREATED) {
+            Console::warning('Domain verification for ' . $rule->getAttribute('domain', '') . ' is not needed.');
+            return;
+        }
+
+        Console::info('Domain verification for ' . $rule->getAttribute('domain', '') . ' started.');
+
+        try {
+            // Verify DNS records
+            $this->validateDomain($rule, $domain, $validationDomain);
+            // Reset logs and status for the rule
+            $rule->setAttribute('logs', '');
+            $rule->setAttribute('status', RULE_STATUS_CERTIFICATE_GENERATING);
+
+            Console::success('Domain verification succeeded.');
+        } catch (AppwriteException $err) {
+            Console::warning('Domain verification failed: ' . $err->getMessage());
+            $date = \date('H:i:s');
+            $logs = "\033[90m[{$date}] \033[31mDNS verification failed: \033[0m\n";
+            $logs .= \mb_strcut($err->getMessage(), 0, 500000); // Limit to 500kb
+            $rule->setAttribute('logs', $logs);
+        } finally {
+            // Update rule and emit events
+            $this->updateRuleAndSendEvents($rule, $dbForPlatform, $queueForEvents, $queueForWebhooks, $publisherForFunctions, $queueForRealtime, $bus);
+        }
+
+        // Issue a TLS certificate when domain is verified
+        if ($rule->getAttribute('status', '') === RULE_STATUS_CERTIFICATE_GENERATING) {
+            $publisherForCertificates->enqueue(new \Appwrite\Event\Message\Certificate(
+                project: new Document([
+                    '$id' => $rule->getAttribute('projectId', ''),
+                    '$sequence' => $rule->getAttribute('projectInternalId', 0),
+                ]),
+                domain: new Document([
+                    'domain' => $rule->getAttribute('domain'),
+                    'domainType' => $rule->getAttribute('deploymentResourceType', $rule->getAttribute('type')),
+                ]),
+                action: \Appwrite\Event\Certificate::ACTION_GENERATION,
+                skipDomainValidation: true,
+            ));
+
+            Console::success('Certificate generation triggered successfully.');
+        }
+    }
+
+    /**
+     * @param Domain $domain
+     * @param ?string $domainType
+     * @param Database $dbForPlatform
+     * @param MailPublisher $publisherForMails
+     * @param NotificationPublisher $publisherForNotifications
+     * @param Event $queueForEvents
+     * @param Webhook $queueForWebhooks
+     * @param FunctionPublisher $publisherForFunctions
+     * @param Realtime $queueForRealtime
+     * @param Provider $certificates
+     * @param ValidatorAuthorization $authorization
+     * @param bool $skipRenewCheck
+     * @param array $plan
+     * @param array $platform
+     * @param string|null $validationDomain
+     * @param bool $skipDomainValidation DNS already passed for this rule
+     * @return void
+     * @throws Authorization
+     * @throws Conflict
+     * @throws NotFound
+     * @throws Structure
+     * @throws Throwable
+     * @throws \Utopia\Database\Exception
+     * @throws \Utopia\Database\Exception\Query
+     */
+    private function handleCertificateGenerationAction(
+        Domain $domain,
+        ?string $domainType,
+        Database $dbForPlatform,
+        MailPublisher $publisherForMails,
+        NotificationPublisher $publisherForNotifications,
+        Event $queueForEvents,
+        Webhook $queueForWebhooks,
+        FunctionPublisher $publisherForFunctions,
+        Realtime $queueForRealtime,
+        Provider $certificates,
+        ValidatorAuthorization $authorization,
+        Bus $bus,
+        bool $skipRenewCheck = false,
+        array $plan = [],
+        array $platform = [],
+        ?string $validationDomain = null,
+        bool $skipDomainValidation = false
+    ): void {
+        /**
+         * 1. Read arguments and validate domain
+         * 2. Get main domain
+         * 3. Validate CNAME DNS if parameter is not main domain (meaning it's custom domain)
+         * 4. Validate renew date with certificate file, unless requested to skip by parameter
+         * 5. Issue a certificate using certbot CLI
+         * 6. Update 'log' attribute on certificate document with Certbot message
+         * 7. Create storage folder for certificate, if not ready already
+         * 8. Move certificates from Certbot location to our Storage
+         * 9. Create/Update our Storage with new Traefik config with new certificate paths
+         * 11. Read certificate file and update 'renewDate' on certificate document
+         * 12. Update 'issueDate' and 'attempts' on certificate
+         *
+         * If at any point unexpected error occurs, program stops without applying changes to document, and error is thrown into worker
+         *
+         * If code stops with expected error:
+         * 1. 'log' attribute on document is updated with error message
+         * 2. 'attempts' amount is increased
+         * 3. Console log is shown
+         * 4. Email is sent to security email, unless the rule stays generating for another attempt
+         *
+         * Unless unexpected error occurs, at the end, we:
+         * 1. Update 'updated' attribute on document
+         * 2. Save document to database
+         * 3. Update all domains documents with current certificate ID
+         *
+         * Note: Renewals are checked and scheduled from maintenance worker
+         */
+
+        // Get rule document for domain
+        // TODO: (@Meldiron) Remove after 1.7.x migration
+        $rule = System::getEnv('_APP_RULES_FORMAT') === 'md5'
+            ? $dbForPlatform->getDocument('rules', md5($domain->get()))
+            : $dbForPlatform->findOne('rules', [
+                Query::equal('domain', [$domain->get()]),
+                Query::limit(1),
+            ]);
+
+        // Rule not found (or) not in the expected state
+        if ($rule->isEmpty() || !\in_array($rule->getAttribute('status'), [RULE_STATUS_CERTIFICATE_GENERATING, RULE_STATUS_VERIFIED])) {
+            Console::warning('Certificate generation for ' . $domain->get() . ' is skipped as the associated rule is either empty or not in the expected state.');
+            return;
+        }
+
+        // Get associated certificate for the rule
+        $certificate = $dbForPlatform->getDocument('certificates', $rule->getAttribute('certificateId') ?? '');
+
+        // If we don't have certificate for the rule yet, let's create one.
+        if ($certificate->isEmpty()) {
+            $certificate = new Document();
+            $certificate->setAttribute('domain', $domain->get());
+        }
+
+        $date = \date('H:i:s');
+        $logs = "\033[90m[{$date}] \033[97mProcessing SSL certificate issuance. \033[0m\n";
+
+        // Set once DNS has passed on a delayed provider, so a failure after that can be retried
+        $awaitingProvider = false;
+
+        // A renewal: the domain already serves a certificate. Retries keep the rule verified, so this holds on every attempt
+        $renewing = $rule->getAttribute('status') === RULE_STATUS_VERIFIED;
+
+        try {
+            $certificate->setAttribute('logs', $logs);
+
+            // Persist ASAP so that logs are reset in retry flow and user can see the latest logs on Console.
+            $certificate = $this->upsertCertificate($rule, $certificate, $dbForPlatform);
+            // Ensure certificate is associated with the rule
+            $rule->setAttribute('certificateId', $certificate->getId());
+
+            // Validate domain and DNS records. Skip if job is forced, or if DNS
+            // already passed for this rule: a second run of the same check can
+            // only agree, or fail on a transient and contradict that result.
+            if (!$skipRenewCheck && !$skipDomainValidation) {
+                $this->validateDomain($rule, $domain, $validationDomain);
+            }
+
+            $awaitingProvider = !$certificates->isInstantGeneration($domain->get(), $domainType);
+
+            // If certificate exists already, double-check expiry date. Skip if job is forced
+            if (!$skipRenewCheck && !$certificates->isRenewRequired($domain->get(), $domainType)) {
+                if ($certificates->isInstantGeneration($domain->get(), $domainType)) {
+                    Console::info("Skipping, renew isn't required");
+                    $rule->setAttribute('status', RULE_STATUS_VERIFIED);
+                    $certificate->setAttributes([
+                        'status' => Status::ISSUED,
+                        'expireDate' => $this->getExpireDate($certificates, $domain->get(), $domainType, $certificate),
+                    ]);
+                    return;
+                }
+
+                $status = $certificates->getCertificateStatus($domain->get(), $domainType);
+                $certificate->setAttribute('status', $status);
+                $expireDate = $status === Status::EXPIRING ? $this->getExpireDate($certificates, $domain->get(), $domainType, $certificate) : null;
+                $expired = $expireDate !== null && \strtotime($expireDate) <= \time();
+
+                // The provider owns the renewal and has not finished it; issuing again would not help.
+                // A first issuance inheriting an expired certificate has nothing serving, so it waits below like a new order.
+                if ($status === Status::EXPIRING && ($renewing || !$expired)) {
+                    // It still serves, so a rule a renewal left generating is verified again, and renewal checks report it
+                    $rule->setAttribute('status', RULE_STATUS_VERIFIED);
+                    $date = \date('H:i:s');
+                    if ($expired) {
+                        $expiredOn = (new \DateTime($expireDate))->format('Y-m-d');
+                        $logs .= "\033[90m[{$date}] \033[33mSSL certificate expired on {$expiredOn}, and the certificate provider has not renewed it yet. We'll check again tomorrow. \033[0m\n";
+                        Console::warning('Certificate for ' . $domain->get() . ' expired on ' . $expiredOn . ' and its provider has not renewed it');
+                    } else {
+                        $logs .= "\033[90m[{$date}] \033[33mSSL certificate expires soon, and the certificate provider has not renewed it yet. We'll check again tomorrow. \033[0m\n";
+                        Console::warning('Certificate for ' . $domain->get() . ' expires soon and its provider has not renewed it');
+                    }
+                    $certificate->setAttributes([
+                        'expireDate' => $expireDate,
+                        'renewDate' => DateTime::addSeconds(new \DateTime(), self::PROVIDER_CHECK_INTERVAL),
+                    ]);
+                    return;
+                }
+
+                // Wait for the delayed provider's existing order; issuing again below picks up its renew date
+                if (!\in_array($status, [Status::ISSUED, Status::RENEWING], true)) {
+                    $date = \date('H:i:s');
+                    $logs .= "\033[90m[{$date}] \033[97mSSL certificate is being issued. This usually takes a few minutes — no action needed on your end. We'll periodically check and update the status. \033[0m\n";
+                    Console::info('Certificate for ' . $domain->get() . ' is not issued yet');
+                    $certificate->setAttribute('renewDate', DateTime::addSeconds(new \DateTime(), self::PROVIDER_CHECK_INTERVAL));
+                    return;
+                }
+            }
+
+            // Prepare unique cert name. Using this helps prevent mismatch in configuration when renewing certificates.
+            $certName = Id::unique();
+            $renewDate = $certificates->issueCertificate($certName, $domain->get(), $domainType);
+
+            $date = \date('H:i:s');
+            $status = $certificates->isInstantGeneration($domain->get(), $domainType)
+                ? Status::ISSUED
+                : $certificates->getCertificateStatus($domain->get(), $domainType);
+            $certificate->setAttribute('status', $status);
+
+            // Mark the rule as 'verified' once the certificate is issued, instantly or by a delayed provider.
+            if (\in_array($status, [Status::ISSUED, Status::RENEWING], true)) {
+                $rule->setAttribute('status', RULE_STATUS_VERIFIED);
+                // Until then a delayed provider has no certificate to read an expiry from
+                $certificate->setAttribute('expireDate', $this->getExpireDate($certificates, $domain->get(), $domainType, $certificate));
+                $logs .= "\033[90m[{$date}] \033[97mSSL certificate successfully issued. \033[0m\n";
+                $certificate->setAttribute('logs', $logs);
+            } else {
+                // Delayed generation: third-party handles certificate issuance asynchronously
+                $logs .= "\033[90m[{$date}] \033[97mSSL certificate is being issued. This usually takes a few minutes — no action needed on your end. We'll periodically check and update the status. \033[0m\n";
+                $certificate->setAttribute('logs', $logs);
+            }
+
+            // A delayed provider has no renew date until it issues, and one already due would be queued on every maintenance run
+            if ($awaitingProvider && ($renewDate === null || $renewDate <= DateTime::now())) {
+                $renewDate = DateTime::addSeconds(new \DateTime(), self::PROVIDER_CHECK_INTERVAL);
+            }
+
+            $certificate->setAttributes([
+                'attempts' => 0, // Reset attempts count
+                'issueDate' => DateTime::now(), // Store current time as issue date
+                'renewDate' => $renewDate,
+            ]);
+        } catch (Throwable $e) {
+            $date = \date('H:i:s');
+            $attempts = $certificate->getAttribute('attempts', 0) + 1; // Increase attempts count
+            $waiting = $awaitingProvider && $attempts < self::MAX_GENERATION_ATTEMPTS;
+
+            // A provider waiting on the domain owner is not a failure while attempts remain
+            $logs .= $waiting && $e instanceof CertificateException && $e->isBlocked()
+                ? "\033[90m[{$date}] \033[33mSSL certificate is waiting on domain verification: \033[0m\n"
+                : "\033[90m[{$date}] \033[31mSSL certificate issuance failed: \033[0m\n";
+            $logs .= \rtrim(\mb_strcut($e->getMessage(), 0, 500000)) . "\n"; // Limit to 500kb
+
+            // Update attributes on certificate document
+            $certificate->setAttributes([
+                'attempts' => $attempts,
+                'renewDate' => DateTime::now(), // Store current time as renew date to ensure another attempt in next maintenance cycle.
+            ]);
+
+            // A provider reports whether it waits on the domain owner or has stopped trying.
+            // Any other error keeps the last reported state while attempts remain.
+            if ($e instanceof CertificateException) {
+                $certificate->setAttribute('status', $e->getStatus());
+            }
+
+            if ($waiting) {
+                // Nothing retries 'unverified', so keep the rule generating while attempts remain, for the
+                // interval to retry. A renewal stays verified, since its certificate still serves, for
+                // maintenance to retry. This is a wait, not a worker error.
+                $rule->setAttribute('status', $renewing ? RULE_STATUS_VERIFIED : RULE_STATUS_CERTIFICATE_GENERATING);
+                Console::warning('Certificate for ' . $domain->get() . ' will be retried: ' . $e->getMessage());
+            } else {
+                // A failed renewal stays verified: 'unverified' rules are never renewed again
+                $rule->setAttribute('status', $renewing ? RULE_STATUS_VERIFIED : RULE_STATUS_CERTIFICATE_GENERATION_FAILED);
+                if (!$e instanceof CertificateException) {
+                    $certificate->setAttribute('status', Status::FAILED);
+                }
+
+                // Send email to security email. Past the attempts maintenance retries, a certificate
+                // about to expire is checked twice a day: one more email for that, not one per check.
+                if ($attempts <= self::MAX_GENERATION_ATTEMPTS + 1) {
+                    $this->notifyError($domain->get(), $e->getMessage(), $attempts, $renewing, $certificate->getAttribute('expireDate'), $publisherForMails, $plan, $dbForPlatform->getDocument('projects', 'console'));
+                }
+
+                throw $e;
+            }
+        } finally {
+            // Update certificate document with logs
+            $certificate->setAttribute('logs', $logs);
+            $this->upsertCertificate($rule, $certificate, $dbForPlatform);
+
+            // Update rule and emit events
+            $rule->setAttribute('certificateId', $certificate->getId());
+            $rule->setAttribute('logs', $logs);
+            $this->updateRuleAndSendEvents($rule, $dbForPlatform, $queueForEvents, $queueForWebhooks, $publisherForFunctions, $queueForRealtime, $bus);
+
+            // A renewal was already live, so only a first issuance tells the owners
+            if (!$renewing && $rule->getAttribute('status') === RULE_STATUS_VERIFIED) {
+                $this->sendVerifiedAlert($rule, $dbForPlatform, $publisherForNotifications, $platform, $plan);
+            }
+        }
+    }
+
+    /**
+     * When the certificate expires, as the provider reports it, or as last
+     * recorded when the provider cannot tell. The date only informs the rule,
+     * so a failed read keeps the recorded one rather than failing the job.
+     * A subclass that handles a job without generation records it the same way.
+     */
+    protected function getExpireDate(Provider $certificates, string $domain, ?string $domainType, Document $certificate): ?string
+    {
+        try {
+            return $certificates->getCertificateExpiry($domain, $domainType) ?? $certificate->getAttribute('expireDate');
+        } catch (Throwable $th) {
+            Console::warning('Failed to read the certificate expiry for ' . $domain . ': ' . $th->getMessage());
+
+            return $certificate->getAttribute('expireDate');
+        }
+    }
+
+    /**
+     * Save certificate data to database.
+     *
+     * @param Document $rule Rule associated with the domain
+     * @param Document $certificate Certificate document that we need to save
+     * @param Database $dbForPlatform Database connection for console
+     * @return Document
+     * @throws \Utopia\Database\Exception
+     * @throws Authorization
+     * @throws Conflict
+     * @throws Structure
+     */
+    private function upsertCertificate(
+        Document $rule,
+        Document $certificate,
+        Database $dbForPlatform,
+    ): Document {
+        // Decide whether update (or) insert is needed
+        $existingCertificate = $dbForPlatform->getDocument('certificates', $rule->getAttribute('certificateId') ?? '');
+
+        if ($existingCertificate->isEmpty()) {
+            $certificate->removeAttribute('$sequence');
+            $certificate = $dbForPlatform->createDocument('certificates', $certificate);
+        } else {
+            $certificate = new Document(\array_merge($existingCertificate->getArrayCopy(), $certificate->getArrayCopy()));
+            $certificate = $dbForPlatform->updateDocument('certificates', $certificate->getId(), $certificate);
+        }
+
+        return $certificate;
+    }
+
+    /**
+     * Update all existing domain documents so they have relation to correct certificate document.
+     * This solves issues:
+     * - when adding a domain for which there is already a certificate
+     * - when renew creates new document? It might?
+     * - overall makes it more reliable
+     *
+     * @param Document $rule Rule document that is affected by new certificate
+     * @param Database $dbForPlatform Database connection for console
+     * @param Event $queueForEvents Event publisher for events
+     * @param Webhook $queueForWebhooks Webhook publisher for webhooks
+     * @param FunctionPublisher $publisherForFunctions Function publisher for functions
+     * @param Realtime $queueForRealtime Realtime publisher for realtime events
+     *
+     * @return void
+     */
+    protected function updateRuleAndSendEvents(
+        Document $rule,
+        Database $dbForPlatform,
+        Event $queueForEvents,
+        Webhook $queueForWebhooks,
+        FunctionPublisher $publisherForFunctions,
+        Realtime $queueForRealtime,
+        Bus $bus
+    ): void {
+        $rule = $dbForPlatform->updateDocument('rules', $rule->getId(), new Document([
+            'status' => $rule->getAttribute('status'),
+            'certificateId' => $rule->getAttribute('certificateId'),
+            'logs' => $rule->getAttribute('logs'),
+        ]));
+        $bus->dispatch(new RuleUpdated($rule->getArrayCopy()));
+
+        $projectId = (string) $rule->getAttribute('projectId', '');
+
+        // Skip events for console project (triggered by auto-ssl generation for 1 click setups)
+        if ($projectId === '' || $projectId === 'console') {
+            return;
+        }
+
+        $project = $dbForPlatform->getDocument('projects', $projectId);
+        if ($project->isEmpty()) {
+            return;
+        }
+
+        // The rule model carries its certificate's state, which is what a job here changes
+        $certificate = $dbForPlatform->getDocument('certificates', $rule->getAttribute('certificateId') ?? '');
+        $payload = (new Rule())->payload(new Document(\array_merge($rule->getArrayCopy(), [
+            'renewAt' => $certificate->getAttribute('renewDate', ''),
+            'expireAt' => $certificate->getAttribute('expireDate', ''),
+            'certificateStatus' => $certificate->getAttribute('status', ''),
+        ])));
+
+        $queueForEvents
+            ->setProject($project)
+            ->setEvent('rules.[ruleId].update')
+            ->setParam('ruleId', $rule->getId())
+            ->setPayload($payload);
+
+        /** Trigger Webhook */
+        $queueForWebhooks
+            ->from($queueForEvents)
+            ->trigger();
+
+        /** Trigger Functions */
+        $publisherForFunctions->enqueue(FunctionMessage::fromEvent(
+            event: $queueForEvents->getEvent(),
+            params: $queueForEvents->getParams(),
+            project: $queueForEvents->getProject(),
+            user: $queueForEvents->getUser(),
+            userId: $queueForEvents->getUserId(),
+            payload: $queueForEvents->getPayload(),
+            platform: $queueForEvents->getPlatform(),
+        ));
+
+        /** Trigger Realtime Events */
+        $queueForRealtime
+            ->setSubscribers(['console', $projectId])
+            ->from($queueForEvents)
+            ->trigger();
+    }
+
+    /**
+     * Internal domain validation functionality to prevent unnecessary attempts. We check:
+     * - Domain needs to be public and valid (prevents NFT domains that are not supported)
+     * - Domain must have proper DNS record
+     *
+     * @param Document $rule Rule to validate
+     * @param Domain $domain Domain to validate
+     * @param string|null $validationDomain Override for main domain check
+     *
+     * @return void
+     * @throws Exception
+     */
+    private function validateDomain(Document $rule, Domain $domain, ?string $validationDomain = null): void
+    {
+        $mainDomain = $validationDomain ?? $this->getMainDomain();
+        $isMainDomain = !isset($mainDomain) || $domain->get() === $mainDomain;
+        $isAppwriteOwned = $rule->getAttribute('owner') === 'Appwrite';
+
+        // Skip DNS verification for the main domain and Appwrite-owned subdomains
+        // (auto-generated under _APP_DOMAIN_FUNCTIONS / _APP_DOMAIN_SITES). Appwrite
+        // created those subdomains itself; they typically rely on a wildcard A/AAAA
+        // record rather than a per-subdomain CNAME to _APP_DOMAIN_TARGET_CNAME.
+        if ($isMainDomain || $isAppwriteOwned) {
+            // TODO: Would be awesome to check A/AAAA record here. Maybe dry run?
+            return;
+        }
+
+        try {
+            $this->verifyRule($rule);
+        } catch (AppwriteException $err) {
+            $msg = $err->getMessage() . "\n";
+            $msg .= "Verify your DNS records are correctly configured and try again.\n";
+            $msg .= "If they're correct and it still fails, please retry after sometime. DNS records can take up to 48 hours to propagate.\n";
+            throw new AppwriteException($err->getType(), $msg);
+        }
+    }
+
+    /**
+     * Get main domain. Needed as we do different checks for main and non-main domains.
+     *
+     * @return null|string Returns main domain. If null, there is no main domain yet.
+     */
+    private function getMainDomain(): ?string
+    {
+        $envDomain = System::getEnv('_APP_DOMAIN', '');
+        if (!empty($envDomain) && $envDomain !== 'localhost') {
+            return $envDomain;
+        }
+
+        return null;
+    }
+
+    /**
+     * Method to make sure information about error is delivered to administrator.
+     *
+     * @param string $domain Domain that caused the error
+     * @param string $errorMessage Verbose error message
+     * @param int $attempt How many times it failed already
+     * @param bool $renewing Whether the domain already serves a certificate
+     * @param string|null $expireDate When that certificate expires, if recorded
+     * @param MailPublisher $publisherForMails
+     * @param array $plan
+     * @return void
+     * @throws Exception
+     */
+    private function notifyError(string $domain, string $errorMessage, int $attempt, bool $renewing, ?string $expireDate, MailPublisher $publisherForMails, array $plan, Document $console): void
+    {
+        // Log error into console
+        Console::warning('Cannot renew domain (' . $domain . ') on attempt no. ' . $attempt . ' certificate: ' . $errorMessage);
+
+        $locale = new Locale(System::getEnv('_APP_LOCALE', 'en'));
+        $locale->setFallback('en');
+
+        // Send mail to administrator mail
+        $template = Template::fromFile(__DIR__ . '/../../../../app/config/locale/templates/email-certificate-failed.tpl');
+        $template->setParam('{{domain}}', $domain);
+        // Escape the error before adding line breaks, so the breaks render
+        $template->setParam('{{error}}', \nl2br(\htmlspecialchars($errorMessage, ENT_QUOTES, 'UTF-8')), escapeHtml: false);
+        $template->setParam('{{attempts}}', $attempt);
+
+        $expiry = 'Your domain has no valid certificate until one is generated.';
+        if ($renewing) {
+            $expiry = 'The existing certificate keeps serving your domain until it expires.';
+        }
+        if ($renewing && !empty($expireDate)) {
+            $expiresOn = (new \DateTime($expireDate))->format('Y-m-d');
+            $expiry = \strtotime($expireDate) <= \time()
+                ? 'The existing certificate expired on ' . $expiresOn . '.'
+                : 'The existing certificate keeps serving your domain until it expires on ' . $expiresOn . '.';
+        }
+        $template->setParam('{{expiry}}', $expiry);
+
+        $body = $template->render();
+
+        $emailVariables = [
+            'direction' => $locale->getText('settings.direction'),
+            'domain' => $domain,
+            'logoUrl' => $plan['logoUrl'] ?? APP_EMAIL_LOGO_URL,
+            'accentColor' => $plan['accentColor'] ?? APP_EMAIL_ACCENT_COLOR,
+            'twitter' => $plan['twitterUrl'] ?? APP_SOCIAL_TWITTER,
+            'discord' => $plan['discordUrl'] ?? APP_SOCIAL_DISCORD,
+            'github' => $plan['githubUrl'] ?? APP_SOCIAL_GITHUB_APPWRITE,
+            'terms' => $plan['termsUrl'] ?? APP_EMAIL_TERMS_URL,
+            'privacy' => $plan['privacyUrl'] ?? APP_EMAIL_PRIVACY_URL,
+            'platform' => $plan['platformName'] ?? APP_NAME,
+        ];
+
+        $subject = $locale->getText("emails.certificate.subject");
+        $preview = $locale->getText("emails.certificate.preview");
+
+        $publisherForMails->enqueue(new MailMessage(
+            project: $console,
+            recipient: System::getEnv('_APP_EMAIL_CERTIFICATES', System::getEnv('_APP_SYSTEM_SECURITY_EMAIL_ADDRESS')),
+            name: 'Appwrite Administrator',
+            subject: $subject,
+            template: MAIL_TEMPLATE_CERTIFICATE_FAILED,
+            bodyTemplate: __DIR__ . '/../../../../app/config/locale/templates/email-base-styled.tpl',
+            body: $body,
+            preview: $preview,
+            variables: $emailVariables,
+        ));
+    }
+
+    /**
+     * Mail and notify the project owners, the same way webhook alerts do.
+     * Protected for workers that verify a rule outside certificate generation.
+     */
+    protected function sendVerifiedAlert(Document $rule, Database $dbForPlatform, NotificationPublisher $publisherForNotifications, array $platform, array $plan): void
+    {
+        $projectId = (string) $rule->getAttribute('projectId', '');
+        if ($projectId === '' || $projectId === 'console') {
+            return;
+        }
+
+        $project = $dbForPlatform->getDocument('projects', $projectId);
+        if ($project->isEmpty()) {
+            return;
+        }
+
+        $memberships = $dbForPlatform->find('memberships', [
+            Query::equal('teamInternalId', [$project->getAttribute('teamInternalId')]),
+            Query::equal('confirm', [true]),
+            Query::limit(APP_LIMIT_SUBQUERY),
+        ]);
+
+        $userIds = [];
+        foreach ($memberships as $membership) {
+            if (\in_array('owner', $membership->getAttribute('roles', []), true)) {
+                $userIds[] = $membership->getAttribute('userId');
+            }
+        }
+
+        if (empty($userIds)) {
+            return;
+        }
+
+        $users = $dbForPlatform->find('users', [
+            Query::equal('$id', \array_values(\array_unique($userIds))),
+            Query::limit(APP_LIMIT_SUBQUERY),
+        ]);
+
+        $projectInternalId = (string) $project->getSequence();
+        $domain = $rule->getAttribute('domain', '');
+
+        // A site or function lists its own domains; API domains are in project settings
+        $resourceId = $rule->getAttribute('deploymentResourceId', '');
+        $path = match ($resourceId === '' ? '' : $rule->getAttribute('deploymentResourceType', '')) {
+            'site' => "/projects/{$projectId}/sites/{$resourceId}/domains",
+            'function' => "/projects/{$projectId}/functions/{$resourceId}/domains",
+            default => "/projects/{$projectId}/settings/domains",
+        };
+
+        foreach ($users as $user) {
+            $userId = $user->getId();
+            $recipient = [
+                'resourceType' => RESOURCE_TYPE_USERS,
+                'resourceId' => $userId,
+                'resourceInternalId' => (string) $user->getSequence(),
+                'parentResourceType' => RESOURCE_TYPE_PROJECTS,
+                'parentResourceId' => $projectId,
+                'parentResourceInternalId' => $projectInternalId,
+            ];
+
+            $recipients = [['address' => $userId, 'channel' => NOTIFICATION_TYPE_CONSOLE] + $recipient];
+            if (!empty($user->getAttribute('email'))) {
+                $recipients[] = ['address' => $user->getAttribute('email'), 'channel' => NOTIFICATION_TYPE_EMAIL] + $recipient;
+            }
+
+            $template = Template::fromFile(__DIR__ . '/../../../../app/config/locale/templates/email-domain-verified.tpl');
+            $template->setParam('{{user}}', (string) ($user->getAttribute('name', 'there') ?: 'there'));
+            $template->setParam('{{domain}}', $domain);
+            $template->setParam('{{project}}', $project->getAttribute('name'));
+            $template->setParam('{{host}}', $platform['consoleUrl'] ?? '');
+            $template->setParam('{{path}}', $path);
+
+            $publisherForNotifications->enqueue(new NotificationMessage(
+                project: $project,
+                recipients: $recipients,
+                template: MAIL_TEMPLATE_DOMAIN_VERIFIED,
+                deduplicationKey: 'rule:' . $rule->getId() . ':verified:' . $rule->getUpdatedAt(),
+                subject: 'Your domain ' . $domain . ' is live',
+                bodyTemplate: __DIR__ . '/../../../../app/config/locale/templates/email-base-styled.tpl',
+                body: $template->render(),
+                preview: 'Domain "' . $domain . '" on project "' . $project->getAttribute('name') . '" is verified and live.',
+                variables: [
+                    'logoUrl' => $plan['logoUrl'] ?? APP_EMAIL_LOGO_URL,
+                    'accentColor' => $plan['accentColor'] ?? APP_EMAIL_ACCENT_COLOR,
+                    'twitter' => $plan['twitterUrl'] ?? APP_SOCIAL_TWITTER,
+                    'discord' => $plan['discordUrl'] ?? APP_SOCIAL_DISCORD,
+                    'github' => $plan['githubUrl'] ?? APP_SOCIAL_GITHUB_APPWRITE,
+                    'terms' => $plan['termsUrl'] ?? APP_EMAIL_TERMS_URL,
+                    'privacy' => $plan['privacyUrl'] ?? APP_EMAIL_PRIVACY_URL,
+                    'platform' => $plan['platformName'] ?? APP_NAME,
+                ],
+            ));
+        }
+    }
+}

@@ -1,0 +1,457 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\Databases\Collections;
+
+use Appwrite\Event\Event;
+use Appwrite\Extend\Exception;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Deprecated;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Database\Attribute as AttributeDefinition;
+use Appwrite\Utopia\Database\Validator\Attributes as AttributesValidator;
+use Appwrite\Utopia\Database\Validator\CustomId;
+use Appwrite\Utopia\Database\Validator\Indexes as IndexesValidator;
+use Appwrite\Utopia\Response as UtopiaResponse;
+use Utopia\Database\Attribute;
+use Utopia\Database\Capability;
+use Utopia\Database\Collection;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Exception\Duplicate as DuplicateException;
+use Utopia\Database\Exception\Index as IndexException;
+use Utopia\Database\Exception\Limit as LimitException;
+use Utopia\Database\Exception\NotFound as NotFoundException;
+use Utopia\Database\Id;
+use Utopia\Database\Index;
+use Utopia\Database\Permission;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\IndexDefinition as IndexValidator;
+use Utopia\Database\Validator\Permissions;
+use Utopia\Database\Validator\UID;
+use Utopia\Http\Adapter\Swoole\Response as SwooleResponse;
+use Utopia\Http\Http;
+use Utopia\Query\Schema\ColumnType;
+use Utopia\Validator\ArrayList;
+use Utopia\Validator\Boolean;
+use Utopia\Validator\JSON\ObjectValidator as JSONObject;
+use Utopia\Validator\Nullable;
+use Utopia\Validator\Text;
+
+class Create extends Action
+{
+    public static function getName(): string
+    {
+        return 'createCollection';
+    }
+
+    protected function getResponseModel(): string
+    {
+        return UtopiaResponse::MODEL_COLLECTION;
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(self::HTTP_REQUEST_METHOD_POST)
+            ->setHttpPath('/v1/databases/:databaseId/collections')
+            ->desc('Create collections')
+            ->groups(['api', 'database'])
+            ->label('event', 'databases.[databaseId].collections.[collectionId].create')
+            ->label('scope', 'collections.write')
+            ->label('resourceType', RESOURCE_TYPE_DATABASES)
+            ->label('audits.event', 'collection.create')
+            ->label('audits.resource', 'database/{request.databaseId}/collection/{response.$id}')
+            ->label('usage.resource', 'database/{request.databaseId}/collection/{response.$id}')
+            ->label('sdk', new Method(
+                namespace: 'databases',
+                group: $this->getSDKGroup(),
+                name: self::getName(),
+                description: '/docs/references/databases/create-collection.md',
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: SwooleResponse::STATUS_CODE_CREATED,
+                        model: $this->getResponseModel(),
+                    )
+                ],
+                contentType: ContentType::JSON,
+                deprecated: new Deprecated(
+                    since: '1.8.0',
+                    replaceWith: 'tablesDB.createTable',
+                ),
+            ))
+            ->param('databaseId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Database ID.', false, ['dbForProject'])
+            ->param('collectionId', '', fn (Database $dbForProject) => new CustomId(false, $dbForProject->getMaxUidLength()), 'Unique Id. Choose a custom ID or generate a random ID with `ID.unique()`. Valid chars are a-z, A-Z, 0-9, period, hyphen, and underscore. Can\'t start with a special char. Max length is 36 chars.', false, ['dbForProject'])
+            ->param('name', '', new Text(128), 'Collection name. Max length: 128 chars.')
+            ->param('permissions', null, new Nullable(new Permissions(APP_LIMIT_ARRAY_PARAMS_SIZE)), 'An array of permissions strings. By default, no user is granted with any permissions. [Learn more about permissions](https://appwrite.io/docs/permissions).', true)
+            ->param('documentSecurity', false, new Boolean(true), 'Enables configuring permissions for individual documents. A user needs one of document or collection level permissions to access a document. [Learn more about permissions](https://appwrite.io/docs/permissions).', true)
+            ->param('enabled', true, new Boolean(), 'Is collection enabled? When set to \'disabled\', users cannot access the collection but Server SDKs with and API key can still read and write to the collection. No data is lost when this is toggled.', true)
+            ->param('attributes', [], new ArrayList(new JSONObject(), APP_LIMIT_ARRAY_PARAMS_SIZE), 'Array of attribute definitions to create. Each attribute should contain: key (string), type (string: string, varchar, text, mediumtext, longtext, integer, bigint, double, boolean, datetime, point, linestring, polygon, email, url, ip, enum), size (integer, required for string and varchar types), required (boolean, optional), default (mixed, optional), array (boolean, optional), and type-specific options.', true)
+            ->param('indexes', [], new ArrayList(new JSONObject(), APP_LIMIT_ARRAY_PARAMS_SIZE), 'Array of index definitions to create. Each index should contain: key (string), type (string: key, fulltext, unique, spatial, trigram), attributes (array of attribute keys), orders (array of ASC/DESC, optional), and lengths (array of integers, optional).', true)
+            ->param('description', '', new Text(1024, 0), 'Optional description for the collection.', true)
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('getDatabasesDB')
+            ->inject('queueForEvents')
+            ->inject('authorization')
+            ->inject('plan')
+            ->callback($this->action(...));
+    }
+
+    public function action(string $databaseId, string $collectionId, string $name, ?array $permissions, bool $documentSecurity, bool $enabled, array $attributes, array $indexes, string $description, UtopiaResponse $response, Database $dbForProject, callable $getDatabasesDB, Event $queueForEvents, Authorization $authorization, array $plan): void
+    {
+        $database = $authorization->skip(fn () => $dbForProject->getDocument('databases', $databaseId));
+
+        if ($database->isEmpty() || $this->isDatabaseTypeMismatch($database)) {
+            throw new Exception(Exception::DATABASE_NOT_FOUND, params: [$databaseId]);
+        }
+
+        $collectionId = $collectionId === 'unique()' ? Id::unique() : $collectionId;
+
+        // Map aggregate permissions into the multiple permissions they represent.
+        $permissions = Permission::aggregate($permissions) ?? [];
+
+        // Resolve the data-plane database BEFORE writing the metadata row. For a
+        // dedicated product database this throws while provisioning (no DSN yet);
+        // writing the row first would leave an orphaned collection with no backing
+        // collection, which lists fine but fails every document operation.
+        /**
+         * @var Database $dbForDatabases
+         */
+        $dbForDatabases = $getDatabasesDB($database);
+
+        try {
+            $collection = $dbForProject->createDocument('database_' . $database->getSequence(), new Document([
+                '$id' => $collectionId,
+                'databaseInternalId' => $database->getSequence(),
+                'databaseId' => $databaseId,
+                '$permissions' => $permissions,
+                'documentSecurity' => $documentSecurity,
+                'enabled' => $enabled,
+                'name' => $name,
+                'description' => $description,
+                'search' => \implode(' ', [$collectionId, $name, $description]),
+            ]));
+        } catch (DuplicateException) {
+            throw new Exception($this->getDuplicateException(), params: [$collectionId]);
+        } catch (LimitException) {
+            throw new Exception($this->getLimitException(), params: [$databaseId]);
+        } catch (NotFoundException) {
+            throw new Exception(Exception::DATABASE_NOT_FOUND, params: [$databaseId]);
+        }
+
+        $collectionKey = 'database_' . $database->getSequence() . '_collection_' . $collection->getSequence();
+        $databaseKey = 'database_' . $database->getSequence();
+
+        $attributesValidator = new AttributesValidator(
+            APP_LIMIT_ARRAY_PARAMS_SIZE,
+            $this->supportsSpatial($dbForDatabases->getAdapter()),
+            $this->supportsDefinedAttributes($dbForDatabases->getAdapter())
+        );
+
+        if (!$attributesValidator->isValid($attributes)) {
+            $dbForProject->deleteDocument($databaseKey, $collection->getId());
+            throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, $attributesValidator->getDescription());
+        }
+
+        foreach ($attributes as $attribute) {
+            if (($attribute['type'] ?? '') === ColumnType::Relationship->value) {
+                $dbForProject->deleteDocument($databaseKey, $collection->getId());
+                throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, 'Relationship attributes cannot be created inline. Use the create relationship endpoint instead.');
+            }
+
+            // Loose match, as the attribute response filter reads it, so no filters shape skips the checks
+            if (!\in_array('encrypt', (array) ($attribute['filters'] ?? []))) {
+                continue;
+            }
+
+            $resources = $this->isCollectionsAPI() ? 'attributes' : 'columns';
+            if (!Http::isDevelopment() && !empty($plan) && !($plan['databasesAllowEncrypt'] ?? false)) {
+                $dbForProject->deleteDocument($databaseKey, $collection->getId());
+                throw new Exception(Exception::GENERAL_BAD_REQUEST, 'Encrypted ' . $resources . ' are not available on your plan. Please upgrade to create encrypted ' . $resources . '.');
+            }
+
+            if (AttributeDefinition::resolve($attribute)['size'] < APP_DATABASE_ENCRYPT_SIZE_MIN) {
+                $dbForProject->deleteDocument($databaseKey, $collection->getId());
+                throw new Exception(Exception::GENERAL_BAD_REQUEST, 'Size too small. Encrypted strings require a minimum size of ' . APP_DATABASE_ENCRYPT_SIZE_MIN . ' characters.');
+            }
+        }
+
+        $collectionAttributes = [];
+        $attributeDocuments = [];
+        try {
+            foreach ($attributes as $attributeDef) {
+                $attrDoc = $this->buildAttributeDocument($database, $collection, $attributeDef);
+                $collectionAttributes[] = $attrDoc['collection'];
+                $attributeDocuments[] = $attrDoc['document'];
+            }
+        } catch (\Throwable $e) {
+            $dbForProject->deleteDocument($databaseKey, $collection->getId());
+            throw $e;
+        }
+
+        // Validate indexes
+        $indexesValidator = new IndexesValidator($dbForDatabases->getLimitForIndexes());
+        if (!$indexesValidator->isValid($indexes)) {
+            $dbForProject->deleteDocument($databaseKey, $collection->getId());
+            throw new Exception(Exception::GENERAL_ARGUMENT_INVALID, $indexesValidator->getDescription());
+        }
+
+        $collectionIndexes = [];
+        $indexDocuments = [];
+        try {
+            foreach ($indexes as $indexDef) {
+                $idxDoc = $this->buildIndexDocument($database, $collection, $indexDef, $collectionAttributes, $dbForDatabases);
+                $collectionIndexes[] = $idxDoc['collection'];
+                $indexDocuments[] = $idxDoc['document'];
+            }
+        } catch (\Throwable $e) {
+            $dbForProject->deleteDocument($databaseKey, $collection->getId());
+            throw $e;
+        }
+
+        // Validate indexes with DB adapter capabilities
+        $indexValidator = new IndexValidator(
+            $collectionAttributes,
+            [],
+            $dbForDatabases->profile(),
+        );
+
+        foreach ($collectionIndexes as $indexDoc) {
+            if (!$indexValidator->isValid($indexDoc)) {
+                $dbForProject->deleteDocument($databaseKey, $collection->getId());
+                throw new Exception($this->getInvalidIndexException(), $indexValidator->getDescription());
+            }
+        }
+
+        try {
+            $dbForDatabases->createCollection(Collection::create(
+                id: $collectionKey,
+                attributes: $collectionAttributes,
+                indexes: $collectionIndexes,
+                permissions: $permissions,
+                documentSecurity: $documentSecurity,
+            ));
+        } catch (DuplicateException) {
+            $dbForProject->deleteDocument($databaseKey, $collection->getId());
+            throw new Exception($this->getDuplicateException(), params: [$collectionId]);
+        } catch (IndexException $e) {
+            $dbForProject->deleteDocument($databaseKey, $collection->getId());
+            throw new Exception($this->getInvalidIndexException(), $e->getMessage());
+        } catch (LimitException) {
+            $dbForProject->deleteDocument($databaseKey, $collection->getId());
+            throw new Exception($this->getLimitException(), params: [$collectionId]);
+        } catch (\Throwable $e) {
+            $dbForProject->deleteDocument($databaseKey, $collection->getId());
+            throw $e;
+        }
+
+        // Create documents in attributes and indexes collections
+        try {
+            if (!empty($attributeDocuments)) {
+                $dbForProject->createDocuments('attributes', $attributeDocuments);
+            }
+            if (!empty($indexDocuments)) {
+                $dbForProject->createDocuments('indexes', $indexDocuments);
+            }
+        } catch (DuplicateException) {
+            $this->cleanup($dbForProject, $dbForDatabases, $databaseKey, $collectionKey, $collection->getId());
+            throw new Exception($this->getDuplicateException(), params: [$collectionId]);
+        } catch (\Throwable $e) {
+            $this->cleanup($dbForProject, $dbForDatabases, $databaseKey, $collectionKey, $collection->getId());
+            throw $e;
+        }
+
+        $dbForProject->purgeCachedDocument('database_' . $database->getSequence(), $collection->getId());
+        $dbForDatabases->purgeCachedCollection('database_' . $database->getSequence() . '_collection_' . $collection->getSequence());
+
+        // Reload the collection so its subquery filters include the schema created above.
+        $collection = $authorization->skip(fn () => $dbForProject->getDocument($databaseKey, $collection->getId()));
+
+        $queueForEvents
+            ->setContext('database', $database)
+            ->setParam('databaseId', $databaseId)
+            ->setParam($this->getEventsParamKey(), $collection->getId());
+
+        $this->addRowBytesInfo($collection, $dbForProject);
+
+        $response
+            ->setStatusCode(SwooleResponse::STATUS_CODE_CREATED)
+            ->dynamic($collection, $this->getResponseModel());
+    }
+
+    /**
+     * @return array{collection: Attribute, document: Document}
+     */
+    protected function buildAttributeDocument(
+        Document $database,
+        Document $collection,
+        array $attribute,
+    ): array {
+        ['type' => $type, 'format' => $format, 'size' => $size] = AttributeDefinition::resolve($attribute);
+
+        $key = $attribute['key'];
+        $required = $attribute['required'] ?? false;
+        $signed = $attribute['signed'] ?? true;
+        $array = $attribute['array'] ?? false;
+        $formatOptions = [];
+        $filters = $attribute['filters'] ?? [];
+        $default = $attribute['default'] ?? null;
+
+        if ($format === APP_DATABASE_ATTRIBUTE_ENUM && isset($attribute['elements'])) {
+            $formatOptions = ['elements' => $attribute['elements']];
+        }
+
+        // The dedicated endpoints store a range on every numeric attribute, falling
+        // back to the full width of the type, so omitting min/max here has to produce
+        // the same document rather than one with no range at all.
+        if (\in_array($type, [
+            ColumnType::Integer->value,
+            Attribute::storedType(ColumnType::BigInteger),
+            ColumnType::Float->value,
+            ColumnType::Double->value,
+        ], true)) {
+            $isFloat = \in_array($type, [ColumnType::Float->value, ColumnType::Double->value], true);
+
+            $format = match ($type) {
+                ColumnType::Integer->value => APP_DATABASE_ATTRIBUTE_INT_RANGE,
+                Attribute::storedType(ColumnType::BigInteger) => APP_DATABASE_ATTRIBUTE_BIGINT_RANGE,
+                default => APP_DATABASE_ATTRIBUTE_FLOAT_RANGE,
+            };
+
+            $min = $attribute['min'] ?? ($isFloat ? -\PHP_FLOAT_MAX : \PHP_INT_MIN);
+            $max = $attribute['max'] ?? ($isFloat ? \PHP_FLOAT_MAX : \PHP_INT_MAX);
+
+            $formatOptions = [
+                'min' => $isFloat ? \floatval($min) : $min,
+                'max' => $isFloat ? \floatval($max) : $max,
+            ];
+        }
+
+        $collectionDoc = Attribute::fromArray([
+            '$id' => $key,
+            'key' => $key,
+            'type' => $type,
+            'size' => $size,
+            'required' => $required,
+            'signed' => $signed,
+            'default' => $default,
+            'array' => $array,
+            'format' => $format,
+            'formatOptions' => $formatOptions,
+            'filters' => $filters,
+        ]);
+
+        $document = new Document([
+            '$id' => Id::custom($database->getSequence() . '_' . $collection->getSequence() . '_' . $key),
+            'key' => $key,
+            'description' => $attribute['description'] ?? '',
+            'databaseInternalId' => $database->getSequence(),
+            'databaseId' => $database->getId(),
+            'collectionInternalId' => $collection->getSequence(),
+            'collectionId' => $collection->getId(),
+            'type' => $type,
+            'status' => 'available',
+            'size' => $size,
+            'required' => $required,
+            'signed' => $signed,
+            'default' => $default,
+            'array' => $array,
+            'format' => $format,
+            'formatOptions' => $formatOptions,
+            'filters' => $filters,
+        ]);
+
+        return [
+            'collection' => $collectionDoc,
+            'document' => $document,
+        ];
+    }
+
+    /**
+     * @param list<Attribute> $attributes
+     * @return array{collection: Index, document: Document}
+     */
+    protected function buildIndexDocument(Document $database, Document $collection, array $indexDef, array $attributes, Database $dbForDatabases): array
+    {
+        $key = $indexDef['key'];
+        $type = $indexDef['type'];
+        $indexAttributes = $indexDef['attributes'];
+        $orders = $indexDef['orders'] ?? [];
+        $lengths = $indexDef['lengths'] ?? [];
+
+        $attributesByKey = [];
+        foreach ($attributes as $attribute) {
+            $attributesByKey[$attribute->key] = $attribute;
+        }
+
+        foreach ($indexAttributes as $i => $attr) {
+            if (empty($lengths[$i])) {
+                $lengths[$i] = null;
+            }
+
+            if (!(($attributesByKey[$attr] ?? null)?->array)) {
+                continue;
+            }
+
+            $lengths[$i] = Database::MAX_ARRAY_INDEX_LENGTH;
+            $orders[$i] = null;
+
+            if ($dbForDatabases->getAdapter()->supports(Capability::DefinedAttributes)) {
+                // Because of a bug in MySQL, we cannot create indexes on array attributes for now, otherwise queries break.
+                throw new Exception(Exception::INDEX_INVALID, 'Creating indexes on array attributes is not currently supported.');
+            }
+        }
+
+        $collectionDoc = Index::fromArray([
+            '$id' => $key,
+            'key' => $key,
+            'type' => $type,
+            'attributes' => $indexAttributes,
+            'lengths' => $lengths,
+            'orders' => $orders,
+        ]);
+
+        $document = new Document([
+            '$id' => Id::custom($database->getSequence() . '_' . $collection->getSequence() . '_' . $key),
+            'key' => $key,
+            'description' => $indexDef['description'] ?? '',
+            'status' => 'available',
+            'databaseInternalId' => $database->getSequence(),
+            'databaseId' => $database->getId(),
+            'collectionInternalId' => $collection->getSequence(),
+            'collectionId' => $collection->getId(),
+            'type' => $type,
+            'attributes' => $indexAttributes,
+            'lengths' => $lengths,
+            'orders' => $orders,
+        ]);
+
+        return [
+            'collection' => $collectionDoc,
+            'document' => $document,
+        ];
+    }
+
+    protected function cleanup(
+        Database $dbForProject,
+        Database $dbForDatabases,
+        string $databaseId,
+        string $collectionId,
+        string $collectionDocumentId
+    ): void {
+        try {
+            $dbForDatabases->deleteCollection($collectionId);
+        } catch (\Throwable) {
+            // Ignore cleanup errors for collection deletion
+        }
+
+        try {
+            $dbForProject->deleteDocument($databaseId, $collectionDocumentId);
+        } catch (\Throwable) {
+            // Ignore cleanup errors for document deletion
+        }
+    }
+}

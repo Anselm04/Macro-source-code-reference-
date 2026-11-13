@@ -1,0 +1,108 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\Databases\Collections\Attributes\Polygon;
+
+use Appwrite\Event\Event;
+use Appwrite\Extend\Exception;
+use Appwrite\Platform\Modules\Databases\Http\Databases\Collections\Attributes\Action;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\ContentType;
+use Appwrite\SDK\Deprecated;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response as UtopiaResponse;
+use Utopia\Database\Database;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\Key;
+use Utopia\Database\Validator\Spatial;
+use Utopia\Database\Validator\UID;
+use Utopia\Http\Adapter\Swoole\Response as SwooleResponse;
+use Utopia\Query\Schema\ColumnType;
+use Utopia\Validator\Boolean;
+use Utopia\Validator\Nullable;
+use Utopia\Validator\Text;
+
+class Update extends Action
+{
+    public static function getName(): string
+    {
+        return 'updatePolygonAttribute';
+    }
+
+    protected function getResponseModel(): string|array
+    {
+        return UtopiaResponse::MODEL_ATTRIBUTE_POLYGON;
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(self::HTTP_REQUEST_METHOD_PATCH)
+            ->setHttpPath('/v1/databases/:databaseId/collections/:collectionId/attributes/polygon/:key')
+            ->desc('Update polygon attribute')
+            ->groups(['api', 'database', 'schema'])
+            ->label('scope', 'collections.write')
+            ->label('resourceType', RESOURCE_TYPE_DATABASES)
+            ->label('event', 'databases.[databaseId].collections.[collectionId].attributes.[attributeId].update')
+            ->label('audits.event', 'attribute.update')
+            ->label('audits.resource', 'database/{request.databaseId}/collection/{request.collectionId}')
+            ->label('usage.resource', 'database/{request.databaseId}/collection/{request.collectionId}')
+            ->label('sdk', new Method(
+                namespace: $this->getSDKNamespace(),
+                group: $this->getSDKGroup(),
+                name: self::getName(),
+                description: '/docs/references/databases/update-polygon-attribute.md',
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: SwooleResponse::STATUS_CODE_OK,
+                        model: $this->getResponseModel(),
+                    )
+                ],
+                contentType: ContentType::JSON,
+                deprecated: new Deprecated(
+                    since: '1.8.0',
+                    replaceWith: 'tablesDB.updatePolygonColumn',
+                ),
+            ))
+            ->param('databaseId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Database ID.', false, ['dbForProject'])
+            ->param('collectionId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Collection ID. You can create a new collection using the Database service [server integration](https://appwrite.io/docs/server/databases#createCollection).', false, ['dbForProject'])
+            ->param('key', '', fn (Database $dbForProject) => new Key(false, $dbForProject->getMaxUidLength()), 'Attribute Key.', false, ['dbForProject'])
+            ->param('required', null, new Boolean(), 'Is attribute required?')
+            ->param('default', null, new Nullable(new Spatial(ColumnType::Polygon->value)), 'Default value for attribute when not provided, three-dimensional array where the outer array holds one or more linear rings, [[[longitude, latitude], …], …], the first ring is the exterior boundary, any additional rings are interior holes, and each ring must start and end with the same coordinate pair. Cannot be set when attribute is required.', true)
+            ->param('newKey', null, fn (Database $dbForProject) => new Nullable(new Key(false, $dbForProject->getMaxUidLength())), 'New attribute key.', true, ['dbForProject'])
+            ->param('description', null, new Nullable(new Text(1024, 0)), 'Optional description for the attribute.', true)
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('getDatabasesDB')
+            ->inject('queueForEvents')
+            ->inject('authorization')
+            ->callback($this->action(...));
+    }
+
+    public function action(string $databaseId, string $collectionId, string $key, ?bool $required, ?array $default, ?string $newKey, ?string $description, UtopiaResponse $response, Database $dbForProject, callable $getDatabasesDB, Event $queueForEvents, Authorization $authorization): void
+    {
+        if (!$this->supportsSpatial($dbForProject->getAdapter())) {
+            throw new Exception(Exception::GENERAL_FEATURE_UNSUPPORTED, 'Spatial columns are not supported by this database.');
+        }
+
+        $attribute = $this->updateAttribute(
+            databaseId: $databaseId,
+            collectionId: $collectionId,
+            key: $key,
+            dbForProject: $dbForProject,
+            getDatabasesDB: $getDatabasesDB,
+            queueForEvents: $queueForEvents,
+            authorization: $authorization,
+            type: ColumnType::Polygon->value,
+            default: $default,
+            required: $required,
+            newKey: $newKey,
+            description: $description
+        );
+
+        $response
+            ->setStatusCode(SwooleResponse::STATUS_CODE_OK)
+            ->dynamic($attribute, $this->getResponseModel());
+    }
+}

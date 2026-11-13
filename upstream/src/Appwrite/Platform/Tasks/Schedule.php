@@ -1,0 +1,160 @@
+<?php
+
+namespace Appwrite\Platform\Tasks;
+
+use Appwrite\Event\Publisher\Alert as AlertPublisher;
+use Appwrite\Event\Publisher\Func as FunctionPublisher;
+use Appwrite\Event\Publisher\Maintenance as MaintenancePublisher;
+use Appwrite\Event\Publisher\Messaging as MessagingPublisher;
+use Appwrite\Event\Publisher\StatsResources as StatsResourcesPublisher;
+use Appwrite\Maintenance\Cohort;
+use Appwrite\Usage\Connection;
+use Swoole\Coroutine as Co;
+use Utopia\Console\Console;
+use Utopia\Database\Database;
+use Utopia\Platform\Action;
+use Utopia\Pools\Group;
+use Utopia\Span\Span;
+use Utopia\System\System;
+use Utopia\Telemetry\Adapter as Telemetry;
+
+class Schedule extends Action
+{
+    public static function getName(): string
+    {
+        return 'schedule';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->desc('Run the function, execution, message, alert rule, project maintenance and, when self-hosted, resource stats schedulers in one process')
+            ->inject('publisherForFunctions')
+            ->inject('publisherForMessaging')
+            ->inject('getIsResourceBlocked')
+            ->inject('dbForPlatform')
+            ->inject('getProjectDB')
+            ->inject('telemetry')
+            ->inject('locks')
+            ->inject('publisherForMaintenance')
+            ->inject('pools')
+            ->inject('publisherForAlerts');
+
+        if (System::getEnv('_APP_EDITION', 'self-hosted') === 'self-hosted') {
+            $this
+                ->inject('publisherForStatsResources')
+                ->inject('usageConnection')
+                ->callback($this->actionWithUsage(...));
+            return;
+        }
+
+        $this->callback($this->action(...));
+    }
+
+    public function action(
+        FunctionPublisher $publisherForFunctions,
+        MessagingPublisher $publisherForMessaging,
+        callable $getIsResourceBlocked,
+        Database $dbForPlatform,
+        callable $getProjectDB,
+        Telemetry $telemetry,
+        callable $locks,
+        MaintenancePublisher $publisherForMaintenance,
+        Group $pools,
+        AlertPublisher $publisherForAlerts,
+    ): never {
+        $this->start($publisherForFunctions, $publisherForMessaging, $getIsResourceBlocked, $dbForPlatform, $getProjectDB, $telemetry, $locks, $publisherForMaintenance, $pools, $publisherForAlerts);
+    }
+
+    public function actionWithUsage(
+        FunctionPublisher $publisherForFunctions,
+        MessagingPublisher $publisherForMessaging,
+        callable $getIsResourceBlocked,
+        Database $dbForPlatform,
+        callable $getProjectDB,
+        Telemetry $telemetry,
+        callable $locks,
+        MaintenancePublisher $publisherForMaintenance,
+        Group $pools,
+        AlertPublisher $publisherForAlerts,
+        StatsResourcesPublisher $publisherForStatsResources,
+        Connection $usageConnection,
+    ): never {
+        $this->start(
+            $publisherForFunctions,
+            $publisherForMessaging,
+            $getIsResourceBlocked,
+            $dbForPlatform,
+            $getProjectDB,
+            $telemetry,
+            $locks,
+            $publisherForMaintenance,
+            $pools,
+            $publisherForAlerts,
+            $publisherForStatsResources,
+            $usageConnection,
+        );
+    }
+
+    private function start(
+        FunctionPublisher $publisherForFunctions,
+        MessagingPublisher $publisherForMessaging,
+        callable $getIsResourceBlocked,
+        Database $dbForPlatform,
+        callable $getProjectDB,
+        Telemetry $telemetry,
+        callable $locks,
+        MaintenancePublisher $publisherForMaintenance,
+        Group $pools,
+        AlertPublisher $publisherForAlerts,
+        ?StatsResourcesPublisher $publisherForStatsResources = null,
+        ?Connection $usageConnection = null,
+    ): never {
+        // Parsed before any loop starts: a loop that throws only ends its own coroutine, so an invalid interval
+        // would otherwise leave the process healthy with a cohort of projects never maintained.
+        $cycles = [];
+        foreach (Cohort::cases() as $cohort) {
+            $cycles[] = [$cohort, ScheduleMaintenance::cycle($cohort)];
+        }
+
+        $this->loop(ScheduleFunctions::getName(), fn () => (new ScheduleFunctions())->action($publisherForFunctions, $getIsResourceBlocked, $dbForPlatform, $getProjectDB, $telemetry, $pools));
+        $this->loop(ScheduleExecutions::getName(), fn () => (new ScheduleExecutions())->action($publisherForFunctions, $getIsResourceBlocked, $dbForPlatform, $getProjectDB, $telemetry, $pools));
+        $this->loop(ScheduleMessages::getName(), fn () => (new ScheduleMessages())->action($publisherForMessaging, $getIsResourceBlocked, $dbForPlatform, $getProjectDB, $telemetry, $locks, $pools));
+        $this->loop(ScheduleAlerts::getName(), fn () => (new ScheduleAlerts())->action($publisherForAlerts, $dbForPlatform, $telemetry, $pools));
+        foreach ($cycles as [$cohort, $cycle]) {
+            $this->loop(ScheduleMaintenance::getName() . ':' . $cohort->value, fn () => (new ScheduleMaintenance())->run(ScheduleMaintenance::loop($cohort, $cycle, $publisherForMaintenance, $telemetry), $cohort, $pools));
+        }
+
+        if ($publisherForStatsResources !== null && $usageConnection !== null) {
+            $this->loop(StatsResources::getName(), fn () => (new StatsResources())->action($dbForPlatform, $publisherForStatsResources, $usageConnection, $telemetry));
+        }
+
+        while (true) {
+            sleep(3600);
+        }
+    }
+
+    private function loop(string $name, \Closure $task): void
+    {
+        // The process outlives any one loop, so nothing else restarts a loop
+        // that throws or returns: its schedules would silently stop firing.
+        Co::create(function () use ($name, $task): never {
+            for (;;) {
+                Span::init('schedule.combined.loop');
+                Span::add('loop', $name);
+                $error = null;
+
+                try {
+                    $task();
+                } catch (\Throwable $th) {
+                    $error = $th;
+                    Console::error('schedule: ' . $name . ' loop stopped: ' . $th->getMessage());
+                } finally {
+                    Span::current()?->finish(error: $error);
+                }
+
+                Co::sleep(1);
+            }
+        });
+    }
+}

@@ -1,0 +1,164 @@
+<?php
+
+require_once __DIR__ . '/init.php';
+
+use Appwrite\Database\Factory as DatabaseFactory;
+use Appwrite\Platform\Appwrite;
+use Appwrite\Runtimes\Runtimes;
+use Appwrite\Usage\Context as UsageContext;
+use Swoole\Runtime;
+use Swoole\Timer;
+use Utopia\Cache\Adapter\Pool as CachePool;
+use Utopia\Cache\Adapter\Sharding;
+use Utopia\Cache\Cache;
+use Utopia\CLI\Adapters\Generic;
+use Utopia\CLI\CLI;
+use Utopia\Config\Config;
+use Utopia\Console\Console;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Platform\Service;
+use Utopia\Registry\Registry;
+use Utopia\Span\Span;
+
+use function Swoole\Coroutine\run;
+
+// overwriting runtimes to be architecture agnostic for CLI
+Config::setParam('runtimes', (new Runtimes('v5'))->getAll(supported: false));
+
+// require controllers after overwriting runtimes
+require_once __DIR__ . '/controllers/general.php';
+
+global $register;
+global $container;
+
+$platform = new Appwrite();
+$args = $_SERVER['argv'] ?? [];
+
+\array_shift($args);
+if (! isset($args[0])) {
+    Console::error('Missing task name');
+    Console::exit(1);
+}
+
+$taskName = $args[0];
+$cli = new CLI(new Generic(), $_SERVER['argv'] ?? [], $container);
+
+$platform->setCli($cli);
+$platform->init(Service::TYPE_TASK);
+
+$container->set('register', fn () => $register, []);
+
+$container->set('cache', function ($pools) {
+    $list = Config::getParam('pools-cache', []);
+    $adapters = [];
+
+    foreach ($list as $value) {
+        $adapters[] = new CachePool($pools->get($value));
+    }
+
+    return new Cache(new Sharding($adapters));
+}, ['pools']);
+
+$container->set('pools', function (Registry $register) {
+    return $register->get('pools');
+}, ['register']);
+
+$container->set('authorization', function () {
+    $authorization = new Authorization();
+    $authorization->disable();
+
+    return $authorization;
+}, []);
+
+$container->set('dbForPlatform', function (DatabaseFactory $databaseFactory) {
+    $sleep = 3;
+    $maxAttempts = 5;
+    $attempts = 0;
+    $ready = false;
+
+    do {
+        $attempts++;
+        try {
+            $dbForPlatform = $databaseFactory->platform(metadata: [
+                'host' => \gethostname(),
+                'project' => 'console',
+            ]);
+
+            // Ensure tables exist
+            $collections = Config::getParam('collections', [])['console'];
+            $last = \array_key_last($collections);
+
+            if (! ($dbForPlatform->collectionExists($last, $dbForPlatform->getDatabase()))) { /** TODO cache ready variable using registry */
+                throw new Exception('Tables not ready yet.');
+            }
+
+            $ready = true;
+        } catch (\Throwable $err) {
+            Console::warning($err->getMessage());
+            sleep($sleep);
+        }
+    } while ($attempts < $maxAttempts && ! $ready);
+
+    if (! $ready) {
+        throw new Exception('Console is not ready yet. Please try again later.');
+    }
+
+    return $dbForPlatform;
+}, ['databaseFactory']);
+
+$container->set(
+    'getIsResourceBlocked',
+    fn () => fn (Document $project, string $resourceType, ?string $resourceId) => false,
+    []
+);
+
+$container->set('getProjectDB', function (DatabaseFactory $databaseFactory, Database $dbForPlatform) {
+    return function (Document $project) use ($databaseFactory, $dbForPlatform): Database {
+        if ($project->isEmpty() || $project->getId() === 'console') {
+            return $dbForPlatform;
+        }
+
+        return $databaseFactory->project(
+            $project,
+            APP_DATABASE_TIMEOUT_MILLISECONDS_TASK,
+            APP_DATABASE_QUERY_MAX_VALUES,
+            ['host' => \gethostname(), 'project' => $project->getId()]
+        );
+    };
+}, ['databaseFactory', 'dbForPlatform']);
+
+$container->set('usage', function () {
+    return new UsageContext();
+}, []);
+$container->set('bus', function (Registry $register) use ($container) {
+    return $register->get('bus')->setResolver(fn (string $name) => $container->get($name));
+}, ['register']);
+
+$exitCode = 0;
+
+$cli
+    ->error()
+    ->inject('error')
+    ->action(function (Throwable $error) use ($taskName, &$exitCode) {
+        $span = Span::current() ?? Span::init("task.$taskName");
+        $span->finish(error: $error);
+
+        $exitCode = 1;
+        Timer::clearAll();
+    });
+
+$cli->init()->action(function () use ($taskName) {
+    Span::init("task.$taskName");
+});
+
+$cli->shutdown()->action(function () {
+    Span::current()?->finish();
+    Timer::clearAll();
+});
+
+Runtime::enableCoroutine(SWOOLE_HOOK_ALL);
+require_once __DIR__ . '/init/span.php';
+run($cli->run(...));
+Console::exit($exitCode);

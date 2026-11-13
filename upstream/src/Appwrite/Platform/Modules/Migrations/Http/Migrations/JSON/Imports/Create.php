@@ -1,0 +1,231 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Migrations\Http\Migrations\JSON\Imports;
+
+use Appwrite\Event\Event;
+use Appwrite\Event\Message\Migration as MigrationMessage;
+use Appwrite\Event\Publisher\Migration as MigrationPublisher;
+use Appwrite\Extend\Exception;
+use Appwrite\Platform\Modules\Migrations\Http\Migrations\Action;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Storage\Encryption;
+use Appwrite\Utopia\Request;
+use Appwrite\Utopia\Response;
+use Utopia\Compression\Algorithms\GZIP;
+use Utopia\Compression\Algorithms\Zstd;
+use Utopia\Compression\Compression;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\Id;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\UID;
+use Utopia\Migration\Destinations\OnDuplicate;
+use Utopia\Migration\Resource;
+use Utopia\Migration\Sources\Appwrite as AppwriteSource;
+use Utopia\Migration\Sources\JSON as JSONSource;
+use Utopia\Migration\Transfer;
+use Utopia\Platform\Enum;
+use Utopia\Psr7\Stream;
+use Utopia\Storage\Device;
+use Utopia\Validator\Boolean;
+use Utopia\Validator\WhiteList;
+
+class Create extends Action
+{
+    public static function getName(): string
+    {
+        return 'createJSONImport';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_POST)
+            ->setHttpPath('/v1/migrations/json/imports')
+            ->desc('Import documents from a JSON')
+            ->groups(['api', 'migrations'])
+            ->label('scope', 'migrations.write')
+            ->label('event', 'migrations.[migrationId].create')
+            ->label('audits.event', 'migration.create')
+            ->label('sdk', new Method(
+                namespace: 'migrations',
+                group: null,
+                name: 'createJSONImport',
+                description: '/docs/references/migrations/migration-json-import.md',
+                auth: [AuthType::KEY, AuthType::ADMIN],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_ACCEPTED,
+                        model: Response::MODEL_MIGRATION,
+                    )
+                ]
+            ))
+            ->param('bucketId', '', new UID(), 'Storage bucket unique ID. You can create a new storage bucket using the Storage service [server integration](https://appwrite.io/docs/server/storage#createBucket).')
+            ->param('fileId', '', new UID(), 'File ID.')
+            ->param('databaseId', '', new UID(), 'Database ID containing the target collection.')
+            ->param('collectionId', '', new UID(), 'Collection ID to import documents into.')
+            ->param('internalFile', false, new Boolean(), 'Is the file stored in an internal bucket?', true)
+            ->param('onDuplicate', OnDuplicate::Fail->value, new WhiteList(OnDuplicate::values()), 'Behavior when a row with an existing $id is encountered. "fail" (default): abort on first conflict. "skip": silently ignore. "overwrite": replace existing row.', true, enum: new Enum(name: 'OnDuplicate'))
+            ->inject('request')
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('dbForPlatform')
+            ->inject('authorization')
+            ->inject('project')
+            ->inject('user')
+            ->inject('platform')
+            ->inject('deviceForFiles')
+            ->inject('deviceForMigrations')
+            ->inject('queueForEvents')
+            ->inject('publisherForMigrations')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        string $bucketId,
+        string $fileId,
+        string $databaseId,
+        string $collectionId,
+        bool $internalFile,
+        string $onDuplicate,
+        Request $request,
+        Response $response,
+        Database $dbForProject,
+        Database $dbForPlatform,
+        Authorization $authorization,
+        Document $project,
+        Document $user,
+        array $platform,
+        Device $deviceForFiles,
+        Device $deviceForMigrations,
+        Event $queueForEvents,
+        MigrationPublisher $publisherForMigrations
+    ): void {
+        $bucket = $authorization->skip(function () use ($internalFile, $dbForPlatform, $dbForProject, $bucketId) {
+            if ($internalFile) {
+                return $dbForPlatform->getDocument('buckets', 'default');
+            }
+            return $dbForProject->getDocument('buckets', $bucketId);
+        });
+
+        if ($bucket->isEmpty()) {
+            throw new Exception(Exception::STORAGE_BUCKET_NOT_FOUND);
+        }
+
+        $file = $authorization->skip(fn () => $internalFile ? $dbForPlatform->getDocument('bucket_' . $bucket->getSequence(), $fileId) : $dbForProject->getDocument('bucket_' . $bucket->getSequence(), $fileId));
+        // An internal file is readable only by the project that exported it, or the console user who uploaded it
+        $metadata = $file->getAttribute('metadata', []);
+        $owned = ($metadata['projectInternalId'] ?? null) === $project->getSequence()
+            || (!$user->isEmpty() && ($metadata['uploaderId'] ?? null) === $user->getId());
+        if ($file->isEmpty() || ($internalFile && !$owned)) {
+            throw new Exception(Exception::STORAGE_FILE_NOT_FOUND);
+        }
+
+        $path = $file->getAttribute('path', '');
+        if (!$deviceForFiles->exists($path)) {
+            throw new Exception(Exception::STORAGE_FILE_NOT_FOUND, 'File not found in ' . $path);
+        }
+
+        $database = $authorization->skip(fn () => $dbForProject->getDocument('databases', $databaseId));
+        if ($database->isEmpty()) {
+            throw new Exception(Exception::DATABASE_NOT_FOUND);
+        }
+
+        $collection = $authorization->skip(fn () => $dbForProject->getDocument('database_' . $database->getSequence(), $collectionId));
+        if ($collection->isEmpty()) {
+            throw new Exception(Exception::COLLECTION_NOT_FOUND);
+        }
+
+        $databaseType = $database->getAttribute('type');
+
+        $scopes = $this->authorize($request, [], [
+            match ($databaseType) {
+                DATABASE_TYPE_DOCUMENTSDB => ['documentsdb.documents.write'],
+                DATABASE_TYPE_VECTORSDB => ['vectorsdb.documents.write'],
+                default => ['rows.write', 'documents.write'],
+            },
+            ...($internalFile ? [] : [['files.read']]),
+        ]);
+
+        $hasEncryption = !empty($file->getAttribute('openSSLCipher'));
+        $compression = $file->getAttribute('algorithm', Compression::NONE);
+        $hasCompression = $compression !== Compression::NONE;
+
+        $migrationId = Id::unique();
+        $newPath = $deviceForMigrations->getPath($migrationId . '_' . $fileId . '.json');
+
+        $encryption = new Encryption($file);
+        if ($encryption->isSegmented()) {
+            $encryption->copy($deviceForFiles, $deviceForMigrations, $newPath, 'application/json');
+        } elseif ($hasEncryption || $hasCompression) {
+            $source = (string) $deviceForFiles->read($path);
+
+            if ($hasEncryption) {
+                $source = $encryption->decrypt($source);
+            }
+
+            if ($hasCompression) {
+                switch ($compression) {
+                    case Compression::ZSTD:
+                        $source = (new Zstd())->decompress($source);
+                        break;
+                    case Compression::GZIP:
+                        $source = (new GZIP())->decompress($source);
+                        break;
+                }
+            }
+
+            // Manual write after decryption and/or decompression
+            if (!$deviceForMigrations->write($newPath, new Stream($source), 'application/json')) {
+                throw new \Exception('Unable to copy file');
+            }
+        } elseif (!$deviceForFiles->copy($path, $newPath, $deviceForMigrations)) {
+            throw new \Exception('Unable to copy file');
+        }
+
+        $fileSize = $deviceForMigrations->getFileSize($newPath);
+        $resources = Transfer::extractServices([self::transferGroupForDatabaseType($databaseType)]);
+        $parentResourceType = self::resourceTypeForDatabaseType($databaseType);
+
+        $migration = $dbForProject->createDocument('migrations', new Document([
+            '$id' => $migrationId,
+            'status' => 'pending',
+            'stage' => 'init',
+            'source' => JSONSource::getName(),
+            'destination' => AppwriteSource::getName(),
+            'resources' => $resources,
+            'resourceId' => $collection->getId(),
+            'resourceInternalId' => $collection->getSequence(),
+            'resourceType' => Resource::TYPE_COLLECTION,
+            'parentResourceId' => $database->getId(),
+            'parentResourceInternalId' => $database->getSequence(),
+            'parentResourceType' => $parentResourceType,
+            'destinationResourceId' => $database->getId(),
+            'destinationResourceInternalId' => $database->getSequence(),
+            'destinationResourceType' => $parentResourceType,
+            'statusCounters' => '{}',
+            'resourceData' => '{}',
+            'errors' => [],
+            'options' => [
+                'path' => $newPath,
+                'size' => $fileSize,
+                'onDuplicate' => $onDuplicate,
+                'scopes' => $scopes,
+            ],
+        ]));
+
+        $queueForEvents->setParam('migrationId', $migration->getId());
+
+        $publisherForMigrations->enqueue(new MigrationMessage(
+            project: $project,
+            migration: $migration,
+            platform: $platform,
+        ));
+
+        $response
+            ->setStatusCode(Response::STATUS_CODE_ACCEPTED)
+            ->dynamic($migration, Response::MODEL_MIGRATION);
+    }
+}

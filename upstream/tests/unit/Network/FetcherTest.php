@@ -1,0 +1,196 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Unit\Network;
+
+use Appwrite\Extend\Exception;
+use Appwrite\Network\Validator\PublicHostname;
+use Appwrite\Network\Validator\PublicURL;
+use Appwrite\Platform\Modules\Avatars\Http\Favicon\Get;
+use PHPUnit\Framework\TestCase;
+use Psr\Http\Client\ClientInterface;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use Utopia\Client\Destinations\PublicInternet;
+use Utopia\Psr7\Response;
+use Utopia\Psr7\Stream;
+
+final class FetcherTest extends TestCase
+{
+    public function testFetchFollowsPublicRedirect(): void
+    {
+        $client = $this->scriptedClient([
+            $this->redirect('https://1.1.1.1/final'),
+            $this->ok('FINAL_BODY'),
+        ]);
+
+        $fetcher = new TestableGet();
+        $response = $fetcher->fetchForTest('http://8.8.8.8/start', $client);
+
+        $this->assertSame(200, $response->getStatusCode());
+        $this->assertSame('FINAL_BODY', (string) $response->getBody());
+        $this->assertSame(2, $client->callCount);
+    }
+
+    public function testFetchBlocksRedirectToPrivateIp(): void
+    {
+        // This is the exact SSRF chain from the report:
+        //   public attacker page → 302 → 169.254.169.254 (AWS IMDS)
+        $client = $this->scriptedClient([
+            $this->redirect('http://169.254.169.254/latest/meta-data/iam/security-credentials/'),
+            // This second response must NEVER be served — the fetcher should
+            // reject the redirect target before calling sendRequest() again.
+            $this->ok('SHOULD_NEVER_LEAK'),
+        ]);
+
+        $fetcher = new TestableGet();
+
+        try {
+            $fetcher->fetchForTest('http://8.8.8.8/attacker-page', $client);
+            $this->fail('Expected Exception');
+        } catch (Exception $e) {
+            $this->assertSame(Exception::AVATAR_REMOTE_URL_FAILED, $e->getType());
+            $this->assertStringContainsString('169.254.169.254', $e->getMessage());
+            $this->assertSame(
+                1,
+                $client->callCount,
+                'Redirect target should not have been fetched — only the initial request should hit the client'
+            );
+        }
+    }
+
+    public function testFetchBlocksRedirectToLoopback(): void
+    {
+        $client = $this->scriptedClient([
+            $this->redirect('http://127.0.0.1:9999/secrets'),
+            $this->ok('SHOULD_NEVER_LEAK'),
+        ]);
+
+        $fetcher = new TestableGet();
+
+        try {
+            $fetcher->fetchForTest('http://8.8.8.8/attacker-page', $client);
+            $this->fail('Expected Exception');
+        } catch (Exception $e) {
+            $this->assertSame(Exception::AVATAR_REMOTE_URL_FAILED, $e->getType());
+            $this->assertStringContainsString('127.0.0.1', $e->getMessage());
+            $this->assertSame(1, $client->callCount);
+        }
+    }
+
+    public function testFetchBlocksRedirectToRelativePathOnPrivateBase(): void
+    {
+        // Edge case: a server on a public IP returns a relative redirect.
+        // We resolve it against the (still public) base and continue — safe.
+        $client = $this->scriptedClient([
+            $this->redirect('/different-path'),
+            $this->ok('FINAL'),
+        ]);
+
+        $fetcher = new TestableGet();
+        $response = $fetcher->fetchForTest('http://8.8.8.8/start', $client);
+
+        $this->assertSame('FINAL', (string) $response->getBody());
+    }
+
+    public function testFetchRejectsRedirectChainOverLimit(): void
+    {
+        // Six redirects all to public targets; with maxRedirects=5 the sixth
+        // hop trips the limit.
+        $client = $this->scriptedClient([
+            $this->redirect('https://1.1.1.1/2'),
+            $this->redirect('https://1.0.0.1/3'),
+            $this->redirect('https://8.8.8.8/4'),
+            $this->redirect('https://8.8.4.4/5'),
+            $this->redirect('https://9.9.9.9/6'),
+            $this->redirect('https://208.67.222.222/7'),
+        ]);
+
+        $fetcher = new TestableGet();
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Too many redirects');
+        $fetcher->fetchForTest('http://8.8.8.8/0', $client);
+    }
+
+    public function testFetchBlocksNonHttpRedirect(): void
+    {
+        $client = $this->scriptedClient([
+            $this->redirect('file:///etc/passwd'),
+            $this->ok('SHOULD_NEVER_LEAK'),
+        ]);
+
+        $fetcher = new TestableGet();
+
+        try {
+            $fetcher->fetchForTest('http://8.8.8.8/page', $client);
+            $this->fail('Expected Exception');
+        } catch (Exception $e) {
+            $this->assertSame(Exception::AVATAR_REMOTE_URL_FAILED, $e->getType());
+            $this->assertStringContainsString('valid URL', $e->getMessage());
+            $this->assertSame(1, $client->callCount);
+        }
+    }
+
+    private function redirect(string $location): ResponseInterface
+    {
+        return (new Response(302))->withHeader('Location', $location);
+    }
+
+    private function ok(string $body): ResponseInterface
+    {
+        return new Response(200, body: new Stream($body));
+    }
+
+    /**
+     * @param ResponseInterface[] $responses
+     */
+    private function scriptedClient(array $responses): ScriptedClient
+    {
+        return new ScriptedClient($responses);
+    }
+}
+
+/**
+ * Test-only client that returns a pre-scripted list of responses in order.
+ * Exposed as a named class so PHPStan can see the callCount property.
+ */
+class ScriptedClient implements ClientInterface
+{
+    public int $callCount = 0;
+
+    /** @param ResponseInterface[] $responses */
+    public function __construct(private array $responses)
+    {
+    }
+
+    public function sendRequest(RequestInterface $request): ResponseInterface
+    {
+        $response = $this->responses[$this->callCount] ?? null;
+        $this->callCount++;
+        if ($response === null) {
+            throw new \RuntimeException("Client ran out of scripted responses (call {$this->callCount})");
+        }
+        return $response;
+    }
+}
+
+class TestableGet extends Get
+{
+    /**
+     * Skip parent constructor. Action::__construct chains into
+     * Appwrite\SDK\Method, which loads Swoole at file-load time —
+     * Swoole is a production-only extension, so building the real
+     * Action in a unit test fails. The protected method bridges
+     * below are all the surface the redirect-chain tests need.
+     */
+    public function __construct()
+    {
+    }
+
+    public function fetchForTest(string $url, ClientInterface $client): ResponseInterface
+    {
+        return $this->safeFetch($url, 'test', new PublicURL(new PublicHostname(new PublicInternet(), new FixedLookup())), $client);
+    }
+}

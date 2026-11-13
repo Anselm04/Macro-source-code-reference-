@@ -1,0 +1,183 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Databases\Http\Databases\Collections\Attributes\Relationship;
+
+use Appwrite\Event\Event;
+use Appwrite\Event\Publisher\Database as DatabasePublisher;
+use Appwrite\Extend\Exception;
+use Appwrite\Platform\Modules\Databases\Http\Databases\Collections\Attributes\Action;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\Deprecated;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Response as UtopiaResponse;
+use Utopia\Database\Database;
+use Utopia\Database\Document;
+use Utopia\Database\RelationshipDeleteAction;
+use Utopia\Database\RelationshipType;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\Key;
+use Utopia\Database\Validator\UID;
+use Utopia\Http\Adapter\Swoole\Response as SwooleResponse;
+use Utopia\Platform\Enum;
+use Utopia\Query\Schema\ColumnType;
+use Utopia\Validator\Boolean;
+use Utopia\Validator\Nullable;
+use Utopia\Validator\Text;
+use Utopia\Validator\WhiteList;
+
+class Create extends Action
+{
+    public static function getName(): string
+    {
+        return 'createRelationshipAttribute';
+    }
+
+    protected function getResponseModel(): string|array
+    {
+        return UtopiaResponse::MODEL_ATTRIBUTE_RELATIONSHIP;
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(self::HTTP_REQUEST_METHOD_POST)
+            ->setHttpPath('/v1/databases/:databaseId/collections/:collectionId/attributes/relationship')
+            ->desc('Create relationship attribute')
+            ->groups(['api', 'database', 'schema'])
+            ->label('scope', 'collections.write')
+            ->label('resourceType', RESOURCE_TYPE_DATABASES)
+            ->label('event', 'databases.[databaseId].collections.[collectionId].attributes.[attributeId].create')
+            ->label('audits.event', 'attribute.create')
+            ->label('audits.resource', 'database/{request.databaseId}/collection/{request.collectionId}')
+            ->label('usage.resource', 'database/{request.databaseId}/collection/{request.collectionId}')
+            ->label('sdk', new Method(
+                namespace: $this->getSDKNamespace(),
+                group: $this->getSDKGroup(),
+                name: self::getName(),
+                description: '/docs/references/databases/create-relationship-attribute.md',
+                auth: [AuthType::ADMIN, AuthType::KEY],
+                responses: [
+                    new SDKResponse(
+                        code: SwooleResponse::STATUS_CODE_ACCEPTED,
+                        model: $this->getResponseModel()
+                    )
+                ],
+                deprecated: new Deprecated(
+                    since: '1.8.0',
+                    replaceWith: 'tablesDB.createRelationshipColumn',
+                ),
+            ))
+            ->param('databaseId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Database ID.', false, ['dbForProject'])
+            ->param('collectionId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Collection ID.', false, ['dbForProject'])
+            ->param('relatedCollectionId', '', fn (Database $dbForProject) => new UID($dbForProject->getMaxUidLength()), 'Related Collection ID.', false, ['dbForProject'])
+            ->param('type', '', new WhiteList([
+                RelationshipType::OneToOne->value,
+                RelationshipType::ManyToOne->value,
+                RelationshipType::ManyToMany->value,
+                RelationshipType::OneToMany->value
+            ], true), 'Relationship type. Possible values are: oneToOne, oneToMany, manyToOne, manyToMany.', enum: new Enum(name: 'RelationshipType'))
+            ->param('twoWay', false, new Boolean(), 'Is Two Way?', true)
+            ->param('key', null, fn (Database $dbForProject) => new Nullable(new Key(false, $dbForProject->getMaxUidLength())), 'Attribute Key.', true, ['dbForProject'])
+            ->param('twoWayKey', null, fn (Database $dbForProject) => new Nullable(new Key(false, $dbForProject->getMaxUidLength())), 'Two Way Attribute Key.', true, ['dbForProject'])
+            ->param('onDelete', RelationshipDeleteAction::Restrict->value, new WhiteList([
+                RelationshipDeleteAction::Cascade->value,
+                RelationshipDeleteAction::Restrict->value,
+                RelationshipDeleteAction::SetNull->value
+            ], true), 'Delete constraint. Possible values are: cascade, restrict, setNull.', true, enum: new Enum(name: 'RelationMutate'))
+            ->param('description', '', new Text(1024, 0), 'Optional description for the attribute.', true)
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('getDatabasesDB')
+            ->inject('publisherForDatabase')
+            ->inject('queueForEvents')
+            ->inject('authorization')
+            ->callback($this->action(...));
+    }
+
+    public function action(string $databaseId, string $collectionId, string $relatedCollectionId, string $type, bool $twoWay, ?string $key, ?string $twoWayKey, string $onDelete, string $description, UtopiaResponse $response, Database $dbForProject, callable $getDatabasesDB, DatabasePublisher $publisherForDatabase, Event $queueForEvents, Authorization $authorization): void
+    {
+        $key ??= $relatedCollectionId;
+        $twoWayKeyWasProvided = $twoWayKey !== null;
+        $twoWayKey ??= $collectionId;
+
+        $database = $authorization->skip(fn () => $dbForProject->getDocument('databases', $databaseId));
+        if ($database->isEmpty() || $this->isDatabaseTypeMismatch($database)) {
+            throw new Exception(Exception::DATABASE_NOT_FOUND, params: [$databaseId]);
+        }
+
+        $dbForDatabases = $getDatabasesDB($database);
+
+        if (!$this->supportsRelationships($dbForDatabases->getAdapter())) {
+            throw new Exception(Exception::GENERAL_FEATURE_UNSUPPORTED, 'Relationships are not supported by this database.');
+        }
+
+        $collection = $dbForProject->getDocument('database_' . $database->getSequence(), $collectionId);
+        $collection = $dbForDatabases->findCollection('database_' . $database->getSequence() . '_collection_' . $collection->getSequence());
+        if ($collection === null) {
+            throw new Exception($this->getParentNotFoundException(), params: [$collectionId]);
+        }
+
+        $relatedCollectionDocument = $dbForProject->getDocument('database_' . $database->getSequence(), $relatedCollectionId);
+        $relatedCollection = $dbForDatabases->findCollection('database_' . $database->getSequence() . '_collection_' . $relatedCollectionDocument->getSequence());
+        if ($relatedCollection === null) {
+            throw new Exception($this->getParentNotFoundException(), params: [$relatedCollectionId]);
+        }
+
+        $attributes = $collection->getAttribute('attributes', []);
+        foreach ($attributes as $attribute) {
+            if ($attribute->getAttribute('type') !== ColumnType::Relationship->value) {
+                continue;
+            }
+
+            if (\strtolower($attribute->getId()) === \strtolower($key)) {
+                throw new Exception($this->getDuplicateException(), params: [$key]);
+            }
+
+            if (
+                \strtolower($attribute->getAttribute('options')['twoWayKey']) === \strtolower($twoWayKey) &&
+                $attribute->getAttribute('options')['relatedCollection'] === $relatedCollection->getId()
+            ) {
+                // If user explicitly provided twoWayKey, report that.
+                // Otherwise report the key that they're trying to create.
+                $conflictingKey = $twoWayKeyWasProvided ? $twoWayKey : $key;
+                throw new Exception($this->getDuplicateException(), params: [$conflictingKey]);
+            }
+
+            if (
+                $type === RelationshipType::ManyToMany->value &&
+                $attribute->getAttribute('options')['relationType'] === RelationshipType::ManyToMany->value &&
+                $attribute->getAttribute('options')['relatedCollection'] === $relatedCollection->getId()
+            ) {
+                $parentType = $this->isCollectionsAPI() ? 'collection' : 'table';
+                throw new Exception($this->getDuplicateException(), "Creating more than one \"manyToMany\" relationship on the same $parentType is currently not permitted.");
+            }
+        }
+
+        $attribute = $this->createAttribute($databaseId, $collectionId, new Document([
+            'key' => $key,
+            'description' => $description,
+            'type' => ColumnType::Relationship->value,
+            'size' => 0,
+            'required' => false,
+            'default' => null,
+            'array' => false,
+            'filters' => [],
+            'options' => [
+                'relatedCollection' => $relatedCollectionId,
+                'relationType' => $type,
+                'twoWay' => $twoWay,
+                'twoWayKey' => $twoWayKey,
+                'onDelete' => $onDelete,
+            ]
+        ]), $response, $dbForProject, $getDatabasesDB, $publisherForDatabase, $queueForEvents, $authorization);
+
+        foreach ($attribute->getAttribute('options', []) as $k => $option) {
+            $attribute->setAttribute($k, $option);
+        }
+
+        $response
+            ->setStatusCode(SwooleResponse::STATUS_CODE_ACCEPTED)
+            ->dynamic($attribute, $this->getResponseModel());
+    }
+}

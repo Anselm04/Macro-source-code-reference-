@@ -1,0 +1,170 @@
+<?php
+
+namespace Appwrite\Platform\Modules\Storage\Http\Buckets\Files;
+
+use Appwrite\Abuse\Limit;
+use Appwrite\Event\Event;
+use Appwrite\Extend\Exception;
+use Appwrite\SDK\AuthType;
+use Appwrite\SDK\Method;
+use Appwrite\SDK\Response as SDKResponse;
+use Appwrite\Utopia\Database\Documents\User;
+use Appwrite\Utopia\Database\Validator\Filename;
+use Appwrite\Utopia\Response;
+use Utopia\Database\Database;
+use Utopia\Database\Exception\NotFound as NotFoundException;
+use Utopia\Database\Permission;
+use Utopia\Database\PermissionType;
+use Utopia\Database\Role;
+use Utopia\Database\Validator\Authorization;
+use Utopia\Database\Validator\Authorization\Input;
+use Utopia\Database\Validator\Permissions;
+use Utopia\Database\Validator\UID;
+use Utopia\Platform\Action;
+use Utopia\Platform\Scope\HTTP;
+use Utopia\Storage\Validator\FileExt;
+use Utopia\Validator\Nullable;
+
+class Update extends Action
+{
+    use HTTP;
+
+    public static function getName()
+    {
+        return 'updateFile';
+    }
+
+    public function __construct()
+    {
+        $this
+            ->setHttpMethod(Action::HTTP_REQUEST_METHOD_PUT)
+            ->setHttpPath('/v1/storage/buckets/:bucketId/files/:fileId')
+            ->desc('Update file')
+            ->groups(['api', 'storage'])
+            ->label('scope', 'files.write')
+            ->label('resourceType', RESOURCE_TYPE_BUCKETS)
+            ->label('event', 'buckets.[bucketId].files.[fileId].update')
+            ->label('audits.event', 'file.update')
+            ->label('audits.resource', 'file/{response.$id}')
+            ->label('usage.resource', 'bucket/{request.bucketId}/file/{response.$id}')
+            ->label('abuse', [Limit::attempts(['ip', 'method', 'url', 'userId'], APP_LIMIT_WRITE_RATE_DEFAULT, seconds: APP_LIMIT_WRITE_RATE_PERIOD_DEFAULT)])
+            ->label('sdk', new Method(
+                namespace: 'storage',
+                group: 'files',
+                name: 'updateFile',
+                description: '/docs/references/storage/update-file.md',
+                auth: [AuthType::ADMIN, AuthType::SESSION, AuthType::KEY, AuthType::JWT],
+                responses: [
+                    new SDKResponse(
+                        code: Response::STATUS_CODE_OK,
+                        model: Response::MODEL_FILE,
+                    )
+                ]
+            ))
+            ->param('bucketId', '', new UID(), 'Bucket unique ID.')
+            ->param('fileId', '', new UID(), 'File ID.')
+            ->param('name', null, new Filename(128), 'File name.', true)
+            ->param('permissions', null, new Nullable(new Permissions(APP_LIMIT_ARRAY_PARAMS_SIZE)), 'An array of permission strings. By default, the current permissions are inherited. [Learn more about permissions](https://appwrite.io/docs/permissions).', true)
+            ->inject('response')
+            ->inject('dbForProject')
+            ->inject('queueForEvents')
+            ->inject('authorization')
+            ->inject('user')
+            ->callback($this->action(...));
+    }
+
+    public function action(
+        string $bucketId,
+        string $fileId,
+        ?string $name,
+        ?array $permissions,
+        Response $response,
+        Database $dbForProject,
+        Event $queueForEvents,
+        Authorization $authorization,
+        User $user
+    ) {
+        $bucket = $authorization->skip(fn () => $dbForProject->getDocument('buckets', $bucketId));
+
+        $isAPIKey = $user->isKey($authorization->getRoles());
+        $isPrivilegedUser = $user->isPrivileged($authorization->getRoles());
+
+        if ($bucket->isEmpty() || (!$bucket->getAttribute('enabled') && !$isAPIKey && !$isPrivilegedUser)) {
+            throw new Exception(Exception::STORAGE_BUCKET_NOT_FOUND);
+        }
+
+        $fileSecurity = $bucket->getAttribute('fileSecurity', false);
+        $valid = $authorization->isValid(new Input(PermissionType::Update, $bucket->getPermissionsByType(PermissionType::Update)));
+        if (!$fileSecurity && !$valid) {
+            throw new Exception(Exception::USER_UNAUTHORIZED, $authorization->getDescription());
+        }
+
+        // Read permission should not be required for update
+        $file = $authorization->skip(fn () => $dbForProject->getDocument('bucket_' . $bucket->getSequence(), $fileId));
+
+        if ($file->isEmpty()) {
+            throw new Exception(Exception::STORAGE_FILE_NOT_FOUND);
+        }
+
+        // Map aggregate permissions into the multiple permissions they represent.
+        $permissions = Permission::aggregate($permissions, [
+            PermissionType::Read,
+            PermissionType::Update,
+            PermissionType::Delete,
+        ]);
+
+        // Users can only manage their own roles, API keys and Admin users can manage any
+        $roles = $authorization->getRoles();
+        if (!$user->isKey($roles) && !$user->isPrivileged($roles) && !\is_null($permissions)) {
+            foreach ([PermissionType::Read, PermissionType::Create, PermissionType::Update, PermissionType::Delete] as $type) {
+                foreach ($permissions as $permission) {
+                    $permission = Permission::parse($permission);
+                    if ($permission->getPermission() != $type->value) {
+                        continue;
+                    }
+                    $role = (new Role(
+                        $permission->getRole(),
+                        $permission->getIdentifier(),
+                        $permission->getDimension()
+                    ))->toString();
+                    if (!$authorization->hasRole($role)) {
+                        throw new Exception(Exception::USER_UNAUTHORIZED, 'Permissions must be one of: (' . \implode(', ', $roles) . ')');
+                    }
+                }
+            }
+        }
+
+        if (\is_null($permissions)) {
+            $permissions = $file->getPermissions();
+        }
+
+        $file->setAttribute('$permissions', $permissions);
+
+        if (!is_null($name)) {
+            $allowedFileExtensions = $bucket->getAttribute('allowedFileExtensions', []);
+            if (!empty($allowedFileExtensions) && $name !== $file->getAttribute('name') && !(new FileExt($allowedFileExtensions))->isValid($name)) {
+                throw new Exception(Exception::STORAGE_FILE_TYPE_UNSUPPORTED, 'File extension not allowed');
+            }
+
+            $file->setAttribute('name', $name);
+        }
+
+        try {
+            if ($fileSecurity && !$valid) {
+                $file = $dbForProject->updateDocument('bucket_' . $bucket->getSequence(), $fileId, $file);
+            } else {
+                $file = $authorization->skip(fn () => $dbForProject->updateDocument('bucket_' . $bucket->getSequence(), $fileId, $file));
+            }
+        } catch (NotFoundException) {
+            throw new Exception(Exception::STORAGE_BUCKET_NOT_FOUND);
+        }
+
+        $queueForEvents
+            ->setParam('bucketId', $bucket->getId())
+            ->setParam('fileId', $file->getId())
+            ->setContext('bucket', $bucket)
+        ;
+
+        $response->dynamic($file, Response::MODEL_FILE);
+    }
+}
