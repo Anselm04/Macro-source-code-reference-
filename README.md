@@ -1,2 +1,43 @@
-# Macro-source-code-reference-
-This is for viewing source code structure for our builds 
+# Macro source-code reference — independent engineering study
+
+This is a private research workspace for studying the architecture of [Macro](https://github.com/macro-inc/macro) to inform original TrillionAI engineering. It is **not yet a complete clone or mirror** of the upstream source.
+
+## Provenance
+- Upstream: https://github.com/macro-inc/macro
+- Copyright and credit remain with their respective authors.
+- Macro is AGPL-3.0 licensed; preserve upstream licensing, copyright and notices if copying or redistributing source.
+- Record the exact upstream commit SHA for every detailed code review.
+
+## Architecture subjects
+1. Agent harness, session lifecycle and tool execution
+2. Domain triggers, scheduled jobs and event broker
+3. Long-term memory and context isolation
+4. Authorization, authentication and tenancy
+5. AI usage, billing admission and budget limits
+6. Telemetry, observability, debugging and reliability
+7. Web interfaces, API contracts and verification
+8. Database models, migrations and transaction safety
+
+## First study
+[Initial verified architecture notes](docs/01-initial-architecture.md)
+
+## Check out the source independently
+For a manageable study checkout on a computer with GitHub access:
+
+```bash
+git clone --depth=1 --filter=blob:none --no-checkout https://github.com/macro-inc/macro.git macro-upstream
+cd macro-upstream
+git sparse-checkout init --cone
+git sparse-checkout set crates/agent_harness crates/agent_trigger crates/memory crates/macro_authorization crates/macro_event_broker services/agent_harness_service docs
+git checkout main
+git rev-parse HEAD
+```
+
+Macro is a large repository. A shallow sparse clone downloads selected working files rather than the complete history; it still needs disk space and network access. Keep this checkout separate from proprietary TrillionAI repositories.
+
+## Research ground rules
+- Analyze design, security boundaries, failure recovery and test strategy.
+- Document evidence, caveats and exact source locations.
+- Independently implement ideas in TrillionAI's Flutter and Node.js stack.
+- Do not copy upstream AGPL code into proprietary products without an appropriate licence review.
+- Do not enable paid integrations, deployments or production workloads for this study.
