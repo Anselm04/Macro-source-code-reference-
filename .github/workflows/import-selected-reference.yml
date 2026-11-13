@@ -1,6 +1,6 @@
 name: Import selected engineering reference source
 
-# One-time public research import of Activepieces; restored to manual-only afterward.
+# One-time public research import of Chatwoot; restored to manual-only afterward.
 # Download and source verification only; never run upstream applications.
 on:
   push:
@@ -25,12 +25,13 @@ on:
           - coolify
           - medusa
           - twenty
+          - chatwoot
 
 permissions:
   contents: write
 
 concurrency:
-  group: reference-import-${{ github.event.inputs.project || 'activepieces' }}
+  group: reference-import-${{ github.event.inputs.project || 'chatwoot' }}
   cancel-in-progress: false
 
 jobs:
@@ -40,7 +41,7 @@ jobs:
     steps:
       - name: Resolve audited allowlist
         env:
-          PROJECT: ${{ github.event.inputs.project || 'activepieces' }}
+          PROJECT: ${{ github.event.inputs.project || 'chatwoot' }}
         run: |
           set -euo pipefail
           case "$PROJECT" in
@@ -56,6 +57,7 @@ jobs:
             coolify)           SOURCE="coollabsio/coolify" ;;
             medusa)            SOURCE="medusajs/medusa" ;;
             twenty)            SOURCE="twentyhq/twenty" ;;
+            chatwoot)           SOURCE="chatwoot/chatwoot" ;;
             *) echo "::error::Invalid source"; exit 1 ;;
           esac
           echo "SOURCE=$SOURCE" >> "$GITHUB_ENV"
