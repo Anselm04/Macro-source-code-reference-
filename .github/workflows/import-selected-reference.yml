@@ -1,7 +1,11 @@
 name: Import selected engineering reference source
 
-# Explicitly manual imports only. Imported code is never built or executed.
+# One-time public research import of Trigger.dev; restored to manual-only afterward.
+# Download and source verification only; never run upstream applications.
 on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/import-selected-reference.yml']
   workflow_dispatch:
     inputs:
       project:
@@ -26,7 +30,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: reference-import-${{ github.event.inputs.project || 'bolt-diy' }}
+  group: reference-import-${{ github.event.inputs.project || 'trigger-dev' }}
   cancel-in-progress: false
 
 jobs:
@@ -36,7 +40,7 @@ jobs:
     steps:
       - name: Resolve audited allowlist
         env:
-          PROJECT: ${{ github.event.inputs.project || 'bolt-diy' }}
+          PROJECT: ${{ github.event.inputs.project || 'trigger-dev' }}
         run: |
           set -euo pipefail
           case "$PROJECT" in
