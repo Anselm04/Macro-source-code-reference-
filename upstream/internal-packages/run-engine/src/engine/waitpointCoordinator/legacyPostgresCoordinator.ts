@@ -1,0 +1,661 @@
+import {
+  DelegatingRunStore,
+  type RunStore,
+  type WaitpointColocationOptions,
+} from "@internal/run-store";
+import { tryCatch } from "@trigger.dev/core/v3";
+import {
+  mintWaitpointIdFor,
+  mintWaitpointIdForShard,
+  UnclassifiableRunId,
+} from "@trigger.dev/core/v3/isomorphic";
+import type { Logger } from "@trigger.dev/core/logger";
+import type { PrismaClient, PrismaClientOrTransaction, Waitpoint } from "@trigger.dev/database";
+import { boundedIn, Prisma } from "@trigger.dev/database";
+import { nanoid } from "nanoid";
+import { UnclassifiableWaitpointId } from "../errors.js";
+import type {
+  AbandonRunBlockersParams,
+  AbsorbBlockersParams,
+  AbsorbedBlockersParams,
+  AbsorbBlockersResult,
+  AcknowledgeResumeParams,
+  PrepareWaitpointResumeParams,
+  WaitpointResumeIntent,
+  AssociatedWaitpointData,
+  AssociatedWaitpointPlan,
+  BlockerRegistration,
+  ClearRunBlockStateParams,
+  CreateBatchWaitpointParams,
+  ReleaseRunBlockersParams,
+  CompleteParams,
+  CompleteResult,
+  CreateDateTimeWaitpointParams,
+  CreateManualWaitpointParams,
+  CreateWaitpointResult,
+  RegisterBlockersResult,
+  RegisterBlocksLocklessParams,
+  RegisterBlocksParams,
+  RunBlockEdge,
+  WaitpointCoordinator,
+} from "./types.js";
+
+export type LegacyPostgresWaitpointCoordinatorOptions = {
+  // A getter, not a value: the engine swaps its run store (setRunStore) once after boot, so this
+  // coordinator must resolve the CURRENT store on every call — reading a value captured at construction
+  // would keep every waitpoint operation on the pre-swap, undecorated store.
+  runStore: () => RunStore;
+  prisma: PrismaClient;
+  logger: Logger;
+};
+
+/**
+ * Waitpoint coordination against Postgres, through the run-ops store.
+ *
+ * Dependencies are deliberately narrow: no run lock, no worker, no event bus.
+ * That makes "this owns waitpoint state only" structural rather than a convention.
+ */
+export class LegacyPostgresWaitpointCoordinator implements WaitpointCoordinator {
+  readonly #getRunStore: () => RunStore;
+  // The CURRENT run store, resolved live on every access so a post-boot setRunStore swap is honored.
+  private get runStore(): RunStore {
+    return this.#getRunStore();
+  }
+  private readonly prisma: PrismaClient;
+  private readonly logger: Logger;
+
+  constructor(options: LegacyPostgresWaitpointCoordinatorOptions) {
+    this.#getRunStore = options.runStore;
+    this.prisma = options.prisma;
+    this.logger = options.logger;
+  }
+
+  /** Enabled key arbitration only: reuse the original legacy creators on the owning transaction. */
+  withKeyClaim(claim: NonNullable<CreateDateTimeWaitpointParams["keyClaim"]>) {
+    const store = new KeyClaimRunStore(claim.store, claim.tx);
+    return new LegacyPostgresWaitpointCoordinator({
+      runStore: () => store,
+      prisma: this.prisma,
+      logger: this.logger,
+    });
+  }
+
+  async clearRunBlockState({
+    runId,
+    edgeIds,
+    tx,
+  }: ClearRunBlockStateParams): Promise<{ count: number }> {
+    if (edgeIds) {
+      // Bounded delete of named edges, on the unblock path. No tx: that path is not inside a
+      // caller transaction, and boundedIn caps the id-list arity for Prisma.
+      return this.runStore.deleteManyTaskRunWaitpoints({
+        where: {
+          taskRunId: runId,
+          id: { in: boundedIn(edgeIds) },
+        },
+      });
+    }
+
+    // A run's edges co-locate with the run (the edge write routes by runId), so the router routes
+    // this taskRunId-keyed delete to the run's store rather than fanning out. The caller's `tx` is
+    // passed through: a routing store strips it, and a single store joins it.
+    return this.runStore.deleteManyTaskRunWaitpoints({ where: { taskRunId: runId } }, tx);
+  }
+
+  async readRunBlockState(runId: string): Promise<RunBlockEdge[]> {
+    return this.runStore.findManyTaskRunWaitpoints(
+      {
+        where: { taskRunId: runId },
+        select: {
+          id: true,
+          batchId: true,
+          batchIndex: true,
+          waitpoint: {
+            select: { id: true, status: true, type: true, completedAfter: true },
+          },
+        },
+      },
+      this.prisma
+    );
+  }
+
+  async registerBlocks({
+    client,
+    ...edge
+  }: RegisterBlocksParams): Promise<{ pendingCount: number }> {
+    await this.#writeBlockEdges(edge);
+
+    // Check if the run is actually blocked using a separate query. The separate statement is the
+    // point: under PostgreSQL READ COMMITTED each statement gets its own snapshot, so a
+    // concurrent completion that commits between the edge write and this check is still seen.
+    // It queries ALL requested ids, not just inserted ones: a row that already existed (ON
+    // CONFLICT skipped the insert) but is still PENDING must still block. Pass the caller's
+    // client so the re-read is read-your-writes on the owning PRIMARY, and pass the run id so
+    // the router counts on the run's store instead of fanning out to both DBs.
+    const pendingCount = await this.runStore.countPendingWaitpoints(
+      edge.waitpointIds,
+      client,
+      edge.runId
+    );
+
+    return { pendingCount };
+  }
+
+  async registerBlocksLockless(params: RegisterBlocksLocklessParams): Promise<void> {
+    await this.#writeBlockEdges(params);
+  }
+
+  async finalizeBlockers(_params: AbsorbedBlockersParams): Promise<void> {}
+
+  async hasAbsorbedBlockers(_params: AbsorbedBlockersParams): Promise<boolean> {
+    return false;
+  }
+
+  // Phase 1. Legacy has no absorb/register split: the edge write IS the absorption, and the separate
+  // pending re-count is the same READ COMMITTED re-read `registerBlocks` does. The count is carried in
+  // the noop continuation so phase 3 can return it unchanged.
+  async absorbBlockers({ client, ...edge }: AbsorbBlockersParams): Promise<AbsorbBlockersResult> {
+    await this.#writeBlockEdges(edge);
+    const pendingCount = await this.runStore.countPendingWaitpoints(
+      edge.waitpointIds,
+      client,
+      edge.runId
+    );
+    return { pendingCount, registration: { kind: "noop", pendingCount } };
+  }
+
+  // Phase 3. Nothing to register for a Postgres blocker — completion fans out at complete() time by
+  // querying the edges. Returns the pending count absorb carried, so the caller's resume decision is
+  // identical to today's single-call behaviour.
+  async registerBlockers(registration: BlockerRegistration): Promise<RegisterBlockersResult> {
+    if (registration.kind !== "noop") {
+      throw new Error(
+        `LegacyPostgresWaitpointCoordinator.registerBlockers received a ${registration.kind} continuation`
+      );
+    }
+    return { pendingCount: registration.pendingCount };
+  }
+
+  // Postgres has no store block-operation id.
+  async currentStoreBlockId(): Promise<string | undefined> {
+    return undefined;
+  }
+
+  // Postgres has no watcher registration or resume handoff to acknowledge — completion already fanned
+  // out at complete() time — so the resume cleanup is just deleting the run's consumed edge rows.
+  async prepareResume(
+    _params: PrepareWaitpointResumeParams
+  ): Promise<WaitpointResumeIntent | undefined> {
+    return undefined;
+  }
+
+  async readResumeIntent(): Promise<WaitpointResumeIntent | undefined> {
+    return undefined;
+  }
+
+  async acknowledgeResume(params: AcknowledgeResumeParams): Promise<void> {
+    await this.clearRunBlockState({ runId: params.runId, edgeIds: params.edgeIds });
+  }
+
+  // No terminal-fence to install for Postgres: deleting the edge rows is the cancel/terminal cleanup.
+  async releaseRunBlockers(params: ReleaseRunBlockersParams): Promise<{ count: number }> {
+    return this.clearRunBlockState({ runId: params.runId, tx: params.tx });
+  }
+
+  // No terminal marker to avoid either: a retry abandon is the same edge delete for Postgres.
+  async abandonRunBlockers(params: AbandonRunBlockersParams): Promise<{ count: number }> {
+    return this.clearRunBlockState({ runId: params.runId, tx: params.tx });
+  }
+
+  // No store watchers to withdraw on the legacy half — the retained store replay never reaches here.
+  async resumeRetainedWithdrawal(): Promise<{ count: number }> {
+    return { count: 0 };
+  }
+
+  // A pure-Postgres run IS legacy-only: delete its edges in the caller's client, before the transition.
+  async clearLegacyBlockersBeforeTransition(params: {
+    runId: string;
+    organizationId?: string;
+    tx?: PrismaClientOrTransaction;
+  }): Promise<{ count: number }> {
+    return this.clearRunBlockState({ runId: params.runId, tx: params.tx });
+  }
+
+  // No store contribution to compensate on the legacy half of a mixed absorption.
+  async compensateAbsorption(): Promise<void> {}
+
+  // No store block to fence: a pure-Postgres run never installs a MemoryDB cycle over a previous one.
+  async armCleanupFence(): Promise<void> {}
+
+  async assertNoCleanupOwed(): Promise<void> {}
+
+  async complete({ waitpointId, output }: CompleteParams): Promise<CompleteResult> {
+    // Residency store-selection guard. complete arrives with only (waitpointId, output) — no run
+    // id — so the owning run-ops store is selected by the waitpoint's own residency. In single-DB
+    // this is the one store (no classification). An unclassifiable id throws loud — never
+    // default-routes. The try wraps ONLY the resolve: widening it would swallow the
+    // "Waitpoint not found" path that a single store relies on.
+    let store: RunStore;
+    try {
+      store = await this.runStore.forWaitpointCompletion(waitpointId, { routeKind: "MANUAL" });
+    } catch (error) {
+      // Only a genuine id-classification failure should become UnclassifiableWaitpointId.
+      // forWaitpointCompletion also probes the DB to resolve the owning store, so a transient
+      // database/infra error (e.g. can't reach the database) can surface here too. Those MUST
+      // bubble up unchanged so they keep their original type, retryability, and error grouping
+      // instead of being mislabelled as an unclassifiable id.
+      const isClassificationFailure =
+        error instanceof UnclassifiableRunId ||
+        (error instanceof Error && error.name === "UnclassifiableRunId");
+
+      if (isClassificationFailure) {
+        this.logger.error("completeWaitpoint: unclassifiable waitpointId", {
+          waitpointId,
+          error,
+        });
+        throw new UnclassifiableWaitpointId(waitpointId, { cause: error });
+      }
+
+      this.logger.error("completeWaitpoint: error resolving waitpoint store", {
+        waitpointId,
+        error,
+      });
+      throw error;
+    }
+
+    // 1. Complete the Waitpoint (if not completed)
+    // Replay-safe completion: the store builds the PENDING guard and COMPLETED values internally and
+    // retries this (and only this) waitpoint-update path on a connection blip.
+    const [updateError, updateResult] = await tryCatch(
+      store.markWaitpointCompleted(waitpointId, { output })
+    );
+
+    if (updateError) {
+      this.logger.error("completeWaitpoint: error updating waitpoint:", { updateError });
+      throw updateError;
+    }
+
+    if (updateResult.count === 0) {
+      this.logger.info("completeWaitpoint: attempted to complete a waitpoint that is not PENDING", {
+        waitpointId,
+      });
+    }
+
+    // Re-read the just-written row from the RESOLVED store's PRIMARY: the replica (findWaitpoint's
+    // default) can miss it under lag → false "not found" → the parent hangs. Going back through
+    // the router would re-resolve the store and change the routing, so use the handle.
+    const waitpoint = await store.findWaitpointOnPrimary({
+      where: { id: waitpointId },
+    });
+
+    if (!waitpoint) {
+      this.logger.error("completeWaitpoint: waitpoint not found", { waitpointId });
+      throw new Error("Waitpoint not found");
+    }
+
+    if (waitpoint.status !== "COMPLETED") {
+      this.logger.error(`completeWaitpoint: waitpoint is not completed`, { waitpointId });
+      throw new Error("Waitpoint not completed");
+    }
+
+    // 2. Find the TaskRuns blocked by this waitpoint. The edge (TaskRunWaitpoint) co-locates
+    // with its RUN, not this token, so it can live on the OTHER run-ops DB: read via the router
+    // (which fans the waitpointId lookup across both DBs) rather than the token's own `store`,
+    // or a cross-DB blocked run is never found and hangs forever.
+    const blockedRuns = await this.runStore.findManyTaskRunWaitpoints(
+      {
+        where: { waitpointId },
+        select: { taskRunId: true, spanIdToComplete: true, createdAt: true },
+      },
+      this.prisma
+    );
+
+    return { waitpoint, blockedRuns };
+  }
+
+  async createDateTimeWaitpoint({
+    runId,
+    projectId,
+    environmentId,
+    completedAfter,
+    idempotencyKey,
+    idempotencyKeyExpiresAt,
+  }: CreateDateTimeWaitpointParams): Promise<CreateWaitpointResult> {
+    // Co-location invariant: a DATETIME wait waitpoint lives on the same run-ops DB as the run that
+    // blocks on it (so the block edge's local `Waitpoint` join resolves and completion/resume stay
+    // local). The minted waitpoint id is always a cuid, so without `coLocateWithRunId` the upsert
+    // would always route to LEGACY and a run-ops run on NEW would hang. The (env,idempotencyKey) dedup
+    // is within the owning run/tree (co-resident on one DB), so the dedup probe + rotation target the
+    // SAME store. With no run id (a standalone token has no owning run yet) the lookup falls back to
+    // a cross-DB NEW-then-LEGACY scan and the upsert routes by id-shape. Always routed through the
+    // run store (never a caller tx) so it can never bypass residency onto the wrong DB.
+    const colocate = runId ? { coLocateWithRunId: runId } : undefined;
+    const existingWaitpoint = idempotencyKey
+      ? await this.runStore.findWaitpoint(
+          {
+            where: {
+              environmentId,
+              idempotencyKey,
+            },
+          },
+          undefined,
+          colocate
+        )
+      : undefined;
+
+    if (existingWaitpoint) {
+      if (
+        existingWaitpoint.idempotencyKeyExpiresAt &&
+        new Date() > existingWaitpoint.idempotencyKeyExpiresAt
+      ) {
+        //the idempotency key has expired
+        //remove the waitpoint idempotencyKey
+        const rotateArgs = {
+          where: {
+            id: existingWaitpoint.id,
+          },
+          data: {
+            idempotencyKey: nanoid(24),
+            inactiveIdempotencyKey: existingWaitpoint.idempotencyKey,
+          },
+        };
+        await this.runStore.updateWaitpoint(rotateArgs, undefined, colocate);
+
+        //let it fall through to create a new waitpoint
+      } else {
+        return { kind: "cached", waitpoint: existingWaitpoint };
+      }
+    }
+
+    // The two `nanoid(24)` calls below are deliberately separate and produce DIFFERENT values:
+    // the upsert `where` key must not match the `create` key, or a guaranteed-miss upsert becomes
+    // a possible update. Do not hoist either to a shared constant.
+    const upsertArgs = {
+      where: {
+        environmentId_idempotencyKey: {
+          environmentId,
+          idempotencyKey: idempotencyKey ?? nanoid(24),
+        },
+      },
+      create: {
+        ...mintWaitpointIdFor(runId),
+        type: "DATETIME" as const,
+        idempotencyKey: idempotencyKey ?? nanoid(24),
+        idempotencyKeyExpiresAt,
+        userProvidedIdempotencyKey: !!idempotencyKey,
+        environmentId,
+        projectId,
+        completedAfter,
+      },
+      update: {},
+    };
+    const waitpoint = await this.runStore.upsertWaitpoint(upsertArgs, undefined, colocate);
+
+    return { kind: "created", waitpoint };
+  }
+
+  async createManualWaitpoint({
+    runId,
+    environmentId,
+    projectId,
+    idempotencyKey,
+    idempotencyKeyExpiresAt,
+    timeout,
+    tags,
+    standaloneResidency,
+    standaloneShardKey,
+  }: CreateManualWaitpointParams): Promise<CreateWaitpointResult> {
+    // Co-location invariant (see createDateTimeWaitpoint): when a `runId` is supplied the waitpoint
+    // co-locates with that run's DB and the (env,idempotencyKey) dedup is per-run (co-resident). A
+    // standalone token (api.v1.waitpoints.tokens.ts) passes no run id — it is created without an
+    // owner, blocked later by whichever run waits on it (possibly cross-DB, resolved by the
+    // run-co-resident block edge + completion fan-out). With no owner it reads the env mint kind via
+    // `standaloneResidency` so a minted-new env keeps its tokens on NEW; unset, it routes by id-shape. No tx here.
+    // A gen-2 standalone token carries its shard in its own id, so it passes no residency hint.
+    const standaloneShard = runId ? undefined : standaloneShardKey;
+    const isGen2Standalone =
+      standaloneShard !== undefined && standaloneShard !== "new" && standaloneShard !== "legacy";
+    const colocate = runId
+      ? { coLocateWithRunId: runId }
+      : isGen2Standalone
+        ? undefined
+        : standaloneResidency
+          ? { residency: standaloneResidency }
+          : undefined;
+    const existingWaitpoint = idempotencyKey
+      ? await this.runStore.findWaitpoint(
+          {
+            where: {
+              environmentId,
+              idempotencyKey,
+            },
+          },
+          undefined,
+          colocate
+        )
+      : undefined;
+
+    if (existingWaitpoint) {
+      if (
+        existingWaitpoint.idempotencyKeyExpiresAt &&
+        new Date() > existingWaitpoint.idempotencyKeyExpiresAt
+      ) {
+        //the idempotency key has expired
+        //remove the waitpoint idempotencyKey
+        await this.runStore.updateWaitpoint(
+          {
+            where: {
+              id: existingWaitpoint.id,
+            },
+            data: {
+              idempotencyKey: nanoid(24),
+              inactiveIdempotencyKey: existingWaitpoint.idempotencyKey,
+            },
+          },
+          undefined,
+          colocate
+        );
+
+        //let it fall through to create a new waitpoint
+      } else {
+        return { kind: "cached", waitpoint: existingWaitpoint };
+      }
+    }
+
+    const maxRetries = 5;
+    let attempts = 0;
+
+    while (attempts < maxRetries) {
+      try {
+        // As in createDateTimeWaitpoint, the two `nanoid(24)` calls are deliberately separate and
+        // differ. Both are re-evaluated per attempt, so a retry after a conflict tries a fresh
+        // key. The anchor does not change, so every attempt stays on the same shard.
+        const waitpoint = await this.runStore.upsertWaitpoint(
+          {
+            where: {
+              environmentId_idempotencyKey: {
+                environmentId,
+                idempotencyKey: idempotencyKey ?? nanoid(24),
+              },
+            },
+            create: {
+              ...(standaloneShard !== undefined
+                ? mintWaitpointIdForShard(standaloneShard)
+                : mintWaitpointIdFor(runId)),
+              type: "MANUAL",
+              idempotencyKey: idempotencyKey ?? nanoid(24),
+              idempotencyKeyExpiresAt,
+              userProvidedIdempotencyKey: !!idempotencyKey,
+              environmentId,
+              projectId,
+              completedAfter: timeout,
+              tags,
+            },
+            update: {},
+          },
+          undefined,
+          colocate
+        );
+
+        return { kind: "created", waitpoint };
+      } catch (error) {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+          // A failed statement aborts the claim transaction; only a fresh transaction can retry it.
+          if (this.runStore instanceof KeyClaimRunStore) throw error;
+          // Handle unique constraint violation (conflict)
+          attempts++;
+          if (attempts >= maxRetries) {
+            throw new Error(
+              `Failed to create waitpoint after ${maxRetries} attempts due to conflicts.`
+            );
+          }
+        } else {
+          throw error; // Re-throw other errors
+        }
+      }
+    }
+
+    throw new Error(`Failed to create waitpoint after ${maxRetries} attempts due to conflicts.`);
+  }
+
+  async createBatchWaitpoint({
+    batchId,
+    environmentId,
+    projectId,
+    tx,
+  }: CreateBatchWaitpointParams): Promise<CreateWaitpointResult> {
+    // From the batch, not the blocked run: the create passes only completedByBatchId, which is the owner
+    // the router validates against. The id anchors to the batch id. A duplicate batch idempotency key
+    // raises P2002, which the caller maps to its own "already created" contract.
+    const waitpoint = await this.runStore.createWaitpoint(
+      {
+        data: {
+          ...mintWaitpointIdFor(batchId),
+          type: "BATCH",
+          idempotencyKey: batchId,
+          userProvidedIdempotencyKey: false,
+          completedByBatchId: batchId,
+          environmentId,
+          projectId,
+        },
+      },
+      tx
+    );
+    return { kind: "created", waitpoint };
+  }
+
+  mintAssociatedWaitpointData({
+    projectId,
+    environmentId,
+    anchorRunId,
+  }: {
+    projectId: string;
+    environmentId: string;
+    anchorRunId: string;
+  }): AssociatedWaitpointData {
+    return {
+      ...mintWaitpointIdFor(anchorRunId),
+      type: "RUN" as const,
+      status: "PENDING" as const,
+      idempotencyKey: nanoid(24),
+      userProvidedIdempotencyKey: false,
+      projectId,
+      environmentId,
+    };
+  }
+
+  async createAssociatedWaitpoint({
+    runId,
+    data,
+  }: {
+    runId: string;
+    data: AssociatedWaitpointData;
+  }): Promise<Waitpoint> {
+    // RUN-type within-tree waitpoint that belongs to runId; routes by owning run id.
+    return this.runStore.createWaitpoint({
+      data: {
+        ...data,
+        completedByTaskRunId: runId,
+      },
+    });
+  }
+
+  // Legacy only ever mints legacy; the router selects store when eligible and never reaches here for one.
+  async planAssociatedWaitpoint(params: {
+    projectId: string;
+    environmentId: string;
+    anchorRunId: string;
+  }): Promise<AssociatedWaitpointPlan> {
+    return { residency: "legacy", data: this.mintAssociatedWaitpointData(params) };
+  }
+
+  // A legacy run's RUN waitpoint is a Postgres row reached through `run.associatedWaitpoint`, never a
+  // derived store id, so there is nothing to discover here.
+  async findAssociatedRunWaitpointId(): Promise<string | undefined> {
+    return undefined;
+  }
+
+  // A legacy run's association is a Postgres row read directly by the caller, never a store record.
+  async readAssociatedRunWaitpoint(): Promise<Waitpoint | undefined> {
+    return undefined;
+  }
+
+  /**
+   * The edge write, shared by both register paths so they cannot drift.
+   *
+   * Routed by the owning run id so the edge co-resides with the run. Never pinned to a caller
+   * transaction: that joined `Waitpoint` on the wrong DB, wrote 0 edges, and silently never
+   * suspended the parent. The write is idempotent (ON CONFLICT DO NOTHING).
+   */
+  #writeBlockEdges({
+    runId,
+    waitpointIds,
+    projectId,
+    spanIdToComplete,
+    batchId,
+    batchIndex,
+  }: RegisterBlocksLocklessParams): Promise<void> {
+    return this.runStore.blockRunWithWaitpointEdges({
+      runId,
+      waitpointIds,
+      projectId,
+      spanIdToComplete,
+      batchId,
+      batchIndex,
+    });
+  }
+}
+
+/** Used only after the enabled caller has acquired the physical key owner's transaction. */
+class KeyClaimRunStore extends DelegatingRunStore {
+  constructor(
+    delegate: RunStore,
+    private readonly claimTx: PrismaClientOrTransaction
+  ) {
+    super(delegate);
+  }
+
+  override findWaitpoint<T extends Prisma.WaitpointFindFirstArgs>(
+    args: Prisma.SelectSubset<T, Prisma.WaitpointFindFirstArgs>,
+    _client?: Parameters<RunStore["findWaitpoint"]>[1],
+    opts?: WaitpointColocationOptions
+  ): Promise<Prisma.WaitpointGetPayload<T> | null> {
+    return this.delegate.findWaitpoint(args, this.claimTx, opts);
+  }
+
+  override updateWaitpoint<T extends Prisma.WaitpointUpdateArgs>(
+    args: Prisma.SelectSubset<T, Prisma.WaitpointUpdateArgs>,
+    _tx?: PrismaClientOrTransaction,
+    opts?: WaitpointColocationOptions
+  ): Promise<Prisma.WaitpointGetPayload<T>> {
+    return this.delegate.updateWaitpoint(args, this.claimTx, opts);
+  }
+
+  override upsertWaitpoint<T extends Prisma.WaitpointUpsertArgs>(
+    args: Prisma.SelectSubset<T, Prisma.WaitpointUpsertArgs>,
+    _tx?: PrismaClientOrTransaction,
+    opts?: WaitpointColocationOptions
+  ): Promise<Prisma.WaitpointGetPayload<T>> {
+    return this.delegate.upsertWaitpoint(args, this.claimTx, opts);
+  }
+}

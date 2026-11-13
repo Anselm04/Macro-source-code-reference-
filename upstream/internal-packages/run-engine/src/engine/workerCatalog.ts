@@ -1,0 +1,274 @@
+import { z } from "zod";
+
+export const workerCatalog = {
+  recoverBatchWaitpoint: {
+    schema: z.object({
+      runId: z.string(),
+      batchId: z.string(),
+      organizationId: z.string(),
+      projectId: z.string(),
+      environmentId: z.string(),
+      cycleAnchor: z.string(),
+    }),
+    visibilityTimeoutMs: 30000,
+    retry: { maxAttempts: 10000, minTimeoutInMs: 1000, maxTimeoutInMs: 300000 },
+  },
+  // Each item is a bounded, durable discovery target. Exhausted failures remain in the DLQ.
+  recoverRunWaitpoint: {
+    schema: z.object({
+      parkedOnExternalDeploymentId: z.string().optional(),
+      runId: z.string(),
+      parentRunId: z.string(),
+      batch: z.object({ id: z.string(), index: z.number().optional() }).optional(),
+      organizationId: z.string(),
+      waitpointId: z.string(),
+      blockOperation: z.object({
+        id: z.string(),
+        absorptionId: z.string(),
+        cycleAnchor: z.string(),
+      }),
+      armedAt: z.coerce.date().optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+    retry: { maxAttempts: 10_000, minTimeoutInMs: 1_000, maxTimeoutInMs: 300_000 },
+  },
+  recoverWaitpointBlock: {
+    schema: z.object({
+      runId: z.string(),
+      organizationId: z.string(),
+      projectId: z.string(),
+      waitpoints: z.array(z.string()),
+      blockOperation: z.object({
+        id: z.string(),
+        absorptionId: z.string(),
+        cycleAnchor: z.string(),
+        expectedPreviousBlockId: z.string().optional(),
+      }),
+      timeout: z.coerce.date().optional(),
+      spanIdToComplete: z.string().optional(),
+      batch: z.object({ id: z.string(), index: z.number().optional() }).optional(),
+      workerId: z.string().optional(),
+      runnerId: z.string().optional(),
+      expectedEnvironmentId: z.string().optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+    retry: { maxAttempts: 10_000, minTimeoutInMs: 1_000, maxTimeoutInMs: 300_000 },
+  },
+  recoverDateTimeWaitpoint: {
+    schema: z.object({
+      manual: z.boolean().optional(),
+      waitpointId: z.string(),
+      organizationId: z.string(),
+      projectId: z.string(),
+      environmentId: z.string(),
+      completedAfter: z.coerce.date(),
+      creationAcceptUntil: z.number().optional(),
+      keyedCreation: z
+        .object({
+          scope: z.string(),
+          idempotencyKey: z.string(),
+          acceptUntil: z.number(),
+        })
+        .optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+    retry: { maxAttempts: 10_000, minTimeoutInMs: 1_000, maxTimeoutInMs: 300_000 },
+  },
+  retireManualWaitpointCatalog: {
+    schema: z.object({ waitpointId: z.string(), organizationId: z.string() }),
+    visibilityTimeoutMs: 30_000,
+    retry: { maxAttempts: 10_000, minTimeoutInMs: 1_000, maxTimeoutInMs: 300_000 },
+  },
+  deliverWaitpointFanout: {
+    schema: z.object({ waitpointId: z.string(), organizationId: z.string() }),
+    visibilityTimeoutMs: 30_000,
+    retry: { maxAttempts: 10_000, minTimeoutInMs: 1_000, maxTimeoutInMs: 300_000 },
+  },
+  /** Complete a scheduled waitpoint, optionally with an error output. */
+  finishWaitpoint: {
+    schema: z.object({
+      waitpointId: z.string(),
+      organizationId: z.string().optional(),
+      error: z.string().optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+  },
+  heartbeatSnapshot: {
+    schema: z.object({
+      runId: z.string(),
+      snapshotId: z.string(),
+      restartAttempt: z.number().optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+  },
+  repairSnapshot: {
+    schema: z.object({
+      runId: z.string(),
+      snapshotId: z.string().nullable(),
+      executionStatus: z.string(),
+    }),
+    visibilityTimeoutMs: 30_000,
+  },
+  expireRun: {
+    schema: z.object({
+      runId: z.string(),
+    }),
+    visibilityTimeoutMs: 30_000,
+  },
+  cancelRun: {
+    schema: z.object({
+      runId: z.string(),
+      completedAt: z.coerce.date(),
+      reason: z.string().optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+  },
+  queueRunsPendingVersion: {
+    schema: z.object({
+      backgroundWorkerId: z.string(),
+      /**
+       * Bounded retry counter used by {@link PendingVersionSystem} to cover
+       * ClickHouse replication lag. The first scheduling has no attempt;
+       * if the lookup returns zero candidates, the system reschedules
+       * itself once with `attempt = 1`. Capped by
+       * `pendingVersionLagMaxRetries` on `RunEngineOptions`.
+       */
+      attempt: z.number().int().nonnegative().optional(),
+    }),
+    visibilityTimeoutMs: 60_000,
+  },
+  expireParkedExternalDeploymentRun: {
+    schema: z.object({
+      runId: z.string(),
+      externalDeploymentId: z.string(),
+    }),
+    visibilityTimeoutMs: 60_000,
+  },
+  tryCompleteBatch: {
+    schema: z.object({
+      batchId: z.string(),
+      organizationId: z.string().optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+  },
+  expireBatch: {
+    schema: z.object({
+      batchId: z.string(),
+      organizationId: z.string().optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+  },
+  continueRunIfUnblocked: {
+    schema: z.object({
+      runId: z.string(),
+      // The blocked run's org, so the continuation can skip MemoryDB for a never-enabled org
+      // when handling a delayed continuation. For an old payload without it, the continuation recovers
+      // trusted org context from the environment it already loads before rediscovering blockers.
+      organizationId: z.string().optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+  },
+  /**
+   * Write-ahead guard enqueued before every run-finish commit and acked when the
+   * inline finalization side effects (waitpoint completion, parent unblock fan-out,
+   * batch nudge) all succeed. It is the recovery mechanism for a finish whose side
+   * effects were lost mid-flight, so its retry budget must outlive any database
+   * outage: roughly five weeks at the capped backoff before it dead-letters, where
+   * a genuinely poisoned item becomes visible and redrivable instead of retrying
+   * silently forever.
+   */
+  ensureRunFinalized: {
+    schema: z.object({
+      runId: z.string(),
+      /**
+       * How many times the guard has already deferred to an in-flight cancellation.
+       * Bounds the watch: past the budget the guard delivers anyway, so a lost
+       * heartbeat job cannot turn the deferral into an infinite loop.
+       */
+      deferCount: z.number().int().nonnegative().optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+    retry: {
+      maxAttempts: 10_000,
+      minTimeoutInMs: 1_000,
+      maxTimeoutInMs: 300_000,
+    },
+  },
+  // Write-ahead guard for a MANUAL/API waitpoint completion (the run-finish path is already covered
+  // by ensureRunFinalized). Armed before the completion mutation and acked once the transition and
+  // every fanout enqueue succeed; it only executes when the inline path died in between. The payload
+  // is the first-writer's output (enqueueOnce), so a replay preserves the winning completion.
+  ensureWaitpointCompleted: {
+    schema: z.object({
+      waitpointId: z.string(),
+      organizationId: z.string().optional(),
+      output: z
+        .object({
+          value: z.string(),
+          type: z.string().optional(),
+          isError: z.boolean(),
+        })
+        .optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+    retry: {
+      maxAttempts: 10_000,
+      minTimeoutInMs: 1_000,
+      maxTimeoutInMs: 300_000,
+    },
+  },
+  enqueueDelayedRun: {
+    schema: z.object({
+      runId: z.string(),
+    }),
+    visibilityTimeoutMs: 30_000,
+  },
+  /**
+   * Write-ahead guard for the failed-attempt MemoryDB blocker cleanup. Armed (only when the run holds an
+   * observed store block) before the failure/retry transition and acked once the inline cleanup succeeds;
+   * it fires only if that path died after the transition committed. On replay it re-drives the SAME
+   * block's cleanup under the run lock, fenced so it never touches a newer cycle: it releases once the run
+   * is durably terminal, abandons once the specific retry/requeue transition (proven by the minted
+   * `transitionId` existing as a snapshot — a checkpoint or other advancement is not proof) has
+   * committed, and otherwise defers. Its retry budget matches the other finalization guards.
+   */
+  ensureBlockersCleanedUp: {
+    schema: z.object({
+      runId: z.string(),
+      organizationId: z.string().optional(),
+      /** The exact store block this cleans; replay is fenced to it so it never touches a newer cycle. */
+      blockId: z.string(),
+      /** Minted for this attempt's retry/requeue transition and stamped on its snapshot; replay abandons only once that snapshot exists (terminal cleanup uses durable status instead). */
+      transitionId: z.string(),
+    }),
+    visibilityTimeoutMs: 30_000,
+    retry: {
+      maxAttempts: 10_000,
+      minTimeoutInMs: 1_000,
+      maxTimeoutInMs: 300_000,
+    },
+  },
+  /**
+   * Retry cleanup when Postgres registration and immediate MemoryDB cleanup both fail.
+   * Hold the parent run lock. Release only this operation's edge claims.
+   * Preserve successful registrations and newer blocks.
+   */
+  ensureAbsorptionCompensated: {
+    schema: z.object({
+      runId: z.string(),
+      blockId: z.string(),
+      absorptionId: z.string(),
+      organizationId: z.string().optional(),
+    }),
+    visibilityTimeoutMs: 30_000,
+    retry: {
+      maxAttempts: 10_000,
+      minTimeoutInMs: 1_000,
+      maxTimeoutInMs: 300_000,
+    },
+  },
+};
+
+for (const job of Object.values(workerCatalog)) {
+  job.schema = z.compile(job.schema);
+}

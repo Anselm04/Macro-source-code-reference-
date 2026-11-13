@@ -1,0 +1,208 @@
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { z } from "zod/v4";
+import type { AnyZodSchema } from "../../types/schemas.js";
+import { SupervisorHttpClient } from "./http.js";
+import { WorkerApiRunLatestSnapshotResponseBody } from "./schemas.js";
+
+const createdAt = "2026-01-01T00:00:00.000Z";
+const execution = {
+  version: "1",
+  snapshot: {
+    id: "snapshot_1",
+    friendlyId: "snap_1",
+    executionStatus: "EXECUTING",
+    description: "Run is executing",
+    createdAt,
+  },
+  run: { id: "run_1", friendlyId: "run_1", status: "EXECUTING" },
+  completedWaitpoints: [],
+};
+
+const compiledSchemas = new Map<AnyZodSchema, AnyZodSchema>([
+  [
+    WorkerApiRunLatestSnapshotResponseBody,
+    z.compile(WorkerApiRunLatestSnapshotResponseBody, { strict: true }),
+  ],
+]);
+
+function resolveCompiledSchema<T extends AnyZodSchema>(schema: T): T {
+  return (compiledSchemas.get(schema) as T | undefined) ?? schema;
+}
+
+describe("supervisor response schema resolution", () => {
+  let server: Server;
+  let apiUrl: string;
+
+  beforeAll(async () => {
+    server = createServer((request, response) => {
+      response.setHeader("content-type", "application/json");
+      response.end(
+        JSON.stringify({ execution: request.url?.includes("/invalid/") ? {} : execution })
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    apiUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it.each([false, true])("parses responses with schema resolution enabled=%s", async (enabled) => {
+    const resolved: AnyZodSchema[] = [];
+    const client = new SupervisorHttpClient({
+      apiUrl,
+      workerToken: "token",
+      instanceName: "test",
+      resolveResponseSchema: enabled
+        ? (schema) => {
+            resolved.push(schema);
+            return resolveCompiledSchema(schema);
+          }
+        : undefined,
+    });
+
+    const result = await client.getLatestSnapshot("run_1");
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.execution.snapshot.createdAt).toEqual(new Date(createdAt));
+      expect(result.data.execution.run.id).toBe("run_1");
+    }
+    expect(resolved).toEqual(enabled ? [WorkerApiRunLatestSnapshotResponseBody] : []);
+  });
+
+  it("returns a validation failure for malformed responses with compiled parsing", async () => {
+    const client = new SupervisorHttpClient({
+      apiUrl,
+      workerToken: "token",
+      instanceName: "test",
+      resolveResponseSchema: resolveCompiledSchema,
+    });
+
+    const result = await client.getLatestSnapshot("invalid");
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.statusCode).toBe(200);
+    }
+  });
+});
+
+describe("supervisor worker actions", () => {
+  type Answer = { status: number; body: unknown; headers?: Record<string, string> };
+  type Received = { method?: string; url?: string; headers: Record<string, unknown>; body: string };
+
+  let server: Server;
+  let apiUrl: string;
+  let answer: Answer;
+  let received: Received[];
+
+  beforeAll(async () => {
+    server = createServer((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        received.push({ method: request.method, url: request.url, headers: request.headers, body });
+        response.writeHead(answer.status, {
+          "content-type": "application/json",
+          ...answer.headers,
+        });
+        response.end(JSON.stringify(answer.body));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    apiUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  beforeEach(() => {
+    received = [];
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  // Catches: dispatch or checkpoint recording dropping the runner's verified environment.
+  it.each([undefined, "env_verified"])(
+    "preserves suspend caller environment %s on both engine hops",
+    async (environmentId) => {
+      answer = { status: 200, body: { ok: true } };
+      const client = new SupervisorHttpClient({
+        apiUrl,
+        workerToken: "token",
+        instanceName: "test",
+      });
+      expect(
+        (await client.preflightSuspend("run_1", "snapshot_1", "runner_1", environmentId)).success
+      ).toBe(true);
+      expect(
+        (
+          await client.submitSuspendCompletion({
+            runId: "run_1",
+            snapshotId: "snapshot_1",
+            runnerId: "runner_1",
+            environmentId,
+            body: { success: true, checkpoint: { type: "COMPUTE", location: "node/snapshot" } },
+          })
+        ).success
+      ).toBe(true);
+      expect(received).toHaveLength(2);
+      expect(received.map((request) => request.url)).toEqual([
+        "/engine/v1/worker-actions/runs/run_1/snapshots/snapshot_1/suspend/preflight",
+        "/engine/v1/worker-actions/runs/run_1/snapshots/snapshot_1/suspend",
+      ]);
+      for (const request of received) {
+        expect(request.headers["x-trigger-worker-environment-id"]).toBe(environmentId);
+        expect(request.headers["x-trigger-worker-runner-id"]).toBe("runner_1");
+      }
+    }
+  );
+
+  function release() {
+    const client = new SupervisorHttpClient({ apiUrl, workerToken: "token", instanceName: "test" });
+    return client.releaseRun("run_1", "snapshot_1", { reason: "PodFailed" }, "runner_1", "env_1");
+  }
+
+  it("posts the reason for the run's snapshot and returns whether it was requeued", async () => {
+    answer = { status: 200, body: { ok: true, requeued: true } };
+
+    const result = await release();
+
+    expect(result).toEqual({ success: true, data: { ok: true, requeued: true } });
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({
+      method: "POST",
+      url: "/engine/v1/worker-actions/runs/run_1/snapshots/snapshot_1/release",
+      headers: {
+        "x-trigger-worker-runner-id": "runner_1",
+        "x-trigger-worker-environment-id": "env_1",
+      },
+    });
+    expect(JSON.parse(received[0]!.body)).toEqual({ reason: "PodFailed" });
+  });
+
+  it("returns a webapp without the route as a 404, without retrying", async () => {
+    answer = { status: 404, body: { error: "Not Found" } };
+
+    const result = await release();
+
+    expect(result).toMatchObject({ success: false, statusCode: 404 });
+    expect(received).toHaveLength(1);
+  });
+
+  it("returns a conflict as a failure that says not to retry", async () => {
+    answer = {
+      status: 409,
+      body: { error: "Snapshot is no longer the run's dequeued snapshot" },
+      headers: { "x-should-retry": "false" },
+    };
+
+    const result = await release();
+
+    expect(result).toMatchObject({ success: false, statusCode: 409, shouldRetry: false });
+    expect(received).toHaveLength(1);
+  });
+});

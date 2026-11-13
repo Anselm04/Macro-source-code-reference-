@@ -1,0 +1,1269 @@
+import { SupervisorSession } from "@trigger.dev/core/v3/workers";
+import { SimpleStructuredLogger } from "@trigger.dev/core/v3/utils/structuredLogger";
+import { formatLogLine, startTelnetLogServer } from "@trigger.dev/core/v3/telnetLogServer";
+import { env } from "./env.js";
+import { Agent, EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
+import { WorkloadServer } from "./workloadServer/index.js";
+import type {
+  WorkloadManagerCreateOptions,
+  WorkloadManagerOptions,
+  WorkloadManager,
+} from "./workloadManager/types.js";
+import Docker from "dockerode";
+import { z } from "zod";
+import { type DequeuedMessage } from "@trigger.dev/core/v3";
+import {
+  DockerResourceMonitor,
+  KubernetesResourceMonitor,
+  NoopResourceMonitor,
+  type ResourceMonitor,
+} from "./resourceMonitor.js";
+import { KubernetesWorkloadManager } from "./workloadManager/kubernetes.js";
+import {
+  RunCrdWorkloadManager,
+  RunnerKillInformer,
+  RunnerRestoreInformer,
+  reportTemplateKeyRefusal,
+  settleRestoreFailure,
+  type RunnerStartFailure,
+} from "./workloadManager/runCrd.js";
+import { workerLaneFor, type WorkloadManagerBackend } from "./workerLane.js";
+import { RestoreWatcher, type RestoreFailure } from "./services/restoreWatcher.js";
+import {
+  ColdStartHeartbeats,
+  heartbeatRejected,
+  type ColdStartBeatResult,
+  type ColdStartTarget,
+} from "./services/coldStartHeartbeats.js";
+import { DockerWorkloadManager } from "./workloadManager/docker.js";
+import {
+  HttpServer,
+  CheckpointClient,
+  isKubernetesEnvironment,
+} from "@trigger.dev/core/v3/serverOnly";
+import { installShutdown } from "./shutdown.js";
+import { createK8sApi, createPodCountFetcher } from "./clients/kubernetes.js";
+import { resolveResponseSchema } from "./clients/responseSchemas.js";
+import { collectDefaultMetrics, Counter, Gauge, Histogram } from "prom-client";
+import { register } from "./metrics.js";
+import { PodCleaner } from "./services/podCleaner.js";
+import { GuestSnapshotCleaner } from "./services/guestSnapshotCleaner.js";
+import { FailedPodHandler } from "./services/failedPodHandler.js";
+import { RunnerKillReporter } from "./services/runnerKills.js";
+import { dequeuedRun, RunReleaser } from "./services/runReleases.js";
+import { WorkloadNotCreatedError } from "./workloadManager/createErrors.js";
+import { DequeueDrain } from "./services/dequeueDrain.js";
+import { getWorkerToken } from "./workerToken.js";
+import { mintDeploymentToken } from "./workloadToken.js";
+import {
+  WarmStartVerificationService,
+  type WarmStartTimings,
+} from "./services/warmStartVerificationService.js";
+import { extractTraceparent, getRunnerId } from "./util.js";
+import { Redis } from "ioredis";
+import { BackpressureMonitor } from "./backpressure/backpressureMonitor.js";
+import { RedisBackpressureSignalSource } from "./backpressure/redisBackpressureSignalSource.js";
+import { BackpressureMetrics } from "./backpressure/backpressureMetrics.js";
+import { K8sPodCountSignalSource } from "./backpressure/k8sPodCountSignalSource.js";
+import {
+  fromContext,
+  recordPhaseSince,
+  runWideEvent,
+  setExtra,
+  setMeta,
+  type WideEventOptions,
+} from "./wideEvents/index.js";
+
+// fetch keeps an idle connection for only 4 s by default, so a quiet supervisor that calls the
+// platform every few seconds opens a new TCP and TLS connection for most calls. A Keep-Alive
+// header on the response still wins: undici then uses its timeout instead of this one.
+// Node installs an EnvHttpProxyAgent for fetch under NODE_USE_ENV_PROXY or --use-env-proxy, so
+// keep routing through the proxy in that case.
+const keepAliveTimeout = env.SUPERVISOR_HTTP_KEEPALIVE_TIMEOUT_MS;
+setGlobalDispatcher(
+  getGlobalDispatcher().constructor.name === "EnvHttpProxyAgent"
+    ? new EnvHttpProxyAgent({ keepAliveTimeout })
+    : new Agent({ keepAliveTimeout })
+);
+
+if (env.METRICS_COLLECT_DEFAULTS) {
+  collectDefaultMetrics({ register });
+}
+
+const workloadCreateDuration = new Histogram({
+  name: "workload_create_duration_seconds",
+  help: "Duration of workload manager create calls. A create may include backend-internal retries, so one observation can span multiple attempts.",
+  labelNames: ["backend", "outcome"],
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60],
+  registers: [register],
+});
+
+const outboundRequestsTotal = new Counter({
+  name: "supervisor_outbound_request_total",
+  help: "Count of outbound HTTP requests from the supervisor, by target name, method, response status, and outcome (ok, http_error, invalid_response, network_error).",
+  labelNames: ["name", "method", "status", "outcome"],
+  registers: [register],
+});
+
+const outboundRequestDuration = new Histogram({
+  name: "supervisor_outbound_request_duration_seconds",
+  help: "Duration of outbound HTTP requests from the supervisor, by target name and outcome. Includes the HTTP client's internal retries and backoff.",
+  labelNames: ["name", "outcome"],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 11, 12.5, 15, 20, 30, 60],
+  registers: [register],
+});
+
+const startReportsTotal = new Counter({
+  name: "supervisor_start_reports_total",
+  help: "Cold starts the operator failed before they began, moved to the fallback lane through the platform, by result: ok, conflict when the run had already moved on, or error.",
+  labelNames: ["result"],
+  registers: [register],
+});
+
+const templateKeyRefusalsTotal = new Counter({
+  name: "supervisor_template_key_refusals_total",
+  help: "Dequeued runs this lane created no Runner for, as they had no valid template key, by outcome (fallback or fail) and result: ok, conflict when the run had already moved on, or error.",
+  labelNames: ["outcome", "result"],
+  registers: [register],
+});
+
+const restoreReportsTotal = new Counter({
+  name: "supervisor_restore_reports_total",
+  help: "Failed restores reported to the platform, by outcome (requeue or fail) and result: ok, conflict when the run had already moved on, or error.",
+  labelNames: ["outcome", "result"],
+  registers: [register],
+});
+
+class ManagedSupervisor {
+  private readonly workerSession: SupervisorSession;
+  private readonly dequeueDrain: DequeueDrain;
+  private readonly metricsServer?: HttpServer;
+  private readonly workloadServer: WorkloadServer;
+  private readonly workloadManager: WorkloadManager;
+  private readonly workloadManagerBackend: WorkloadManagerBackend;
+  private readonly runCrdManager?: RunCrdWorkloadManager;
+  private readonly restoreInformer?: RunnerRestoreInformer;
+  private readonly restoreWatcher?: RestoreWatcher;
+  private readonly coldStartHeartbeats?: ColdStartHeartbeats;
+  private readonly runnerKillReporter?: RunnerKillReporter;
+  private readonly runnerKillInformer?: RunnerKillInformer;
+  private readonly runReleaser?: RunReleaser;
+  private readonly logger = new SimpleStructuredLogger("managed-supervisor");
+  private readonly resourceMonitor: ResourceMonitor;
+  private readonly checkpointClient?: CheckpointClient;
+  private readonly snapshotDeleteClient?: CheckpointClient;
+  private readonly warmStartVerifier?: WarmStartVerificationService;
+
+  private readonly podCleaner?: PodCleaner;
+  private readonly guestSnapshotCleaner?: GuestSnapshotCleaner;
+  private readonly failedPodHandler?: FailedPodHandler;
+  private readonly backpressureMonitors: BackpressureMonitor[] = [];
+  private readonly backpressureRedis?: Redis;
+
+  private readonly isKubernetes = isKubernetesEnvironment(env.KUBERNETES_FORCE_ENABLED);
+  private readonly warmStartUrl = env.TRIGGER_WARM_START_URL;
+  private readonly warmStartDispatchUrl =
+    env.TRIGGER_WARM_START_DISPATCH_URL ?? env.TRIGGER_WARM_START_URL;
+
+  private readonly wideEventOpts: WideEventOptions = {
+    service: "supervisor",
+    env: { nodeId: env.TRIGGER_WORKER_INSTANCE_NAME },
+    enabled: env.TRIGGER_WIDE_EVENTS_ENABLED,
+  };
+  private readonly wideEventsNoisyRoutes = env.TRIGGER_WIDE_EVENTS_NOISY_ROUTES;
+
+  constructor() {
+    // Strip secret-like env vars before debug-logging the rest. Add any new
+    // secret env var here so it never lands in the DEBUG "Starting up" log.
+    const {
+      TRIGGER_WORKER_TOKEN,
+      MANAGED_WORKER_SECRET,
+      DOCKER_REGISTRY_PASSWORD,
+      TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_PASSWORD,
+      WORKLOAD_TOKEN_SECRET,
+      WORKLOAD_TOKEN_SECRET_PREVIOUS,
+      WORKLOAD_TOKEN_SECRETS,
+      WORKLOAD_TOKEN_SIGNING_KEY,
+      ...envWithoutSecrets
+    } = env;
+
+    if (env.DEBUG) {
+      this.logger.debug("Starting up", { envWithoutSecrets });
+    }
+
+    if (this.warmStartUrl) {
+      this.logger.log("🔥 Warm starts enabled", {
+        warmStartUrl: this.warmStartUrl,
+      });
+    }
+
+    const workloadManagerOptions = {
+      workloadApiProtocol: env.TRIGGER_WORKLOAD_API_PROTOCOL,
+      workloadApiDomain: env.TRIGGER_WORKLOAD_API_DOMAIN,
+      workloadApiPort: env.TRIGGER_WORKLOAD_API_PORT_EXTERNAL,
+      warmStartUrl: this.warmStartUrl,
+      metadataUrl: env.TRIGGER_METADATA_URL,
+      imagePullSecrets: env.KUBERNETES_IMAGE_PULL_SECRETS?.split(","),
+      heartbeatIntervalSeconds: env.RUNNER_HEARTBEAT_INTERVAL_SECONDS,
+      snapshotPollIntervalSeconds: env.RUNNER_SNAPSHOT_POLL_INTERVAL_SECONDS,
+      additionalEnvVars: env.RUNNER_ADDITIONAL_ENV_VARS,
+      dockerAutoremove: env.DOCKER_AUTOREMOVE_EXITED_CONTAINERS,
+      checkpointsEnabled: !!env.TRIGGER_CHECKPOINT_URL,
+      releaseUnstartedRuns: env.RELEASE_UNSTARTED_RUNS_ENABLED,
+    } satisfies WorkloadManagerOptions;
+
+    this.runReleaser =
+      env.RELEASE_UNSTARTED_RUNS_ENABLED || env.RELEASE_FAILED_POD_RUNS_ENABLED
+        ? new RunReleaser({
+            register,
+            client: () => this.workerSession.httpClient,
+            runsReleasedAMinute: env.RUN_RELEASES_PER_MINUTE,
+          })
+        : undefined;
+
+    this.resourceMonitor = env.RESOURCE_MONITOR_ENABLED
+      ? this.isKubernetes
+        ? new KubernetesResourceMonitor(createK8sApi(), env.TRIGGER_WORKER_INSTANCE_NAME)
+        : new DockerResourceMonitor(new Docker())
+      : new NoopResourceMonitor();
+
+    if (this.isKubernetes && env.RUNNER_KILL_REPORTS_ENABLED) {
+      const killReporter = new RunnerKillReporter({
+        register,
+        client: () => this.workerSession.httpClient,
+      });
+      this.runnerKillReporter = killReporter;
+      // Separate from the run CRD manager: the process that sees Runners fail need not run them.
+      if (env.KUBERNETES_RUNNER_KILL_INFORMER_ENABLED) {
+        this.runnerKillInformer = new RunnerKillInformer({
+          namespace: env.KUBERNETES_NAMESPACE,
+          onRunnerKilled: (runnerId, kill) => void killReporter.onRunnerKilled(runnerId, kill),
+          ...(env.KUBERNETES_RUN_CRD_ENABLED
+            ? { onRunnerStartFailed: (failure) => void this.reportStartFailure(failure) }
+            : {}),
+        });
+      }
+    }
+
+    if (this.isKubernetes && env.KUBERNETES_RUN_CRD_ENABLED) {
+      // Only a process that dequeues creates resumes, and only the microvm lane restores.
+      if (
+        env.KUBERNETES_RUNNER_RESTORE_INFORMER_ENABLED &&
+        env.TRIGGER_DEQUEUE_ENABLED &&
+        env.KUBERNETES_RUNNER_RUNTIME === "microvm"
+      ) {
+        this.restoreInformer = new RunnerRestoreInformer({
+          namespace: env.KUBERNETES_NAMESPACE,
+          onUnwatchedFailure: (failure) => void this.restoreWatcher?.report(failure),
+          onUnwatchedRestore: ({
+            runnerId,
+            uid,
+            runFriendlyId,
+            snapshotFriendlyId,
+            environmentId,
+          }) => {
+            if (runFriendlyId && snapshotFriendlyId) {
+              void this.restoreWatcher?.watch(
+                { runFriendlyId, snapshotFriendlyId, environmentId },
+                { runnerId, uid }
+              );
+            }
+          },
+        });
+      }
+      const runCrdManager = new RunCrdWorkloadManager({
+        ...workloadManagerOptions,
+        namespace: env.KUBERNETES_NAMESPACE,
+        runtime: env.KUBERNETES_RUNNER_RUNTIME,
+        nodeName: env.TRIGGER_WORKER_INSTANCE_NAME,
+        snapshots: {
+          enabled: env.COMPUTE_SNAPSHOTS_ENABLED,
+          delayMs: env.COMPUTE_SNAPSHOT_DELAY_MS,
+          dispatchLimit: env.COMPUTE_SNAPSHOT_DISPATCH_LIMIT,
+        },
+        suspendPollMs: env.KUBERNETES_RUNNER_POLL_INTERVAL_MS,
+        restoreTimeoutMs: env.KUBERNETES_RUNNER_RESTORE_TIMEOUT_MS,
+        tokenSecretSettleMs: env.KUBERNETES_RUNNER_TOKEN_SECRET_SETTLE_MS,
+        restoreInformer: this.restoreInformer,
+      });
+      this.runCrdManager = runCrdManager;
+      this.restoreWatcher = new RestoreWatcher({
+        awaitRestore: (restore, onPhase, signal) =>
+          runCrdManager.awaitRestore(restore, onPhase, signal),
+        heartbeat: (beat) => this.heartbeatRestore(beat),
+        heartbeatIntervalMs: env.KUBERNETES_RUNNER_RESTORE_HEARTBEAT_INTERVAL_MS,
+        reportFailure: (failure) => this.reportRestoreFailure(failure),
+        register,
+      });
+      if (env.KUBERNETES_RUNNER_START_HEARTBEAT_ENABLED) {
+        this.coldStartHeartbeats = new ColdStartHeartbeats({
+          readState: ({ runnerId, snapshotFriendlyId }) =>
+            runCrdManager.coldStartState(runnerId, snapshotFriendlyId),
+          heartbeat: (target) => this.heartbeatColdStart(target),
+          intervalMs: env.KUBERNETES_RUNNER_RESTORE_HEARTBEAT_INTERVAL_MS,
+          timeoutMs: env.KUBERNETES_RUNNER_START_HEARTBEAT_TIMEOUT_MS,
+          register,
+        });
+      }
+      this.workloadManager = runCrdManager;
+      this.workloadManagerBackend = "run-crd";
+
+      if (
+        env.GUEST_SNAPSHOT_CLEANER_ENABLED &&
+        env.GUEST_SNAPSHOT_CLEANER_NODE_PROXY_URL &&
+        env.GUEST_SNAPSHOT_CLEANER_TOKEN_PATH
+      ) {
+        this.logger.log("🧹 Guest snapshot cleaner enabled", {
+          nodeProxyUrl: env.GUEST_SNAPSHOT_CLEANER_NODE_PROXY_URL,
+          intervalMs: env.GUEST_SNAPSHOT_CLEANER_INTERVAL_MS,
+          minAgeMs: env.GUEST_SNAPSHOT_CLEANER_MIN_AGE_MS,
+        });
+        this.guestSnapshotCleaner = new GuestSnapshotCleaner({
+          nodeProxyUrl: env.GUEST_SNAPSHOT_CLEANER_NODE_PROXY_URL,
+          tokenPath: env.GUEST_SNAPSHOT_CLEANER_TOKEN_PATH,
+          minAgeMs: env.GUEST_SNAPSHOT_CLEANER_MIN_AGE_MS,
+          intervalMs: env.GUEST_SNAPSHOT_CLEANER_INTERVAL_MS,
+          client: () => this.workerSession.httpClient,
+          register,
+        });
+      }
+    } else if (this.isKubernetes) {
+      this.workloadManager = new KubernetesWorkloadManager(workloadManagerOptions);
+      this.workloadManagerBackend = "kubernetes";
+    } else {
+      this.workloadManager = new DockerWorkloadManager(workloadManagerOptions);
+      this.workloadManagerBackend = "docker";
+    }
+
+    // Not run-crd: the operator owns those pods and fails a Runner without one.
+    if (this.isKubernetes && this.workloadManagerBackend !== "run-crd") {
+      if (env.POD_CLEANER_ENABLED) {
+        this.logger.log("🧹 Pod cleaner enabled", {
+          namespace: env.KUBERNETES_NAMESPACE,
+          batchSize: env.POD_CLEANER_BATCH_SIZE,
+          intervalMs: env.POD_CLEANER_INTERVAL_MS,
+        });
+        this.podCleaner = new PodCleaner({
+          register,
+          namespace: env.KUBERNETES_NAMESPACE,
+          batchSize: env.POD_CLEANER_BATCH_SIZE,
+          intervalMs: env.POD_CLEANER_INTERVAL_MS,
+        });
+      } else {
+        this.logger.warn("Pod cleaner disabled");
+      }
+
+      if (env.FAILED_POD_HANDLER_ENABLED) {
+        this.logger.log("🔁 Failed pod handler enabled", {
+          namespace: env.KUBERNETES_NAMESPACE,
+          reconnectIntervalMs: env.FAILED_POD_HANDLER_RECONNECT_INTERVAL_MS,
+        });
+        const runReleaser = env.RELEASE_FAILED_POD_RUNS_ENABLED ? this.runReleaser : undefined;
+        this.failedPodHandler = new FailedPodHandler({
+          register,
+          namespace: env.KUBERNETES_NAMESPACE,
+          reconnectIntervalMs: env.FAILED_POD_HANDLER_RECONNECT_INTERVAL_MS,
+          watchTimeoutSeconds: env.FAILED_POD_HANDLER_WATCH_TIMEOUT_SECONDS,
+          onRunnerKilled: this.runnerKillReporter
+            ? (runnerId, kill) => this.runnerKillReporter!.onRunnerKilled(runnerId, kill)
+            : undefined,
+          onRunPodFailed: runReleaser ? (run) => runReleaser.release(run, "PodFailed") : undefined,
+        });
+      } else {
+        this.logger.warn("Failed pod handler disabled");
+      }
+    } else if (this.isKubernetes) {
+      this.logger.log("🧹 Pod cleaner and failed pod handler disabled, the operator owns run pods");
+    }
+
+    if (env.RELEASE_FAILED_POD_RUNS_ENABLED && !this.failedPodHandler) {
+      this.logger.warn(
+        "RELEASE_FAILED_POD_RUNS_ENABLED has no effect without the failed pod handler"
+      );
+    }
+
+    if (env.TRIGGER_DEQUEUE_INTERVAL_MS > env.TRIGGER_DEQUEUE_IDLE_INTERVAL_MS) {
+      this.logger.warn(
+        `⚠️  TRIGGER_DEQUEUE_INTERVAL_MS (${env.TRIGGER_DEQUEUE_INTERVAL_MS}) is greater than TRIGGER_DEQUEUE_IDLE_INTERVAL_MS (${env.TRIGGER_DEQUEUE_IDLE_INTERVAL_MS}) - did you mix them up?`
+      );
+    }
+
+    // Redis-verdict source (external aggregator). Keeps existing metric names.
+    if (env.TRIGGER_DEQUEUE_BACKPRESSURE_ENABLED) {
+      this.backpressureRedis = new Redis({
+        host: env.TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_HOST,
+        port: env.TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_PORT,
+        username: env.TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_USERNAME,
+        password: env.TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_PASSWORD,
+        ...(env.TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_TLS_DISABLED ? {} : { tls: {} }),
+        maxRetriesPerRequest: null,
+      });
+      this.backpressureRedis.on("error", (error) =>
+        this.logger.error("Backpressure redis error", { error: error.message })
+      );
+      this.backpressureMonitors.push(
+        new BackpressureMonitor({
+          enabled: true,
+          source: new RedisBackpressureSignalSource(
+            this.backpressureRedis,
+            env.TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_KEY
+          ),
+          refreshIntervalMs: env.TRIGGER_DEQUEUE_BACKPRESSURE_REFRESH_MS,
+          maxVerdictAgeMs: env.TRIGGER_DEQUEUE_BACKPRESSURE_MAX_VERDICT_AGE_MS,
+          rampMs: env.TRIGGER_DEQUEUE_BACKPRESSURE_RAMP_MS,
+          dryRun: env.TRIGGER_DEQUEUE_BACKPRESSURE_DRY_RUN,
+          logger: this.logger,
+          metrics: new BackpressureMetrics({ register }),
+        })
+      );
+      this.logger.log("🛑 Dequeue backpressure enabled (redis source)", {
+        key: env.TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_KEY,
+        refreshIntervalMs: env.TRIGGER_DEQUEUE_BACKPRESSURE_REFRESH_MS,
+        dryRun: env.TRIGGER_DEQUEUE_BACKPRESSURE_DRY_RUN,
+      });
+    }
+
+    // Pod-count source (in-process apiserver scrape). Namespaced metrics so the
+    // redis source's metric names are preserved.
+    if (env.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_ENABLED) {
+      // RELEASE < ENGAGE is enforced in env.ts (superRefine), so it's valid here.
+      const podCountGauge = new Gauge({
+        name: "supervisor_cluster_pod_count",
+        help: "Pod objects in the workload namespace, counted for backpressure",
+        registers: [register],
+      });
+      this.backpressureMonitors.push(
+        new BackpressureMonitor({
+          enabled: true,
+          source: new K8sPodCountSignalSource({
+            fetchPodCount: createPodCountFetcher(
+              createK8sApi(),
+              env.KUBERNETES_NAMESPACE,
+              env.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_SCRAPE_TIMEOUT_MS
+            ),
+            engageThreshold: env.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_ENGAGE,
+            releaseThreshold: env.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_RELEASE,
+            reportPodCount: (count) => podCountGauge.set(count),
+          }),
+          refreshIntervalMs: env.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_REFRESH_MS,
+          maxVerdictAgeMs: env.TRIGGER_DEQUEUE_BACKPRESSURE_MAX_VERDICT_AGE_MS,
+          rampMs: env.TRIGGER_DEQUEUE_BACKPRESSURE_RAMP_MS,
+          dryRun: env.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_DRY_RUN,
+          logger: this.logger,
+          metrics: new BackpressureMetrics({
+            register,
+            prefix: "supervisor_backpressure_pod_count",
+          }),
+        })
+      );
+      this.logger.log("🛑 Dequeue backpressure enabled (pod-count source)", {
+        engage: env.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_ENGAGE,
+        release: env.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_RELEASE,
+        refreshIntervalMs: env.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_REFRESH_MS,
+        dryRun: env.TRIGGER_DEQUEUE_BACKPRESSURE_POD_COUNT_DRY_RUN,
+      });
+    }
+
+    const workerToken = getWorkerToken();
+
+    const workerStamp = {
+      workerCell: env.TRIGGER_WORKER_CELL_NAME,
+      workerLane: workerLaneFor(this.workloadManagerBackend, env.KUBERNETES_RUNNER_RUNTIME),
+    };
+
+    this.workerSession = new SupervisorSession({
+      metadata: workerStamp,
+      resolveResponseSchema,
+      workerToken,
+      apiUrl: env.TRIGGER_API_URL,
+      instanceName: env.TRIGGER_WORKER_INSTANCE_NAME,
+      managedWorkerSecret: env.MANAGED_WORKER_SECRET,
+      dequeueIntervalMs: env.TRIGGER_DEQUEUE_INTERVAL_MS,
+      dequeueIdleIntervalMs: env.TRIGGER_DEQUEUE_IDLE_INTERVAL_MS,
+      queueConsumerEnabled: env.TRIGGER_DEQUEUE_ENABLED,
+      queueClass: env.TRIGGER_WORKER_QUEUE_CLASS,
+      subscriptions: env.TRIGGER_WORKER_QUEUE_SUBSCRIPTIONS,
+      metricsRegistry: register,
+      scaling: {
+        strategy: env.TRIGGER_DEQUEUE_SCALING_STRATEGY,
+        minConsumerCount: env.TRIGGER_DEQUEUE_MIN_CONSUMER_COUNT,
+        maxConsumerCount: env.TRIGGER_DEQUEUE_MAX_CONSUMER_COUNT,
+        scaleUpCooldownMs: env.TRIGGER_DEQUEUE_SCALING_UP_COOLDOWN_MS,
+        scaleDownCooldownMs: env.TRIGGER_DEQUEUE_SCALING_DOWN_COOLDOWN_MS,
+        targetRatio: env.TRIGGER_DEQUEUE_SCALING_TARGET_RATIO,
+        ewmaAlpha: env.TRIGGER_DEQUEUE_SCALING_EWMA_ALPHA,
+        batchWindowMs: env.TRIGGER_DEQUEUE_SCALING_BATCH_WINDOW_MS,
+        dampingFactor: env.TRIGGER_DEQUEUE_SCALING_DAMPING_FACTOR,
+        // Freeze scale-up while backpressure is hard-engaged (not during the resume
+        // ramp). Undefined when backpressure is disabled → no effect on scaling.
+        shouldPauseScaling: () => this.backpressureMonitors.some((m) => m.isEngaged()),
+      },
+      runNotificationsEnabled: env.TRIGGER_WORKLOAD_API_ENABLED,
+      heartbeatIntervalSeconds: env.TRIGGER_WORKER_HEARTBEAT_INTERVAL_SECONDS,
+      sendRunDebugLogs: env.SEND_RUN_DEBUG_LOGS,
+      onHttpRequestComplete: ({ name, method, status, outcome, durationMs }) => {
+        outboundRequestsTotal.inc({ name, method, status, outcome });
+        outboundRequestDuration.observe({ name, outcome }, durationMs / 1000);
+      },
+      preDequeue: async () => {
+        // Synchronous, hot-path-safe cached read; false when no monitors are active.
+        const skipForBackpressure = this.backpressureMonitors.some((m) => m.shouldSkipDequeue());
+
+        if (!env.RESOURCE_MONITOR_ENABLED || this.isKubernetes) {
+          // Resource monitor is not used in k8s; backpressure is the only gate there.
+          return { skipDequeue: skipForBackpressure };
+        }
+
+        const resources = await this.resourceMonitor.getNodeResources();
+
+        return {
+          maxResources: {
+            cpu: resources.cpuAvailable,
+            memory: resources.memoryAvailable,
+          },
+          skipDequeue:
+            skipForBackpressure ||
+            resources.cpuAvailable < 0.25 ||
+            resources.memoryAvailable < 0.25,
+        };
+      },
+      preSkip: async () => {
+        // When the node is full, it should still try to warm start runs
+        // await this.tryWarmStartAllThisNode();
+      },
+    });
+    this.dequeueDrain = new DequeueDrain(this.workerSession, this.logger);
+
+    if (env.TRIGGER_CHECKPOINT_URL) {
+      this.logger.log("🥶 Checkpoints enabled", {
+        checkpointUrl: env.TRIGGER_CHECKPOINT_URL,
+      });
+
+      this.checkpointClient = new CheckpointClient({
+        apiUrl: new URL(env.TRIGGER_CHECKPOINT_URL),
+        managedWorkerSecret: env.MANAGED_WORKER_SECRET,
+        workerClient: this.workerSession.httpClient,
+        orchestrator: this.isKubernetes ? "KUBERNETES" : "DOCKER",
+      });
+    }
+
+    if (env.TRIGGER_SNAPSHOT_DELETE_URL) {
+      this.snapshotDeleteClient = new CheckpointClient({
+        apiUrl: new URL(env.TRIGGER_SNAPSHOT_DELETE_URL),
+        managedWorkerSecret: env.MANAGED_WORKER_SECRET,
+        workerClient: this.workerSession.httpClient,
+        orchestrator: "KUBERNETES",
+      });
+    }
+
+    if (env.TRIGGER_WARM_START_VERIFY_ENABLED && this.warmStartUrl) {
+      this.logger.log("Warm-start delivery verification enabled", {
+        delayMs: env.TRIGGER_WARM_START_VERIFY_DELAY_MS,
+      });
+
+      this.warmStartVerifier = new WarmStartVerificationService({
+        workerClient: this.workerSession.httpClient,
+        delayMs: env.TRIGGER_WARM_START_VERIFY_DELAY_MS,
+        createWorkload: (message, timings) => this.createWorkload(message, timings),
+        wideEventOpts: this.wideEventOpts,
+      });
+    }
+
+    this.workerSession.on("runNotification", async ({ time, run }) => {
+      this.logger.verbose("runNotification", { time, run });
+
+      this.workloadServer.notifyRun({ run });
+    });
+
+    this.workerSession.on(
+      "runQueueMessage",
+      this.dequeueDrain.tracked(async ({ time, message, dequeueResponseMs, pollingIntervalMs }) => {
+        this.logger.verbose(`Received message with timestamp ${time.toLocaleString()}`, message);
+
+        const traceparent = extractTraceparent(message.run.traceContext);
+
+        await runWideEvent(
+          {
+            ...this.wideEventOpts,
+            op: "dequeue",
+            kind: "inbound",
+            traceparent,
+            setup: (state) => {
+              setMeta(state, "run_id", message.run.friendlyId);
+              setMeta(state, "env_id", message.environment.id);
+              setMeta(state, "org_id", message.organization.id);
+              setMeta(state, "project_id", message.project.id);
+              if (message.deployment.friendlyId) {
+                setMeta(state, "deployment_id", message.deployment.friendlyId);
+              }
+              setMeta(state, "machine_preset", message.run.machine.name);
+              state.extras.iteration = "dequeue";
+              state.extras.dequeue_response_ms = dequeueResponseMs;
+              state.extras.polling_interval_ms = pollingIntervalMs;
+              state.extras.completed_waitpoints = message.completedWaitpoints.length;
+            },
+          },
+          async () => {
+            if (message.completedWaitpoints.length > 0) {
+              this.logger.debug("Run has completed waitpoints", {
+                runId: message.run.id,
+                completedWaitpoints: message.completedWaitpoints.length,
+              });
+            }
+
+            if (!message.image) {
+              setExtra(fromContext(), "path_taken", "skipped_no_image");
+              this.logger.error("Run has no image", { runId: message.run.id });
+              return;
+            }
+
+            const { checkpoint, ...rest } = message;
+
+            if (this.runCrdManager && (await this.refuseWithoutTemplateKey(message))) {
+              setExtra(fromContext(), "path_taken", "no_template_key");
+              return;
+            }
+
+            if (checkpoint) {
+              setExtra(fromContext(), "path_taken", "restore");
+              this.logger.debug("Restoring run", { runId: message.run.id });
+
+              if (this.runCrdManager?.restores(checkpoint)) {
+                await this.restoreRunner(this.runCrdManager, message, checkpoint);
+                return;
+              }
+
+              if (!this.checkpointClient) {
+                this.logger.error("No checkpoint client", { runId: message.run.id });
+                return;
+              }
+
+              const restoreStart = performance.now();
+              try {
+                const didRestore = await this.checkpointClient.restoreRun({
+                  runFriendlyId: message.run.friendlyId,
+                  snapshotFriendlyId: message.snapshot.friendlyId,
+                  body: {
+                    ...rest,
+                    checkpoint,
+                  },
+                });
+                recordPhaseSince("restore", restoreStart, undefined);
+                setExtra(fromContext(), "did_restore", didRestore);
+
+                if (didRestore) {
+                  this.logger.debug("Restore successful", { runId: message.run.id });
+                } else {
+                  this.logger.error("Restore failed", { runId: message.run.id });
+                }
+              } catch (error) {
+                recordPhaseSince(
+                  "restore",
+                  restoreStart,
+                  error instanceof Error ? error : new Error(String(error))
+                );
+                this.logger.error("Failed to restore run", { error });
+              }
+
+              return;
+            }
+
+            this.logger.debug("Scheduling run", { runId: message.run.id });
+
+            const warmStartStart = performance.now();
+            const didWarmStart = await this.tryWarmStart(message, traceparent);
+            const warmStartCheckMs = Math.round(performance.now() - warmStartStart);
+            recordPhaseSince("warm_start", warmStartStart, undefined);
+            setExtra(fromContext(), "did_warm_start", didWarmStart);
+
+            if (didWarmStart) {
+              setExtra(fromContext(), "path_taken", "warm_start");
+              this.logger.debug("Warm start successful", { runId: message.run.id });
+              // A hit only means the response was written to the long-poll
+              // socket, not that the runner received it. Schedule a delivery
+              // verification that cold-starts the run if nobody acts on it.
+              this.warmStartVerifier?.schedule(message, {
+                dequeueResponseMs,
+                pollingIntervalMs,
+                warmStartCheckMs,
+              });
+              return;
+            }
+
+            setExtra(fromContext(), "path_taken", "cold_create");
+
+            await this.createWorkload(message, {
+              dequeueResponseMs,
+              pollingIntervalMs,
+              warmStartCheckMs,
+            });
+          }
+        );
+      })
+    );
+
+    if (env.METRICS_ENABLED) {
+      this.metricsServer = new HttpServer({
+        port: env.METRICS_PORT,
+        host: env.METRICS_HOST,
+        metrics: {
+          register,
+          expose: true,
+        },
+      });
+    }
+
+    // Responds to workload requests only
+    this.workloadServer = new WorkloadServer({
+      workerStamp,
+      port: env.TRIGGER_WORKLOAD_API_PORT_INTERNAL,
+      host: env.TRIGGER_WORKLOAD_API_HOST_INTERNAL,
+      workerClient: this.workerSession.httpClient,
+      checkpointClient: this.checkpointClient,
+      snapshotDeleteClient: this.snapshotDeleteClient,
+      runnerSnapshotter: this.runCrdManager,
+      wideEventOpts: this.wideEventOpts,
+      wideEventsNoisyRoutes: this.wideEventsNoisyRoutes,
+      continueRetryBudgetMs: env.TRIGGER_CONTINUE_RETRY_BUDGET_MS,
+    });
+
+    this.workloadServer.on("runConnected", this.onRunConnected.bind(this));
+    this.workloadServer.on("runDisconnected", this.onRunDisconnected.bind(this));
+  }
+
+  async onRunConnected({ run }: { run: { friendlyId: string } }) {
+    this.logger.debug("Run connected", { run });
+    // The dispatched run reached a runner on this node - no fallback needed.
+    this.warmStartVerifier?.cancel(run.friendlyId);
+    this.coldStartHeartbeats?.runnerConnected(run.friendlyId);
+    this.workerSession.subscribeToRunNotifications([run.friendlyId]);
+  }
+
+  async onRunDisconnected({ run }: { run: { friendlyId: string } }) {
+    this.logger.debug("Run disconnected", { run });
+    this.workerSession.unsubscribeFromRunNotifications([run.friendlyId]);
+  }
+
+  private async createOptionsFor(
+    message: DequeuedMessage,
+    timings?: WarmStartTimings
+  ): Promise<WorkloadManagerCreateOptions> {
+    if (!message.deployment.friendlyId) {
+      // mostly a type guard, deployments always exists for deployed environments
+      // a proper fix would be to use a discriminated union schema to differentiate between dequeued runs in dev and in deployed environments.
+      throw new Error("Deployment is missing");
+    }
+
+    if (!message.image) {
+      // same type-guard situation as deployment above
+      throw new Error("Image is missing");
+    }
+
+    const deploymentToken = await mintDeploymentToken({
+      deployment: message.deployment.friendlyId,
+      deployment_version: message.backgroundWorker.version,
+      environment_id: message.environment.id,
+      environment_type: message.environment.type,
+      org_id: message.organization.id,
+      project_id: message.project.id,
+    });
+
+    return {
+      dequeuedAt: message.dequeuedAt,
+      dequeueResponseMs: timings?.dequeueResponseMs,
+      pollingIntervalMs: timings?.pollingIntervalMs,
+      warmStartCheckMs: timings?.warmStartCheckMs,
+      envId: message.environment.id,
+      envType: message.environment.type,
+      image: message.image,
+      templateKey: message.templateKey,
+      machine: message.run.machine,
+      orgId: message.organization.id,
+      projectId: message.project.id,
+      deploymentFriendlyId: message.deployment.friendlyId,
+      deploymentVersion: message.backgroundWorker.version,
+      runtime: message.backgroundWorker.runtime,
+      deploymentToken,
+      runId: message.run.id,
+      runFriendlyId: message.run.friendlyId,
+      version: message.version,
+      nextAttemptNumber: message.run.attemptNumber,
+      snapshotId: message.snapshot.id,
+      snapshotFriendlyId: message.snapshot.friendlyId,
+      placementTags: message.placementTags,
+      traceContext: message.run.traceContext,
+      annotations: message.run.annotations,
+      hasPrivateLink: message.organization.hasPrivateLink,
+    };
+  }
+
+  private async restoreRunner(
+    manager: RunCrdWorkloadManager,
+    message: DequeuedMessage,
+    checkpoint: { id: string; location: string }
+  ) {
+    const restoreStart = performance.now();
+    try {
+      const restore = await manager.restore(await this.createOptionsFor(message), checkpoint);
+      recordPhaseSince("restore", restoreStart, undefined);
+      setExtra(fromContext(), "did_restore", true);
+      this.logger.debug("Runner restore created", { runId: message.run.id });
+      // Not awaited: the resume can take minutes, and the dequeue is done.
+      void this.restoreWatcher?.watch(
+        {
+          runFriendlyId: message.run.friendlyId,
+          snapshotFriendlyId: message.snapshot.friendlyId,
+          environmentId: message.environment.id,
+        },
+        restore
+      );
+    } catch (error) {
+      recordPhaseSince(
+        "restore",
+        restoreStart,
+        error instanceof Error ? error : new Error(String(error))
+      );
+      setExtra(fromContext(), "did_restore", false);
+      this.logger.error("Failed to restore run (run-crd)", { runId: message.run.id, error });
+    }
+  }
+
+  /** Keeps the dequeued snapshot from stalling while the operator brings the resume up. */
+  private async heartbeatRestore({
+    runFriendlyId,
+    snapshotFriendlyId,
+    runnerId,
+  }: {
+    runFriendlyId: string;
+    snapshotFriendlyId: string;
+    runnerId: string;
+  }) {
+    const result = await this.workerSession.httpClient.heartbeatRun(
+      runFriendlyId,
+      snapshotFriendlyId,
+      {},
+      runnerId
+    );
+    if (!result.success) {
+      this.logger.warn("Restore heartbeat failed", {
+        runFriendlyId,
+        snapshotFriendlyId,
+        runnerId,
+        error: result.error,
+      });
+    }
+  }
+
+  /**
+   * Keeps a cold start's dequeued snapshot from stalling while its Runner waits for a node.
+   * A refusal ends the heartbeat quietly: the run has moved on from the snapshot.
+   */
+  private async heartbeatColdStart({
+    runFriendlyId,
+    snapshotFriendlyId,
+    runnerId,
+  }: ColdStartTarget): Promise<ColdStartBeatResult> {
+    const result = await this.workerSession.httpClient.heartbeatRun(
+      runFriendlyId,
+      snapshotFriendlyId,
+      {},
+      runnerId
+    );
+    if (result.success) {
+      return "ok";
+    }
+    if (heartbeatRejected(result.statusCode)) {
+      return "rejected";
+    }
+    this.logger.warn("Cold start heartbeat failed", {
+      runFriendlyId,
+      snapshotFriendlyId,
+      runnerId,
+      error: result.error,
+    });
+    return "failed";
+  }
+
+  private async reportRestoreFailure({
+    runFriendlyId,
+    snapshotFriendlyId,
+    environmentId,
+    runnerId,
+    outcome,
+  }: RestoreFailure) {
+    const fields = { runFriendlyId, snapshotFriendlyId, runnerId, reason: outcome.reason };
+    this.logger.error("Runner restore failed (run-crd)", { ...fields, error: outcome.error });
+    if (!runFriendlyId) {
+      return;
+    }
+    await this.workerSession.httpClient.sendDebugLog(runFriendlyId, {
+      time: new Date(),
+      message: "restore failed on the node",
+      properties: { runnerId, error: outcome.error },
+    });
+    const manager = this.runCrdManager;
+    if (!snapshotFriendlyId || !manager) {
+      return;
+    }
+    const settled = await settleRestoreFailure(
+      { runnerId, outcome },
+      {
+        deleteRunner: (name, uid) => manager.deleteRestoreRunner(name, uid),
+        report: (body) =>
+          this.workerSession.httpClient.reportRestoreOutcome(
+            runFriendlyId,
+            snapshotFriendlyId,
+            body,
+            runnerId,
+            environmentId
+          ),
+      }
+    );
+    switch (settled.action) {
+      case "none":
+        this.logger.info("Restore failure left to the stall timeout", fields);
+        return;
+      case "kept":
+        if (settled.forbidden) {
+          this.logger.error(
+            "Restore Runner delete forbidden, so the run was left to the stall timeout; grant delete on runners",
+            { ...fields, error: settled.error }
+          );
+          return;
+        }
+        this.logger.warn("Restore Runner not deleted, so the run was not requeued", {
+          ...fields,
+          error: settled.error,
+        });
+        return;
+      case "reported":
+        restoreReportsTotal.inc({ outcome: settled.outcome, result: settled.result });
+        if (settled.result === "error") {
+          this.logger.warn("Restore outcome report failed", {
+            ...fields,
+            outcome: settled.outcome,
+            error: settled.error,
+          });
+        } else {
+          this.logger.info(
+            settled.result === "conflict"
+              ? "Restore outcome not applied, the run has moved on"
+              : "Restore outcome reported",
+            { ...fields, outcome: settled.outcome }
+          );
+        }
+        if (settled.cleanupError) {
+          this.logger.warn("Failed restore Runner not deleted after its report", {
+            ...fields,
+            error: settled.cleanupError,
+          });
+        }
+    }
+  }
+
+  /** Reports a run this lane needs a template key for and has none, rather than starting it. */
+  private async refuseWithoutTemplateKey(message: DequeuedMessage): Promise<boolean> {
+    const refused = await reportTemplateKeyRefusal(
+      {
+        runtime: env.KUBERNETES_RUNNER_RUNTIME,
+        templateKey: message.templateKey,
+        checkpoint: message.checkpoint,
+      },
+      (body) =>
+        this.workerSession.httpClient.reportRestoreOutcome(
+          message.run.friendlyId,
+          message.snapshot.friendlyId,
+          body,
+          undefined,
+          message.environment.id
+        )
+    );
+    if (!refused) {
+      return false;
+    }
+    templateKeyRefusalsTotal.inc({ outcome: refused.outcome, result: refused.result });
+    const fields = {
+      runId: message.run.friendlyId,
+      snapshotId: message.snapshot.friendlyId,
+      outcome: refused.outcome,
+      reason: refused.reason,
+      result: refused.result,
+    };
+    if (refused.result === "error") {
+      this.logger.error("No Runner created without a template key, and the report failed", {
+        ...fields,
+        error: refused.error,
+      });
+    } else {
+      this.logger.warn("No Runner created without a template key", fields);
+    }
+    return true;
+  }
+
+  /**
+   * Moves a cold start the operator failed before its attempt began to the platform's fallback
+   * lane, rather than leaving it to the stall timeout. Without one it is requeued here, and the
+   * queue's redelivery budget bounds how often a run comes back this way.
+   */
+  private async reportStartFailure(failure: RunnerStartFailure) {
+    const { runFriendlyId, snapshotFriendlyId, runnerId, environmentId, outcome } = failure;
+    const fields = { runFriendlyId, snapshotFriendlyId, runnerId, reason: outcome.reason };
+    this.logger.warn("Runner start failed (run-crd)", { ...fields, error: outcome.error });
+    const manager = this.runCrdManager;
+    if (!manager) {
+      this.logger.warn(
+        "Runner start failure left to the stall timeout, no run-crd manager",
+        fields
+      );
+      return;
+    }
+    await this.workerSession.httpClient.sendDebugLog(runFriendlyId, {
+      time: new Date(),
+      message: "runner failed to start on the node",
+      properties: { runnerId, error: outcome.error },
+    });
+    const settled = await settleRestoreFailure(
+      { runnerId, outcome, action: { outcome: "fallback", deleteRunner: true } },
+      {
+        deleteRunner: (name, uid) => manager.deleteFailedRunner(name, uid),
+        report: (body) =>
+          this.workerSession.httpClient.reportRestoreOutcome(
+            runFriendlyId,
+            snapshotFriendlyId,
+            body,
+            runnerId,
+            environmentId
+          ),
+      }
+    );
+    switch (settled.action) {
+      case "none":
+        return;
+      case "kept":
+        this.logger.warn("Failed start Runner not deleted, so the run was not moved", {
+          ...fields,
+          error: settled.error,
+        });
+        return;
+      case "reported":
+        startReportsTotal.inc({ result: settled.result });
+        if (settled.result === "error") {
+          this.logger.warn("Start failure report failed", { ...fields, error: settled.error });
+        } else {
+          this.logger.info(
+            settled.result === "conflict"
+              ? "Start failure not applied, the run has moved on"
+              : "Start failure reported, the run was moved",
+            fields
+          );
+        }
+    }
+  }
+
+  private async createWorkload(message: DequeuedMessage, timings: WarmStartTimings) {
+    const createStart = performance.now();
+    // Started before the create, which can itself take a while to return.
+    const heartbeat = this.coldStartHeartbeats?.start({
+      runFriendlyId: message.run.friendlyId,
+      snapshotFriendlyId: message.snapshot.friendlyId,
+      runnerId: getRunnerId(message.run.friendlyId, message.run.attemptNumber),
+    });
+    try {
+      await this.workloadManager.create(await this.createOptionsFor(message, timings));
+      heartbeat?.created();
+      recordPhaseSince("workload_create", createStart, undefined);
+      workloadCreateDuration.observe(
+        { backend: this.workloadManagerBackend, outcome: "success" },
+        (performance.now() - createStart) / 1000
+      );
+
+      // Disabled for now
+      // this.resourceMonitor.blockResources({
+      //   cpu: message.run.machine.cpu,
+      //   memory: message.run.machine.memory,
+      // });
+    } catch (error) {
+      heartbeat?.createFailed();
+      recordPhaseSince(
+        "workload_create",
+        createStart,
+        error instanceof Error ? error : new Error(String(error))
+      );
+      workloadCreateDuration.observe(
+        { backend: this.workloadManagerBackend, outcome: "error" },
+        (performance.now() - createStart) / 1000
+      );
+      this.logger.error("Failed to create workload", {
+        runId: message.run.friendlyId,
+        error,
+      });
+
+      if (error instanceof WorkloadNotCreatedError) {
+        await this.runReleaser?.release(dequeuedRun(message), "CreateFailed");
+      }
+    }
+  }
+
+  private async tryWarmStart(
+    dequeuedMessage: DequeuedMessage,
+    traceparent: string | undefined
+  ): Promise<boolean> {
+    if (!this.warmStartUrl) {
+      return false;
+    }
+
+    const warmStartUrlWithPath = new URL("/warm-start", this.warmStartDispatchUrl);
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    // Lets the warm-start receiver continue this trace instead of minting a new one.
+    // Gated by the wide-events kill switch, so the wire is unchanged when disabled.
+    if (this.wideEventOpts.enabled && traceparent) {
+      headers.traceparent = traceparent;
+    }
+
+    const requestStart = performance.now();
+    const record = (
+      status: string,
+      outcome: "ok" | "http_error" | "invalid_response" | "network_error"
+    ) => {
+      outboundRequestsTotal.inc({ name: "warm_start", method: "POST", status, outcome });
+      outboundRequestDuration.observe(
+        { name: "warm_start", outcome },
+        (performance.now() - requestStart) / 1000
+      );
+    };
+
+    try {
+      const res = await fetch(warmStartUrlWithPath.href, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ dequeuedMessage }),
+      });
+
+      if (!res.ok) {
+        record(String(res.status), "http_error");
+        this.logger.error("Warm start failed", {
+          runId: dequeuedMessage.run.id,
+          statusCode: res.status,
+        });
+        return false;
+      }
+
+      const data = await res.json();
+      const parsedData = z.object({ didWarmStart: z.boolean() }).safeParse(data);
+
+      if (!parsedData.success) {
+        record(String(res.status), "invalid_response");
+        this.logger.error("Warm start response invalid", {
+          runId: dequeuedMessage.run.id,
+          data,
+        });
+        return false;
+      }
+
+      record(String(res.status), "ok");
+
+      return parsedData.data.didWarmStart;
+    } catch (error) {
+      record("none", "network_error");
+      this.logger.error("Warm start error", {
+        runId: dequeuedMessage.run.id,
+        error,
+      });
+      return false;
+    }
+  }
+
+  async start() {
+    this.logger.log("Starting up");
+
+    // Optional services
+    this.backpressureMonitors.forEach((m) => m.start());
+    await this.podCleaner?.start();
+    this.guestSnapshotCleaner?.start();
+    await this.failedPodHandler?.start();
+    await this.restoreInformer?.start();
+    await this.runnerKillInformer?.start();
+    await this.adoptColdStarts();
+    await this.metricsServer?.start();
+
+    if (env.TRIGGER_WORKLOAD_API_ENABLED) {
+      this.logger.log("Workload API enabled", {
+        protocol: env.TRIGGER_WORKLOAD_API_PROTOCOL,
+        domain: env.TRIGGER_WORKLOAD_API_DOMAIN,
+        port: env.TRIGGER_WORKLOAD_API_PORT_INTERNAL,
+      });
+      await this.workloadServer.start();
+    } else {
+      this.logger.warn("Workload API disabled");
+    }
+
+    await this.workerSession.start();
+  }
+
+  /**
+   * Takes over the heartbeats of the cold starts an earlier process left still starting.
+   * Only a process that dequeues heartbeats cold starts, as for restores.
+   */
+  private async adoptColdStarts() {
+    if (!this.coldStartHeartbeats || !this.runCrdManager || !env.TRIGGER_DEQUEUE_ENABLED) {
+      return;
+    }
+    try {
+      const starting = await this.runCrdManager.startingColdStarts(
+        env.KUBERNETES_RUNNER_RESTORE_HEARTBEAT_INTERVAL_MS
+      );
+      for (const { createdAt, ...target } of starting) {
+        this.coldStartHeartbeats.adopt(target, createdAt);
+      }
+      this.logger.log("Adopting cold start heartbeats", { found: starting.length });
+    } catch (error) {
+      // Those runs are left to the stall timeout, as before cold starts were heartbeated.
+      this.logger.warn("Failed to list cold starts to adopt", { error });
+    }
+  }
+
+  async stop() {
+    this.logger.log("Shutting down");
+    // Stop the verifier first: its timer can otherwise fire mid-shutdown and
+    // cold-create a workload on a node that is going down.
+    this.warmStartVerifier?.stop();
+    await this.workerSession.stop();
+    await this.dequeueDrain.stop();
+    // The next process adopts the restores and cold starts, and recovers the suspends left unanswered.
+    await this.restoreWatcher?.stop();
+    this.coldStartHeartbeats?.stop();
+    await this.restoreInformer?.stop();
+    await this.runnerKillInformer?.stop();
+
+    // Optional services
+    this.backpressureMonitors.forEach((m) => m.stop());
+    await this.backpressureRedis?.quit();
+    await this.podCleaner?.stop();
+    this.guestSnapshotCleaner?.stop();
+    await this.failedPodHandler?.stop();
+
+    // Last: it waits for the requests in flight, which can take until the timeout.
+    await this.workloadServer.stop();
+    await this.metricsServer?.stop();
+  }
+}
+
+// Opt-in, dev-only: mirror this process's structured logs to a local telnet/TCP stream.
+if (env.SUPERVISOR_TELNET_LOGS_PORT && env.SUPERVISOR_TELNET_LOGS_PORT > 0) {
+  const telnetLogServer = startTelnetLogServer({
+    port: env.SUPERVISOR_TELNET_LOGS_PORT,
+    name: "supervisor",
+  });
+  SimpleStructuredLogger.onLog = (log) => telnetLogServer.broadcast(formatLogLine(log));
+}
+
+const worker = new ManagedSupervisor();
+installShutdown({
+  stop: () => worker.stop(),
+  timeoutMs: env.SUPERVISOR_SHUTDOWN_TIMEOUT_MS,
+  logger: new SimpleStructuredLogger("supervisor-shutdown"),
+});
+worker.start();

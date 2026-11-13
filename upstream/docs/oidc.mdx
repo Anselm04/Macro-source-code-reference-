@@ -1,0 +1,75 @@
+---
+title: "OpenID Connect (OIDC)"
+sidebarTitle: "Overview"
+description: "Use workload identity to access external services from your tasks without storing long-lived credentials."
+---
+
+Trigger.dev uses **workload identity** in an OpenID Connect (OIDC) flow to let your tasks authenticate to external services without storing long-lived access keys.
+
+Instead of saving a service's credentials as environment variables, configure it to trust Trigger.dev as an identity provider. Your task requests a signed, short-lived token that identifies its environment. The service verifies that identity and grants the permissions you configure, usually by exchanging the token for temporary credentials.
+
+This gives you:
+
+- **No stored access keys**: tasks obtain short-lived credentials when they need them.
+- **Environment-specific access**: grant different permissions to Production, Staging, and individual Preview environments.
+- **Organization-scoped trust**: each organization has its own issuer URL, `https://oidc.trigger.dev/YOUR_ORG_SLUG`.
+
+## Get started
+
+Choose an official integration, or connect a service that supports external OIDC workload identities yourself.
+
+### Official integrations
+
+<CardGroup cols={2}>
+  <Card title="AWS" href="/oidc/aws">
+    Assume an IAM role using the SDK's AWS credential provider.
+  </Card>
+  <Card title="Anthropic" href="/oidc/anthropic">
+    Call Claude from tasks and chat agents without an API key.
+  </Card>
+  <Card title="Infisical" href="/oidc/infisical">
+    Read secrets using your task's workload identity.
+  </Card>
+</CardGroup>
+
+For other services, follow [Custom integrations](/oidc/custom) to request a token and implement the service's authentication flow.
+
+## Prerequisites
+
+- Use `@trigger.dev/sdk` and the Trigger.dev CLI (`trigger.dev`) **4.8.3 or later**, including the CLI used in CI.
+- **Redeploy after upgrading the CLI**, then start a new run on that deployment. Updating the SDK alone or replaying a run against an old deployment does not update its runner.
+- Request tokens inside an executing task attempt in Production, Staging, or Preview. Local Development runs cannot mint OIDC tokens; use the service's local credentials instead.
+
+## Connection details
+
+Go to the [OIDC](https://cloud.trigger.dev/_/oidc) page for your environment. Copy the exact values from that page when configuring your service.
+
+| Value                  | Purpose                                                                                                                                                                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Issuer URL** (`iss`) | Your organization's identity provider URL, such as `https://oidc.trigger.dev/YOUR_ORG_SLUG`. The service uses it to verify who issued the token.                                                              |
+| **Subject** (`sub`)    | Identifies your organization, project, and environment. The service uses it to decide which identity receives access.                                                                                         |
+| **Audience** (`aud`)   | Identifies the intended recipient. Request the value the service expects and configure it to require the same value. The AWS helper uses `sts.amazonaws.com`; other services may require something different. |
+
+The audience is supplied when requesting a token, not a fixed setting on your environment. Some services require a particular value; others let you choose one. Checking only the issuer and audience is not enough to restrict access to one environment: configure an exact subject match or the service's equivalent identity mapping too.
+
+Subjects have this format:
+
+```text
+org:YOUR_ORG_ID:project:YOUR_PROJECT_REF:env:ENVIRONMENT_TYPE:ENVIRONMENT_SLUG
+```
+
+Copy the full subject rather than constructing it. For Preview environments, it uses the individual environment's persisted slug, not a branch display name. The subject stays the same across integrations and identifies every task in that environment, not an individual task.
+
+## How tokens work
+
+Tokens are signed with `RS256` and expire after five minutes. They include the issuer, subject, audience, issue time (`iat`), and expiry (`exp`). Credentials issued by the receiving service can have a different lifetime.
+
+Services can discover your organization's issuer at:
+
+```text
+https://oidc.trigger.dev/YOUR_ORG_SLUG/.well-known/openid-configuration
+```
+
+Public signing keys are available at `https://oidc.trigger.dev/YOUR_ORG_SLUG/.well-known/jwks.json`. Configure the service to validate the token's signature, issuer, audience, expiry, and authorized subject. Merely decoding a token does not verify it.
+
+Keep tokens and credentials within the executing run. Do not log them, return them as task output, or silently fall back to static credentials if OIDC fails in a deployed environment. OIDC tokens for external services cannot be used to call Trigger.dev APIs.

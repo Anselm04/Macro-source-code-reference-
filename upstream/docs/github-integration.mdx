@@ -1,0 +1,190 @@
+---
+title: "GitHub integration"
+description: "Automatically deploy your tasks on every push to your GitHub repository."
+---
+
+## How it works
+
+Once you connect a GitHub repository to your project, you can configure tracking branches for the production and staging environments.
+Every push to a tracked branch creates a deployment in the corresponding environment. Preview branch deployments are also supported for pull requests.
+
+This eliminates the need to manually run the `trigger.dev deploy` command or set up custom CI/CD workflows.
+
+## Setup
+
+<Steps>
+
+<Step title="Install our GitHub app">
+  Go to your project's settings page and click `Install GitHub app`.
+  This will take you to GitHub to authorize the Trigger.dev app for your organization or personal account.
+</Step>
+
+<Step title="Connect your repository">
+  Select a repository to connect to your project.
+</Step>
+
+<Step title="Configure branch tracking">
+  Choose which branches should trigger automatic deployments:
+
+  - **Production**: The branch that deploys to your production environment, e.g., `main`.
+  - **Staging**: The branch that deploys to your staging environment.
+  - **Preview**: Toggle to enable preview deployments for pull requests
+</Step>
+
+<Step title="Customize build settings (optional)">
+  Configure how your project is built:
+
+  - **Trigger config file**: Auto-detected by default — we find your `trigger.config.ts` anywhere in your repository. Set a path relative to the root of your repository to override it, e.g., `apps/tasks/trigger.config.ts`. If your repository contains more than one config file, set the path of the one to use.
+  - **Install command**: Auto-detected by default, but you can override it if necessary. The command will be run from the root of your repository.
+  - **Pre-build command**: Run any commands before building and deploying your project, e.g., `pnpm run prisma:generate`. The command will be run from the root of your repository.
+</Step>
+
+</Steps>
+
+## Branch tracking
+
+Our GitHub integration uses branch tracking to determine when and where to deploy your code.
+
+![Trigger.dev project git settings](/deployment/git-settings.png)
+
+### Production and staging branches
+
+When you connect a repository, the default branch of your repository will be used as the production tracking branch, by default.
+
+When you configure a production or staging branch, every push to that branch will trigger a deployment.
+Our build server will install the project dependencies, build your project, and deploy it to the corresponding environment.
+
+If there are multiple consecutive pushes to a tracked branch, the later deployments will be queued until the previous deployment completes.
+
+<Note>
+  When you connect a repository, the default branch of your repository will be used as the production tracking branch by default.
+  You can change this in the git settings of your project.
+</Note>
+
+### Pull requests
+
+By default, pull requests will be deployed to preview branch environments, enabling you to test changes before merging.
+When the pull request is merged or closed, the preview branch is automatically archived.
+
+The name of the preview branch matches the branch name of the pull request.
+
+<Note>
+  Preview branch deployments require the preview environment to be enabled on your project. Learn more about [preview branches](/deployment/preview-branches).
+</Note>
+
+## Ignored branches
+
+Ignored branches stop pull requests from matching branches from getting a preview deployment, for example Dependabot updates.
+
+Open **Integrations** in your project settings and add the patterns in the git settings panel, one per line. Use **Test a branch** to check which pattern, if any, matches a branch.
+
+```text
+dependabot/**
+skip-preview/**
+```
+
+- Patterns match the whole branch name. `*` stays within one part of the name and `**` also crosses `/`, so `skip-preview/**` matches `skip-preview/login` and `skip-preview` itself.
+- Negation (`!`), braces (`{a,b}`) and extglob groups like `@(a|b)` aren't supported. A pattern can use `**` at most twice and `*` at most twice more, and you can add up to 100 patterns of up to 256 characters each.
+- Only previews are affected: pushes to your production and staging branches always deploy, and a preview deployed before you added a pattern is archived as usual.
+
+When a preview is skipped, the pull request's Trigger.dev check is marked as skipped with the matching pattern. Re-run that check from GitHub to deploy the preview anyway.
+
+<Warning>
+  If your project is connected to Vercel, ignore the same branches in both places. A Vercel preview of a branch that Trigger.dev ignores has no task deployment for its commit, so with [version skew protection](/vercel-integration#version-skew-protection) its runs wait for one and [expire after an hour](/deployment/atomic-deployment#waiting-and-expiry).
+</Warning>
+
+## Ignored paths
+
+Skip builds for pushes that only touch files your tasks do not depend on, such as docs or another app in a monorepo.
+
+Open **Integrations** in your project settings and add the patterns in the git settings panel below the branch fields, one per line. A push builds unless every file changed by the pushed commits matches a pattern. A newly opened pull request compares every file it changes against its base branch in the same way. Some pushes build regardless of the patterns, such as force pushes or pushes that change 300 or more files. Use **Test a path** to check which pattern, if any, ignores a given file.
+
+```text
+docs/**
+**/*.md
+apps/web/**
+.github/**
+```
+
+Patterns are globs relative to the repository root and match like `paths-ignore` in GitHub Actions. `**` matches across folders and also matches dotfiles, so `**/*.md` ignores `.github/PULL_REQUEST_TEMPLATE.md`. Negation (`!`), braces (`{a,b}`), extglob groups like `+(...)` and `[!...]` are not supported; use `[^...]` to exclude characters. You can add up to 100 patterns of up to 256 characters each.
+
+When a build is skipped, no deployment is created and the commit's Trigger.dev check is marked as skipped, with the matched patterns in its summary. Re-run that check from GitHub to build the commit anyway.
+
+<Note>
+  Projects connected to Vercel always build. See [production waits for your tasks](/vercel-integration#production-waits-for-your-tasks).
+</Note>
+
+## Version skew protection
+
+Every deployment the GitHub integration creates is tagged with the commit SHA it was built from. That is the deploy half of [version skew protection](/deployment/atomic-deployment) — you get it for free.
+
+To complete it, give your running application the same value. Unlike the Vercel integration, we have no access to wherever your app is hosted, so this half is yours to set:
+
+```bash
+TRIGGER_EXTERNAL_DEPLOYMENT_ID=<the-commit-sha-this-release-was-built-from>
+```
+
+If your host already exposes the commit SHA at runtime, set `TRIGGER_AUTOMATIC_SKEW_VERSION_PROTECTION=1` instead and the SDK will find it — see the [platform table](/deployment/atomic-deployment#hosting-platforms).
+
+## Disconnecting a repository
+
+You can disconnect a repository at any time from your project git settings. This will stop automatic deployments triggered from GitHub.
+
+## Managing repository access
+
+To add or remove repository access for the Trigger.dev GitHub app, follow the link in the `Connect GitHub repository` modal:
+
+![Trigger.dev prompt to connect a GitHub repository](/deployment/connect-repo.png)
+
+Alternatively, you can follow these steps on GitHub:
+
+1. Go to your GitHub account settings
+2. Navigate to **Settings** → **Applications** → **Installed GitHub Apps**
+3. Click **Configure** next to `Trigger.dev App`
+4. Update repository access under `Repository access`
+
+Changes to repository access will be reflected immediately in your Trigger.dev project settings.
+
+## Environment variables at build time
+
+You can expose environment variables during the build and deployment process by prefixing them with `TRIGGER_BUILD_`.
+In the build server, the `TRIGGER_BUILD_` prefix is stripped from the variable name, i.e., `TRIGGER_BUILD_MY_TOKEN` is exposed as `MY_TOKEN`.
+
+Build extensions will also have access to these variables.
+
+<Note>
+  Build environment variables only apply to deployments in the environment you set them in.
+</Note>
+
+Learn more about managing [environment variables](/deploy-environment-variables).
+
+## Using a private npm registry
+
+If your project uses packages from a private npm registry, you can provide authentication by setting a `TRIGGER_BUILD_NPM_RC` environment variable.
+
+The value should be the contents of your `.npmrc` file including any token credentials, encoded to base64.
+
+### Example
+
+Example `.npmrc` file containing credentials for a private npm registry and a GitHub package registry:
+
+```
+//registry.npmjs.org/:_authToken=<YOUR_NPM_TOKEN>
+@<YOUR_NAMESPACE>:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:always-auth=true
+//npm.pkg.github.com/:_authToken=<YOUR_GITHUB_TOKEN>
+```
+
+Encode it to base64:
+
+```bash
+# Encode your .npmrc file
+cat .npmrc | base64
+```
+
+Then, set the `TRIGGER_BUILD_NPM_RC` environment variable in your project settings with the encoded value.
+
+<Note>
+  The build server will automatically create a `.npmrc` file in the installation directory based on the content of the `TRIGGER_BUILD_NPM_RC` environment variable.
+  This enables the build server to authenticate to your private npm registry.
+</Note>

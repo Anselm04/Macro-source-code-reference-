@@ -1,0 +1,103 @@
+import type { ActionFunctionArgs } from "@remix-run/server-runtime";
+import { json } from "@remix-run/server-runtime";
+import { z } from "zod";
+import { regenerateApiKey, RootApiKeyNotVisibleError } from "~/models/api-key.server";
+import {
+  authenticatedEnvironmentForAuthentication,
+  authenticateRequest,
+} from "~/services/apiAuth.server";
+import { authorizePatEnvironmentAccess } from "~/services/environmentVariableApiAccess.server";
+import { logger } from "~/services/logger.server";
+import { personalAccessTokenUnauthorizedResponse } from "~/services/personalAccessToken.server";
+
+const ParamsSchema = z.object({
+  projectRef: z.string(),
+  env: z.enum(["dev", "staging", "prod", "preview"]),
+});
+
+const BodySchema = z.object({
+  revokeImmediately: z.boolean().default(false),
+});
+
+export async function action({ request, params }: ActionFunctionArgs) {
+  if (request.method.toUpperCase() !== "POST") {
+    return json({ error: "Method Not Allowed" }, { status: 405 });
+  }
+
+  const parsedParams = ParamsSchema.safeParse(params);
+
+  if (!parsedParams.success) {
+    return json({ error: "Invalid Params" }, { status: 400 });
+  }
+
+  const { projectRef, env } = parsedParams.data;
+
+  try {
+    const authenticationResult = await authenticateRequest(request, {
+      personalAccessToken: true,
+      organizationAccessToken: false,
+      apiKey: false,
+    });
+
+    if (!authenticationResult) {
+      return personalAccessTokenUnauthorizedResponse(request);
+    }
+
+    if (request.headers.has("x-trigger-branch")) {
+      return json({ error: "Branch-scoped key rotation is not supported" }, { status: 400 });
+    }
+
+    const rawBody = await request.text();
+    let body: unknown = {};
+    if (rawBody.trim().length > 0) {
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        return json({ error: "Invalid JSON body" }, { status: 400 });
+      }
+    }
+
+    const parsedBody = BodySchema.safeParse(body);
+
+    if (!parsedBody.success) {
+      return json({ error: "Invalid Body" }, { status: 400 });
+    }
+
+    const { revokeImmediately } = parsedBody.data;
+
+    const environment = await authenticatedEnvironmentForAuthentication(
+      authenticationResult,
+      projectRef,
+      env,
+      undefined
+    );
+
+    // Rotating the key requires env-tier write:apiKeys — same gate the
+    // dashboard resource route enforces.
+    const denied = await authorizePatEnvironmentAccess({
+      request,
+      authType: authenticationResult.type,
+      organizationId: environment.organizationId,
+      projectId: environment.project.id,
+      envType: environment.type,
+      resource: "apiKeys",
+      action: "write",
+    });
+    if (denied) return denied;
+
+    const updatedEnvironment = await regenerateApiKey({
+      userId: authenticationResult.result.userId,
+      environmentId: environment.id,
+      revokeImmediately,
+    });
+
+    return json({ apiKey: updatedEnvironment.apiKey });
+  } catch (error) {
+    if (error instanceof Response) throw error;
+    if (error instanceof RootApiKeyNotVisibleError) {
+      return json({ error: error.message }, { status: 409 });
+    }
+    logger.error("Failed to regenerate API key", { error, projectRef });
+    return json({ error: "Internal Server Error" }, { status: 500 });
+  }
+}

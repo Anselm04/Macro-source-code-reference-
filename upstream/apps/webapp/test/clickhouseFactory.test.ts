@@ -1,0 +1,228 @@
+import { describe, expect } from "vitest";
+
+vi.mock("~/db.server", () => ({ prisma: {}, $replica: {} }));
+
+import { postgresTest } from "@internal/testcontainers";
+import { OrganizationDataStoresRegistry } from "~/services/dataStores/organizationDataStoresRegistry.server";
+import { ClickhouseConnectionSchema } from "~/services/clickhouse/clickhouseSecretSchemas.server";
+import { ClickhouseFactory } from "~/services/clickhouse/clickhouseFactory.server";
+import type { ClickhouseEventRepository } from "~/v3/eventRepository/clickhouseEventRepository.server";
+
+vi.setConfig({ testTimeout: 60_000 });
+
+const TEST_URL = "https://default:password@ch-org.example.com:8443";
+const TEST_URL_2 = "https://default:password@ch-other.example.com:8443";
+
+describe("ClickHouse Factory", () => {
+  postgresTest("returns default client when org has no data store", async ({ prisma }) => {
+    const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+    await registry.loadFromDatabase();
+
+    const factory = new ClickhouseFactory(registry);
+    const client = await factory.getClickhouseForOrganization("org-no-store", "standard");
+    expect(client).toBeDefined();
+  });
+
+  postgresTest(
+    "returns org-specific client when a data store is configured",
+    async ({ prisma }) => {
+      const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+
+      await registry.addDataStore({
+        key: "factory-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-custom"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+      });
+
+      await registry.loadFromDatabase();
+
+      const factory = new ClickhouseFactory(registry);
+      const client = await factory.getClickhouseForOrganization("org-custom", "standard");
+      expect(client).toBeDefined();
+
+      // Default client is a different instance from the org-specific one
+      const defaultClient = await factory.getClickhouseForOrganization("org-no-store", "standard");
+      expect(client).not.toBe(defaultClient);
+    }
+  );
+
+  postgresTest(
+    "two orgs sharing the same data store get the same cached client",
+    async ({ prisma }) => {
+      const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+
+      await registry.addDataStore({
+        key: "shared-factory-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-shared-1", "org-shared-2"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+      });
+
+      await registry.loadFromDatabase();
+
+      const factory = new ClickhouseFactory(registry);
+      const client1 = await factory.getClickhouseForOrganization("org-shared-1", "standard");
+      const client2 = await factory.getClickhouseForOrganization("org-shared-2", "standard");
+
+      // Same hostname → same cached client instance
+      expect(client1).toBe(client2);
+    }
+  );
+
+  postgresTest(
+    "two data stores with different URLs produce different clients",
+    async ({ prisma }) => {
+      const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+
+      await registry.addDataStore({
+        key: "store-a",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-a"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+      });
+
+      await registry.addDataStore({
+        key: "store-b",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-b"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL_2 }),
+      });
+
+      await registry.loadFromDatabase();
+
+      const factory = new ClickhouseFactory(registry);
+      const clientA = await factory.getClickhouseForOrganization("org-a", "standard");
+      const clientB = await factory.getClickhouseForOrganization("org-b", "standard");
+
+      expect(clientA).not.toBe(clientB);
+    }
+  );
+
+  postgresTest(
+    "after reload with a deleted store, org falls back to default",
+    async ({ prisma }) => {
+      const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+
+      await registry.addDataStore({
+        key: "removable-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-removable"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+      });
+
+      await registry.loadFromDatabase();
+
+      const factory = new ClickhouseFactory(registry);
+      const before = await factory.getClickhouseForOrganization("org-removable", "standard");
+      const defaultClient = await factory.getClickhouseForOrganization("org-no-store", "standard");
+      expect(before).not.toBe(defaultClient);
+
+      await registry.deleteDataStore({ key: "removable-store", kind: "CLICKHOUSE" });
+      await registry.reload();
+
+      const after = await factory.getClickhouseForOrganization("org-removable", "standard");
+      expect(after).toBe(defaultClient);
+    }
+  );
+  /**
+   * Catches: a factory cache key that ignores the mirror URL, so setting or clearing a mirror keeps
+   * serving the previously built client and event repository.
+   */
+  postgresTest(
+    "setting a mirror URL yields a fresh client whose writer is mirrored",
+    async ({ prisma }) => {
+      const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+
+      await registry.addDataStore({
+        key: "mirror-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-mirror"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+      });
+      await registry.loadFromDatabase();
+
+      const factory = new ClickhouseFactory(registry);
+      const before = await factory.getClickhouseForOrganization("org-mirror", "standard");
+      expect(before.writer).toBe(before.reader);
+
+      await registry.updateDataStore({
+        key: "mirror-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-mirror"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL, mirrorUrl: TEST_URL_2 }),
+      });
+      await registry.reload();
+
+      const mirrored = await factory.getClickhouseForOrganization("org-mirror", "standard");
+      expect(mirrored).not.toBe(before);
+      expect(mirrored.writer).not.toBe(mirrored.reader);
+
+      const repoBefore = factory.getEventRepositoryForOrganizationSync(
+        "clickhouse_v2",
+        "org-mirror"
+      );
+
+      await registry.updateDataStore({
+        key: "mirror-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-mirror"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+      });
+      await registry.reload();
+
+      const cleared = await factory.getClickhouseForOrganization("org-mirror", "standard");
+      expect(cleared).toBe(before);
+      const repoAfter = factory.getEventRepositoryForOrganizationSync(
+        "clickhouse_v2",
+        "org-mirror"
+      );
+      expect(repoAfter.key).not.toBe(repoBefore.key);
+    }
+  );
+
+  postgresTest(
+    "routes the v1 store to the shared v2 repository when the reroute is on",
+    async ({ prisma }) => {
+      const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+
+      await registry.addDataStore({
+        key: "reroute-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-reroute"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+      });
+
+      await registry.loadFromDatabase();
+
+      const factory = new ClickhouseFactory(registry, true);
+      const v1 = factory.getEventRepositoryForOrganizationSync("clickhouse", "org-reroute");
+      const v2 = factory.getEventRepositoryForOrganizationSync("clickhouse_v2", "org-reroute");
+
+      expect(v1.key).toBe(v2.key);
+      expect(v1.repository).toBe(v2.repository);
+      expect((v1.repository as ClickhouseEventRepository).version).toBe("v2");
+    }
+  );
+
+  postgresTest("keeps the v1 repository when the reroute is off", async ({ prisma }) => {
+    const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+
+    await registry.addDataStore({
+      key: "no-reroute-store",
+      kind: "CLICKHOUSE",
+      organizationIds: ["org-no-reroute"],
+      config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+    });
+
+    await registry.loadFromDatabase();
+
+    const factory = new ClickhouseFactory(registry, false);
+    const v1 = factory.getEventRepositoryForOrganizationSync("clickhouse", "org-no-reroute");
+    const v2 = factory.getEventRepositoryForOrganizationSync("clickhouse_v2", "org-no-reroute");
+
+    expect(v1.key).not.toBe(v2.key);
+    expect((v1.repository as ClickhouseEventRepository).version).toBe("v1");
+    expect((v2.repository as ClickhouseEventRepository).version).toBe("v2");
+  });
+});

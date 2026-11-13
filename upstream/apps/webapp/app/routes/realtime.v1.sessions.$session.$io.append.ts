@@ -1,0 +1,189 @@
+import { json } from "@remix-run/server-runtime";
+import { z } from "zod";
+import { logger } from "~/services/logger.server";
+import {
+  canonicalSessionAddressingKey,
+  resolveSessionWithWriterFallback,
+} from "~/services/realtime/sessions.server";
+import { env } from "~/env.server";
+import {
+  isServerOnlySessionInKind,
+  sanitizeClientInPart,
+} from "~/services/realtime/sanitizeSessionInput.server";
+import { isSafeSessionExternalId } from "~/services/realtime/sessionChannels.server";
+import { ensureRunThenAppend } from "~/services/realtime/sessionChannelAppend.server";
+import { anyResource, createActionApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+
+const ParamsSchema = z.object({
+  session: z.string(),
+  io: z.enum(["out", "in"]),
+});
+
+// POST: server-side append of a single record to a session channel. Mirrors
+// the existing /realtime/v1/streams/:runId/:target/:streamId/append route,
+// scoped to a Session primitive.
+//
+// The HTTP body cap here is just a DoS pre-guard — set generously at
+// 1 MiB so we don't buffer arbitrarily large inputs before we can
+// compute the wrapped size. The actual S2 per-record limit (verified
+// empirically against cloud S2) is enforced precisely inside
+// `S2RealtimeStreams.#appendPartByName` — it throws
+// `S2RecordTooLargeError` (a `ServiceValidationError` with status
+// 413) when the metered record size would exceed S2's 1 MiB ceiling
+// after JSON wrapping. That lets legitimate bodies up to ~1023 KiB
+// raw through (ASCII or low-escape content) while still rejecting
+// pathological all-quote content that would double on wrap.
+const MAX_APPEND_BODY_BYTES = 1024 * 1024;
+
+const { action, loader } = createActionApiRoute(
+  {
+    params: ParamsSchema,
+    method: "POST",
+    maxContentLength: MAX_APPEND_BODY_BYTES,
+    allowJWT: true,
+    corsStrategy: "all",
+    // Sessions are task-bound (created by `POST /api/v1/sessions` which
+    // also triggers the first run). The row exists before any caller
+    // can reach `.in/append` — no row, no append. Resolved here so the
+    // authorization scope can expand to both addressing forms (friendlyId
+    // + externalId) and the handler can skip its own lookup. Writer
+    // fallback: a first append can land inside the replica apply window.
+    findResource: async (params, auth) =>
+      resolveSessionWithWriterFallback(auth.environment.id, params.session),
+    authorization: {
+      action: "write",
+      // Authorize against the union of the URL form, friendlyId, and
+      // externalId so a JWT scoped to any form authorizes any URL.
+      // Type-level `write:sessions` (no id) also matches; `write:all` /
+      // `admin` bypass via the JWT ability's wildcard branches.
+      resource: (params, _, __, ___, session) => {
+        const ids = new Set<string>([params.session]);
+        if (session) {
+          ids.add(session.friendlyId);
+          if (session.externalId) ids.add(session.externalId);
+        }
+        return anyResource(
+          [...ids].filter(isSafeSessionExternalId).map((id) => ({ type: "sessions", id }))
+        );
+      },
+    },
+  },
+  async ({ request, params, authentication, resource: session }) => {
+    if (!session) {
+      // Unreachable — `findResource` short-circuits to 404 before this
+      // handler runs. Type-narrow the rest of the body.
+      return new Response("Session not found", { status: 404 });
+    }
+
+    if (session.closedAt) {
+      return json(
+        {
+          ok: false,
+          error: "Cannot append to a closed session",
+          code: "session_closed",
+          closedReason: session.closedReason,
+        },
+        { status: 409 }
+      );
+    }
+
+    if (session.expiresAt && session.expiresAt.getTime() < Date.now()) {
+      return json(
+        { ok: false, error: "Cannot append to an expired session", code: "session_expired" },
+        { status: 400 }
+      );
+    }
+
+    // `.out` is the agent→client channel. Only PRIVATE (secret key) auth —
+    // i.e. the agent run itself — may write to it. Session-scoped JWTs carry
+    // `write:sessions:<key>` for `.in`; without this gate they could forge
+    // assistant chunks and complete `.out` waitpoints on their own session.
+    if (params.io === "out" && authentication.type !== "PRIVATE") {
+      return json(
+        { ok: false, error: "Appending to the out channel requires secret key authentication" },
+        { status: 403 }
+      );
+    }
+
+    const addressingKey = canonicalSessionAddressingKey(session, params.session);
+
+    let part = await request.text();
+    if (params.io === "in") {
+      const sanitized = sanitizeClientInPart(part);
+      part = sanitized.part;
+      if (isServerOnlySessionInKind(sanitized.kind) && authentication.type !== "PRIVATE") {
+        const enforce = env.REALTIME_SESSION_IN_HANDOVER_GUARD === "enforce";
+        logger.warn("Server-only record appended to session.in with a public access token", {
+          sessionId: session.id,
+          kind: sanitized.kind,
+          enforced: enforce,
+        });
+        if (enforce) {
+          return json(
+            {
+              ok: false,
+              error: "Appending a handover to the in channel requires secret key authentication",
+            },
+            { status: 403 }
+          );
+        }
+      }
+    }
+
+    // Ensure a live run, then append. A failed ensure is best effort: the
+    // record is durable in S2 and the next append retries the ensure, so the
+    // caller still gets a 200 (the SSE tail delivers it once a run boots).
+    const result = await ensureRunThenAppend({
+      session,
+      environment: authentication.environment,
+      addressingKey,
+      io: params.io,
+      part,
+      partId: request.headers.get("X-Part-Id") ?? undefined,
+      reason: "continuation",
+    });
+
+    if (!result.ok && result.kind === "unsupported_backend") {
+      return json(
+        { ok: false, error: "Session channels require the S2 realtime backend" },
+        { status: 501 }
+      );
+    }
+
+    if (!result.ensure.ok) {
+      // A close that lands mid-request is an expected race, not a failure.
+      const level = result.ensure.sessionClosed ? "warn" : "error";
+      logger[level]("Failed to ensureRunForSession on .in/append", {
+        sessionId: session.id,
+        externalId: session.externalId,
+        error: result.ensure.error,
+      });
+    }
+
+    if (!result.ok) {
+      if (result.kind === "rejected") {
+        return json({ ok: false, error: result.message }, { status: result.status });
+      }
+      logger.error("Failed to append to session stream", {
+        sessionId: session.id,
+        io: params.io,
+        error: result.error,
+      });
+      return json({ ok: false, error: "Something went wrong, please try again." }, { status: 500 });
+    }
+
+    // `seq` lets the client correlate this send to the turn that consumes it.
+    return json(
+      {
+        ok: true,
+        seq: result.seq,
+        ...(result.ensure.ok && result.ensure.result.pendingVersion
+          ? { pendingVersion: true }
+          : {}),
+      },
+      { status: 200 }
+    );
+  }
+);
+
+export { action, loader };

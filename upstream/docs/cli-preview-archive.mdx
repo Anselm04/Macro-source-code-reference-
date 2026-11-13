@@ -1,0 +1,67 @@
+---
+title: "CLI preview archive command"
+sidebarTitle: "preview archive"
+description: "The `trigger.dev preview archive` command can be used to archive a preview branch."
+---
+
+import ProjectPathArg from "/snippets/cli-args-project-path.mdx";
+import CommonOptions from "/snippets/cli-options-common.mdx";
+import ProjectRefOption from "/snippets/cli-options-project-ref.mdx";
+import EnvFileOption from "/snippets/cli-options-env-file.mdx";
+import ConfigFileOption from "/snippets/cli-options-config-file.mdx";
+import SkipUpdateCheckOption from "/snippets/cli-options-skip-update-check.mdx";
+import BranchOption from "/snippets/cli-options-branch.mdx";
+
+Run the command like this:
+
+<CodeGroup>
+
+```bash npm
+npx trigger.dev@latest preview archive
+```
+
+```bash pnpm
+pnpm dlx trigger.dev@latest preview archive
+```
+
+```bash yarn
+yarn dlx trigger.dev@latest preview archive
+```
+
+</CodeGroup>
+
+It will archive the preview branch, automatically detecting the branch name from git. You can manually specify the branch using the `--branch` option.
+
+## Arguments
+
+```
+npx trigger.dev@latest preview archive [path]
+```
+
+<ProjectPathArg />
+
+## Options
+
+<ParamField body="Authentication method" type="--auth-method <method>">
+  Use `auto` (default) or `oidc`. In GitHub Actions, `auto` uses OIDC when no
+  `TRIGGER_ACCESS_TOKEN` is set. Explicit `oidc` ignores stored credentials and tokens.
+  See [Trusted publishing](/deployment/trusted-publishing).
+</ParamField>
+
+You can also authenticate with a parent Preview environment API key in `TRIGGER_ACCESS_TOKEN`.
+
+<BranchOption />
+
+<ConfigFileOption />
+
+<ProjectRefOption />
+
+<EnvFileOption />
+
+<SkipUpdateCheckOption />
+
+### Common options
+
+These options are available on most commands.
+
+<CommonOptions />

@@ -1,0 +1,306 @@
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import path from "node:path";
+import { z } from "zod";
+import { xdgAppPaths } from "../imports/xdg-app-paths.js";
+import { readJSONFileSync } from "./fileSystem.js";
+import { logger } from "./logger.js";
+
+function getGlobalConfigFolderPath() {
+  const configDir = xdgAppPaths("trigger").config();
+
+  return configDir;
+}
+
+export const DEFFAULT_PROFILE = "default";
+
+const CONFIG_FILE = "config.json";
+const OLD_CONFIG_FILE = "default.json";
+
+const PendingAuthorization = z.object({
+  authorizationCode: z.string(),
+  url: z.string().url(),
+  apiUrl: z.string().url(),
+  createdAt: z.string().datetime(),
+  name: z.string().optional(),
+  codeVerifier: z.string().optional(),
+  approval: z.enum(["callback", "paste"]).optional(),
+});
+export type PendingAuthorization = z.infer<typeof PendingAuthorization>;
+
+const CliConfigProfileSettings = z.object({
+  accessToken: z.string().optional(),
+  apiUrl: z.string().optional(),
+  pendingAuthorization: PendingAuthorization.optional(),
+  pendingProfileName: z.string().optional(),
+});
+type CliConfigProfileSettings = z.infer<typeof CliConfigProfileSettings>;
+
+const OldCliConfigFile = z.record(z.string(), CliConfigProfileSettings);
+type OldCliConfigFile = z.infer<typeof OldCliConfigFile>;
+
+const CliConfigFile = z.object({
+  version: z.literal(2),
+  currentProfile: z.string().default(DEFFAULT_PROFILE),
+  profiles: z.record(z.string(), CliConfigProfileSettings),
+  settings: z
+    .object({
+      hasSeenMCPInstallPrompt: z.boolean().optional(),
+      hasSeenRulesInstallPrompt: z.boolean().optional(),
+      lastRulesInstallPromptVersion: z.string().optional(),
+    })
+    .optional(),
+});
+type CliConfigFile = z.infer<typeof CliConfigFile>;
+
+function getOldAuthConfigFilePath() {
+  return path.join(getGlobalConfigFolderPath(), OLD_CONFIG_FILE);
+}
+
+function getAuthConfigFilePath() {
+  return path.join(getGlobalConfigFolderPath(), CONFIG_FILE);
+}
+function getBlankConfig(): CliConfigFile {
+  return {
+    version: 2,
+    currentProfile: DEFFAULT_PROFILE,
+    profiles: {},
+    settings: {
+      hasSeenMCPInstallPrompt: false,
+      hasSeenRulesInstallPrompt: false,
+    },
+  };
+}
+
+function getConfig() {
+  return readAuthConfigFile() ?? getBlankConfig();
+}
+
+export function writeAuthConfigCurrentProfileName(profile: string) {
+  const config = getConfig();
+
+  config.currentProfile = profile;
+
+  writeAuthConfigFile(config);
+}
+
+export function readAuthConfigCurrentProfileName(): string {
+  const config = getConfig();
+  return config.currentProfile;
+}
+
+export function writeAuthConfigProfile(
+  settings: CliConfigProfileSettings,
+  profile: string = DEFFAULT_PROFILE
+) {
+  const config = getConfig();
+
+  config.profiles[profile] = settings;
+
+  writeAuthConfigFile(config);
+}
+
+export function writePendingAuthorization(
+  pendingAuthorization: PendingAuthorization,
+  profile: string = DEFFAULT_PROFILE
+) {
+  const config = getConfig();
+
+  const existing = config.profiles[profile];
+  config.profiles[profile] = {
+    ...existing,
+    apiUrl: existing?.accessToken ? existing.apiUrl : pendingAuthorization.apiUrl,
+    pendingAuthorization,
+  };
+
+  writeAuthConfigFile(config);
+}
+
+export function deletePendingAuthorization(profile: string = DEFFAULT_PROFILE) {
+  const config = getConfig();
+  const settings = config.profiles[profile];
+
+  if (!settings?.pendingAuthorization) {
+    return;
+  }
+
+  delete settings.pendingAuthorization;
+  writeAuthConfigFile(config);
+}
+
+export function writePendingProfileName(name: string, profile: string = DEFFAULT_PROFILE) {
+  const config = getConfig();
+  const settings = config.profiles[profile];
+
+  if (!settings) {
+    return;
+  }
+
+  settings.pendingProfileName = name;
+  writeAuthConfigFile(config);
+}
+
+export function deletePendingProfileName(profile: string = DEFFAULT_PROFILE) {
+  const config = getConfig();
+  const settings = config.profiles[profile];
+
+  if (!settings?.pendingProfileName) {
+    return;
+  }
+
+  delete settings.pendingProfileName;
+  writeAuthConfigFile(config);
+}
+
+export function listAuthConfigProfiles(): string[] {
+  const config = getConfig();
+  return Object.keys(config.profiles);
+}
+
+export function readAuthConfigProfile(
+  profile: string = DEFFAULT_PROFILE
+): CliConfigProfileSettings | undefined {
+  try {
+    const config = getConfig();
+    return config.profiles[profile];
+  } catch (error) {
+    logger.debug(`Error reading auth config file: ${error}`);
+    return undefined;
+  }
+}
+
+export function readConfigHasSeenMCPInstallPrompt(): boolean {
+  const config = getConfig();
+  return typeof config.settings?.hasSeenMCPInstallPrompt === "boolean"
+    ? config.settings.hasSeenMCPInstallPrompt
+    : false;
+}
+
+export function writeConfigHasSeenMCPInstallPrompt(hasSeenMCPInstallPrompt: boolean) {
+  const config = getConfig();
+  config.settings = {
+    ...config.settings,
+    hasSeenMCPInstallPrompt,
+  };
+  writeAuthConfigFile(config);
+}
+
+export function readConfigHasSeenRulesInstallPrompt(): boolean {
+  const config = getConfig();
+  return typeof config.settings?.hasSeenRulesInstallPrompt === "boolean"
+    ? config.settings.hasSeenRulesInstallPrompt
+    : false;
+}
+
+export function writeConfigHasSeenRulesInstallPrompt(hasSeenRulesInstallPrompt: boolean) {
+  const config = getConfig();
+  config.settings = {
+    ...config.settings,
+    hasSeenRulesInstallPrompt,
+  };
+  writeAuthConfigFile(config);
+}
+
+export function readConfigLastRulesInstallPromptVersion(): string | undefined {
+  const config = getConfig();
+  return config.settings?.lastRulesInstallPromptVersion;
+}
+
+export function writeConfigLastRulesInstallPromptVersion(version: string) {
+  const config = getConfig();
+  config.settings = {
+    ...config.settings,
+    lastRulesInstallPromptVersion: version,
+  };
+  writeAuthConfigFile(config);
+}
+
+export function deleteAuthConfigProfile(profile: string = DEFFAULT_PROFILE) {
+  const config = getConfig();
+
+  delete config.profiles[profile];
+
+  if (config.currentProfile === profile) {
+    config.currentProfile = DEFFAULT_PROFILE;
+  }
+
+  writeAuthConfigFile(config);
+}
+
+export function readAuthConfigFile(): CliConfigFile | null {
+  try {
+    const configFilePath = getAuthConfigFilePath();
+    const configFileExists = existsSync(configFilePath);
+
+    logger.debug(`Reading auth config file`, { configFilePath, configFileExists });
+
+    const json = readJSONFileSync(configFileExists ? configFilePath : getOldAuthConfigFilePath());
+
+    if ("currentProfile" in json) {
+      // This is the new format
+      const parsed = CliConfigFile.parse(json);
+      return parsed;
+    }
+
+    // This is the old format and we need to convert it
+    const oldConfigFormat = OldCliConfigFile.parse(json);
+
+    const newConfigFormat = {
+      version: 2,
+      currentProfile: DEFFAULT_PROFILE,
+      profiles: oldConfigFormat,
+    } satisfies CliConfigFile;
+
+    // Save to new config file location, retaining the old file.
+    writeAuthConfigFile(newConfigFormat);
+
+    return newConfigFormat;
+  } catch (error) {
+    logger.debug(`Error reading auth config file: ${error}`);
+    return null;
+  }
+}
+
+function writeAuthConfigFile(config: CliConfigFile) {
+  const authConfigFilePath = getAuthConfigFilePath();
+  const authConfigFolderPath = path.dirname(authConfigFilePath);
+  mkdirSync(authConfigFolderPath, {
+    recursive: true,
+    mode: 0o700,
+  });
+  chmodSync(authConfigFolderPath, 0o700);
+
+  // Migration retains the legacy file, which may still contain credentials.
+  const oldAuthConfigFilePath = getOldAuthConfigFilePath();
+  if (existsSync(oldAuthConfigFilePath)) {
+    try {
+      chmodSync(oldAuthConfigFilePath, 0o600);
+    } catch {
+      logger.warn(
+        `Could not restrict permissions on legacy auth config ${oldAuthConfigFilePath}. It may still be readable by other users; restrict its permissions or remove it after migration.`
+      );
+    }
+  }
+
+  // Replace the inode so existing readers cannot observe newly written credentials.
+  const tempFolderPath = mkdtempSync(path.join(authConfigFolderPath, ".auth-config-"));
+  try {
+    const tempFilePath = path.join(tempFolderPath, CONFIG_FILE);
+    writeFileSync(tempFilePath, JSON.stringify(config, undefined, 2), {
+      encoding: "utf-8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    chmodSync(tempFilePath, 0o600);
+    renameSync(tempFilePath, authConfigFilePath);
+  } finally {
+    rmSync(tempFolderPath, { recursive: true, force: true });
+  }
+}

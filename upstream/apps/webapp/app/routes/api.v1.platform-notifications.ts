@@ -1,0 +1,27 @@
+import type { LoaderFunctionArgs } from "@remix-run/server-runtime";
+import { json } from "@remix-run/server-runtime";
+import {
+  authenticateApiRequestWithPersonalAccessToken,
+  personalAccessTokenUnauthorizedResponse,
+} from "~/services/personalAccessToken.server";
+import { getNextCliNotification } from "~/services/platformNotifications.server";
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const authenticationResult = await authenticateApiRequestWithPersonalAccessToken(request);
+
+  if (!authenticationResult) {
+    return personalAccessTokenUnauthorizedResponse(request);
+  }
+
+  const url = new URL(request.url);
+  const projectRef = url.searchParams.get("projectRef") ?? undefined;
+  const cliVersion = request.headers.get("x-trigger-cli-version")?.trim() || undefined;
+
+  const notification = await getNextCliNotification({
+    userId: authenticationResult.userId,
+    projectRef,
+    cliVersion,
+  });
+
+  return json({ notification });
+}

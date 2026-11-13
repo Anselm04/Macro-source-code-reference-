@@ -1,0 +1,874 @@
+import type { Prisma, Session, TaskRunStatus } from "@trigger.dev/database";
+import { SessionTriggerConfig as SessionTriggerConfigZod, tryCatch } from "@trigger.dev/core/v3";
+import { CURRENT_DEPLOYMENT_LABEL } from "@trigger.dev/core/v3/isomorphic";
+import type { z } from "zod";
+import { prisma, $replica, $transaction } from "~/db.server";
+import { runStore } from "~/v3/runStore.server";
+import { engine } from "~/v3/runEngine.server";
+import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
+import { logger } from "~/services/logger.server";
+import { CancelTaskRunService, type CancelableTaskRun } from "~/v3/services/cancelTaskRun.server";
+import { TriggerTaskService } from "~/v3/services/triggerTask.server";
+import { isFinalRunStatus } from "~/v3/taskStatus";
+import { externalDeploymentCacheInstance } from "~/services/externalDeploymentCacheInstance.server";
+import { resolveExternalDeployment } from "~/v3/services/resolveExternalDeployment.server";
+import { S2RealtimeStreams } from "./s2realtimeStreams.server";
+import {
+  determineRealtimeStreamsVersion,
+  getRealtimeStreamInstance,
+} from "./v1StreamsGlobal.server";
+import {
+  basePayloadHasMessage,
+  isVersionBelowSessionVersionFloor,
+  sessionVersionFloorFor,
+  shouldSupersedeLiveRun,
+  waitpointBlockingRunCheck,
+  type LiveRunFloorChecks,
+  type SessionVersionFloor,
+} from "./sessionVersionFloor.server";
+import { listSessionStreamWaitpoints } from "~/services/sessionStreamWaitpointCache.server";
+
+/**
+ * Schema for `Session.triggerConfig` (stored as JSONB). The wire-format
+ * source of truth lives in `@trigger.dev/core/v3` as `SessionTriggerConfig`;
+ * we re-export it here for the trigger machinery to validate on read.
+ *
+ * `basePayload` carries the customer's wire payload (for chat.agent:
+ * `{ chatId, ...clientData, idleTimeoutInSeconds? }`). Runtime fields
+ * specific to a particular trigger (e.g. `trigger: "trigger" | "preload"`,
+ * an `isContinuation` flag) come in via the `payloadOverrides` argument
+ * to `ensureRunForSession` and shallow-merge on top of `basePayload`.
+ */
+const SessionTriggerConfigSchema = SessionTriggerConfigZod;
+
+export type SessionTriggerConfig = z.infer<typeof SessionTriggerConfigSchema>;
+
+export type EnsureRunReason = "initial" | "continuation" | "upgrade" | "manual";
+
+/**
+ * Hard cap on how many times `ensureRunForSession` will recurse on the
+ * pathological "we lost the claim race AND the winner's run was already
+ * terminal" path. In practice progress through the run engine bounds
+ * this, but a misconfigured task that crashes before it can be dequeued
+ * could otherwise loop without limit. After this many attempts we
+ * surface `SessionRunManagerError` so the caller can 5xx instead of
+ * blowing the stack.
+ */
+const ENSURE_RUN_FOR_SESSION_MAX_ATTEMPTS = 3;
+
+type EnsureRunForSessionParams = {
+  /**
+   * Session row to operate on. Caller is responsible for the env match —
+   * we don't re-check `runtimeEnvironmentId` against `environment.id`.
+   *
+   * `friendlyId` is used to pre-populate `payload.sessionId` on the new
+   * run so the agent's `chat.agent` boot path can attach to `session.in/.out`
+   * without a control-plane round-trip. `currentRunId` is also forwarded
+   * as `payload.previousRunId` (with `continuation: true`) when the prior
+   * run is dead, so the agent's boot gate triggers snapshot.read + replay
+   * instead of treating the run as a fresh chat.
+   */
+  session: Pick<
+    Session,
+    | "id"
+    | "friendlyId"
+    | "externalId"
+    | "taskIdentifier"
+    | "triggerConfig"
+    | "currentRunId"
+    | "currentRunVersion"
+    | "streamBasinName"
+  >;
+  environment: AuthenticatedEnvironment;
+  reason: EnsureRunReason;
+  /**
+   * Shallow-merged on top of `triggerConfig.basePayload`. Runtime fields
+   * only — caller-controlled data that varies per trigger (`trigger:
+   * "preload"` vs `"trigger"`, etc).
+   */
+  payloadOverrides?: Record<string, unknown>;
+  /**
+   * @internal Recursion-guard counter for the lost-claim-race retry path.
+   * Public callers should leave this unset; the function recurses with
+   * an incremented value on the pathological "winner's run was already
+   * terminal" branch and throws once it exceeds
+   * {@link ENSURE_RUN_FOR_SESSION_MAX_ATTEMPTS}.
+   */
+  _attempt?: number;
+};
+
+export type EnsureRunResult = {
+  runId: string;
+  /** True if this call triggered a fresh run; false if it reused an alive existing one. */
+  triggered: boolean;
+  /** The run is parked waiting for a deployment carrying the session's external deployment id. */
+  pendingVersion: boolean;
+};
+
+/**
+ * Idempotently make sure the session has a live run.
+ *
+ * Algorithm:
+ *   1. If `currentRunId` is set, probe its status. Alive → return as-is,
+ *      unless the environment has a version floor, the run is below it, the
+ *      current deployment is at or above it and the run is idle: then it is
+ *      superseded by the new run.
+ *   2. Trigger a new run upfront (cheap to cancel if we lose the race).
+ *      A superseded run is cancelled now, before the new run becomes visible
+ *      through the claim. If that cancel fails, cancel the new run and keep
+ *      the superseded one.
+ *   3. Atomic claim via `updateMany` keyed on `currentRunVersion`.
+ *      - Won (the SessionRun row is written in the same transaction): return
+ *        new runId.
+ *      - Lost: cancel our triggered run, re-read session, reuse winner's
+ *        run if alive. If pathological (winner's run already terminal),
+ *        recurse.
+ *
+ * No DB lock is held across the trigger call. Wasted-trigger window is
+ * the rare multi-tab race on a dead run; cancel cost is negligible and
+ * the run-engine handles it gracefully.
+ */
+export async function ensureRunForSession(
+  params: EnsureRunForSessionParams
+): Promise<EnsureRunResult> {
+  const { session, environment, reason, payloadOverrides, _attempt = 1 } = params;
+
+  if (_attempt > ENSURE_RUN_FOR_SESSION_MAX_ATTEMPTS) {
+    throw new SessionRunManagerError(
+      `ensureRunForSession exceeded ${ENSURE_RUN_FOR_SESSION_MAX_ATTEMPTS} attempts for session ${session.id} — every triggered run reached a terminal state before claim could resolve`
+    );
+  }
+
+  const floor = sessionVersionFloorFor(environment);
+
+  // 1. Probe currentRunId.
+  let priorRunFriendlyId: string | undefined;
+  let superseded: { runId: string; taskVersion: string | null; status: TaskRunStatus } | undefined;
+  if (session.currentRunId) {
+    let probe = await getCurrentRunProbe(session.currentRunId);
+    if (!probe) {
+      // Replica miss on a row we just observed via `currentRunId` — the
+      // run was likely triggered moments ago and hasn't replicated yet.
+      // Re-probe the writer BEFORE deciding liveness: treating a lagging
+      // replica as "row vanished" double-triggers the session (a fast
+      // first append after session create races the replica apply delay
+      // and spawns a second live run consuming the same `.in`).
+      probe = await runStore.findRun(
+        { id: session.currentRunId },
+        { select: CURRENT_RUN_PROBE_SELECT },
+        prisma
+      );
+    }
+    if (probe && !isFinalRunStatus(probe.status)) {
+      if (
+        !floor ||
+        !(await supersedesLiveRun(session, environment, floor, {
+          id: session.currentRunId,
+          taskVersion: probe.taskVersion,
+          createdAt: probe.createdAt,
+          startedWithMessage: basePayloadHasMessage(session.triggerConfig),
+        }))
+      ) {
+        return {
+          runId: session.currentRunId,
+          triggered: false,
+          pendingVersion: isPendingVersionStatus(probe.status),
+        };
+      }
+      superseded = {
+        runId: session.currentRunId,
+        taskVersion: probe.taskVersion,
+        status: probe.status,
+      };
+    }
+    // The prior run is gone (probe null on the writer too), final, or below
+    // the version floor and about to be cancelled. In each case it won't
+    // consume new appends — but the session may still hold conversation state on
+    // `session.out` and an S3 snapshot keyed on `session.friendlyId`.
+    // Forward the prior run's public-form id (friendlyId — same shape as
+    // `ctx.run.id`) to the agent as `previousRunId` so its boot gate flips
+    // `couldHavePriorState` and replays the persisted state instead of
+    // treating this as a fresh chat. See `chat.agent`'s boot orchestration
+    // in `packages/trigger-sdk/src/v3/ai.ts`.
+    priorRunFriendlyId = probe?.friendlyId ?? session.currentRunId;
+  }
+
+  // 2. Validate config + trigger upfront. Continuation overrides
+  // (`continuation`, `previousRunId`) are derived from session state above
+  // and merged AFTER caller-supplied overrides — caller can't accidentally
+  // unset them on a session that has had a prior run, but can still
+  // override `trigger`/`metadata` etc. `sessionId` is always set so the
+  // agent doesn't need a control-plane round-trip to look up the session
+  // friendlyId from `payload.chatId`.
+  // Continuation overrides strip the basePayload's first-run-only fields
+  // so a continuation run doesn't inherit a stale boot payload. The Session
+  // row's `triggerConfig.basePayload` is captured at create-time and used
+  // verbatim for every Run we trigger; if the customer included `message`
+  // / `messages` / `trigger: "submit-message"` to make the FIRST run boot
+  // straight into a first turn (via `chat.createStartSessionAction`), those
+  // values stick around and get replayed on every continuation. With
+  // `continuation: true` and `message`/`messages` cleared, the SDK boot
+  // path enters its continuation-wait branch and waits for the next
+  // session.in record before running a turn.
+  const continuationOverrides: Record<string, unknown> = {
+    sessionId: session.friendlyId,
+    ...(priorRunFriendlyId !== undefined
+      ? {
+          continuation: true,
+          previousRunId: priorRunFriendlyId,
+          // Clear sticky boot-payload fields so the new run waits for the
+          // next session.in record instead of re-processing whatever was
+          // in the original `createStartSessionAction({ basePayload })`.
+          message: undefined,
+          messages: undefined,
+          trigger: undefined,
+        }
+      : {}),
+  };
+  const mergedPayloadOverrides: Record<string, unknown> = {
+    ...(payloadOverrides ?? {}),
+    ...continuationOverrides,
+  };
+
+  const config = SessionTriggerConfigSchema.parse(session.triggerConfig);
+  const triggered = await triggerSessionRun({
+    session,
+    config,
+    environment,
+    payloadOverrides: mergedPayloadOverrides,
+  });
+
+  if (superseded) {
+    const [cancelError] = await tryCatch(cancelSupersededRun(superseded.runId));
+    if (cancelError && !(await isRunFinalOnWriter(superseded.runId))) {
+      logger.warn("Failed to cancel a session run below the session version floor; keeping it", {
+        sessionId: session.id,
+        runId: superseded.runId,
+        error: cancelError,
+      });
+      cancelUnclaimedRun({
+        runId: triggered.id,
+        sessionId: session.id,
+        reason: "Superseded run could not be cancelled",
+        failureMessage: "Failed to cancel an unused session run",
+      });
+      return {
+        runId: superseded.runId,
+        triggered: false,
+        pendingVersion: isPendingVersionStatus(superseded.status),
+      };
+    }
+  }
+
+  // 3. Try to claim the slot atomically, recording the SessionRun row with it.
+  const won = await claimSessionRun({
+    where: {
+      id: session.id,
+      currentRunVersion: session.currentRunVersion,
+      // Closedness is decided on the writer, not on the replica the caller
+      // resolved from. An append that raced a close reads a stale open row and
+      // gets this far; without this the closed conversation would get a brand
+      // new run.
+      closedAt: null,
+    },
+    data: {
+      currentRunId: triggered.id,
+      currentRunVersion: { increment: 1 },
+    },
+    sessionId: session.id,
+    triggered,
+    reason,
+  });
+
+  if (won) {
+    if (superseded) {
+      logger.info("Superseded a live run below the session version floor", {
+        sessionId: session.id,
+        runId: superseded.runId,
+        taskVersion: superseded.taskVersion,
+        minVersion: floor?.minVersion,
+        newRunId: triggered.id,
+      });
+    }
+    return {
+      runId: triggered.id,
+      triggered: true,
+      pendingVersion: isPendingVersionStatus(triggered.status),
+    };
+  }
+
+  // 4. Lost the race. Cancel our triggered run; reuse the winner's.
+  cancelUnclaimedRun({
+    runId: triggered.id,
+    sessionId: session.id,
+    failureMessage: "Failed to cancel lost-race session run",
+  });
+
+  // Read-after-write: the winner just wrote `currentRunId` /
+  // `currentRunVersion` on the writer. Reading from `$replica` could
+  // return pre-race state and cause us to recurse with the same stale
+  // version, losing the next claim, until we exhaust max attempts.
+  const fresh = await prisma.session.findFirst({
+    where: { id: session.id },
+    select: {
+      id: true,
+      friendlyId: true,
+      externalId: true,
+      taskIdentifier: true,
+      triggerConfig: true,
+      currentRunId: true,
+      currentRunVersion: true,
+      streamBasinName: true,
+      closedAt: true,
+    },
+  });
+
+  if (!fresh) {
+    // Session vanished mid-flight. Surface as an error — caller decides
+    // whether to 404 or retry.
+    throw new SessionRunManagerError(`Session ${session.id} not found after lost claim race`);
+  }
+
+  if (fresh.closedAt) {
+    // The claim lost to a close, not to another writer. Recursing would
+    // trigger and cancel a run per attempt and then throw; there is nothing to
+    // ensure for a conversation that is over.
+    throw new SessionClosedError(`Session ${session.id} is closed`);
+  }
+
+  if (fresh.currentRunId) {
+    // Same read-after-write reason as the `fresh` reload above: the winner
+    // just wrote `currentRunId` on the writer, so probe the writer too —
+    // the replica may not have the run row yet, and a missed probe forces
+    // another trigger+recurse until `ENSURE_RUN_FOR_SESSION_MAX_ATTEMPTS`.
+    const probe = await runStore.findRun(
+      { id: fresh.currentRunId },
+      { select: { status: true, friendlyId: true } },
+      prisma
+    );
+    if (probe && !isFinalRunStatus(probe.status)) {
+      return {
+        runId: fresh.currentRunId,
+        triggered: false,
+        pendingVersion: isPendingVersionStatus(probe.status),
+      };
+    }
+  }
+
+  // Pathological: winner's run already terminal. Recurse with the fresh
+  // version. Bounded by `ENSURE_RUN_FOR_SESSION_MAX_ATTEMPTS` so a task
+  // that always crashes before being dequeued surfaces as an error
+  // instead of a stack overflow.
+  return ensureRunForSession({
+    session: fresh,
+    environment,
+    reason,
+    payloadOverrides,
+    _attempt: _attempt + 1,
+  });
+}
+
+/** Both version pins are forwarded; `TriggerTaskService` decides which governs. */
+export function buildSessionRunOptions(config: SessionTriggerConfig) {
+  return {
+    ...(config.machine ? { machine: config.machine as never } : {}),
+    ...(config.queue ? { queue: { name: config.queue } } : {}),
+    ...(config.concurrency ? { concurrency: config.concurrency } : {}),
+    ...(config.concurrencyKey !== undefined ? { concurrencyKey: config.concurrencyKey } : {}),
+    ...(config.tags ? { tags: config.tags } : {}),
+    ...(config.maxAttempts !== undefined ? { maxAttempts: config.maxAttempts } : {}),
+    ...(config.maxDuration !== undefined ? { maxDuration: config.maxDuration } : {}),
+    ...(config.lockToVersion ? { lockToVersion: config.lockToVersion } : {}),
+    ...(config.externalDeploymentId ? { externalDeploymentId: config.externalDeploymentId } : {}),
+    ...(config.region ? { region: config.region } : {}),
+    ...(config.ttl !== undefined ? { ttl: config.ttl } : {}),
+  };
+}
+
+function isPendingVersionStatus(status: TaskRunStatus): boolean {
+  return status === "PENDING_VERSION";
+}
+
+/**
+ * Trigger a single run for a session. Builds `TriggerTaskRequestBody`
+ * by shallow-merging `payloadOverrides` over `config.basePayload` and
+ * threading `config`'s machine/queue/tags through the trigger options.
+ *
+ * A session's own channels are always v2, so the run is stamped to match
+ * rather than inheriting the `realtimeStreamsVersion` column default. Without
+ * this, run-scoped `streams.*` calls inside a session run resolve to v1 while
+ * the session it belongs to is on v2. `determineRealtimeStreamsVersion`
+ * degrades to v1 where v2 streams are not configured.
+ */
+async function triggerSessionRun(params: {
+  session: Pick<Session, "id" | "taskIdentifier">;
+  config: SessionTriggerConfig;
+  environment: AuthenticatedEnvironment;
+  payloadOverrides?: Record<string, unknown>;
+}): Promise<{ id: string; friendlyId: string; status: TaskRunStatus; createdAt?: Date }> {
+  const { session, environment, payloadOverrides } = params;
+  const floor = sessionVersionFloorFor(environment);
+  const config = floor
+    ? await dropPinsBelowFloor(params.config, environment, floor)
+    : params.config;
+
+  const payload = {
+    ...config.basePayload,
+    ...(config.idleTimeoutInSeconds !== undefined
+      ? { idleTimeoutInSeconds: config.idleTimeoutInSeconds }
+      : {}),
+    ...(payloadOverrides ?? {}),
+  };
+
+  const body = {
+    payload,
+    context: {},
+    options: buildSessionRunOptions(config),
+  };
+
+  const service = new TriggerTaskService();
+  const result = await service.call(session.taskIdentifier, environment, body, {
+    triggerSource: "session",
+    triggerAction: "trigger",
+    realtimeStreamsVersion: determineRealtimeStreamsVersion(
+      "v2",
+      environment.organization.streamBasinName
+    ),
+  });
+
+  if (!result) {
+    throw new SessionRunManagerError(
+      `TriggerTaskService returned no result for taskIdentifier=${session.taskIdentifier}`
+    );
+  }
+
+  return {
+    id: result.run.id,
+    friendlyId: result.run.friendlyId,
+    status: result.run.status,
+    // A mollified trigger returns a synthetic run: no row yet, so no createdAt.
+    createdAt: result.isMollified ? undefined : result.run.createdAt,
+  };
+}
+
+type SwapSessionRunParams = {
+  /**
+   * Session row to swap. `friendlyId` is forwarded as `payload.sessionId`
+   * on the new run so the agent attaches to `session.in/.out` without a
+   * control-plane round-trip (same convention as
+   * {@link EnsureRunForSessionParams}).
+   */
+  session: Pick<
+    Session,
+    "id" | "friendlyId" | "taskIdentifier" | "triggerConfig" | "currentRunId" | "currentRunVersion"
+  >;
+  /**
+   * The run requesting the swap. Optimistic claim requires
+   * `Session.currentRunId === callingRunId` so the swap can't clobber
+   * a run triggered out-of-band (e.g. a parallel `.in/append` probe
+   * that already replaced the dead run).
+   *
+   * Also forwarded as `payload.previousRunId` on the new run alongside
+   * `continuation: true` — every swap is a continuation by construction
+   * (`chat.requestUpgrade` / `chat.endRun` deliberately hand off prior
+   * conversation state to a new run), so the agent's boot gate flips
+   * `couldHavePriorState` and replays the snapshot + session.out tail.
+   */
+  callingRunId: string;
+  environment: AuthenticatedEnvironment;
+  reason: EnsureRunReason;
+  payloadOverrides?: Record<string, unknown>;
+  /** Only read when `reason` is `"upgrade"`: a string re-pins the session, absent clears the pin. */
+  externalDeploymentId?: string | null;
+};
+
+export type SwapSessionRunResult = {
+  /** runId of the newly-triggered run that has taken over the session. */
+  runId: string;
+  /**
+   * False when the swap was preempted (currentRunId is no longer the
+   * calling run). The caller should treat this as "someone else
+   * already moved on" — exit cleanly without expecting to drive the
+   * next run.
+   */
+  swapped: boolean;
+  /** See {@link EnsureRunResult.pendingVersion}. */
+  pendingVersion: boolean;
+};
+
+/**
+ * Force-swap the session to a freshly-triggered run, regardless of
+ * whether the current run is alive. Called by `end-and-continue` when
+ * the running agent wants a clean handoff (typically version upgrade).
+ *
+ * Differs from `ensureRunForSession`: never reuses the current run.
+ * The optimistic claim is keyed on `currentRunId === callingRunId`, so
+ * a parallel append-time probe that already swapped to a different
+ * run wins the race and `swapped: false` is surfaced.
+ */
+export async function swapSessionRun(params: SwapSessionRunParams): Promise<SwapSessionRunResult> {
+  const { session, callingRunId, environment, reason, payloadOverrides } = params;
+
+  // `callingRunId` is the internal cuid (`Session.currentRunId` stores
+  // cuid; the route handler resolves the wire's friendlyId before passing
+  // it here). The agent's `previousRunId` is customer-visible and must
+  // match the public `run_*` form exposed via `ctx.run.id` — resolve
+  // before forwarding.
+  const callingRunFriendlyId = await resolveRunFriendlyId(callingRunId);
+
+  // Continuation overrides — unconditionally set on swap. Unlike
+  // `ensureRunForSession`, there's no dead-run-detection branch here:
+  // every swap is a deliberate handoff from `callingRunId` (which owned
+  // prior conversation state) to a fresh run. Merged AFTER caller-supplied
+  // overrides so a caller can't accidentally unset them.
+  //
+  // Sticky boot-payload fields (`message` / `messages` / `trigger`) are
+  // cleared here for the same reason as in `ensureRunForSession`: the
+  // Session's basePayload is captured at create-time and replays on every
+  // continuation if not stripped. See the comment in `ensureRunForSession`.
+  const mergedPayloadOverrides: Record<string, unknown> = {
+    ...(payloadOverrides ?? {}),
+    sessionId: session.friendlyId,
+    continuation: true,
+    previousRunId: callingRunFriendlyId,
+    message: undefined,
+    messages: undefined,
+    trigger: undefined,
+  };
+
+  const storedConfig = SessionTriggerConfigSchema.parse(session.triggerConfig);
+
+  // The upgrade's pin is persisted in the claim below, not applied to this run alone: the next
+  // continuation re-reads the stored config. `lockToVersion` is deliberately untouched.
+  const config =
+    reason === "upgrade"
+      ? { ...storedConfig, externalDeploymentId: params.externalDeploymentId ?? undefined }
+      : storedConfig;
+
+  const triggered = await triggerSessionRun({
+    session,
+    config,
+    environment,
+    payloadOverrides: mergedPayloadOverrides,
+  });
+
+  const won = await claimSessionRun({
+    where: {
+      id: session.id,
+      currentRunId: callingRunId,
+      currentRunVersion: session.currentRunVersion,
+      // Same writer-side guard as the ensure path: a close can commit between
+      // the route's replica read and this update, and a handoff must not start
+      // a continuation on a conversation that is over.
+      closedAt: null,
+    },
+    data: {
+      currentRunId: triggered.id,
+      currentRunVersion: { increment: 1 },
+      ...(reason === "upgrade" ? { triggerConfig: config as Prisma.InputJsonValue } : {}),
+    },
+    sessionId: session.id,
+    triggered,
+    reason,
+  });
+
+  if (won) {
+    return {
+      runId: triggered.id,
+      swapped: true,
+      pendingVersion: isPendingVersionStatus(triggered.status),
+    };
+  }
+
+  // Lost the race — someone else already swapped to a new run. Cancel
+  // ours, surface the existing winner.
+  cancelUnclaimedRun({
+    runId: triggered.id,
+    sessionId: session.id,
+    failureMessage: "Failed to cancel preempted swap run",
+  });
+
+  // Read-after-write: the winner's swap was just committed on the
+  // writer. A replica read could return the pre-swap `currentRunId`
+  // (often `callingRunId` itself), which would tell the caller it is
+  // still the canonical run when in fact a different run has taken
+  // over.
+  const fresh = await prisma.session.findFirst({
+    where: { id: session.id },
+    select: { currentRunId: true, closedAt: true },
+  });
+
+  if (fresh?.closedAt) {
+    // The claim lost to a close, not to another swap. The run triggered above
+    // is already being cancelled; reporting a winner here would tell the caller
+    // a closed session has a live run.
+    throw new SessionClosedError(`Session ${session.id} is closed`);
+  }
+
+  // Mirror `ensureRunForSession`'s "session vanished" branch: if we
+  // can't find the row (or it has no current run) on the writer right
+  // after losing the race, surface as an error rather than handing back
+  // `callingRunId` with `swapped: false` — that would tell the caller
+  // it's still the canonical run when in fact we don't know who is.
+  if (!fresh?.currentRunId) {
+    throw new SessionRunManagerError(
+      `Session ${session.id} has no currentRunId after preempted swap`
+    );
+  }
+
+  const winner = await runStore.findRun(
+    { id: fresh.currentRunId },
+    { select: { status: true } },
+    prisma
+  );
+
+  return {
+    runId: fresh.currentRunId,
+    swapped: false,
+    pendingVersion: winner ? isPendingVersionStatus(winner.status) : false,
+  };
+}
+
+type TriggeredSessionRun = Awaited<ReturnType<typeof triggerSessionRun>>;
+
+/**
+ * Claims the session for `triggered` and records its SessionRun row in one transaction, so a
+ * claimed run is always linked to its session. Returns false when the claim was lost. If the
+ * transaction fails and the run's row isn't on the writer, the triggered run is cancelled and
+ * the error is rethrown.
+ */
+async function claimSessionRun(params: {
+  where: Prisma.SessionWhereInput;
+  data: Prisma.SessionUpdateManyMutationInput;
+  sessionId: string;
+  triggered: TriggeredSessionRun;
+  reason: EnsureRunReason;
+}): Promise<boolean> {
+  const { where, data, sessionId, triggered, reason } = params;
+
+  const [error, won] = await tryCatch(
+    $transaction(prisma, "sessionRunManager.claimSessionRun", async (tx) => {
+      const claim = await tx.session.updateMany({ where, data });
+      if (claim.count !== 1) return false;
+
+      // Mollified runs have no createdAt yet; the column default (insert time) stands in.
+      await tx.sessionRun.create({
+        data: { sessionId, runId: triggered.id, reason, triggeredAt: triggered.createdAt },
+      });
+      return true;
+    })
+  );
+
+  if (!error) return won === true;
+
+  // The commit may have landed with its reply lost. This session's row for the run only exists if
+  // this transaction committed. If that can't be read either, cancel: a cancelled claimed run
+  // is replaced by the next append, while a leaked run competes for the session's input.
+  const [readError, row] = await tryCatch(
+    prisma.sessionRun.findFirst({ where: { runId: triggered.id, sessionId }, select: { id: true } })
+  );
+  if (readError) {
+    logger.warn("Could not check whether a failed session run claim committed", {
+      sessionId,
+      runId: triggered.id,
+      error: readError,
+    });
+  } else if (row) {
+    logger.warn("Session run claim committed despite a transaction error", {
+      sessionId,
+      runId: triggered.id,
+      error,
+    });
+    return true;
+  }
+
+  cancelUnclaimedRun({
+    runId: triggered.id,
+    sessionId,
+    failureMessage: "Failed to cancel unclaimed session run",
+  });
+  throw error;
+}
+
+const CANCELABLE_RUN_SELECT = {
+  id: true,
+  engine: true,
+  status: true,
+  friendlyId: true,
+  taskEventStore: true,
+  createdAt: true,
+  completedAt: true,
+} as const satisfies Record<keyof CancelableTaskRun, true>;
+
+const CURRENT_RUN_PROBE_SELECT = {
+  status: true,
+  friendlyId: true,
+  taskVersion: true,
+  createdAt: true,
+} as const;
+
+async function getCurrentRunProbe(runId: string): Promise<{
+  status: TaskRunStatus;
+  friendlyId: string;
+  taskVersion: string | null;
+  createdAt: Date;
+} | null> {
+  // Use the read replica — hot-path probe, stale-by-ms is fine. The dangerous
+  // stale shape (looks-vanished → double-trigger) is closed by the writer re-probe
+  // in ensureRunForSession; a stale-non-final reuse self-heals via the durable S2
+  // stream + next-append re-probe (there is no append-handler re-check).
+  // `friendlyId` is fetched alongside `status` so the dead-run-detection
+  // branch in `ensureRunForSession` can forward the public-form id as
+  // `payload.previousRunId` without a second read. `Session.currentRunId`
+  // stores the internal cuid; the agent's wire / customer hooks expose
+  // the friendlyId via `ctx.run.id`, so consistency matters. `taskVersion`
+  // and `createdAt` let the version floor decide whether a live run is
+  // superseded (below the floor, and idle long enough) without another read.
+  const row = await runStore.findRun({ id: runId }, { select: CURRENT_RUN_PROBE_SELECT }, $replica);
+  return row ?? null;
+}
+
+async function supersedesLiveRun(
+  session: Pick<Session, "id" | "friendlyId" | "externalId" | "streamBasinName">,
+  environment: AuthenticatedEnvironment,
+  floor: SessionVersionFloor,
+  run: { id: string; taskVersion: string | null; createdAt: Date; startedWithMessage: boolean }
+): Promise<boolean> {
+  const decision = await shouldSupersedeLiveRun(
+    floor,
+    run,
+    session.externalId ?? session.friendlyId,
+    liveRunFloorChecks(session, environment)
+  );
+  if (decision.supersede) return true;
+
+  if (decision.reason === "current-below-floor") {
+    logger.warn(
+      "Current deployment is below the session version floor; reusing the live run. Promote a deployment at or above minVersion, or lower the floor",
+      {
+        sessionId: session.id,
+        runId: run.id,
+        environmentId: environment.id,
+        currentVersion: decision.currentVersion,
+        minVersion: floor.minVersion,
+      }
+    );
+  } else if (decision.reason === "check-failed") {
+    logger.warn("Idle check failed; reusing the run below the version floor", {
+      sessionId: session.id,
+      runId: run.id,
+      environmentId: environment.id,
+      error: decision.error.message,
+    });
+  }
+  return false;
+}
+
+function liveRunFloorChecks(
+  session: Pick<Session, "streamBasinName">,
+  environment: AuthenticatedEnvironment
+): LiveRunFloorChecks {
+  return {
+    async currentDeploymentVersion() {
+      const promotion = await $replica.workerDeploymentPromotion.findFirst({
+        where: { environmentId: environment.id, label: CURRENT_DEPLOYMENT_LABEL },
+        select: { deployment: { select: { version: true } } },
+      });
+      return promotion?.deployment.version;
+    },
+    streams() {
+      const realtimeStream = getRealtimeStreamInstance(environment, "v2", { session });
+      return realtimeStream instanceof S2RealtimeStreams ? realtimeStream : undefined;
+    },
+    waiters: {
+      listSessionInWaitpoints: (addressingKey) =>
+        listSessionStreamWaitpoints(environment.id, addressingKey, "in"),
+      isWaitpointBlockingRun: waitpointBlockingRunCheck(environment, { engine, runStore }),
+    },
+  };
+}
+
+async function dropPinsBelowFloor(
+  config: SessionTriggerConfig,
+  environment: AuthenticatedEnvironment,
+  floor: SessionVersionFloor
+): Promise<SessionTriggerConfig> {
+  let result = config;
+  if (result.lockToVersion) {
+    if (!isVersionBelowSessionVersionFloor(result.lockToVersion, floor)) return result;
+    result = { ...result, lockToVersion: undefined };
+  }
+
+  if (result.externalDeploymentId) {
+    const resolution = await resolveExternalDeployment({
+      prisma: $replica,
+      environmentId: environment.id,
+      externalDeploymentId: result.externalDeploymentId,
+      cache: externalDeploymentCacheInstance,
+    });
+    if (
+      resolution.outcome === "park" ||
+      isVersionBelowSessionVersionFloor(resolution.worker.version, floor)
+    ) {
+      result = { ...result, externalDeploymentId: undefined };
+    }
+  }
+
+  return result;
+}
+
+async function isRunFinalOnWriter(runId: string): Promise<boolean> {
+  const [error, run] = await tryCatch(
+    runStore.findRun({ id: runId }, { select: { status: true } }, prisma)
+  );
+  return !error && run !== null && isFinalRunStatus(run.status);
+}
+
+async function cancelSupersededRun(runId: string): Promise<void> {
+  await cancelSessionRun(runId, "Superseded by session version floor");
+}
+
+/**
+ * Resolve a TaskRun cuid to its friendlyId. Used by `swapSessionRun` to
+ * forward the calling run's public-form id as `payload.previousRunId` on
+ * the new run. Falls back to the cuid on lookup miss so the swap doesn't
+ * fail just because the read replica hasn't caught up — the agent only
+ * uses `previousRunId` for customer-visible bookkeeping (e.g.
+ * `runs.retrieve(previousRunId)`), so a stale-but-non-null value is
+ * acceptable degraded behavior.
+ */
+async function resolveRunFriendlyId(runId: string): Promise<string> {
+  const row = await runStore.findRun({ id: runId }, { select: { friendlyId: true } }, $replica);
+  return row?.friendlyId ?? runId;
+}
+
+/** Fire-and-forget cancel of a run that never became the session's current run. */
+function cancelUnclaimedRun(params: {
+  runId: string;
+  sessionId: string;
+  failureMessage: string;
+  reason?: string;
+}): void {
+  const { runId, sessionId, failureMessage, reason = "Lost session-run claim race" } = params;
+  cancelSessionRun(runId, reason).catch((error) => {
+    logger.warn(failureMessage, { sessionId, runId, error });
+  });
+}
+
+async function cancelSessionRun(runId: string, reason: string): Promise<void> {
+  // Read on the writer: a lost-race run was just triggered there, and a
+  // `$replica` miss would silently no-op the cancel and leak an orphan run
+  // that no session is going to claim.
+  const run = await runStore.findRun({ id: runId }, { select: CANCELABLE_RUN_SELECT }, prisma);
+  if (!run) return;
+  await new CancelTaskRunService().call(run, { reason });
+}
+
+class SessionRunManagerError extends Error {
+  readonly name: string = "SessionRunManagerError";
+}
+
+/** The run claim lost to a close: there is no run to ensure for this session. */
+export class SessionClosedError extends SessionRunManagerError {
+  readonly name: string = "SessionClosedError";
+}

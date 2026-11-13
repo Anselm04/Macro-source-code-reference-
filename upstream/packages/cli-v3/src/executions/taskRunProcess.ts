@@ -1,0 +1,727 @@
+import {
+  type CompletedWaitpoint,
+  type MachinePresetResources,
+  type ServerBackgroundWorker,
+  type TaskRunExecution,
+  type TaskRunExecutionPayload,
+  type TaskRunExecutionResult,
+  type WorkerManifest,
+  attemptKey,
+  ExecutorToWorkerMessageCatalog,
+  TaskRunErrorCodes,
+  type TaskRunInternalError,
+  tryCatch,
+  WorkerToExecutorMessageCatalog,
+} from "@trigger.dev/core/v3";
+import {
+  type WorkerToExecutorProcessConnection,
+  ZodIpcConnection,
+} from "@trigger.dev/core/v3/zodIpc";
+import { Evt } from "evt";
+import { type ChildProcess, fork } from "node:child_process";
+import { chalkError, chalkGrey, chalkRun, prettyPrintDate } from "../utilities/cliOutput.js";
+
+import {
+  execOptionsForRuntime,
+  execPathForRuntime,
+  isBunRuntime,
+} from "@trigger.dev/core/v3/build";
+import { nodeOptionsWithMaxOldSpaceSize } from "@trigger.dev/core/v3/machines";
+import type { InferSocketMessageSchema } from "@trigger.dev/core/v3/zodSocket";
+import type { RunTokenInstallResult } from "@trigger.dev/core/v3/workers";
+import { logger } from "../utilities/logger.js";
+import { type OomKillCounterPaths, readOomKillCountWithin } from "./oomKills.js";
+import {
+  CancelledProcessError,
+  CleanupProcessError,
+  internalErrorFromUnexpectedExit,
+  GracefulExitTimeoutError,
+  MaxDurationExceededError,
+  UnexpectedExitError,
+  SuspendedProcessError,
+  UncaughtExceptionError,
+} from "@trigger.dev/core/v3/errors";
+
+export type OnSendDebugLogMessage = InferSocketMessageSchema<
+  typeof ExecutorToWorkerMessageCatalog,
+  "SEND_DEBUG_LOG"
+>;
+
+export type OnSetSuspendableMessage = InferSocketMessageSchema<
+  typeof ExecutorToWorkerMessageCatalog,
+  "SET_SUSPENDABLE"
+>;
+
+const RUN_TOKEN_INSTALL_ACK_TIMEOUT_MS = 5_000;
+
+// Two small files under /proc and /sys, which read in well under a millisecond.
+const OOM_KILL_COUNTER_TIMEOUT_MS = 100;
+
+export type TaskRunProcessOptions = {
+  workerManifest: WorkerManifest;
+  serverWorker: ServerBackgroundWorker;
+  env: Record<string, string>;
+  machineResources: MachinePresetResources;
+  isWarmStart?: boolean;
+  cwd?: string;
+  gracefulTerminationTimeoutInMs?: number;
+  /**
+   * Where out-of-memory kills of the task process are counted. Set it only where that cgroup holds
+   * no other task process, since any kill counted there is read as this one's. Unset turns the
+   * detection off.
+   */
+  oomKillCounter?: OomKillCounterPaths;
+};
+
+export type TaskRunProcessExecuteParams = {
+  payload: TaskRunExecutionPayload;
+  messageId: string;
+  env?: Record<string, string>;
+};
+
+export class TaskRunProcess {
+  private _ipc?: WorkerToExecutorProcessConnection;
+  private _child: ChildProcess | undefined;
+  private _childPid?: number;
+  private _attemptPromises: Map<
+    string,
+    { resolver: (value: TaskRunExecutionResult) => void; rejecter: (err?: any) => void }
+  > = new Map();
+  private _attemptStatuses: Map<string, "PENDING" | "REJECTED" | "RESOLVED"> = new Map();
+  private _currentExecution: TaskRunExecution | undefined;
+  private _gracefulExitTimeoutElapsed: boolean = false;
+  private _isBeingKilled: boolean = false;
+  private _isBeingCancelled: boolean = false;
+  private _isBeingSuspended: boolean = false;
+  private _isMaxDurationExceeded: boolean = false;
+  private _maxDurationInfo?: { maxDurationInSeconds: number; elapsedTimeInSeconds: number };
+  private _stderr: Array<string> = [];
+  private _oomKillsAtAttemptStart: number | undefined;
+
+  public onTaskRunHeartbeat: Evt<string> = new Evt();
+  public onExit: Evt<{ code: number | null; signal: NodeJS.Signals | null; pid?: number }> =
+    new Evt();
+  public onSendDebugLog: Evt<OnSendDebugLogMessage> = new Evt();
+  public onSetSuspendable: Evt<OnSetSuspendableMessage> = new Evt();
+
+  private _isPreparedForNextRun: boolean = false;
+  private _isPreparedForNextAttempt: boolean = false;
+
+  constructor(public readonly options: TaskRunProcessOptions) {
+    this._isPreparedForNextRun = true;
+    this._isPreparedForNextAttempt = true;
+  }
+
+  get isPreparedForNextRun() {
+    return this._isPreparedForNextRun;
+  }
+
+  get isPreparedForNextAttempt() {
+    return this._isPreparedForNextAttempt;
+  }
+
+  unsafeDetachEvtHandlers() {
+    this.onExit.detach();
+    this.onSendDebugLog.detach();
+    this.onSetSuspendable.detach();
+    this.onTaskRunHeartbeat.detach();
+  }
+
+  async cancel() {
+    this._isPreparedForNextRun = false;
+    this._isBeingCancelled = true;
+
+    try {
+      await this.#cancel();
+    } catch (_err) {}
+
+    await this.#gracefullyTerminate(this.options.gracefulTerminationTimeoutInMs);
+  }
+
+  async cleanup(kill = true) {
+    this._isPreparedForNextRun = false;
+
+    if (this._isBeingCancelled) {
+      return;
+    }
+
+    await tryCatch(this.#flush({ disableContext: !kill }));
+
+    if (kill) {
+      await this.#gracefullyTerminate(this.options.gracefulTerminationTimeoutInMs);
+    }
+  }
+
+  initialize() {
+    const { env: $env, workerManifest, cwd, machineResources: machine } = this.options;
+
+    const maxOldSpaceSize = nodeOptionsWithMaxOldSpaceSize(undefined, machine);
+
+    const fullEnv = {
+      ...$env,
+      ...trustStoreEnv(process.env, $env),
+      OTEL_IMPORT_HOOK_INCLUDES: workerManifest.otelImportHook?.include?.join(","),
+      // TODO: this will probably need to use something different for bun (maybe --preload?)
+      NODE_OPTIONS: execOptionsForRuntime(workerManifest.runtime, workerManifest, maxOldSpaceSize),
+      PATH: process.env.PATH,
+      TRIGGER_PROCESS_FORK_START_TIME: String(Date.now()),
+      TRIGGER_WARM_START: this.options.isWarmStart ? "true" : "false",
+      TRIGGERDOTDEV: "1",
+    };
+
+    logger.debug(`initializing task run process`, {
+      envKeys: Object.keys(fullEnv),
+      path: workerManifest.workerEntryPoint,
+      cwd,
+    });
+
+    // bun accepts --no-warnings but rejects node's --no-warnings=<type> form at startup
+    const noWarningsFlag = isBunRuntime(workerManifest.runtime)
+      ? "--no-warnings"
+      : "--no-warnings=ExperimentalWarning";
+
+    this._child = fork(workerManifest.workerEntryPoint, executorArgs(workerManifest), {
+      stdio: [/*stdin*/ "ignore", /*stdout*/ "pipe", /*stderr*/ "pipe", "ipc"],
+      cwd,
+      env: fullEnv,
+      execArgv: ["--trace-uncaught", noWarningsFlag],
+      execPath: execPathForRuntime(workerManifest.runtime),
+      serialization: "json",
+    });
+
+    this._childPid = this._child?.pid;
+
+    logger.debug("initialized task run process", {
+      path: workerManifest.workerEntryPoint,
+      cwd,
+      pid: this._childPid,
+    });
+
+    this._ipc = new ZodIpcConnection({
+      listenSchema: ExecutorToWorkerMessageCatalog,
+      emitSchema: WorkerToExecutorMessageCatalog,
+      process: this._child,
+      handlers: {
+        TASK_RUN_COMPLETED: async (message) => {
+          const { result, execution } = message;
+
+          const key = attemptKey(execution);
+
+          const promiseStatus = this._attemptStatuses.get(key);
+
+          if (promiseStatus !== "PENDING") {
+            return;
+          }
+
+          this._attemptStatuses.set(key, "RESOLVED");
+
+          const attemptPromise = this._attemptPromises.get(key);
+
+          if (!attemptPromise) {
+            return;
+          }
+
+          const { resolver } = attemptPromise;
+
+          resolver(result);
+        },
+        TASK_HEARTBEAT: async (message) => {
+          this.onTaskRunHeartbeat.post(message.id);
+        },
+        UNCAUGHT_EXCEPTION: async (message) => {
+          logger.debug("uncaught exception in task run process", { ...message });
+
+          // The worker process reports uncaught exceptions and unhandled rejections via this
+          // event, but does not exit on its own. If we don't terminate the attempt here, run()
+          // hangs (the awaited promise that triggered the throw is orphaned) until maxDuration
+          // expires — surfacing as TIMED_OUT/MAX_DURATION_EXCEEDED with empty attempts. Reject
+          // any pending attempts now and gracefully terminate the worker so OTEL gets a flush
+          // window before SIGKILL.
+          this.#rejectPendingAttempts(new UncaughtExceptionError(message.error, message.origin));
+
+          await this.#gracefullyTerminate(this.options.gracefulTerminationTimeoutInMs);
+        },
+        SEND_DEBUG_LOG: async (message) => {
+          this.onSendDebugLog.post(message);
+        },
+        SET_SUSPENDABLE: async (message) => {
+          this.onSetSuspendable.post(message);
+        },
+        MAX_DURATION_EXCEEDED: async (message) => {
+          logger.debug("max duration exceeded, gracefully terminating child process", {
+            maxDurationInSeconds: message.maxDurationInSeconds,
+            elapsedTimeInSeconds: message.elapsedTimeInSeconds,
+            pid: this.pid,
+          });
+
+          // Set flag and store duration info for error reporting in #handleExit
+          this._isMaxDurationExceeded = true;
+          this._maxDurationInfo = {
+            maxDurationInSeconds: message.maxDurationInSeconds,
+            elapsedTimeInSeconds: message.elapsedTimeInSeconds,
+          };
+
+          // Use the same graceful termination approach as cancel
+          await this.#gracefullyTerminate(this.options.gracefulTerminationTimeoutInMs);
+        },
+      },
+    });
+
+    this._child.on("exit", this.#handleExit.bind(this));
+    this._child.on("error", this.#handleError.bind(this));
+    this._child.stdout?.on("data", this.#handleLog.bind(this));
+    this._child.stderr?.on("data", this.#handleStdErr.bind(this));
+
+    return this;
+  }
+
+  async #flush({ timeoutInMs = 5_000, disableContext = false } = {}) {
+    logger.debug("flushing task run process", { pid: this.pid });
+
+    await this._ipc?.sendWithAck("FLUSH", { timeoutInMs, disableContext }, timeoutInMs + 1_000);
+  }
+
+  async #cancel(timeoutInMs: number = 30_000) {
+    logger.debug("sending cancel message to task run process", { pid: this.pid, timeoutInMs });
+
+    await this._ipc?.sendWithAck("CANCEL", { timeoutInMs }, timeoutInMs + 1_000);
+  }
+
+  async execute(
+    params: TaskRunProcessExecuteParams,
+    isWarmStart?: boolean
+  ): Promise<TaskRunExecutionResult> {
+    this._isBeingCancelled = false;
+    this._isPreparedForNextRun = false;
+    this._isPreparedForNextAttempt = false;
+
+    let resolver: (value: TaskRunExecutionResult) => void;
+    let rejecter: (err?: any) => void;
+
+    const promise = new Promise<TaskRunExecutionResult>((resolve, reject) => {
+      resolver = resolve;
+      rejecter = reject;
+    });
+    // The child can exit while this method is still awaiting below, before the promise is awaited.
+    // Handled here so that is not an unhandled rejection; the await at the end still throws it.
+    promise.catch(() => {});
+
+    const key = attemptKey(params.payload.execution);
+
+    this._attemptStatuses.set(key, "PENDING");
+
+    // @ts-expect-error - We know that the resolver and rejecter are defined
+    this._attemptPromises.set(key, { resolver, rejecter });
+
+    const { execution, traceContext, metrics } = params.payload;
+
+    this._currentExecution = execution;
+
+    // Read before the attempt is dispatched, so a kill straight after it is not in the baseline.
+    // A read that does not finish in time leaves detection off for this attempt.
+    this._oomKillsAtAttemptStart = undefined;
+    if (this.options.oomKillCounter) {
+      this._oomKillsAtAttemptStart = await readOomKillCountWithin(
+        this.options.oomKillCounter,
+        OOM_KILL_COUNTER_TIMEOUT_MS
+      );
+    }
+
+    if (this._child?.connected && !this._isBeingKilled && !this._child.killed) {
+      logger.debug(
+        `[${new Date().toISOString()}][${
+          params.payload.execution.run.id
+        }] sending EXECUTE_TASK_RUN message to task run process`,
+        {
+          pid: this.pid,
+        }
+      );
+
+      await this._ipc?.send("EXECUTE_TASK_RUN", {
+        execution,
+        traceContext,
+        metadata: this.options.serverWorker,
+        metrics,
+        env: params.env,
+        isWarmStart: isWarmStart ?? this.options.isWarmStart,
+      });
+    } else {
+      // Child process is dead or disconnected — the IPC send was skipped so the attempt
+      // promise would hang forever. Reject it immediately to let the caller handle it.
+      this._attemptStatuses.set(key, "REJECTED");
+
+      // @ts-expect-error - rejecter is assigned in the promise constructor above
+      rejecter(
+        new UnexpectedExitError(-1, null, "Child process is not connected, cannot execute task run")
+      );
+    }
+
+    const result = await promise;
+
+    this._currentExecution = undefined;
+    this._isPreparedForNextAttempt = true;
+
+    return result;
+  }
+
+  isExecuting() {
+    return this._currentExecution !== undefined;
+  }
+
+  /** Never throws, and never surfaces IPC errors: they can describe a payload carrying the token. */
+  async installRunToken(update: {
+    runId: string;
+    attemptNumber: number;
+    token: string;
+  }): Promise<RunTokenInstallResult> {
+    if (!this._ipc || !this._child?.connected || this.isBeingKilled) {
+      return { result: "failure", reason: "no_child" };
+    }
+
+    try {
+      const ack = await this._ipc.sendWithAck(
+        "UPDATE_RUN_TOKEN",
+        update,
+        RUN_TOKEN_INSTALL_ACK_TIMEOUT_MS
+      );
+      if (!ack) return { result: "failure", reason: "unsupported" };
+      return ack.installed
+        ? { result: "success" }
+        : { result: "failure", reason: "identity_mismatch" };
+    } catch (error) {
+      const timedOut = typeof error === "string" && error.includes("sendWithAck() timeout");
+      return { result: "failure", reason: timedOut ? "ack_timeout" : "ipc_error" };
+    }
+  }
+
+  waitpointCompleted(waitpoint: CompletedWaitpoint) {
+    if (!this._child?.connected || this._isBeingKilled || this._child.killed) {
+      console.error(
+        "Child process not connected or being killed, can't send waitpoint completed notification"
+      );
+      return;
+    }
+
+    this._ipc?.send("RESOLVE_WAITPOINT", { waitpoint });
+  }
+
+  #handleError(error: Error) {
+    logger.debug("child process error", { error, pid: this.pid });
+  }
+
+  #rejectPendingAttempts(error: Error) {
+    for (const [id, status] of this._attemptStatuses.entries()) {
+      if (status !== "PENDING") {
+        continue;
+      }
+
+      this._attemptStatuses.set(id, "REJECTED");
+
+      const attemptPromise = this._attemptPromises.get(id);
+      if (!attemptPromise) {
+        continue;
+      }
+
+      attemptPromise.rejecter(error);
+    }
+  }
+
+  async #handleExit(code: number | null, signal: NodeJS.Signals | null) {
+    logger.debug("handling child exit", { code, signal, pid: this.pid });
+
+    const killedForMemory = signal === "SIGKILL" && (await this.#oomKilledSinceAttemptStart());
+
+    // Go through all the attempts currently pending and reject them
+    for (const [id, status] of this._attemptStatuses.entries()) {
+      if (status === "PENDING") {
+        logger.debug("found pending attempt", { id });
+
+        this._attemptStatuses.set(id, "REJECTED");
+
+        const attemptPromise = this._attemptPromises.get(id);
+
+        if (!attemptPromise) {
+          continue;
+        }
+
+        const { rejecter } = attemptPromise;
+
+        if (this._isMaxDurationExceeded) {
+          if (!this._maxDurationInfo) {
+            rejecter(
+              new UnexpectedExitError(
+                code ?? -1,
+                signal,
+                "MaxDuration flag set but duration info missing"
+              )
+            );
+            continue;
+          }
+
+          rejecter(
+            new MaxDurationExceededError(
+              this._maxDurationInfo.maxDurationInSeconds,
+              this._maxDurationInfo.elapsedTimeInSeconds
+            )
+          );
+        } else if (this._isBeingCancelled) {
+          rejecter(new CancelledProcessError());
+        } else if (this._gracefulExitTimeoutElapsed) {
+          // Order matters, this has to be before the graceful exit timeout
+          rejecter(new GracefulExitTimeoutError());
+        } else if (this._isBeingKilled) {
+          if (this._isBeingSuspended) {
+            rejecter(new SuspendedProcessError());
+          } else {
+            rejecter(new CleanupProcessError());
+          }
+        } else {
+          const stderr = this._stderr.length ? this._stderr.join("\n") : undefined;
+          rejecter(
+            killedForMemory
+              ? new OutOfMemoryKillError(code ?? -1, signal, stderr)
+              : new UnexpectedExitError(code ?? -1, signal, stderr)
+          );
+        }
+      }
+    }
+
+    logger.debug("Task run process exited, posting onExit", { code, signal, pid: this.pid });
+
+    this.onExit.post({ code, signal, pid: this.pid });
+  }
+
+  /**
+   * The kernel counts an out-of-memory kill in the cgroup the child shares with this process, so
+   * a SIGKILL that came with a new count was the out-of-memory killer, not another sender.
+   */
+  async #oomKilledSinceAttemptStart(): Promise<boolean> {
+    const before = this._oomKillsAtAttemptStart;
+    if (before === undefined || !this.options.oomKillCounter) {
+      return false;
+    }
+    const after = await readOomKillCountWithin(
+      this.options.oomKillCounter,
+      OOM_KILL_COUNTER_TIMEOUT_MS
+    );
+    return after !== undefined && after > before;
+  }
+
+  #handleLog(data: Buffer) {
+    if (!this._currentExecution) {
+      logger.log(`${chalkGrey("○")} ${chalkGrey(prettyPrintDate(new Date()))} ${data.toString()}`);
+
+      return;
+    }
+
+    const runId = chalkRun(
+      `${this._currentExecution.run.id}.${this._currentExecution.attempt.number}`
+    );
+
+    logger.log(
+      `${chalkGrey("○")} ${chalkGrey(prettyPrintDate(new Date()))} ${runId} ${data.toString()}`
+    );
+  }
+
+  #handleStdErr(data: Buffer) {
+    if (this._isBeingKilled) {
+      return;
+    }
+
+    if (!this._currentExecution) {
+      logger.log(`${chalkError("○")} ${chalkGrey(prettyPrintDate(new Date()))} ${data.toString()}`);
+
+      return;
+    }
+
+    const runId = chalkRun(
+      `${this._currentExecution.run.id}.${this._currentExecution.attempt.number}`
+    );
+
+    const errorLine = data.toString();
+
+    logger.log(
+      `${chalkError("○")} ${chalkGrey(prettyPrintDate(new Date()))} ${runId} ${errorLine}`
+    );
+
+    if (this._stderr.length > 100) {
+      this._stderr.shift();
+    }
+    this._stderr.push(errorLine);
+  }
+
+  async #gracefullyTerminate(timeoutInMs: number = 1_000) {
+    logger.debug("gracefully terminating task run process", { pid: this.pid, timeoutInMs });
+
+    await this.kill("SIGTERM", timeoutInMs);
+
+    if (this._child?.connected) {
+      logger.debug("child process is still connected, sending SIGKILL", { pid: this.pid });
+
+      await this.kill("SIGKILL");
+    }
+  }
+
+  /** This will never throw. */
+  async kill(signal?: number | NodeJS.Signals, timeoutInMs?: number) {
+    logger.debug(`killing task run process`, {
+      signal,
+      timeoutInMs,
+      pid: this.pid,
+    });
+
+    this._isBeingKilled = true;
+
+    const killTimeout = this.onExit.waitFor(timeoutInMs);
+
+    try {
+      this._child?.kill(signal);
+    } catch (error) {
+      logger.debug("kill: failed to kill child process", { error });
+    }
+
+    if (!timeoutInMs) {
+      return;
+    }
+
+    const [error] = await tryCatch(killTimeout);
+
+    if (error) {
+      logger.debug("kill: failed to wait for child process to exit", {
+        timeoutInMs,
+        signal,
+        pid: this.pid,
+      });
+    }
+  }
+
+  async suspend({ flush }: { flush: boolean }) {
+    this._isBeingSuspended = true;
+
+    if (flush) {
+      await tryCatch(this.#flush());
+    }
+
+    await this.kill("SIGKILL");
+  }
+
+  get isBeingKilled() {
+    return this._isBeingKilled || this._child?.killed;
+  }
+
+  get isBeingSuspended() {
+    return this._isBeingSuspended;
+  }
+
+  get pid() {
+    return this._childPid;
+  }
+
+  get isHealthy() {
+    if (!this._child) {
+      return false;
+    }
+
+    if (this.isBeingKilled || this.isBeingSuspended) {
+      return false;
+    }
+
+    return this._child.connected;
+  }
+
+  static parseExecuteError(error: unknown, dockerMode = true): TaskRunInternalError {
+    if (error instanceof CancelledProcessError) {
+      return {
+        type: "INTERNAL_ERROR",
+        code: TaskRunErrorCodes.TASK_RUN_CANCELLED,
+      };
+    }
+
+    if (error instanceof MaxDurationExceededError) {
+      return {
+        type: "INTERNAL_ERROR",
+        code: TaskRunErrorCodes.MAX_DURATION_EXCEEDED,
+        message: error.message,
+      };
+    }
+
+    if (error instanceof CleanupProcessError) {
+      return {
+        type: "INTERNAL_ERROR",
+        code: TaskRunErrorCodes.TASK_EXECUTION_ABORTED,
+      };
+    }
+
+    if (error instanceof OutOfMemoryKillError) {
+      return {
+        ...internalErrorFromUnexpectedExit(error, dockerMode),
+        code: TaskRunErrorCodes.TASK_PROCESS_OOM_KILLED,
+      };
+    }
+
+    if (error instanceof UnexpectedExitError) {
+      return internalErrorFromUnexpectedExit(error, dockerMode);
+    }
+
+    if (error instanceof GracefulExitTimeoutError) {
+      return {
+        type: "INTERNAL_ERROR",
+        code: TaskRunErrorCodes.GRACEFUL_EXIT_TIMEOUT,
+      };
+    }
+
+    if (error instanceof UncaughtExceptionError) {
+      // Dedicated INTERNAL_ERROR code so the engine handles retry via the
+      // existing crash-style lookup of run.lockedRetryConfig (same pathway as
+      // TASK_PROCESS_EXITED_WITH_NON_ZERO_CODE etc.) and so the dashboard
+      // renders this as "Failed" rather than "System failure" — the exception
+      // was raised by user code (or a dependency the user controls, e.g. an
+      // EventEmitter "error" event with no listener), not a platform fault.
+      return {
+        type: "INTERNAL_ERROR",
+        code: TaskRunErrorCodes.TASK_RUN_UNCAUGHT_EXCEPTION,
+        message: error.originalError.message,
+        stackTrace: error.originalError.stack,
+      };
+    }
+
+    return {
+      type: "INTERNAL_ERROR",
+      code: TaskRunErrorCodes.TASK_EXECUTION_FAILED,
+      message: String(error),
+    };
+  }
+}
+
+/** A child the kernel's out-of-memory killer ended. */
+class OutOfMemoryKillError extends UnexpectedExitError {
+  constructor(code: number, signal: NodeJS.Signals | null, stderr: string | undefined) {
+    super(code, signal, stderr);
+    this.name = "OutOfMemoryKillError";
+  }
+}
+
+const TRUST_STORE_ENV_KEYS = [
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "REQUESTS_CA_BUNDLE",
+  "PIP_CERT",
+] as const;
+
+export function trustStoreEnv(
+  controllerEnv: NodeJS.ProcessEnv,
+  runEnv: Record<string, string | undefined>
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of TRUST_STORE_ENV_KEYS) {
+    const value = runEnv[key] ?? controllerEnv[key];
+    if (value) {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
+function executorArgs(workerManifest: WorkerManifest): string[] {
+  return [];
+}

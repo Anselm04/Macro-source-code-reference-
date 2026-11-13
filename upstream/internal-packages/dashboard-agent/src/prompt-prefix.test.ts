@@ -1,0 +1,226 @@
+import { describe, expect, it } from "vitest";
+import {
+  describePromptPrefix,
+  describePromptPrefixParts,
+  PROMPT_CACHE_CONTROL,
+  promptCacheAttributes,
+} from "./prompt-prefix";
+import { DASHBOARD_AGENT_SYSTEM_PROMPT, dashboardAgentToolSchemas } from "./tool-schemas";
+import { systemPromptFor, toolSchemasFor } from "./prompt-assembly";
+import { buildDashboardAgentTools } from "./tools";
+import type { RepoSnapshot } from "./repo-tools";
+
+const SCOPE = { projectRef: "proj_abc", environmentId: "env_abc" };
+
+const snapshot: RepoSnapshot = {
+  tarballUrl: "http://unused.invalid/never-fetched",
+  owner: "acme",
+  repo: "demo",
+  sha: "deadbeefdeadbeef",
+};
+
+describe("the system prompt style", () => {
+  it("forbids em dashes and uses none itself", () => {
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("Never use em dashes");
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).not.toContain("\u2014");
+  });
+});
+
+/**
+ * The whole point of the frozen tool key order: the webapp's warm first call and the
+ * agent task's every-later call must hand Anthropic a byte-identical prefix, or they
+ * cache separately and every call pays a fresh write.
+ */
+describe("the head-start and agent prefixes are the same prefix", () => {
+  // The head-start step composes its prefix from the shared helpers; the agent run
+  // builds the real tool set. Both modes, or the cache splits.
+  for (const mode of ["assistant", "code"] as const) {
+    for (const alertsEnabled of [false, true]) {
+      it(`matches in ${mode} mode with alerts ${alertsEnabled ? "on" : "off"}`, () => {
+        const ctx = {
+          ...SCOPE,
+          alertsEnabled,
+          ...(mode === "code" ? { repoSnapshot: snapshot } : {}),
+        };
+        const headStart = describePromptPrefix({
+          system: systemPromptFor(mode, { alertsEnabled }),
+          tools: toolSchemasFor(mode, { alertsEnabled }),
+        });
+        const agent = describePromptPrefix({
+          system: systemPromptFor(mode, { alertsEnabled }),
+          tools: buildDashboardAgentTools(ctx),
+        });
+
+        expect(Object.keys(toolSchemasFor(mode, { alertsEnabled }))).toEqual(
+          Object.keys(buildDashboardAgentTools(ctx))
+        );
+        expect(agent.fingerprint).toBe(headStart.fingerprint);
+        expect(agent.chars).toBe(headStart.chars);
+      });
+    }
+  }
+
+  it("notices a reordered or changed tool set", () => {
+    const base = describePromptPrefix({
+      system: DASHBOARD_AGENT_SYSTEM_PROMPT,
+      tools: dashboardAgentToolSchemas,
+    });
+
+    const { list_projects, ...rest } = dashboardAgentToolSchemas;
+    const reordered = describePromptPrefix({
+      system: DASHBOARD_AGENT_SYSTEM_PROMPT,
+      tools: { ...rest, list_projects },
+    });
+    expect(reordered.fingerprint).not.toBe(base.fingerprint);
+
+    const editedPrompt = describePromptPrefix({
+      system: `${DASHBOARD_AGENT_SYSTEM_PROMPT}\nOne more rule.`,
+      tools: dashboardAgentToolSchemas,
+    });
+    expect(editedPrompt.fingerprint).not.toBe(base.fingerprint);
+  });
+
+  it("caches on the 1-hour breakpoint", () => {
+    expect(PROMPT_CACHE_CONTROL).toEqual({ type: "ephemeral", ttl: "1h" });
+  });
+
+  it("routes a run's why/duration/stuck questions onto an investigation, not a lookup", () => {
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("why did it take 18 minutes");
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain(
+      "get_run and get_run_trace gather the evidence, they don't answer the question"
+    );
+  });
+
+  it("tells the model a tabular answer renders as a table card, never a refusal", () => {
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("never refuse a table");
+  });
+
+  it("tells the model to bucket time-series charts with timeBucket(), not toStartOfHour/Day", () => {
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("never hand-roll toStartOfHour/toStartOfDay");
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).not.toContain("bucket time with toStartOf");
+    expect(dashboardAgentToolSchemas.run_query.description).toContain("timeBucket() AS t");
+    expect(dashboardAgentToolSchemas.run_query.description).not.toContain(
+      "bucket time with toStartOf"
+    );
+  });
+
+  it("routes a trace/timeline request onto the investigation card, never a spans table", () => {
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("never a spans table");
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain(
+      "the card is the timeline, so close with at most one or two sentences of conclusion"
+    );
+    expect(dashboardAgentToolSchemas.get_run_trace.description).toContain(
+      "not a table to paste back"
+    );
+  });
+
+  it("fails when the alert-creation section is missing from the prompt in creation scope", () => {
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("Building an alert from free text");
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain(
+      "exactly one update_alert_draft call carrying the minimal patch"
+    );
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("In alert_creation scope never create");
+    expect(dashboardAgentToolSchemas.update_alert_draft).toBeDefined();
+  });
+
+  // get_query_schema may not list the queue tables, so the prompt is where the model
+  // learns they exist and how to aggregate them.
+  it("carries the queue chart recipe", () => {
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("Queue charts");
+    for (const table of ["concurrency_metrics", "concurrency_metrics_by_key"]) {
+      expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain(table);
+      expect(dashboardAgentToolSchemas.get_query_schema.description).toContain(table);
+    }
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("WHERE queue = '<queue>'");
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("deltaSumTimestampMerge");
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("concurrency_key");
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain('valueFormat "duration_ms"');
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("ORDER BY peak DESC LIMIT 8");
+  });
+});
+
+/**
+ * The prefix is paid on every call of every chat, so it gets a ceiling rather than a
+ * comment. Growing past one of these is allowed — but the PR that grows it moves the
+ * ceiling in the same change, which is what makes the cost a decision instead of a
+ * drift. The snapshot below is the itemised diff a reviewer reads.
+ */
+// plan_monitoring: +1 tool (~2.5k chars, mostly the draft schema), +~660 prompt chars.
+// Plan scope line: +~140 prompt chars. Plan silence lines: +~230.
+// plan_decision: +1 tool (~320 chars), +~390 prompt chars with the failure-rate rule.
+// Direct create tool dropped: -1 tool (~3k chars).
+// update_alert_draft only in creation scope: -1 chat tool (~2.3k chars), +~55 prompt chars.
+const PREFIX_BUDGET = {
+  assistant: { chars: 81_250, estimatedTokens: 20_320, tools: 28, promptChars: 34_720 },
+  code: { chars: 88_210, estimatedTokens: 22_060, tools: 32, promptChars: 37_480 },
+} as const;
+
+// Measured with alerts on: the biggest prefix a turn can hand the provider.
+describe("the prefix stays inside its budget", () => {
+  const assistant = describePromptPrefixParts({
+    system: systemPromptFor("assistant", { alertsEnabled: true }),
+    tools: toolSchemasFor("assistant", { alertsEnabled: true }),
+  });
+  const code = describePromptPrefixParts({
+    system: systemPromptFor("code", { alertsEnabled: true }),
+    tools: toolSchemasFor("code", { alertsEnabled: true }),
+  });
+
+  it("holds the assistant-mode ceilings", () => {
+    expect(assistant.total.chars).toBeLessThanOrEqual(PREFIX_BUDGET.assistant.chars);
+    expect(assistant.total.estimatedTokens).toBeLessThanOrEqual(
+      PREFIX_BUDGET.assistant.estimatedTokens
+    );
+    expect(assistant.tools.count).toBeLessThanOrEqual(PREFIX_BUDGET.assistant.tools);
+    expect(assistant.prompt.chars).toBeLessThanOrEqual(PREFIX_BUDGET.assistant.promptChars);
+  });
+
+  it("holds the code-mode ceilings", () => {
+    expect(code.total.chars).toBeLessThanOrEqual(PREFIX_BUDGET.code.chars);
+    expect(code.total.estimatedTokens).toBeLessThanOrEqual(PREFIX_BUDGET.code.estimatedTokens);
+    expect(code.tools.count).toBeLessThanOrEqual(PREFIX_BUDGET.code.tools);
+    expect(code.prompt.chars).toBeLessThanOrEqual(PREFIX_BUDGET.code.promptChars);
+  });
+
+  // The committed numbers themselves, in `__snapshots__/prompt-prefix.test.ts.snap`.
+  // A prompt edit or a new tool shows up here as a diff; `vitest -u` accepts it.
+  it("matches the committed measurement", () => {
+    expect({ assistant, code }).toMatchSnapshot();
+  });
+});
+
+describe("promptCacheAttributes", () => {
+  const prefix = { chars: 80_000, estimatedTokens: 20_000, fingerprint: "abcd1234" };
+
+  it("records the four token counts the provider reports", () => {
+    expect(
+      promptCacheAttributes({
+        source: "agent-turn",
+        usage: {
+          inputTokens: 21_000,
+          inputTokenDetails: { noCacheTokens: 100, cacheReadTokens: 20_900, cacheWriteTokens: 0 },
+        },
+        prefix,
+      })
+    ).toEqual({
+      "dashboard_agent.prompt_cache.source": "agent-turn",
+      "gen_ai.usage.input_tokens": 21_000,
+      "gen_ai.usage.cache_write_input_tokens": 0,
+      "gen_ai.usage.cache_read_input_tokens": 20_900,
+      "gen_ai.usage.uncached_input_tokens": 100,
+      "dashboard_agent.prefix.estimated_tokens": 20_000,
+      "dashboard_agent.prefix.chars": 80_000,
+      "dashboard_agent.prefix.fingerprint": "abcd1234",
+    });
+  });
+
+  it("reports a value the provider didn't give as null rather than zero", () => {
+    const attributes = promptCacheAttributes({ source: "head-start", usage: undefined, prefix });
+    expect(attributes["gen_ai.usage.cache_write_input_tokens"]).toBeNull();
+    expect(attributes["gen_ai.usage.cache_read_input_tokens"]).toBeNull();
+    expect(attributes["gen_ai.usage.uncached_input_tokens"]).toBeNull();
+    expect(attributes["gen_ai.usage.input_tokens"]).toBeNull();
+    // Ours, so always present.
+    expect(attributes["dashboard_agent.prefix.estimated_tokens"]).toBe(20_000);
+  });
+});

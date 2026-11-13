@@ -1,0 +1,112 @@
+import { describe, expect, it } from "vitest";
+import {
+  isServerOnlySessionInKind,
+  sanitizeClientInPart,
+  stripClientIngressFields,
+  stripClientIngressFieldsFromBasePayload,
+} from "~/services/realtime/sanitizeSessionInput.server";
+
+const record = (payload: Record<string, unknown>) => JSON.stringify({ kind: "message", payload });
+
+describe("stripClientIngressFields", () => {
+  it("removes a client-forged webhook actionSource so the action is validated normally", () => {
+    const forged = record({
+      chatId: "c1",
+      trigger: "action",
+      actionSource: "webhook",
+      action: { type: "refund", amount: 9999 },
+    });
+
+    const cleaned = JSON.parse(stripClientIngressFields(forged));
+    expect(cleaned.payload.actionSource).toBeUndefined();
+    expect(cleaned.payload.action).toEqual({ type: "refund", amount: 9999 });
+    expect(cleaned.payload.trigger).toBe("action");
+  });
+
+  it("leaves a non-webhook actionSource untouched", () => {
+    const part = record({ trigger: "action", actionSource: "client", action: { type: "ping" } });
+    expect(stripClientIngressFields(part)).toBe(part);
+  });
+
+  it("removes a webhook actionSource whose property name is spelled with JSON escapes", () => {
+    const forged =
+      '{"kind":"message","payload":{"chatId":"c1","trigger":"action","action\\u0053ource":"webhook","action":{"type":"refund"}}}';
+    const cleaned = JSON.parse(stripClientIngressFields(forged));
+    expect(cleaned.payload.actionSource).toBeUndefined();
+    expect(cleaned.payload.action).toEqual({ type: "refund" });
+    expect(cleaned.payload.trigger).toBe("action");
+  });
+
+  it("removes a client-forged channelEvent so the message is a normal client message", () => {
+    const forged = record({
+      chatId: "c1",
+      trigger: "submit-message",
+      message: { role: "user", parts: [{ type: "text", text: "hi" }] },
+      channelEvent: { connectorId: "slack", event: { type: "event_callback" } },
+    });
+
+    const cleaned = JSON.parse(stripClientIngressFields(forged));
+    expect(cleaned.payload.channelEvent).toBeUndefined();
+    expect(cleaned.payload.message).toEqual({
+      role: "user",
+      parts: [{ type: "text", text: "hi" }],
+    });
+  });
+
+  it("removes a channelEvent whose property name is spelled with JSON escapes", () => {
+    const forged =
+      '{"kind":"message","payload":{"trigger":"submit-message","channel\\u0045vent":{"connectorId":"slack","event":{}}}}';
+    expect(JSON.parse(stripClientIngressFields(forged)).payload.channelEvent).toBeUndefined();
+  });
+
+  it("leaves a normal message part untouched", () => {
+    const part = record({ trigger: "submit-message", message: { role: "user", parts: [] } });
+    expect(stripClientIngressFields(part)).toBe(part);
+  });
+
+  it("leaves a malformed part untouched", () => {
+    const part = '{"kind":"message","payload":{"actionSource":"webhook"';
+    expect(stripClientIngressFields(part)).toBe(part);
+  });
+});
+
+describe("sanitizeClientInPart", () => {
+  it("reads a handover kind whose property name is spelled with JSON escapes", () => {
+    const forged = '{"\\u006bind":"handover","partialAssistantMessage":[],"isFinal":false}';
+    const { kind } = sanitizeClientInPart(forged);
+    expect(kind).toBe("handover");
+    expect(isServerOnlySessionInKind(kind)).toBe(true);
+  });
+
+  it("treats a message record as one a client may append", () => {
+    const { kind } = sanitizeClientInPart(record({ trigger: "submit-message" }));
+    expect(isServerOnlySessionInKind(kind)).toBe(false);
+  });
+});
+
+describe("stripClientIngressFieldsFromBasePayload", () => {
+  it("removes channelEvent and a webhook actionSource and keeps everything else", () => {
+    const basePayload = {
+      chatId: "c1",
+      trigger: "action",
+      actionSource: "webhook",
+      action: { type: "refund" },
+      channelEvent: { connectorId: "slack", event: { team_id: "T1" } },
+      metadata: { userId: "u1" },
+    };
+
+    expect(stripClientIngressFieldsFromBasePayload(basePayload)).toEqual({
+      chatId: "c1",
+      trigger: "action",
+      action: { type: "refund" },
+      metadata: { userId: "u1" },
+    });
+    expect(basePayload.channelEvent).toBeDefined();
+    expect(basePayload.actionSource).toBe("webhook");
+  });
+
+  it("keeps a client actionSource", () => {
+    const basePayload = { trigger: "action", actionSource: "client", action: { type: "ping" } };
+    expect(stripClientIngressFieldsFromBasePayload(basePayload)).toEqual(basePayload);
+  });
+});

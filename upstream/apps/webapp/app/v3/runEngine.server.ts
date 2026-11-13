@@ -1,0 +1,310 @@
+import { createWaitpointStoreEnabledResolver } from "./utils/waitpointStoreEnabled.server";
+import { FEATURE_FLAG } from "./featureFlags";
+import { globalFlagsRegistry } from "./globalFlagsRegistry.server";
+import { RunEngine, StoreWaitpointCoordinator } from "@internal/run-engine";
+import { waitpointStoreConnection } from "./waitpointStore.server";
+import { $replica, prisma } from "~/db.server";
+import { env } from "~/env.server";
+import { createBatchGlobalRateLimiter } from "~/runEngine/concerns/batchGlobalRateLimiter.server";
+import { SCHEDULED_WORKER_QUEUE_SUFFIX } from "~/runEngine/concerns/workerQueueSplit.server";
+import { logger } from "~/services/logger.server";
+import { defaultMachine, getCurrentPlan } from "~/services/platform.v3.server";
+import { singleton } from "~/utils/singleton";
+import { allMachines } from "./machinePresets.server";
+import { getQueueMetricsEmitter } from "./queueMetrics.server";
+import { runEnginePendingVersionLookup } from "./runEnginePendingVersionLookup.server";
+import { pickRunOpsStoreForCompletion } from "./runOpsMigration/crossSeamGuard.server";
+import { runEngineControlPlaneResolver } from "./runOpsMigration/runEngineControlPlaneResolver.server";
+import { runStore } from "./runStore.server";
+import { meter, tracer } from "./tracer.server";
+
+export const engine = singleton("RunEngine", createRunEngine);
+
+export type { RunEngine };
+
+function createRunEngine() {
+  const waitpointConnection = waitpointStoreConnection;
+  const engine = new RunEngine({
+    waitpointStore: waitpointConnection?.store,
+    waitpointFanoutStore: waitpointConnection?.store,
+    waitpointRouting: waitpointConnection
+      ? {
+          store: new StoreWaitpointCoordinator({ store: waitpointConnection.store }),
+          mintPolicy: {
+            // WaitpointSystem checks the one organization/global activation flag first.
+            resolveMintMode: () => "redis",
+            isCapabilityReady: () => true,
+            eligibleTypes: new Set<"RUN" | "DATETIME" | "BATCH" | "MANUAL">([
+              "RUN",
+              "DATETIME",
+              "BATCH",
+              "MANUAL",
+            ]),
+          },
+        }
+      : undefined,
+    waitpointStoreEnabled: createWaitpointStoreEnabledResolver(
+      () => globalFlagsRegistry.current(),
+      prisma
+    ),
+    prisma,
+    readOnlyPrisma: $replica,
+    crossSeamGuard: pickRunOpsStoreForCompletion,
+    // Inject the shared run-store singleton so the engine and the webapp presenters/
+    // services route through ONE store. When split is off this is the same passthrough
+    // PostgresRunStore the engine would have defaulted to, so behavior is unchanged.
+    store: runStore,
+    controlPlaneResolver: runEngineControlPlaneResolver,
+    logLevel: env.RUN_ENGINE_WORKER_LOG_LEVEL,
+    treatProductionExecutionStallsAsOOM:
+      env.RUN_ENGINE_TREAT_PRODUCTION_EXECUTION_STALLS_AS_OOM === "1",
+    readReplicaSnapshotsSinceEnabled: env.RUN_ENGINE_READ_REPLICA_SNAPSHOTS_SINCE_ENABLED === "1",
+    readReplicaSnapshotsSinceRetryDelay: {
+      minMs: env.RUN_ENGINE_SNAPSHOTS_SINCE_REPLICA_RETRY_MIN_MS,
+      maxMs: env.RUN_ENGINE_SNAPSHOTS_SINCE_REPLICA_RETRY_MAX_MS,
+    },
+    worker: {
+      disabled: env.RUN_ENGINE_WORKER_ENABLED === "0",
+      workers: env.RUN_ENGINE_WORKER_COUNT,
+      tasksPerWorker: env.RUN_ENGINE_TASKS_PER_WORKER,
+      pollIntervalMs: env.RUN_ENGINE_WORKER_POLL_INTERVAL,
+      immediatePollIntervalMs: env.RUN_ENGINE_WORKER_IMMEDIATE_POLL_INTERVAL,
+      limit: env.RUN_ENGINE_WORKER_CONCURRENCY_LIMIT,
+      shutdownTimeoutMs: env.RUN_ENGINE_WORKER_SHUTDOWN_TIMEOUT_MS,
+      redis: {
+        keyPrefix: "engine:",
+        port: env.RUN_ENGINE_WORKER_REDIS_PORT ?? undefined,
+        host: env.RUN_ENGINE_WORKER_REDIS_HOST ?? undefined,
+        username: env.RUN_ENGINE_WORKER_REDIS_USERNAME ?? undefined,
+        password: env.RUN_ENGINE_WORKER_REDIS_PASSWORD ?? undefined,
+        enableAutoPipelining: true,
+        ...(env.RUN_ENGINE_WORKER_REDIS_TLS_DISABLED === "true" ? {} : { tls: {} }),
+      },
+    },
+    machines: {
+      defaultMachine,
+      machines: allMachines(),
+      baseCostInCents: env.CENTS_PER_RUN,
+    },
+    queue: {
+      // A deploying deployment reaches DEPLOYED or TIMED_OUT within DEPLOY_TIMEOUT_MS of
+      // entering DEPLOYING, so twice that only catches deployments whose timeout never fired.
+      deploymentWaitMaxMs: env.DEPLOY_TIMEOUT_MS * 2,
+      // Global flag first so the mode can change without a deploy; it's read from the in-memory
+      // flag snapshot, so this adds no query per dequeue. Per-org overrides would need the org's
+      // flags on the dequeue path, which isn't loaded there.
+      deploymentStatusMode: () =>
+        globalFlagsRegistry.current()?.[FEATURE_FLAG.deploymentStatusMode] ??
+        env.RUN_ENGINE_DEPLOYMENT_STATUS_MODE,
+      defaultEnvConcurrency: env.DEFAULT_ENV_EXECUTION_CONCURRENCY_LIMIT,
+      defaultEnvConcurrencyBurstFactor: env.DEFAULT_ENV_EXECUTION_CONCURRENCY_BURST_FACTOR,
+      totalConcurrencyEnabled: env.RUN_ENGINE_TOTAL_CONCURRENCY_LIMITS_ENABLED === "1",
+      gatesEnabled: env.RUN_ENGINE_QUEUE_GATES_ENABLED === "1",
+      concurrencyKeyLimitsEnabled: env.RUN_ENGINE_CONCURRENCY_KEY_LIMITS_ENABLED === "1",
+      reconcile: {
+        enabled: env.RUN_ENGINE_QUEUE_RECONCILE_ENABLED === "1",
+        scanCount: env.RUN_ENGINE_QUEUE_RECONCILE_SCAN_COUNT,
+        lockTtlSeconds: env.RUN_ENGINE_QUEUE_RECONCILE_LOCK_TTL_SECONDS,
+        maxPassesPerDequeue: env.RUN_ENGINE_QUEUE_RECONCILE_MAX_PASSES_PER_DEQUEUE,
+      },
+      gateSkipAhead: {
+        enabled: env.RUN_ENGINE_QUEUE_GATE_SKIP_AHEAD_ENABLED === "1",
+        readMultiplier: env.RUN_ENGINE_QUEUE_GATE_SKIP_AHEAD_READ_MULTIPLIER,
+      },
+      logLevel: env.RUN_ENGINE_RUN_QUEUE_LOG_LEVEL,
+      redis: {
+        keyPrefix: "engine:",
+        port: env.RUN_ENGINE_RUN_QUEUE_REDIS_PORT ?? undefined,
+        host: env.RUN_ENGINE_RUN_QUEUE_REDIS_HOST ?? undefined,
+        username: env.RUN_ENGINE_RUN_QUEUE_REDIS_USERNAME ?? undefined,
+        password: env.RUN_ENGINE_RUN_QUEUE_REDIS_PASSWORD ?? undefined,
+        enableAutoPipelining: true,
+        ...(env.RUN_ENGINE_RUN_QUEUE_REDIS_TLS_DISABLED === "true" ? {} : { tls: {} }),
+      },
+      queueSelectionStrategyOptions: {
+        parentQueueLimit: env.RUN_ENGINE_PARENT_QUEUE_LIMIT,
+        biases: {
+          concurrencyLimitBias: env.RUN_ENGINE_CONCURRENCY_LIMIT_BIAS,
+          availableCapacityBias: env.RUN_ENGINE_AVAILABLE_CAPACITY_BIAS,
+          queueAgeRandomization: env.RUN_ENGINE_QUEUE_AGE_RANDOMIZATION_BIAS,
+        },
+        reuseSnapshotCount: env.RUN_ENGINE_REUSE_SNAPSHOT_COUNT,
+        maximumEnvCount: env.RUN_ENGINE_MAXIMUM_ENV_COUNT,
+        tracer,
+      },
+      shardCount: env.RUN_ENGINE_RUN_QUEUE_SHARD_COUNT,
+      queueMetrics: env.QUEUE_METRICS_EMIT_ENABLED === "1" ? getQueueMetricsEmitter() : undefined,
+      processWorkerQueueDebounceMs: env.RUN_ENGINE_PROCESS_WORKER_QUEUE_DEBOUNCE_MS,
+      dequeueBlockingTimeoutSeconds: env.RUN_ENGINE_DEQUEUE_BLOCKING_TIMEOUT_SECONDS,
+      masterQueueConsumersIntervalMs: env.RUN_ENGINE_MASTER_QUEUE_CONSUMERS_INTERVAL_MS,
+      masterQueueConsumersDisabled: env.RUN_ENGINE_WORKER_ENABLED === "0",
+      masterQueueCooloffPeriodMs: env.RUN_ENGINE_MASTER_QUEUE_COOLOFF_PERIOD_MS,
+      masterQueueCooloffCountThreshold: env.RUN_ENGINE_MASTER_QUEUE_COOLOFF_COUNT_THRESHOLD,
+      masterQueueConsumerDequeueCount: env.RUN_ENGINE_MASTER_QUEUE_CONSUMER_DEQUEUE_COUNT,
+      concurrencySweeper: {
+        scanSchedule: env.RUN_ENGINE_CONCURRENCY_SWEEPER_SCAN_SCHEDULE,
+        processMarkedSchedule: env.RUN_ENGINE_CONCURRENCY_SWEEPER_PROCESS_MARKED_SCHEDULE,
+        scanJitterInMs: env.RUN_ENGINE_CONCURRENCY_SWEEPER_SCAN_JITTER_IN_MS,
+        processMarkedJitterInMs: env.RUN_ENGINE_CONCURRENCY_SWEEPER_PROCESS_MARKED_JITTER_IN_MS,
+        scanCount: env.RUN_ENGINE_CONCURRENCY_SWEEPER_SCAN_COUNT,
+      },
+      ttlSystem: {
+        disabled: env.RUN_ENGINE_TTL_SYSTEM_DISABLED,
+        consumersDisabled: env.RUN_ENGINE_TTL_CONSUMERS_DISABLED,
+        shardCount: env.RUN_ENGINE_TTL_SYSTEM_SHARD_COUNT,
+        pollIntervalMs: env.RUN_ENGINE_TTL_SYSTEM_POLL_INTERVAL_MS,
+        batchSize: env.RUN_ENGINE_TTL_SYSTEM_BATCH_SIZE,
+        workerConcurrency: env.RUN_ENGINE_TTL_WORKER_CONCURRENCY,
+        batchMaxSize: env.RUN_ENGINE_TTL_WORKER_BATCH_MAX_SIZE,
+        batchMaxWaitMs: env.RUN_ENGINE_TTL_WORKER_BATCH_MAX_WAIT_MS,
+      },
+    },
+    runLock: {
+      redis: {
+        keyPrefix: "engine:",
+        port: env.RUN_ENGINE_RUN_LOCK_REDIS_PORT ?? undefined,
+        host: env.RUN_ENGINE_RUN_LOCK_REDIS_HOST ?? undefined,
+        username: env.RUN_ENGINE_RUN_LOCK_REDIS_USERNAME ?? undefined,
+        password: env.RUN_ENGINE_RUN_LOCK_REDIS_PASSWORD ?? undefined,
+        enableAutoPipelining: true,
+        ...(env.RUN_ENGINE_RUN_LOCK_REDIS_TLS_DISABLED === "true" ? {} : { tls: {} }),
+      },
+      duration: env.RUN_ENGINE_RUN_LOCK_DURATION,
+      automaticExtensionThreshold: env.RUN_ENGINE_RUN_LOCK_AUTOMATIC_EXTENSION_THRESHOLD,
+      retryConfig: {
+        maxAttempts: env.RUN_ENGINE_RUN_LOCK_MAX_RETRIES,
+        baseDelay: env.RUN_ENGINE_RUN_LOCK_BASE_DELAY,
+        maxDelay: env.RUN_ENGINE_RUN_LOCK_MAX_DELAY,
+        backoffMultiplier: env.RUN_ENGINE_RUN_LOCK_BACKOFF_MULTIPLIER,
+        jitterFactor: env.RUN_ENGINE_RUN_LOCK_JITTER_FACTOR,
+        maxTotalWaitTime: env.RUN_ENGINE_RUN_LOCK_MAX_TOTAL_WAIT_TIME,
+      },
+    },
+    tracer,
+    meter,
+    workerQueueObserver: {
+      enabled: env.RUN_ENGINE_WORKER_QUEUE_OBSERVER_ENABLED === "1",
+      intervalMs: env.RUN_ENGINE_WORKER_QUEUE_OBSERVER_INTERVAL_MS,
+      // Also observe the scheduled split variant of each worker queue. The suffix
+      // naming convention lives in the webapp, so it is passed in here.
+      additionalQueueSuffixes: [SCHEDULED_WORKER_QUEUE_SUFFIX],
+      subscriptionsByWorkerGroup: env.RUN_ENGINE_WORKER_QUEUE_SUBSCRIPTIONS,
+      excludedCloudProviders: env.RUN_ENGINE_WORKER_QUEUE_OBSERVER_EXCLUDED_CLOUD_PROVIDERS.split(
+        ","
+      )
+        .map((provider) => provider.trim())
+        .filter(Boolean),
+    },
+    defaultMaxTtl: env.RUN_ENGINE_DEFAULT_MAX_TTL,
+    heartbeatTimeoutsMs: {
+      PENDING_EXECUTING: env.RUN_ENGINE_TIMEOUT_PENDING_EXECUTING,
+      PENDING_CANCEL: env.RUN_ENGINE_TIMEOUT_PENDING_CANCEL,
+      EXECUTING: env.RUN_ENGINE_TIMEOUT_EXECUTING,
+      EXECUTING_WITH_WAITPOINTS: env.RUN_ENGINE_TIMEOUT_EXECUTING_WITH_WAITPOINTS,
+      SUSPENDED: env.RUN_ENGINE_TIMEOUT_SUSPENDED,
+    },
+    suspendedHeartbeatRetriesConfig: {
+      maxCount: env.RUN_ENGINE_SUSPENDED_HEARTBEAT_RETRIES_MAX_COUNT,
+      maxDelayMs: env.RUN_ENGINE_SUSPENDED_HEARTBEAT_RETRIES_MAX_DELAY_MS,
+      initialDelayMs: env.RUN_ENGINE_SUSPENDED_HEARTBEAT_RETRIES_INITIAL_DELAY_MS,
+      factor: env.RUN_ENGINE_SUSPENDED_HEARTBEAT_RETRIES_FACTOR,
+    },
+    retryWarmStartThresholdMs: env.RUN_ENGINE_RETRY_WARM_START_THRESHOLD_MS,
+    duplicateAttemptStartCheck: env.RUN_ENGINE_DUPLICATE_ATTEMPT_START_CHECK,
+    pendingVersionRunIdLookup: runEnginePendingVersionLookup,
+    externalDeploymentParkDeadlineMs: env.EXTERNAL_DEPLOYMENT_PARK_DEADLINE_MS,
+    billing: {
+      getCurrentPlan: async (orgId: string) => {
+        const plan = await getCurrentPlan(orgId);
+
+        // This only happens when there's no billing service running or on errors
+        if (!plan) {
+          logger.warn("engine.getCurrentPlan: no plan", { orgId });
+          return {
+            isPaying: true,
+            type: "paid", // default to paid
+          };
+        }
+
+        // This shouldn't happen
+        if (!plan.v3Subscription) {
+          logger.warn("engine.getCurrentPlan: no v3 subscription", { orgId });
+          return {
+            isPaying: false,
+            type: "free",
+          };
+        }
+
+        // Neither should this
+        if (!plan.v3Subscription.plan) {
+          logger.warn("engine.getCurrentPlan: no v3 subscription plan", { orgId });
+          return {
+            isPaying: plan.v3Subscription.isPaying,
+            type: plan.v3Subscription.isPaying ? "paid" : "free",
+          };
+        }
+
+        // This is the normal case when the billing service is running
+        return {
+          isPaying: plan.v3Subscription.isPaying,
+          type: plan.v3Subscription.plan.type,
+          hasPrivateLink: plan.v3Subscription.plan.limits.hasPrivateNetworking ?? false,
+        };
+      },
+    },
+    // BatchQueue with DRR scheduling for fair batch processing
+    // Consumers are controlled by options.worker.disabled (same as main worker)
+    batchQueue: {
+      redis: {
+        keyPrefix: "engine:",
+        port: env.BATCH_TRIGGER_WORKER_REDIS_PORT ?? undefined,
+        host: env.BATCH_TRIGGER_WORKER_REDIS_HOST ?? undefined,
+        username: env.BATCH_TRIGGER_WORKER_REDIS_USERNAME ?? undefined,
+        password: env.BATCH_TRIGGER_WORKER_REDIS_PASSWORD ?? undefined,
+        enableAutoPipelining: true,
+        ...(env.BATCH_TRIGGER_WORKER_REDIS_TLS_DISABLED === "true" ? {} : { tls: {} }),
+      },
+      drr: {
+        quantum: env.BATCH_QUEUE_DRR_QUANTUM,
+        maxDeficit: env.BATCH_QUEUE_MAX_DEFICIT,
+        masterQueueLimit: env.BATCH_QUEUE_MASTER_QUEUE_LIMIT,
+      },
+      shardCount: env.BATCH_QUEUE_SHARD_COUNT,
+      workerQueueBlockingTimeoutSeconds: env.BATCH_QUEUE_WORKER_QUEUE_ENABLED
+        ? env.BATCH_QUEUE_WORKER_QUEUE_TIMEOUT_SECONDS
+        : undefined,
+      consumerCount: env.BATCH_QUEUE_CONSUMER_COUNT,
+      consumerIntervalMs: env.BATCH_QUEUE_CONSUMER_INTERVAL_MS,
+      consumerEnabled: env.BATCH_QUEUE_WORKER_ENABLED,
+      // Default processing concurrency when no specific limit is set
+      // This is overridden per-batch based on the plan type at batch creation
+      defaultConcurrency: env.BATCH_CONCURRENCY_LIMIT_DEFAULT,
+      // Optional global rate limiter - limits max items/sec processed across all consumers
+      globalRateLimiter: env.BATCH_QUEUE_GLOBAL_RATE_LIMIT
+        ? createBatchGlobalRateLimiter(env.BATCH_QUEUE_GLOBAL_RATE_LIMIT)
+        : undefined,
+      // Worker queue depth cap - prevents unbounded growth protecting visibility timeouts
+      workerQueueMaxDepth: env.BATCH_QUEUE_WORKER_QUEUE_MAX_DEPTH,
+      retry: {
+        maxAttempts: 6,
+        minTimeoutInMs: 1_000,
+        maxTimeoutInMs: 30_000,
+        factor: 2,
+        randomize: true,
+        infrastructureMaxAttempts: env.BATCH_QUEUE_INFRA_RETRY_MAX_ATTEMPTS,
+      },
+    },
+    // Debounce configuration
+    debounce: {
+      maxDebounceDurationMs: env.RUN_ENGINE_MAXIMUM_DEBOUNCE_DURATION_MS,
+      quantizeNewDelayUntilMs: env.RUN_ENGINE_DEBOUNCE_QUANTIZE_NEW_DELAY_UNTIL_MS,
+      fastPathSkipEnabled: env.RUN_ENGINE_DEBOUNCE_FAST_PATH_SKIP_ENABLED === "1",
+      useReplicaForFastPathRead: env.RUN_ENGINE_DEBOUNCE_USE_REPLICA_FOR_FAST_PATH_READ === "1",
+    },
+  });
+
+  // Keep the engine and shared MemoryDB connection for the process lifetime so HTTP,
+  // snapshot readers and other event consumers can finish during the server drain.
+
+  return engine;
+}
