@@ -1,6 +1,13 @@
 # Macro source-code reference — independent engineering study
 
-This is a private research workspace for studying the architecture of [Macro](https://github.com/macro-inc/macro) to inform original TrillionAI engineering. It is **not yet a complete clone or mirror** of the upstream source.
+This is a private research workspace for studying the architecture of [Macro](https://github.com/macro-inc/macro) to inform original TrillionAI engineering. A verified snapshot of the **complete Git-tracked upstream source tree** is available on the [`macro-upstream-snapshot` branch](https://github.com/Anselm04/Macro-source-code-reference-/tree/macro-upstream-snapshot/upstream) under `upstream/`. This is a source snapshot, not an import of all historical commits, submodule payloads, or Git LFS binary objects.
+
+## Verified source import
+- Upstream commit: `532fba5e60c14b91ae641619c32a58120b6b4546`
+- Git tree hash (matches source subtree): `6a1e16ef0f36bb7d93658cb524696c27f37f2c07`
+- Git-tracked files: **41,545**
+- [Successful GitHub Actions import and verification](https://github.com/Anselm04/Macro-source-code-reference-/actions/runs/43500903850)
+- Source location: `macro-upstream-snapshot:upstream/`
 
 ## Provenance
 - Upstream: https://github.com/macro-inc/macro
