@@ -7,10 +7,10 @@ This is a public research workspace for studying the architecture of [Macro](htt
 
 This public repository also hosts our **AppForge + TrillionAI Marketing + TrillionAI Manager** source reference programme.
 
-- [Verified commercial-reference catalogue and import status](docs/THREE_PRODUCT_LAUNCH_REFERENCES.md) — 7 snapshots, 103,692 Git-tracked files verified.
+- [Verified commercial-reference catalogue and import status](docs/THREE_PRODUCT_LAUNCH_REFERENCES.md) — 8 snapshots, 120,365 Git-tracked files verified.
 - [GitHub setup and source-import process](docs/GITHUB_LIBRARY_SETUP.md).
-- [Source import workflow](.github/workflows/import-selected-reference.yml) — manual-only; no paid service activation and no upstream application execution.
-- Individual snapshot branches: `macro-upstream-snapshot`, `reference-bolt-diy-snapshot`, `reference-trigger-dev-snapshot`, `reference-activepieces-snapshot`, `reference-chatwoot-snapshot`, `reference-openhands-snapshot`. Dyad is in its own dedicated reference repository.
+- [Source import workflow](.github/workflows/import-selected-reference.yml) — manual-only; request-file or manual operation; no paid service activation and no upstream application execution.
+- Individual snapshot branches: `macro-upstream-snapshot`, `reference-bolt-diy-snapshot`, `reference-trigger-dev-snapshot`, `reference-activepieces-snapshot`, `reference-chatwoot-snapshot`, `reference-openhands-snapshot`, `reference-appwrite-snapshot`. Dyad is in its own dedicated reference repository.
 
 This is for licensed source inspection and independent engineering designs. **None of the copies is proof that a TrillionAI application is production-ready.**
 
