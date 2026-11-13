@@ -1,7 +1,11 @@
 name: Import selected engineering reference source
 
-# Manually triggered only. Imported code is never built or executed.
+# One-time bolt.diy bootstrap via this workflow-file commit; manual imports thereafter.
+# Imported code is never built or executed.
 on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/import-selected-reference.yml']
   workflow_dispatch:
     inputs:
       project:
@@ -26,7 +30,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: reference-import-${{ inputs.project }}
+  group: reference-import-${{ github.event.inputs.project || 'bolt-diy' }}
   cancel-in-progress: false
 
 jobs:
@@ -36,7 +40,7 @@ jobs:
     steps:
       - name: Resolve audited allowlist
         env:
-          PROJECT: ${{ inputs.project }}
+          PROJECT: ${{ github.event.inputs.project || 'bolt-diy' }}
         run: |
           set -euo pipefail
           case "$PROJECT" in
@@ -94,6 +98,9 @@ jobs:
           git read-tree --empty
           git read-tree --prefix=upstream/ "$(cat ../UPSTREAM_TREE)"
           test "$(git rev-parse "$(git write-tree):upstream")" = "$(cat ../UPSTREAM_TREE)"
+          # The source files are already exactly staged via read-tree; do not
+          # run git add -A, which would introduce root-level workflow files.
+          test "$(git ls-tree --name-only "$(git write-tree)")" = "upstream"
           git -c core.hooksPath=/dev/null commit --quiet -m "Reference source ${SOURCE} @ $(cat ../UPSTREAM_SHA)"
           git fsck --no-reflogs --connectivity-only
 
