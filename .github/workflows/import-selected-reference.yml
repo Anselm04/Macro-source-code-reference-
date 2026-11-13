@@ -1,7 +1,11 @@
 name: Import selected engineering reference source
 
-# Manual source imports only; source is never built or executed.
+# Reviewed source import via an allowlisted request file, or manual action.
+# Never executes upstream application code or deploys any services.
 on:
+  push:
+    branches: [main]
+    paths: ['.github/reference-import-request.txt']
   workflow_dispatch:
     inputs:
       project:
@@ -28,7 +32,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: reference-import-${{ github.event.inputs.project || 'bolt-diy' }}
+  group: reference-import-serialized
   cancel-in-progress: false
 
 jobs:
@@ -38,9 +42,15 @@ jobs:
     steps:
       - name: Resolve audited allowlist
         env:
-          PROJECT: ${{ github.event.inputs.project || 'bolt-diy' }}
+          PROJECT: ${{ github.event.inputs.project }}
         run: |
           set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # The request is a one-line allowlisted source slug from the exact commit.
+            git init -q import-request
+            git -C import-request fetch --quiet --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+            PROJECT="$(git -C import-request show FETCH_HEAD:.github/reference-import-request.txt | tr -d '\\r\\n')"
+          fi
           case "$PROJECT" in
             bolt-diy)          SOURCE="stackblitz-labs/bolt.diy" ;;
             dyad)              SOURCE="dyad-sh/dyad" ;;
