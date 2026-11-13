@@ -1,8 +1,11 @@
 name: Import Macro complete source snapshot
 
-# Manual only. Private-repository GitHub Actions usage may be billed if included allowance is exceeded.
+# One-time push trigger plus manual rerun. Standard runners are free for public repositories.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/import-macro-source.yml']
 
 permissions:
   contents: write
