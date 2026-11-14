@@ -72,6 +72,7 @@ jobs:
           print(json.dumps({k:v for k,v in rep.items() if not isinstance(v,list)},indent=2))
           PY
           rm -f .github/workflows/audit-source-once.yml
+          git add -f docs/verified-source-audit/
           git add -A
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
