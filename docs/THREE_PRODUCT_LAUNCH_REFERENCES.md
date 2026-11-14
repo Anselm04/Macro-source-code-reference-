@@ -13,7 +13,7 @@ Last research verification: 2026-11-14 (NZ time).
 
 ## Current verified library size
 
-**15 verified source snapshots · 285,583 retained Git-tracked files** across fifteen dedicated repositories, including the licence-filtered Twenty and PostHog snapshots. Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
+**16 verified source snapshots · 293,294 retained Git-tracked files** across sixteen dedicated repositories, including the licence-filtered Twenty and PostHog snapshots. Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
 
 ## Launch-critical reference projects
 
@@ -35,7 +35,7 @@ Last research verification: 2026-11-14 (NZ time).
 | L1 | Keycloak | https://github.com/keycloak/keycloak | https://www.keycloak.org/ (open-source IAM platform; **not a verified paid product of Keycloak itself**) | Apache-2.0; review component-specific licensing | **Identity + all launch products** | OAuth2/OIDC, sessions, identity federation, MFA, authorization | **VERIFIED** [13,621 files](https://github.com/Anselm04/Keycloak-Source-Code-Reference/tree/keycloak-upstream-snapshot/upstream); upstream `a29205c778402c02bad1d90b00c390f923d059ac`; tree `a620948522cd495a1f44b782a8b131a37c39994e` |
 | L1 | LangGraph.js | https://github.com/langchain-ai/langgraphjs | https://www.langchain.com/pricing (LangSmith commercial service, **distinct from OSS library**) | MIT | **Manager + AppForge** | Stateful agent graphs and checkpoints | **VERIFIED** [2,073 files](https://github.com/Anselm04/LangGraph-Source-Code-Reference/tree/langgraph-upstream-snapshot/upstream); upstream `62e40b998f769ccf9d872d394d2fd3d6796a0ddf`; tree `c534cd4169babeba9499f1c38363a88782f12961` |
 | L2 | Medusa | https://github.com/medusajs/medusa | https://medusajs.com/pricing (paid Medusa Cloud) | MIT community code; 265 enterprise-licensed paths excluded according to ENTERPRISE-LICENSE.md | **Shared commercial services** | Events, orders, webhooks, transactions, subscriptions integration patterns | **VERIFIED FILTERED** [25,032 files](https://github.com/Anselm04/Medusa-Source-Code-Reference/tree/medusa-upstream-snapshot/upstream), 265 restricted files excluded; upstream `01de0be27a7c228795d5cfc31662ca144781fbfc`; filtered tree `9dfde825357225687b752656368e03a89919c711` |
-| L2 | Cal.com | https://github.com/calcom/cal.com | https://cal.com/pricing (paid scheduling tiers) | Mixed licensing; verify root and enterprise paths | **Manager + Marketing** | Bookings, appointment events, customer follow-up | RESEARCH CANDIDATE |
+| L2 | Cal.com / Cal.diy | https://github.com/calcom/cal.diy | https://cal.com/pricing (Cal.com commercial product, **production source private since April 2026**; community Cal.diy has no verified sales) | MIT community Cal.diy; one OAuth-token YAML fixture excluded | **Manager + Marketing** | Scheduling, booking, calendar integration and notification patterns | **VERIFIED FILTERED** [7,711 files](https://github.com/Anselm04/CalCom-Source-Code-Reference/tree/cal-diy-upstream-snapshot/upstream); upstream `ae027bb70e694e2d2c44569f398d6cbcee0389b1`; filtered tree `917c9be2f9a11a6a0b3d7888ff38fcc76e5a8471` |
 | L2 | Plane | https://github.com/makeplane/plane | https://plane.so/pricing (paid team plans) | Mixed licensing, check before reuse | **Manager** | Work queues, operations dashboards, task dependencies | RESEARCH CANDIDATE |
 | RESEARCH ONLY | n8n | https://github.com/n8n-io/n8n | https://n8n.io/pricing (paid hosted automation) | Sustainable Use License + enterprise licence; **not standard open-source**, customer-facing workflow SaaS may require commercial licensing | **Manager + Marketing** | Compare patterns ONLY; do not embed or copy its implementation | NO IMPORT PLANNED without separate review |
 
@@ -54,7 +54,7 @@ Only copy an upstream snapshot when it answers a concrete product milestone. Don
 ## GitHub setup and storage layout
 
 **Current separation:**
-- Every one of the fifteen verified reference projects now has its **own dedicated public repository**, linked in the table above; each uses a source snapshot branch under `upstream/`.
+- Every one of the sixteen verified reference projects now has its **own dedicated public repository**, linked in the table above; each uses a source snapshot branch under `upstream/`.
 - `Anselm04/Macro-source-code-reference-` currently also hosts the central catalogue and the older legacy snapshot branches created before separation; those older duplicates should not be used for future research.
 - Do **not** merge source snapshot branches into main or commercial TrillionAI repos.
 
