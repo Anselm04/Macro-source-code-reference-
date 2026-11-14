@@ -15,6 +15,11 @@ Last research verification: 2026-11-14 (NZ time).
 
 **18 verified source snapshots · 300,079 retained Git-tracked files** across eighteen dedicated repositories, including the licence-filtered Twenty and PostHog snapshots. Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
 
+
+## TrillionAI-owned plugins and cost reduction
+
+See the [First-Party Connector Reference Plan](TRILLIONAI_FIRST_PARTY_CONNECTOR_REFERENCES.md): new dedicated SDK reference candidates (MCP TypeScript SDK, Node-RED, openid-client), existing Activepieces connector code, licensing restrictions for Nango and Airbyte, and the proposed private `TrillionAI-Connect` implementation. **These new references are documented, not imported.** Native integrations can replace paid connector-middleman fees, but not external API charges or infrastructure operating costs.
+
 ## Launch-critical reference projects
 
 | Priority | Product | Official upstream GitHub | Live commercial evidence | Licence boundary | TrillionAI target | What to inspect | Source status |
