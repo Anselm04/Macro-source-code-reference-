@@ -1,0 +1,73 @@
+name: Reusable inert archive of original upstream CI source
+on:
+  workflow_call:
+    inputs:
+      upstream_url:
+        required: true
+        type: string
+      upstream_sha:
+        required: true
+        type: string
+      archive_slug:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            .trillionai
+            docs
+            upstream-workflow-snapshots
+      - name: Preserve original CI sources as non-executable reference files
+        shell: bash
+        env:
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
+          UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+          SLUG: ${{ inputs.archive_slug }}
+        run: |
+          set -euo pipefail
+          git init -q /tmp/upstream-workflow-audit
+          git -C /tmp/upstream-workflow-audit remote add origin "$UPSTREAM_URL"
+          git -C /tmp/upstream-workflow-audit -c protocol.version=2 fetch -q --depth 1 --filter=blob:none origin "$UPSTREAM_SHA"
+          test "$(git -C /tmp/upstream-workflow-audit rev-parse FETCH_HEAD)" = "$UPSTREAM_SHA"
+          python3 - <<'PY'
+          import subprocess,json,os
+          from pathlib import Path
+          repo="/tmp/upstream-workflow-audit"
+          raw=subprocess.check_output(["git","-C",repo,"ls-tree","-rz","FETCH_HEAD","--",".github/workflows"])
+          base=Path("upstream-workflow-snapshots")/os.environ["SLUG"]
+          records=[]
+          for e in raw.split(b"\0"):
+              if not e: continue
+              meta,name=e.split(b"\t",1)
+              mode,typ,oid=meta.decode().split()
+              p=name.decode("utf-8","surrogateescape")
+              assert p.startswith(".github/workflows/"),p
+              if typ!="blob": raise RuntimeError("Unexpected original workflow Git object "+p)
+              dest=base/p
+              dest.parent.mkdir(parents=True,exist_ok=True)
+              content=subprocess.check_output(["git","-C",repo,"show","FETCH_HEAD:"+p])
+              dest.write_bytes(content)
+              actual=subprocess.check_output(["git","hash-object",str(dest)],text=True).strip()
+              if actual!=oid: raise RuntimeError("Hash mismatch "+p)
+              records.append({"upstream_path":p,"reference_path":str(dest),"git_blob":oid,"original_mode":mode})
+          base.mkdir(parents=True,exist_ok=True)
+          (base/"MANIFEST.json").write_text(json.dumps({"source":os.environ["UPSTREAM_URL"],"commit":os.environ["UPSTREAM_SHA"],"number_of_original_workflow_files":len(records),"original_ci_is_disabled":True,"files":records},indent=2)+"\n")
+          print("Stored",len(records),"original workflow files as inert byte-identical references")
+          PY
+          rm -f .github/workflows/archive-upstream-ci-once.yml
+          git add -f upstream-workflow-snapshots/
+          git add -u
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'archive(reference): preserve upstream CI source without enabling workflows'
+          git push origin HEAD:main
