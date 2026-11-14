@@ -20,11 +20,11 @@ Develop a **TrillionAI Connect** plugin runtime and first-party connector SDK sh
 
 ## New dedicated reference repositories — priority
 
-These have **not been imported**, and no source verification has been claimed. Create one repository per source to preserve clean separation, public only for redistributable upstream material.
+Only references explicitly marked **VERIFIED** have been imported and checked; the others have not. Create one repository per source to preserve clean separation, public only for redistributable upstream material.
 
 | Priority | Suggested repository name | Original upstream GitHub | Licence / legal check | Product use |
 |---|---|---|---|---|
-| P0 | `MCP-TypeScript-SDK-Source-Code-Reference` | https://github.com/modelcontextprotocol/typescript-sdk | Source is mixed MIT (older) / Apache-2.0 (new contributions); verify notices at pinned commit | Native TrillionAI plugin contract, secure Node.js MCP tools and agent integration |
+| P0 | **[MCP-TypeScript-SDK-Source-Code-Reference](https://github.com/Anselm04/MCP-TypeScript-SDK-Source-Code-Reference/tree/mcp-typescript-sdk-upstream-snapshot/upstream)** — **VERIFIED, 1,253 files** | https://github.com/modelcontextprotocol/typescript-sdk | Mixed MIT/Apache-2.0, with CC-BY-4.0 documentation terms; upstream `919bb8ea88b6e10e72c2f8b6218fad4cfdc40b2c`, tree `32137c3eb5b46afa7f783231b0eed90b21ae9ed5` | Native TrillionAI plugin contract, secure Node.js MCP tools and agent integration |
 | P0 | `NodeRED-Source-Code-Reference` | https://github.com/node-red/node-red | Apache-2.0 upstream core; third-party nodes have their own licences | Event-driven triggers, plugin discovery, flow-node lifecycle |
 | P0 | `OpenID-Client-Source-Code-Reference` | https://github.com/panva/openid-client | MIT; review dependencies and provider requirements | Secure OAuth/OIDC consent, refresh/revoke, delegated app connections |
 | P1, study first | `Nango-Source-Code-Reference` | https://github.com/NangoHQ/nango | Elastic License: **not MIT/Apache**, review restrictions on SaaS/managed connector competition before mirroring/using code | OAuth and multi-tenant integration comparison |
