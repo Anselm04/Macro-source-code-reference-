@@ -13,7 +13,7 @@ Last research verification: 2026-11-14 (NZ time).
 
 ## Current verified library size
 
-**10 verified source snapshots · 126,636 Git-tracked files total** across ten dedicated repositories: Macro, Dyad, bolt.diy, Trigger.dev, Activepieces, Chatwoot, OpenHands, Appwrite, LangGraph.js and Temporal. Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
+**11 verified source snapshots · 170,333 retained Git-tracked files** across eleven dedicated repositories: Macro, Dyad, bolt.diy, Trigger.dev, Activepieces, Chatwoot, OpenHands, Appwrite, LangGraph.js, Temporal and the filtered Twenty snapshot. Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
 
 ## Launch-critical reference projects
 
@@ -24,7 +24,7 @@ Last research verification: 2026-11-14 (NZ time).
 | L0 | bolt.diy | https://github.com/stackblitz-labs/bolt.diy | https://bolt.new/ (related paid Bolt product; **not evidence of bolt.diy revenue**) | MIT code; WebContainers commercial licence separate | **AppForge** | Agent-to-file pipeline, editor, runtime preview | **VERIFIED** [720 files](https://github.com/Anselm04/Bolt-DIY-Source-Code-Reference/tree/bolt-diy-upstream-snapshot/upstream) in dedicated research repository |
 | L0 | Trigger.dev | https://github.com/triggerdotdev/trigger.dev | https://trigger.dev/pricing/ (paid hosted workflow tiers) | Apache-2.0, audit subtrees | **Manager + Marketing + AppForge** | Durable workflows, retries, schedules, concurrency, status reporting | **VERIFIED** [7,940 files](https://github.com/Anselm04/TriggerDev-Source-Code-Reference/tree/trigger-dev-upstream-snapshot/upstream) in dedicated repository; upstream `2fbd5c7cf4e9c8e19b88e2b72a7133795611e33d`; tree `c87759655a420817332da8d187a48265f2e41b03` |
 | L0 | Activepieces | https://github.com/activepieces/activepieces | https://www.activepieces.com/pricing (paid cloud/enterprise/embedded products) | MIT community core; commercial `packages/ee` and enterprise server paths | **Marketing + Manager** | Connector patterns, consented automation, flow versioning | **VERIFIED** [36,504 files](https://github.com/Anselm04/Activepieces-Source-Code-Reference/tree/activepieces-upstream-snapshot/upstream) in dedicated repository; upstream `b9f66339ed218e564a645d5c8d23e632e9b2d90c`; tree `d5602f7f09abf4ad8f7c03a95a659485de940d74` |
-| L0 | Twenty | https://github.com/twentyhq/twenty | https://twenty.com/pricing (paid cloud CRM) | AGPLv3 with exceptions; examine exact licences | **Marketing + Manager** | CRM leads, workspaces, tenancy, workflows, onboarding | RESEARCH CANDIDATE |
+| L0 | Twenty | https://github.com/twentyhq/twenty | https://twenty.com/pricing (paid cloud CRM) | AGPLv3/selected MIT packages; commercial-marked files excluded from public mirror | **Marketing + Manager** | CRM leads, workspaces, tenancy, workflows, onboarding | **VERIFIED FILTERED** [43,697 retained files](https://github.com/Anselm04/Twenty-Source-Code-Reference/tree/twenty-upstream-snapshot/upstream), 825 commercial-marked application files excluded; original LICENSE retained; upstream `1dd1c249ad213de6883be5296deb3bbba8420a22`; retained tree `dc9e1541d5d24bc4ec18a12d95bfd71a59e51490` |
 | L1 | OpenHands | https://github.com/OpenHands/OpenHands | https://www.openhands.dev/pricing/ (hosted/enterprise offerings) | MIT core; **separate OpenHands-Cloud has non-OSS Polyform restrictions** | **AppForge** | Tool execution, coding agent lifecycle, sandbox and validation | **VERIFIED** [2,916 files](https://github.com/Anselm04/OpenHands-Source-Code-Reference/tree/openhands-upstream-snapshot/upstream) in dedicated research repository; upstream `46f20abafecbd03c422213bff4bc4499607b9b4f`; tree `3c7ae35db4ee1c485551cdf9ad79366852354426` |
 | HISTORICAL ONLY | Flowise | https://github.com/FlowiseAI/Flowise | https://flowiseai.com/sunset (project announced shutdown, code freeze July 29 2026 and EOL Aug 31 2026; older pricing pages are stale) | Apache-2.0 source | **Manager, historical comparison only** | Agent graphs, tooling and archived implementation patterns | **NOT an active paid commercial reference; do not import in launch-priority list** |
 | L1 | PostHog | https://github.com/PostHog/posthog | https://posthog.com/pricing (paid usage tiers) | MIT except enterprise `ee` code; GPL/third-party dependencies may apply | **Marketing + Manager + AppForge** | Funnels, campaigns analytics, cohorts, usage telemetry, feature flags | RESEARCH CANDIDATE |
@@ -42,7 +42,7 @@ Last research verification: 2026-11-14 (NZ time).
 1. **Already verified:** Macro, Dyad, bolt.diy.
 2. **Imported and verified:** Trigger.dev and Activepieces — durable execution and marketing workflows.
 3. **Imported and verified:** Chatwoot and OpenHands — customer support and coding agents.
-4. **Next study candidate:** Twenty — CRM model (large repo, AGPL and commercial source; copy only when a concrete comparison requires it).
+4. **Verified, licence-filtered:** Twenty — CRM source reference; commercial-marked files not redistributed.
 5. **Imported and verified:** Appwrite — backend/auth/storage reference. **Next if warranted:** PostHog for analytics.
 6. **Imported and verified:** LangGraph.js and Temporal — agent state and durable execution.
 7. **Optional:** PostHog, Medusa, Cal.com and Plane as defects warrant. Flowise is historical-only due to its shutdown.
@@ -52,7 +52,7 @@ Only copy an upstream snapshot when it answers a concrete product milestone. Don
 ## GitHub setup and storage layout
 
 **Current separation:**
-- Every one of the ten verified reference projects now has its **own dedicated public repository**, linked in the table above; each uses a source snapshot branch under `upstream/`.
+- Every one of the eleven verified reference projects now has its **own dedicated public repository**, linked in the table above; each uses a source snapshot branch under `upstream/`.
 - `Anselm04/Macro-source-code-reference-` currently also hosts the central catalogue and the older legacy snapshot branches created before separation; those older duplicates should not be used for future research.
 - Do **not** merge source snapshot branches into main or commercial TrillionAI repos.
 
