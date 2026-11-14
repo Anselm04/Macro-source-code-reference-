@@ -1,0 +1,414 @@
+import { createLazyMemo } from '@solid-primitives/memo';
+import type { Accessor, Signal } from 'solid-js';
+import { createSignal } from 'solid-js';
+import type { MentionItem } from '../../../utils/mentionsUtils';
+
+export type MentionBucketId =
+  | 'all'
+  | 'users'
+  | 'documents'
+  | 'externalChats'
+  | 'routines'
+  | 'agentSessions'
+  | 'channels'
+  | 'crm'
+  | 'emails'
+  | 'dates'
+  | 'openTabs'
+  | 'bookingLinks'
+  | 'calendarEvents';
+
+export interface BucketConfig<T extends MentionItem = MentionItem> {
+  id: MentionBucketId;
+  label: string;
+  getData: () => T[];
+  getFullCount: () => number;
+  windowKey?: () => string | undefined;
+  hasMore?: () => boolean;
+  isLoadingMore?: () => boolean;
+  loadMore?: () => Promise<void> | void;
+}
+
+/**
+ * view mode
+ * - null: show all categories with limited items
+ * - string: show all items for the specified category
+ */
+type ViewAllMode = string | null;
+
+/** the currently selected category id, or null if in view-all mode */
+type SelectedCategory = string | null;
+
+/** result of bin computation - how many items to show per bucket */
+type MentionBins = Record<string, number>;
+
+const PEOPLE_PREVIEW_COUNT = 3;
+
+class MentionsMenuController {
+  private buckets: Accessor<BucketConfig[]>;
+  // A soft preview budget: stable People rows and one row per other category
+  // take precedence so asynchronous results cannot hide a category.
+  private targetItems: number;
+  private ignoredIds: Accessor<string[]> = () => [];
+  private selectedIndexSignal: Signal<number>;
+  private viewAllModeSignal: Signal<ViewAllMode>;
+
+  constructor(
+    buckets: Accessor<BucketConfig[]>,
+    options: {
+      targetItems?: number;
+      ignoredIds?: Accessor<string[]>;
+    } = {}
+  ) {
+    this.buckets = buckets;
+    this.targetItems = options.targetItems ?? 8;
+    this.ignoredIds = options.ignoredIds ?? (() => []);
+
+    this.selectedIndexSignal = createSignal(0);
+    this.viewAllModeSignal = createSignal<ViewAllMode>(null);
+  }
+
+  get selectedIndex(): Accessor<number> {
+    return this.selectedIndexSignal[0];
+  }
+
+  get setSelectedIndex() {
+    return this.selectedIndexSignal[1];
+  }
+
+  get viewAllMode(): Accessor<ViewAllMode> {
+    return this.viewAllModeSignal[0];
+  }
+
+  get setViewAllMode() {
+    return this.viewAllModeSignal[1];
+  }
+
+  rawBins = createLazyMemo((): MentionBins => {
+    const buckets = this.buckets();
+    if (!buckets) return {};
+
+    const bins: MentionBins = {};
+    const seenIds = new Set<string>(this.ignoredIds());
+
+    // Count items per bucket, excluding items already seen in earlier buckets
+    buckets.forEach((config) => {
+      let count = 0;
+      for (const item of config.getData()) {
+        if (!seenIds.has(item.id)) {
+          seenIds.add(item.id);
+          count++;
+        }
+      }
+      bins[config.id] = count;
+    });
+
+    return bins;
+  });
+
+  bins = createLazyMemo((): MentionBins => {
+    const { users, ...otherBins } = this.rawBins();
+    if (users === undefined)
+      return this.computeBins(otherBins, this.targetItems);
+
+    // Keep people visible while asynchronous entity/email results arrive.
+    // Proportional allocation can otherwise remove the person under the pointer.
+    const peopleCount = Math.min(users, PEOPLE_PREVIEW_COUNT, this.targetItems);
+    return {
+      users: peopleCount,
+      ...this.computeBins(otherBins, this.targetItems - peopleCount),
+    };
+  });
+
+  combinedItems = createLazyMemo((): MentionItem[] => {
+    const buckets = this.buckets();
+    const currentBins = this.bins();
+    if (!buckets || !currentBins) return [];
+
+    const currentViewAllMode = this.viewAllMode();
+    const seenIds = new Set<string>(this.ignoredIds());
+
+    if (currentViewAllMode) {
+      const bucket = buckets.find((b) => b.id === currentViewAllMode);
+      if (!bucket) return [];
+
+      return bucket.getData().filter((item) => {
+        if (seenIds.has(item.id)) return false;
+        return true;
+      });
+    }
+
+    const result: MentionItem[] = [];
+
+    buckets.forEach((config) => {
+      const limit = currentBins[config.id] || 0;
+      if (limit === 0) return;
+
+      let added = 0;
+      for (const item of config.getData()) {
+        if (added >= limit) break;
+        if (seenIds.has(item.id)) continue;
+        seenIds.add(item.id);
+        result.push(item);
+        added++;
+      }
+    });
+
+    return result;
+  });
+
+  selectedCategory = createLazyMemo((): SelectedCategory => {
+    if (this.viewAllMode()) return null;
+
+    const buckets = this.buckets();
+    if (!buckets) return null;
+
+    const index = this.selectedIndex();
+    const currentBins = this.bins();
+    let currentIndex = 0;
+
+    for (const config of buckets) {
+      const count = currentBins[config.id] || 0;
+      if (count > 0) {
+        if (index < currentIndex + count) {
+          return config.id;
+        }
+        currentIndex += count;
+      }
+    }
+
+    return null;
+  });
+
+  selectedItem = createLazyMemo((): MentionItem | null => {
+    const items = this.combinedItems();
+    if (!items) return null;
+    const index = this.selectedIndex();
+    return items[index] ?? null;
+  });
+
+  totalItemCount = createLazyMemo((): number => {
+    const items = this.combinedItems();
+    return items?.length ?? 0;
+  });
+
+  selectNext(): void {
+    const items = this.combinedItems();
+    if (!items || items.length === 0) return;
+    const current = this.selectedIndex();
+    const next = current + 1;
+    this.setSelectedIndex(next >= items.length ? 0 : next);
+  }
+
+  selectPrev(): void {
+    const items = this.combinedItems();
+    if (!items || items.length === 0) return;
+    const current = this.selectedIndex();
+    const prev = current - 1;
+    this.setSelectedIndex(prev < 0 ? items.length - 1 : prev);
+  }
+
+  selectItem(index: number): void {
+    const items = this.combinedItems();
+    if (!items) return;
+    if (index >= 0 && index < items.length) {
+      this.setSelectedIndex(index);
+    }
+  }
+
+  selectNextCategory(): void {
+    if (this.viewAllMode()) {
+      this.selectNext();
+      return;
+    }
+
+    const currentCategory = this.selectedCategory();
+    const currentBins = this.bins();
+    const configs = this.buckets();
+    if (!configs) return;
+
+    if (!currentCategory) {
+      this.setSelectedIndex(0);
+      return;
+    }
+
+    const currentCategoryIndex = configs.findIndex(
+      (c) => c.id === currentCategory
+    );
+
+    if (currentCategoryIndex === -1) {
+      this.setSelectedIndex(0);
+      return;
+    }
+
+    let nextCategoryIndex = currentCategoryIndex + 1;
+    while (nextCategoryIndex < configs.length) {
+      const nextConfig = configs[nextCategoryIndex];
+      if (currentBins[nextConfig.id] > 0) {
+        let offset = 0;
+        for (let i = 0; i < nextCategoryIndex; i++) {
+          offset += currentBins[configs[i].id] || 0;
+        }
+        this.setSelectedIndex(offset);
+        return;
+      }
+      nextCategoryIndex++;
+    }
+
+    this.setSelectedIndex(0);
+  }
+
+  selectPrevCategory(): void {
+    if (this.viewAllMode()) {
+      this.selectPrev();
+      return;
+    }
+
+    const currentCategory = this.selectedCategory();
+    const currentBins = this.bins();
+    const configs = this.buckets();
+    if (!configs) return;
+
+    if (!currentCategory) {
+      this.setSelectedIndex(this.totalItemCount() - 1);
+      return;
+    }
+
+    const currentCategoryIndex = configs.findIndex(
+      (c) => c.id === currentCategory
+    );
+
+    if (currentCategoryIndex === -1) {
+      this.setSelectedIndex(0);
+      return;
+    }
+
+    let prevCategoryIndex = currentCategoryIndex - 1;
+    while (prevCategoryIndex >= 0) {
+      const prevConfig = configs[prevCategoryIndex];
+      if (currentBins[prevConfig.id] > 0) {
+        // Jump to first item of previous category
+        let offset = 0;
+        for (let i = 0; i < prevCategoryIndex; i++) {
+          offset += currentBins[configs[i].id] || 0;
+        }
+        this.setSelectedIndex(offset);
+        return;
+      }
+      prevCategoryIndex--;
+    }
+
+    let lastOffset = 0;
+    for (let i = 0; i < configs.length - 1; i++) {
+      lastOffset += currentBins[configs[i].id] || 0;
+    }
+    this.setSelectedIndex(lastOffset);
+  }
+
+  viewAll(bucketId: string): void {
+    this.setViewAllMode(bucketId);
+    this.setSelectedIndex(0);
+  }
+
+  exitViewAll(): void {
+    this.setViewAllMode(null);
+    this.setSelectedIndex(0);
+  }
+
+  toggleViewAllForCurrentCategory(): void {
+    const category = this.selectedCategory();
+    if (category) {
+      this.viewAll(category);
+    }
+  }
+
+  isViewAllMode(): boolean {
+    return this.viewAllMode() !== null;
+  }
+
+  hasOnlyOneCategory = createLazyMemo((): boolean => {
+    const configs = this.buckets();
+    if (!configs) return false;
+    const nonEmptyCount = configs.filter(
+      (config) => config.getFullCount() > 0 || config.hasMore?.()
+    ).length;
+    return nonEmptyCount === 1;
+  });
+
+  reset(): void {
+    this.setSelectedIndex(0);
+    this.setViewAllMode(null);
+  }
+
+  getBucket(id: string): BucketConfig | undefined {
+    const buckets = this.buckets();
+    if (!buckets) return undefined;
+    return buckets.find((b) => b.id === id);
+  }
+
+  getAllBuckets(): BucketConfig[] {
+    return this.buckets() ?? [];
+  }
+
+  canViewAllForCategory(categoryId: string): boolean {
+    const currentBins = this.bins();
+    const config = this.buckets().find((bucket) => bucket.id === categoryId);
+    const abbreviatedCount = currentBins[categoryId] || 0;
+    return (
+      (config?.getFullCount() ?? 0) > abbreviatedCount || !!config?.hasMore?.()
+    );
+  }
+
+  private computeBins(rawBins: MentionBins, targetItems: number): MentionBins {
+    const total = Object.values(rawBins).reduce((sum, count) => sum + count, 0);
+
+    // If total items fit in the target, no scaling needed
+    if (total <= targetItems) {
+      return { ...rawBins };
+    }
+
+    // Give every non-empty category a preview before sharing spare slots.
+    const scaled: MentionBins = {};
+
+    const nonEmptyBins = Object.entries(rawBins).filter(
+      ([_, count]) => count > 0
+    );
+
+    let allocated = 0;
+
+    // First pass: give each non-empty bin at least 1 item
+    for (const [key, count] of nonEmptyBins) {
+      if (count > 0) {
+        scaled[key] = 1;
+        allocated += 1;
+      }
+    }
+
+    // Share spare slots in category order. Total match counts can change on
+    // each keystroke or cache response even when the visible matches are the
+    // same; proportional allocation would hide/show those rows repeatedly.
+    while (allocated < targetItems) {
+      for (const [key, count] of nonEmptyBins) {
+        if (allocated >= targetItems) break;
+        if (scaled[key] >= count) continue;
+        scaled[key] += 1;
+        allocated += 1;
+      }
+    }
+
+    return scaled;
+  }
+}
+
+export function useMentionsMenuController(
+  buckets: Accessor<BucketConfig[]>,
+  options: {
+    targetItems?: number;
+    ignoredIds?: Accessor<string[]>;
+  } = {}
+): MentionsMenuController {
+  return new MentionsMenuController(buckets, {
+    targetItems: options.targetItems,
+    ignoredIds: options.ignoredIds,
+  });
+}

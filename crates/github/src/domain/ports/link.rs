@@ -1,0 +1,318 @@
+//! Port definitions for github link operations (OAuth and account linking).
+
+use std::future::Future;
+
+use crate::domain::models::{
+    EnrichedGithubPullRequest, GithubAccessToken, GithubDraftOutcome, GithubError,
+    GithubExchangeTokenResponse, GithubGrantLinkOutcome, GithubLink, GithubLinkStatus,
+    GithubMergeMethod, GithubMergeOutcome, GithubPullRequestDetails,
+    GithubPullRequestMergeabilityEntry, GithubPullRequestNumber, GithubPullRequestRef,
+    GithubPullRequestState, GithubRepositoryMergeSettings, GithubStateOutcome, GithubUserInfo,
+    MergeGithubPullRequestRequest, MergeGithubPullRequestResponse,
+    SetGithubPullRequestDraftRequest, SetGithubPullRequestDraftResponse,
+    SetGithubPullRequestStateRequest, SetGithubPullRequestStateResponse,
+};
+use macro_user_id::{lowercased::Lowercase, user_id::MacroUserId};
+
+/// Repository for accessing github link data from the database.
+///
+/// All methods perform database operations — SQL queries are written
+/// directly in the outbound adapter implementation.
+#[cfg_attr(test, mockall::automock(type Err = anyhow::Error; type LinkGuard = ();))]
+pub trait GithubRepo: Send + Sync + 'static {
+    /// The error type returned by repository operations.
+    type Err: Into<anyhow::Error> + Send + std::fmt::Debug;
+
+    /// Held until the complete cross-system link operation finishes.
+    type LinkGuard: Send;
+
+    /// Serializes callbacks and disconnects for one Macro user.
+    fn lock_user_link(
+        &self,
+        user_id: &str,
+    ) -> impl Future<Output = Result<Self::LinkGuard, Self::Err>> + Send;
+
+    /// Serializes mutations of a grant shared by multiple Macro users.
+    fn lock_github_account(
+        &self,
+        guard: &mut Self::LinkGuard,
+        github_user_id: &str,
+    ) -> impl Future<Output = Result<(), Self::Err>> + Send;
+
+    /// Gets the github link by the macro user id, or `None` when the user has
+    /// not linked GitHub.
+    fn get_github_link_by_user_id<'a>(
+        &self,
+        macro_user_id: &MacroUserId<Lowercase<'a>>,
+    ) -> impl Future<Output = Result<Option<GithubLink>, Self::Err>> + Send;
+
+    /// Gets the owner's github link for the github user id, or `None` when no
+    /// Macro user has linked that GitHub account.
+    fn get_github_link_by_github_user_id(
+        &self,
+        github_user_id: &str,
+    ) -> impl Future<Output = Result<Option<GithubLink>, Self::Err>> + Send;
+
+    /// Counts the number of github links for the given github user id
+    fn count_github_links_by_github_user_id(
+        &self,
+        github_user_id: &str,
+    ) -> impl Future<Output = Result<i64, Self::Err>> + Send;
+
+    /// Gets the github link by id
+    fn get_github_link_by_id(
+        &self,
+        id: &uuid::Uuid,
+    ) -> impl Future<Output = Result<GithubLink, Self::Err>> + Send;
+
+    /// Inserts a github link
+    fn insert_github_link(
+        &self,
+        link: &GithubLink,
+    ) -> impl Future<Output = Result<(), Self::Err>> + Send;
+
+    /// Repoints links sharing a missing grant after OAuth proves ownership of that GitHub account.
+    /// Only links still referencing `previous_owner` are changed.
+    fn reassign_github_grant(
+        &self,
+        github_user_id: &str,
+        previous_owner: &uuid::Uuid,
+        new_owner: &uuid::Uuid,
+    ) -> impl Future<Output = Result<(), Self::Err>> + Send;
+
+    /// deletes the in progress user link
+    fn delete_in_progress_user_link(
+        &self,
+        in_progress_link_id: &uuid::Uuid,
+    ) -> impl Future<Output = Result<(), Self::Err>> + Send;
+
+    /// Deletes the github link from the repo
+    fn delete_github_link(
+        &self,
+        link_id: &uuid::Uuid,
+    ) -> impl Future<Output = Result<(), Self::Err>> + Send;
+}
+
+/// Repository for handling github oauth related actions.
+#[cfg_attr(test, mockall::automock(type Err = anyhow::Error;))]
+pub trait GithubOauth: Send + Sync + 'static {
+    /// The error type returned by repository operations.
+    type Err: Into<GithubError> + Send + std::fmt::Debug;
+
+    /// Constructs the oauth url to authenticate with github.
+    ///
+    /// `state` is the opaque, already-encoded value the callback expects
+    /// back; it is placed in the URL as-is.
+    fn construct_oauth_url(
+        &self,
+        client_id: &str,
+        redirect_uri: &str,
+        state: &str,
+    ) -> Result<String, Self::Err>;
+
+    /// Exchanges the oauth code for tokens
+    fn exchange_oauth_code_for_tokens(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        redirect_uri: &str,
+        code: &str,
+    ) -> impl Future<Output = Result<GithubExchangeTokenResponse, Self::Err>> + Send;
+
+    /// Gets the user info using the access token
+    fn get_user_info(
+        &self,
+        access_token: &str,
+    ) -> impl Future<Output = Result<GithubUserInfo, Self::Err>> + Send;
+
+    /// Checks if the access token is expired or invalid.
+    fn is_access_token_expired(
+        &self,
+        access_token: &str,
+    ) -> impl Future<Output = Result<bool, Self::Err>> + Send;
+
+    /// Gets pull request details using the user's access token.
+    fn get_pull_request_details(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> impl Future<Output = Result<GithubPullRequestDetails, Self::Err>> + Send;
+
+    /// Reads which merge methods a repository allows, as the user sees it.
+    fn get_repository_merge_settings(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+    ) -> impl Future<Output = Result<GithubRepositoryMergeSettings, Self::Err>> + Send;
+
+    /// Merges a pull request as the user.
+    ///
+    /// GitHub declining the merge is a [`GithubMergeOutcome::Rejected`]
+    /// value, not an error: the request reached GitHub and was answered.
+    fn merge_pull_request(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        merge_method: GithubMergeMethod,
+    ) -> impl Future<Output = Result<GithubMergeOutcome, Self::Err>> + Send;
+
+    /// Converts a pull request to a draft, or marks it ready for review, as
+    /// the user. A change GitHub declines is a [`GithubDraftOutcome::Rejected`]
+    /// value, not an error.
+    fn set_pull_request_draft(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        draft: bool,
+    ) -> impl Future<Output = Result<GithubDraftOutcome, Self::Err>> + Send;
+
+    /// Closes a pull request, or reopens it, as the user. A change GitHub
+    /// declines is a [`GithubStateOutcome::Rejected`] value, not an error.
+    fn set_pull_request_state(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        state: GithubPullRequestState,
+    ) -> impl Future<Output = Result<GithubStateOutcome, Self::Err>> + Send;
+
+    /// Reads whether each pull request merges cleanly, as the user sees it.
+    /// Pull requests the user cannot see are left out.
+    fn get_pull_request_mergeability(
+        &self,
+        access_token: &str,
+        pull_requests: &[GithubPullRequestNumber],
+    ) -> impl Future<Output = Result<Vec<GithubPullRequestMergeabilityEntry>, Self::Err>> + Send;
+}
+
+/// Repository for handling auth related actions.
+#[cfg_attr(test, mockall::automock(type Err = anyhow::Error;))]
+pub trait Auth: Send + Sync + 'static {
+    /// The error type returned by repository operations.
+    type Err: Into<GithubError> + Send + std::fmt::Debug;
+
+    /// Creates or refreshes the grant after OAuth has verified the GitHub account.
+    fn link_user(
+        &self,
+        fusionauth_user_id: &uuid::Uuid,
+        idp_id: &str,
+        github_user_id: &str,
+        username: &str,
+        access_token: &str,
+    ) -> impl Future<Output = Result<GithubGrantLinkOutcome, Self::Err>> + Send;
+
+    /// Deletes the github link for a auth user
+    fn delete_user_link(
+        &self,
+        github_link: &GithubLink,
+        github_idp_id: &str,
+    ) -> impl Future<Output = Result<(), Self::Err>> + Send;
+
+    /// Retrieves the GitHub token, or `None` if the identity or grant no longer exists.
+    fn retreive_access_token(
+        &self,
+        fusionauth_user_id: &uuid::Uuid,
+        github_idp_id: &str,
+        github_user_id: &str,
+    ) -> impl Future<Output = Result<Option<GithubAccessToken>, Self::Err>> + Send;
+}
+
+/// Service interface for github link operations (OAuth and account linking).
+///
+/// Handles OAuth URL construction and user account linking.
+pub trait GithubLinkService: Send + Sync + 'static {
+    /// Constructs the oauth url to authenticate with github.
+    ///
+    /// `state` is the opaque, already-encoded value the callback expects
+    /// back; it is placed in the URL as-is.
+    fn construct_oauth_url(&self, redirect_uri: &str, state: &str) -> Result<String, GithubError>;
+
+    /// Uses token exchange to link the user to the github account
+    fn link_user(
+        &self,
+        user_id: &MacroUserId<Lowercase<'static>>,
+        fusionauth_user_id: &uuid::Uuid,
+        in_progress_user_link: &uuid::Uuid,
+        redirect_uri: &str,
+        code: &str,
+    ) -> impl Future<Output = Result<GithubLink, GithubError>> + Send;
+
+    /// Deletes the link for the user
+    fn delete_user_link(
+        &self,
+        user_id: &MacroUserId<Lowercase<'static>>,
+    ) -> impl Future<Output = Result<(), GithubError>> + Send;
+
+    /// Reports whether the user has linked GitHub and whether the link's
+    /// token still works.
+    fn get_user_link_status(
+        &self,
+        user_id: &MacroUserId<Lowercase<'static>>,
+    ) -> impl Future<Output = Result<GithubLinkStatus, GithubError>> + Send;
+
+    /// The user's GitHub token from their account link, checked against
+    /// GitHub. [`GithubError::NoLinkFound`] when they never linked,
+    /// [`GithubError::ReauthenticationRequired`] when the token no longer works.
+    fn get_user_access_token(
+        &self,
+        user_id: &MacroUserId<Lowercase<'static>>,
+    ) -> impl Future<Output = Result<GithubAccessToken, GithubError>> + Send;
+
+    /// Enriches GitHub pull request references with details from the GitHub API.
+    fn enrich_pull_requests(
+        &self,
+        user_id: &MacroUserId<Lowercase<'static>>,
+        pull_requests: Vec<GithubPullRequestRef>,
+    ) -> impl Future<Output = Result<Vec<EnrichedGithubPullRequest>, GithubError>> + Send;
+
+    /// Merges a pull request as the user, with their own GitHub grant, so
+    /// GitHub applies the user's permissions and branch protections.
+    ///
+    /// A merge GitHub declines is
+    /// [`GithubError::PullRequestMergeRejected`] with GitHub's message.
+    fn merge_pull_request(
+        &self,
+        user_id: &MacroUserId<Lowercase<'static>>,
+        request: MergeGithubPullRequestRequest,
+    ) -> impl Future<Output = Result<MergeGithubPullRequestResponse, GithubError>> + Send;
+
+    /// Converts a pull request to a draft, or marks it ready for review, as
+    /// the user with their own GitHub grant.
+    ///
+    /// A change GitHub declines is
+    /// [`GithubError::PullRequestUpdateRejected`] with GitHub's message.
+    fn set_pull_request_draft(
+        &self,
+        user_id: &MacroUserId<Lowercase<'static>>,
+        request: SetGithubPullRequestDraftRequest,
+    ) -> impl Future<Output = Result<SetGithubPullRequestDraftResponse, GithubError>> + Send;
+
+    /// Closes a pull request, or reopens it, as the user with their own
+    /// GitHub grant.
+    ///
+    /// A change GitHub declines is
+    /// [`GithubError::PullRequestUpdateRejected`] with GitHub's message.
+    fn set_pull_request_state(
+        &self,
+        user_id: &MacroUserId<Lowercase<'static>>,
+        request: SetGithubPullRequestStateRequest,
+    ) -> impl Future<Output = Result<SetGithubPullRequestStateResponse, GithubError>> + Send;
+
+    /// Reads whether each pull request merges cleanly into its base, as the
+    /// user sees it. More than
+    /// [`GithubPullRequestMergeabilityRequest::MAX`](crate::domain::models::GithubPullRequestMergeabilityRequest::MAX)
+    /// pull requests is [`GithubError::TooManyPullRequests`].
+    fn get_pull_request_mergeability(
+        &self,
+        user_id: &MacroUserId<Lowercase<'static>>,
+        pull_requests: Vec<GithubPullRequestNumber>,
+    ) -> impl Future<Output = Result<Vec<GithubPullRequestMergeabilityEntry>, GithubError>> + Send;
+}

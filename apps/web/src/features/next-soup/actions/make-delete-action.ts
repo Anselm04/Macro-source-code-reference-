@@ -1,0 +1,301 @@
+import { openBulkEditModal } from '@app/features/entity/bulk-edit/BulkEditEntityModal';
+import { t } from '@app/lib/i18n';
+import { globalSplitManager } from '@app/signal/splitLayout';
+import { globalRemoveFromSplitHistory } from '@components/app/split-layout/layoutUtils';
+import { toast } from '@core/component/Toast/Toast';
+import { fireAndForget } from '@core/util/fireAndForget';
+import { type EmailEntity, type EntityData, isEmailEntity } from '@entity';
+import ArrowCounterClockwise from '@icon/system/regular/arrow-counter-clockwise.svg?component-solid';
+import type { SoupRow } from '../create-soup-state';
+import { restoreSoupFocus, trashEmails } from '../utils';
+import type { EntityActionListState } from './entity-action-context';
+
+/**
+ * Move email threads to Trash and drop them from split history.
+ *
+ * Emails never reach the confirmation modal: `createBulkDeleteDssItemsMutation`
+ * cannot delete them at all, and the TRASH label is reversible, so the Undo
+ * toast is the safety net the modal gives everything else.
+ */
+function trashEmailThreads(emails: EmailEntity[]) {
+  const handle = trashEmails(
+    emails.map((email) => ({ id: email.id, linkId: email.linkId }))
+  );
+
+  const splitManager = globalSplitManager();
+  if (splitManager) {
+    const entityIdSet = new Set(emails.map(({ id }) => id));
+    globalRemoveFromSplitHistory(splitManager, (entry) =>
+      entityIdSet.has(entry.id)
+    );
+  }
+
+  return handle;
+}
+
+function reportTrashedEmails(
+  handle: ReturnType<typeof trashEmails>,
+  count: number
+) {
+  const toastId = toast.success(
+    count > 1
+      ? t('entityActions.toastMovedCountToTrash', { count })
+      : t('entityActions.toastMovedToTrash'),
+    {
+      dismissStyle: 'icon',
+      actionLayout: 'inline',
+      actions: [
+        {
+          label: t('entityActions.undo'),
+          icon: ArrowCounterClockwise,
+          onClick: () => {
+            if (toastId != null) toast.dismiss(toastId);
+            handle.undo().then(
+              () => toast.success(t('entityActions.toastRestoredFromTrash')),
+              () =>
+                toast.failure(t('entityActions.toastRestoreFromTrashFailed'))
+            );
+          },
+        },
+      ],
+      duration: 10_000,
+    }
+  );
+
+  // Surface background API failures
+  handle.done.catch(() => {
+    toast.failure(t('entityActions.toastMoveToTrashFailed'));
+  });
+}
+
+type MakeDeleteOptions = {
+  userId: () => string | undefined;
+  isTeamAdmin?: (teamId: string) => boolean;
+  onDeleted?: (entities: EntityData[]) => void;
+};
+
+/** Cleanup follows confirmed outcomes, not whether the dialog eventually closes. */
+function createDeletionCleanup() {
+  const deletedIds = new Set<string>();
+  return {
+    deletedIds,
+    confirm: (entities: EntityData[]) => {
+      const newlyDeleted = entities.filter((entity) => {
+        if (deletedIds.has(entity.id)) return false;
+        deletedIds.add(entity.id);
+        return true;
+      });
+      if (newlyDeleted.length === 0) return newlyDeleted;
+      const splitManager = globalSplitManager();
+      if (splitManager) {
+        const ids = new Set(newlyDeleted.map((entity) => entity.id));
+        globalRemoveFromSplitHistory(splitManager, (entry) =>
+          ids.has(entry.id)
+        );
+      }
+      return newlyDeleted;
+    },
+  };
+}
+
+export const makeDeleteAction = (options: MakeDeleteOptions) => {
+  const { userId } = options;
+
+  const canExecute = (entity: EntityData): boolean => {
+    if (entity.type === 'database') return entity.grant === 'owner';
+    if (entity.type === 'email') {
+      return true;
+    }
+    if (entity.type === 'channel') {
+      if (entity.ownerId === userId()) return true;
+      return (
+        entity.channelType === 'team' &&
+        !!entity.teamId &&
+        (options.isTeamAdmin?.(entity.teamId) ?? false)
+      );
+    }
+    // The types the delete mutation supports; it skips any other.
+    if (
+      entity.type !== 'agent_session' &&
+      entity.type !== 'document' &&
+      entity.type !== 'chat' &&
+      entity.type !== 'project' &&
+      entity.type !== 'call' &&
+      entity.type !== 'routine'
+    ) {
+      return false;
+    }
+    return entity.ownerId === userId();
+  };
+
+  const execute = async (entities: EntityData[]) => {
+    const emails = entities.filter(isEmailEntity);
+    const rest = entities.filter((e) => e.type !== 'email');
+
+    if (emails.length > 0) {
+      reportTrashedEmails(trashEmailThreads(emails), emails.length);
+      options.onDeleted?.(emails);
+    }
+
+    if (rest.length === 0) return;
+
+    const cleanup = createDeletionCleanup();
+    openBulkEditModal({
+      view: 'delete',
+      entities: rest,
+      onPartialDelete: (deleted) => {
+        const confirmed = cleanup.confirm(deleted);
+        if (confirmed.length > 0) options.onDeleted?.(confirmed);
+      },
+      onFinish: () => {
+        const confirmed = cleanup.confirm(rest);
+        toast.success(
+          rest.length > 1
+            ? t('entityActions.toastDeletedCount', { count: rest.length })
+            : t('entityActions.toastDeleted')
+        );
+        if (confirmed.length > 0) options.onDeleted?.(confirmed);
+      },
+    });
+  };
+
+  const executeWithSoup = async (
+    entities: EntityData[],
+    soup: EntityActionListState
+  ) => {
+    const currentIndex = soup.focus.index();
+    const nextRow =
+      soup.items.at(currentIndex + 1) ?? soup.items.at(currentIndex - 1);
+    const isFocusableRow = (row: SoupRow | undefined): row is SoupRow =>
+      row !== undefined &&
+      !row.getIsGrouped() &&
+      !row.getIsLoadMore() &&
+      (!row.group || row.group.isExpanded());
+    const captureAnchor = (row: SoupRow | undefined) =>
+      isFocusableRow(row)
+        ? { rowId: row.id, entityId: row.original.id }
+        : undefined;
+    const requestedIds = new Set(entities.map((entity) => entity.id));
+    const anchorNavigation = {
+      wrapNavigation: false,
+      skipGroupHeaders: true,
+      skipLoadMore: true,
+      skip: (row: SoupRow) => requestedIds.has(row.original.id),
+    };
+    // Capture identities while the focused row still exists. The immediate
+    // neighbour can belong to the selected block, so also remember the first
+    // non-target row on either side. Do not retain mutable row-store proxies.
+    const focusAnchors = [
+      captureAnchor(nextRow),
+      captureAnchor(soup.navigate.peekOffset(1, anchorNavigation)?.row),
+      captureAnchor(soup.navigate.peekOffset(-1, anchorNavigation)?.row),
+    ];
+
+    const emailEntities = entities.filter(isEmailEntity);
+    const nonEmailEntities = entities.filter((e) => e.type !== 'email');
+
+    const cleanup = createDeletionCleanup();
+    let remainingEntities: EntityData[] = nonEmailEntities;
+    let hadPartialDeletion = false;
+    const nextSurvivingRow = (alsoRemoved: string[] = []) => {
+      if (!hadPartialDeletion) return nextRow;
+      const removed = new Set([...cleanup.deletedIds, ...alsoRemoved]);
+      const survives = (row: SoupRow | undefined): row is SoupRow =>
+        isFocusableRow(row) && !removed.has(row.original.id);
+      for (const anchor of focusAnchors) {
+        if (!anchor || removed.has(anchor.entityId)) continue;
+        const keyed = soup.items.get(anchor.rowId);
+        const live =
+          keyed?.original.id === anchor.entityId
+            ? keyed
+            : soup.items.get(anchor.entityId);
+        if (survives(live) && live.original.id === anchor.entityId) return live;
+      }
+      // A concurrent refresh can remove both neighbours. Search around the
+      // captured position, not the now-missing focus (peekOffset would start
+      // from the first/last row). The index is bounded by the current list.
+      const count = soup.items.count();
+      if (count === 0) return undefined;
+      const start = Math.min(Math.max(currentIndex, 0), count - 1);
+      for (let index = start; index < count; index += 1) {
+        const row = soup.items.at(index);
+        if (survives(row)) return row;
+      }
+      for (let index = start - 1; index >= 0; index -= 1) {
+        const row = soup.items.at(index);
+        if (survives(row)) return row;
+      }
+      return undefined;
+    };
+    const advancePastDeleted = () => {
+      soup.selection.clear();
+      const next = nextSurvivingRow();
+      if (next || hadPartialDeletion) soup.focus.set(next?.id);
+      fireAndForget(restoreSoupFocus(next?.id), 'entity-actions');
+    };
+
+    const trashEmailEntities = () => {
+      const handle = trashEmailThreads(emailEntities);
+
+      soup.selection.clear();
+      const next = nextSurvivingRow(emailEntities.map((entity) => entity.id));
+      if (next || hadPartialDeletion) {
+        soup.focus.set(next?.id);
+      }
+
+      reportTrashedEmails(handle, emailEntities.length);
+
+      fireAndForget(restoreSoupFocus(next?.id), 'entity-actions');
+    };
+
+    if (nonEmailEntities.length > 0) {
+      // Handle non-email entities first via the bulk edit modal,
+      // then trash emails in onFinish so nextRow/focus are still valid.
+      openBulkEditModal({
+        view: 'delete',
+        entities: nonEmailEntities,
+        onPartialDelete: (deleted, remaining) => {
+          hadPartialDeletion = true;
+          remainingEntities = remaining;
+          soup.selection.clear();
+          cleanup.confirm(deleted);
+        },
+        onFinish: () => {
+          cleanup.confirm(nonEmailEntities);
+          toast.success(
+            nonEmailEntities.length > 1
+              ? t('entityActions.toastDeletedCount', {
+                  count: nonEmailEntities.length,
+                })
+              : t('entityActions.toastDeleted')
+          );
+
+          if (emailEntities.length > 0) {
+            trashEmailEntities();
+          } else {
+            advancePastDeleted();
+          }
+        },
+        onCancel: () => {
+          const firstRemaining = hadPartialDeletion
+            ? remainingEntities.find(
+                (entity) =>
+                  !cleanup.deletedIds.has(entity.id) &&
+                  soup.items.get(entity.id)
+              )
+            : nonEmailEntities[0];
+          const target =
+            firstRemaining?.id ??
+            (hadPartialDeletion ? nextSurvivingRow()?.id : undefined);
+          if (target || hadPartialDeletion) soup.focus.set(target);
+          fireAndForget(restoreSoupFocus(target), 'entity-actions');
+        },
+      });
+    } else if (emailEntities.length > 0) {
+      // Email-only selection: trash immediately
+      trashEmailEntities();
+    }
+  };
+
+  return { canExecute, execute, executeWithSoup };
+};

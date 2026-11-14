@@ -1,0 +1,527 @@
+/**
+ * Parse natural language date inputs like "today", "tomorrow", "next week", etc.
+ */
+
+import { differenceInCalendarDays } from 'date-fns';
+
+export type ParsedDate = {
+  date: Date;
+  displayFormat: string;
+  confidence: number; // 0-1, how confident we are in the parse
+};
+
+const WEEKDAYS = [
+  'sunday',
+  'monday',
+  'tuesday',
+  'wednesday',
+  'thursday',
+  'friday',
+  'saturday',
+];
+
+const WEEKDAY_ABBR: Record<string, number> = {
+  sun: 0,
+  sunday: 0,
+  mon: 1,
+  monday: 1,
+  mndy: 1,
+  tue: 2,
+  tues: 2,
+  tuesday: 2,
+  tu: 2,
+  wed: 3,
+  weds: 3,
+  wednes: 3,
+  wednesday: 3,
+  thu: 4,
+  thur: 4,
+  thurs: 4,
+  thursday: 4,
+  fri: 5,
+  friday: 5,
+  sat: 6,
+  saturday: 6,
+};
+
+const MONTHS = [
+  'january',
+  'february',
+  'march',
+  'april',
+  'may',
+  'june',
+  'july',
+  'august',
+  'september',
+  'october',
+  'november',
+  'december',
+];
+
+const MONTH_ABBR = [
+  'jan',
+  'feb',
+  'mar',
+  'apr',
+  'may',
+  'jun',
+  'jul',
+  'aug',
+  'sep',
+  'oct',
+  'nov',
+  'dec',
+];
+
+const TOMORROW_ALIASES = new Set([
+  'tomorrow',
+  'tom',
+  'tmrw',
+  'tmr',
+  'tomorow',
+  'tomoro',
+  'tmro',
+]);
+
+const YESTERDAY_ALIASES = new Set(['yesterday', 'yest', 'ystrdy', 'yday']);
+
+const TODAY_ALIASES = new Set(['today', 'tod']);
+
+function parseDateString(input: string): ParsedDate | null {
+  const normalized = input.toLowerCase().trim();
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  // Today
+  if (TODAY_ALIASES.has(normalized)) {
+    return {
+      date: new Date(today),
+      displayFormat: 'Today',
+      confidence: 1,
+    };
+  }
+
+  // Tomorrow
+  if (TOMORROW_ALIASES.has(normalized)) {
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return {
+      date: tomorrow,
+      displayFormat: 'Tomorrow',
+      confidence: 1,
+    };
+  }
+
+  // Yesterday
+  if (YESTERDAY_ALIASES.has(normalized)) {
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    return {
+      date: yesterday,
+      displayFormat: 'Yesterday',
+      confidence: 1,
+    };
+  }
+
+  // Next/This week
+  if (normalized === 'next week' || normalized === 'nw') {
+    const nextWeek = new Date(today);
+    nextWeek.setDate(nextWeek.getDate() + 7);
+    return {
+      date: nextWeek,
+      displayFormat: formatDate(nextWeek),
+      confidence: 1,
+    };
+  }
+
+  if (normalized === 'this week' || normalized === 'tw') {
+    // Get next Monday
+    const daysUntilMonday = (8 - today.getDay()) % 7 || 7;
+    const thisWeek = new Date(today);
+    thisWeek.setDate(thisWeek.getDate() + daysUntilMonday);
+    return {
+      date: thisWeek,
+      displayFormat: formatDate(thisWeek),
+      confidence: 0.9,
+    };
+  }
+
+  // Weekday names - use the abbreviation lookup for broader matching
+  const weekdayIndex = WEEKDAY_ABBR[normalized];
+  if (weekdayIndex !== undefined) {
+    const targetDay = weekdayIndex;
+    const currentDay = today.getDay();
+    let daysToAdd = targetDay - currentDay;
+
+    // If the day has passed this week or it's today, get next week's
+    if (daysToAdd <= 0) {
+      daysToAdd += 7;
+    }
+
+    const targetDate = new Date(today);
+    targetDate.setDate(targetDate.getDate() + daysToAdd);
+
+    return {
+      date: targetDate,
+      displayFormat: formatDate(targetDate),
+      confidence: normalized === WEEKDAYS[weekdayIndex] ? 1 : 0.9,
+    };
+  }
+
+  // Fallback: try prefix matching for weekdays (e.g., "mo" for Monday)
+  for (let i = 0; i < WEEKDAYS.length; i++) {
+    if (WEEKDAYS[i].startsWith(normalized) && normalized.length >= 2) {
+      const targetDay = i;
+      const currentDay = today.getDay();
+      let daysToAdd = targetDay - currentDay;
+
+      if (daysToAdd <= 0) {
+        daysToAdd += 7;
+      }
+
+      const targetDate = new Date(today);
+      targetDate.setDate(targetDate.getDate() + daysToAdd);
+
+      return {
+        date: targetDate,
+        displayFormat: formatDate(targetDate),
+        confidence: 0.8,
+      };
+    }
+  }
+
+  // Month names (with optional day and year)
+  for (let i = 0; i < MONTHS.length; i++) {
+    if (
+      normalized.startsWith(MONTHS[i]) ||
+      normalized.startsWith(MONTH_ABBR[i])
+    ) {
+      // Extract day and year if present
+      const parts = normalized.split(/\s+/);
+      let day = 1;
+      let year = today.getFullYear();
+
+      if (parts.length > 1) {
+        const dayPart = parts[1].replace(/[^\d]/g, '');
+        if (dayPart) {
+          day = parseInt(dayPart, 10);
+          if (isNaN(day) || day < 1 || day > 31) {
+            day = 1;
+          }
+        }
+      }
+
+      // Check for year in third part
+      if (parts.length > 2) {
+        const yearPart = parts[2].replace(/[^\d]/g, '');
+        if (yearPart) {
+          const parsedYear = parseInt(yearPart, 10);
+          if (!isNaN(parsedYear)) {
+            // Handle 2-digit years
+            if (parsedYear >= 0 && parsedYear <= 99) {
+              // Assume 00-50 means 2000-2050, 51-99 means 1951-1999
+              year = parsedYear <= 50 ? 2000 + parsedYear : 1900 + parsedYear;
+            } else if (parsedYear >= 1900 && parsedYear <= 2100) {
+              year = parsedYear;
+            }
+          }
+        }
+      }
+
+      const targetDate = new Date(year, i, day);
+
+      // Only apply "next year" logic if no year was explicitly provided
+      if (parts.length <= 2 && targetDate < today) {
+        targetDate.setFullYear(targetDate.getFullYear() + 1);
+      }
+
+      return {
+        date: targetDate,
+        displayFormat: formatDate(targetDate),
+        confidence: parts.length > 2 ? 0.95 : parts.length > 1 ? 0.9 : 0.7,
+      };
+    }
+  }
+
+  // Relative days (in X days)
+  const inDaysMatch = normalized.match(/^in\s+(\d+)\s+days?$/);
+  if (inDaysMatch) {
+    const days = parseInt(inDaysMatch[1], 10);
+    if (!isNaN(days) && days > 0 && days < 365) {
+      const targetDate = new Date(today);
+      targetDate.setDate(targetDate.getDate() + days);
+      return {
+        date: targetDate,
+        displayFormat: formatDate(targetDate),
+        confidence: 1,
+      };
+    }
+  }
+
+  // Next month
+  if (normalized === 'next month' || normalized === 'nm') {
+    const nextMonth = new Date(today);
+    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    nextMonth.setDate(1);
+    return {
+      date: nextMonth,
+      displayFormat: formatDate(nextMonth),
+      confidence: 0.9,
+    };
+  }
+
+  // Date formats (MM/DD, DD/MM depending on locale)
+  const dateMatch = normalized.match(/^(\d{1,2})[\/\-](\d{1,2})$/);
+  if (dateMatch) {
+    const [, first, second] = dateMatch;
+    const month = parseInt(first, 10) - 1; // Assume MM/DD for now
+    const day = parseInt(second, 10);
+
+    if (month >= 0 && month < 12 && day >= 1 && day <= 31) {
+      const targetDate = new Date(today.getFullYear(), month, day);
+
+      // If the date has passed this year, use next year
+      if (targetDate < today) {
+        targetDate.setFullYear(targetDate.getFullYear() + 1);
+      }
+
+      return {
+        date: targetDate,
+        displayFormat: formatDate(targetDate),
+        confidence: 0.8,
+      };
+    }
+  }
+
+  // Date formats with year (MM/DD/YYYY or DD/MM/YYYY)
+  const dateWithYearMatch = normalized.match(
+    /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/
+  );
+  if (dateWithYearMatch) {
+    const [, first, second, yearStr] = dateWithYearMatch;
+    const month = parseInt(first, 10) - 1; // Assume MM/DD/YYYY for now
+    const day = parseInt(second, 10);
+    let year = parseInt(yearStr, 10);
+
+    // Handle 2-digit years
+    if (year >= 0 && year <= 99) {
+      year = year <= 50 ? 2000 + year : 1900 + year;
+    }
+
+    if (
+      month >= 0 &&
+      month < 12 &&
+      day >= 1 &&
+      day <= 31 &&
+      year >= 1900 &&
+      year <= 2100
+    ) {
+      const targetDate = new Date(year, month, day);
+
+      return {
+        date: targetDate,
+        displayFormat: formatDate(targetDate),
+        confidence: 0.9,
+      };
+    }
+  }
+
+  return null;
+}
+
+export function formatDate(date: Date): string {
+  // Check if it's today or tomorrow for special formatting
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const tomorrow = new Date(today);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+
+  const dateOnly = new Date(date);
+  dateOnly.setHours(0, 0, 0, 0);
+
+  if (dateOnly.getTime() === today.getTime()) {
+    return 'Today';
+  } else if (dateOnly.getTime() === tomorrow.getTime()) {
+    return 'Tomorrow';
+  }
+
+  // Calculate if we should show the year
+  const oneMonthFromNow = new Date(today);
+  oneMonthFromNow.setMonth(oneMonthFromNow.getMonth() + 1);
+
+  const isPastDate = dateOnly.getTime() < today.getTime();
+  const isMoreThanOneMonthInFuture =
+    dateOnly.getTime() > oneMonthFromNow.getTime();
+  const shouldShowYear = isPastDate || isMoreThanOneMonthInFuture;
+
+  const options: Intl.DateTimeFormatOptions = {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  };
+
+  // Include year if date is in the past or more than one month in the future
+  if (shouldShowYear) {
+    options.year = 'numeric';
+  }
+
+  return date.toLocaleDateString('en-US', options);
+}
+
+/**
+ * Read a date chip's `date`. A bare `YYYY-MM-DD` names a whole local day;
+ * `new Date` would read it as UTC midnight, the previous day west of
+ * Greenwich. Anything else is a timestamp.
+ */
+export function parseMentionDate(value: string): Date {
+  const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!day) return new Date(value);
+  const [year, month, date] = day.slice(1).map(Number);
+  // The Date constructor reads years 0-99 as 1900-1999; setFullYear does not.
+  const local = new Date(0, 0, 1);
+  local.setFullYear(year, month - 1, date);
+  return local.getMonth() === month - 1 ? local : new Date(Number.NaN);
+}
+
+/**
+ * Day-relative label for dates near now — "Today", "Yesterday", "2 days ago",
+ * "Tomorrow", "In 2 days" — falling back to `formatDate` beyond that window.
+ * (Moved from the DateMention decorator so lists can share it.)
+ */
+export function formatRelativeDay(date: Date): string {
+  const diff = differenceInCalendarDays(date, new Date());
+  switch (diff) {
+    case -2:
+      return '2 days ago';
+    case -1:
+      return 'Yesterday';
+    case 0:
+      return 'Today';
+    case 1:
+      return 'Tomorrow';
+    case 2:
+      return 'In 2 days';
+    default:
+      return formatDate(date);
+  }
+}
+
+/**
+ * Full date for a mention tooltip, with the time of day for dates near now.
+ * (Moved from the DateMention decorator so spreadsheet chips can share it.)
+ */
+export function formatTooltipDate(date: Date): string {
+  const diff = Math.abs(differenceInCalendarDays(date, new Date()));
+  const options: Intl.DateTimeFormatOptions = {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+  };
+  if (diff <= 5) {
+    options.hour = 'numeric';
+    options.minute = '2-digit';
+    options.hour12 = true;
+  }
+  return date.toLocaleDateString('en-US', options);
+}
+
+function _getDateSuggestions(input: string): ParsedDate[] {
+  const suggestions: ParsedDate[] = [];
+  const normalized = input.toLowerCase().trim();
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  // Suggest today if query matches any alias or prefix
+  const todayMatches =
+    [...TODAY_ALIASES].some((alias) => alias.startsWith(normalized)) ||
+    'today'.startsWith(normalized);
+  if (todayMatches && normalized.length > 0) {
+    suggestions.push({
+      date: new Date(today),
+      displayFormat: 'Today',
+      confidence: 1,
+    });
+  }
+
+  // Suggest tomorrow if query matches any alias or prefix
+  const tomorrowMatches =
+    [...TOMORROW_ALIASES].some((alias) => alias.startsWith(normalized)) ||
+    'tomorrow'.startsWith(normalized);
+  if (tomorrowMatches && normalized.length > 0) {
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    suggestions.push({
+      date: tomorrow,
+      displayFormat: 'Tomorrow',
+      confidence: 1,
+    });
+  }
+
+  // Weekday suggestions - check both full names and abbreviations
+  const matchedWeekdays = new Set<number>();
+
+  // Check against abbreviation lookup
+  for (const [abbr, dayIndex] of Object.entries(WEEKDAY_ABBR)) {
+    if (abbr.startsWith(normalized) && normalized.length > 0) {
+      matchedWeekdays.add(dayIndex);
+    }
+  }
+
+  // Also check prefix matching on full weekday names
+  for (let i = 0; i < WEEKDAYS.length; i++) {
+    if (WEEKDAYS[i].startsWith(normalized) && normalized.length > 1) {
+      matchedWeekdays.add(i);
+    }
+  }
+
+  for (const targetDay of matchedWeekdays) {
+    const currentDay = today.getDay();
+    let daysToAdd = targetDay - currentDay;
+
+    if (daysToAdd <= 0) {
+      daysToAdd += 7;
+    }
+
+    const targetDate = new Date(today);
+    targetDate.setDate(targetDate.getDate() + daysToAdd);
+
+    suggestions.push({
+      date: targetDate,
+      displayFormat: formatDate(targetDate),
+      confidence: 0.8,
+    });
+  }
+
+  // Month suggestions
+  for (let i = 0; i < MONTHS.length; i++) {
+    if (MONTHS[i].startsWith(normalized) && normalized.length > 1) {
+      const targetDate = new Date(today.getFullYear(), i, 1);
+      targetDate.setHours(0, 0, 0, 0);
+
+      // If the month has passed this year, use next year
+      if (targetDate < today) {
+        targetDate.setFullYear(targetDate.getFullYear() + 1);
+      }
+
+      suggestions.push({
+        date: targetDate,
+        displayFormat: formatDate(targetDate),
+        confidence: 0.7,
+      });
+    }
+  }
+
+  // Try to parse the full input
+  const parsed = parseDateString(normalized);
+  if (
+    parsed &&
+    !suggestions.some((s) => s.date.getTime() === parsed.date.getTime())
+  ) {
+    suggestions.push(parsed);
+  }
+
+  // Sort by confidence and limit
+  return suggestions.sort((a, b) => b.confidence - a.confidence).slice(0, 5);
+}

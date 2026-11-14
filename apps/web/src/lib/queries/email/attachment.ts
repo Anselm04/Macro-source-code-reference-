@@ -1,0 +1,319 @@
+import { toast } from '@core/component/Toast/Toast';
+import {
+  nativeUploadChecksum,
+  resolveUploadSource,
+  uploadNativeStagedFileToPresignedUrl,
+} from '@core/mobile/nativeStagedUpload';
+import { throwOnErr } from '@core/util/result';
+import { type MutationCallbacks, withCallbacks } from '@queries/utils';
+import { emailClient } from '@service-email/client';
+import { uploadToPresignedUrl } from '@service-storage/util/uploadToPresignedUrl';
+import { useMutation } from '@tanstack/solid-query';
+
+type UploadDraftAttachmentsParams = {
+  draftID: string;
+  draftGeneration?: number;
+  attachments: File[];
+  /** Target inbox for a non-primary inbox; sent as the X-Email-Link-Id header. */
+  linkId?: string;
+  /**
+   * Called as soon as the attachment record exists, before the content upload.
+   * Callers must record the id here rather than after the mutation settles --
+   * the content upload can take a long time, and a debounced draft save that
+   * still sees the file without an id would add it to the draft a second time.
+   */
+  onAttachmentAdded?: (
+    file: File,
+    attachmentID: string
+  ) => void | Promise<void>;
+  onAttachmentUploaded?: (
+    file: File,
+    attachmentID: string
+  ) => void | Promise<void>;
+  /**
+   * Called when the content upload fails, once its attachment record has been
+   * confirmed removed from the draft, so the file becomes eligible for a
+   * retry. Not called when the removal itself fails -- retrying a file whose
+   * record survived would duplicate it on the draft.
+   */
+  onAttachmentUploadFailed?: (file: File) => void;
+};
+
+class UploadDraftAttachmentError extends Error {
+  constructor(
+    message: string,
+    opts: { cause?: unknown },
+    public context: { attachmentID: string; file: File }
+  ) {
+    super(message, { cause: opts.cause });
+  }
+}
+
+// A retried reservation must converge even when its first response was lost.
+const uploadIds = new WeakMap<File, Map<string, string>>();
+function uploadId(file: File, draft: string): string {
+  let drafts = uploadIds.get(file);
+  if (!drafts) {
+    drafts = new Map();
+    uploadIds.set(file, drafts);
+  }
+  let id = drafts.get(draft);
+  if (!id) {
+    id = crypto.randomUUID();
+    drafts.set(draft, id);
+  }
+  return id;
+}
+
+export async function completeDraftAttachment(input: {
+  draftId: string;
+  draftGeneration?: number;
+  attachmentId: string;
+  inboxId?: string;
+}): Promise<void> {
+  try {
+    await throwOnErr(() =>
+      emailClient.completeDraftAttachment(
+        {
+          draftID: input.draftId,
+          attachmentID: input.attachmentId,
+          draftGeneration: input.draftGeneration,
+        },
+        input.inboxId
+      )
+    );
+  } catch (error) {
+    toast.failure(
+      'Attachment upload is unfinished. Retry the upload or remove the file.'
+    );
+    throw error;
+  }
+}
+
+export const useUploadDraftAttachmentsMutation = (
+  callbacks?: MutationCallbacks<void, Error, UploadDraftAttachmentsParams>
+) => {
+  return useMutation(() => ({
+    mutationFn: async (params: UploadDraftAttachmentsParams) => {
+      for (const attachment of params.attachments) {
+        const source = await resolveUploadSource(attachment);
+
+        const result = await throwOnErr(
+          async () =>
+            await emailClient.addDraftAttachment(
+              {
+                draftID: params.draftID,
+                draftGeneration: params.draftGeneration,
+                attachment: {
+                  upload_id: uploadId(attachment, params.draftID),
+                  file_name: attachment.name,
+                  size: source.size,
+                  sha: source.sha,
+                },
+              },
+              params.linkId
+            )
+        );
+
+        // Any content-upload failure must become an UploadDraftAttachmentError
+        // so onError removes the record and clears the id -- a plain throw from
+        // the fetch (network drop, abort) would otherwise leave the id in
+        // place and the broken record would never be retried.
+        const context = {
+          attachmentID: result.attachment_id,
+          file: attachment,
+        };
+        try {
+          await params.onAttachmentAdded?.(attachment, result.attachment_id);
+          if (source.kind === 'staged') {
+            await uploadNativeStagedFileToPresignedUrl(
+              { ...source.staged, mimeType: result.content_type },
+              result.upload_url,
+              nativeUploadChecksum(source.sha)
+            );
+          } else {
+            const uploaded = await uploadToPresignedUrl({
+              presignedUrl: result.upload_url,
+              sha: source.sha,
+              buffer: source.file,
+              type: result.content_type,
+            });
+            if (uploaded.isErr()) {
+              const uploadError = uploaded.error[0] ?? {
+                code: 'SERVER_ERROR',
+                message: 'Upload failed',
+              };
+              throw new UploadDraftAttachmentError(
+                uploadError.message,
+                { cause: uploadError.code },
+                context
+              );
+            }
+          }
+          await completeDraftAttachment({
+            draftId: params.draftID,
+            draftGeneration: params.draftGeneration,
+            attachmentId: result.attachment_id,
+            inboxId: params.linkId,
+          });
+        } catch (cause) {
+          if (cause instanceof UploadDraftAttachmentError) throw cause;
+          throw new UploadDraftAttachmentError(
+            'Upload failed',
+            { cause },
+            context
+          );
+        }
+        // Upload succeeded. A failed local receipt must not delete server data.
+        await params.onAttachmentUploaded?.(attachment, result.attachment_id);
+      }
+    },
+    ...withCallbacks<void, Error, UploadDraftAttachmentsParams>(
+      {
+        async onError(error, variables) {
+          if (error instanceof UploadDraftAttachmentError) {
+            try {
+              await throwOnErr(
+                async () =>
+                  await emailClient.removeDraftAttachment(
+                    {
+                      draftID: variables.draftID,
+                      draftGeneration: variables.draftGeneration,
+                      attachmentID: error.context.attachmentID,
+                    },
+                    variables.linkId
+                  )
+              );
+              uploadIds.delete(error.context.file);
+              variables.onAttachmentUploadFailed?.(error.context.file);
+            } catch {
+              console.error('Unable to remove draft attachment after failure');
+            }
+          }
+          toast.failure('Failed to save attachments');
+        },
+      },
+      callbacks
+    ),
+  }));
+};
+
+type RemoveDraftAttachmentParams = {
+  draftID: string;
+  draftGeneration?: number;
+  attachmentID: string;
+  /** Target inbox for a non-primary inbox; sent as the X-Email-Link-Id header. */
+  linkId?: string;
+};
+
+export const useRemoveDraftAttachmentMutation = (
+  callbacks?: MutationCallbacks<void, Error, RemoveDraftAttachmentParams>
+) => {
+  return useMutation(() => ({
+    mutationFn: async (params: RemoveDraftAttachmentParams) => {
+      await throwOnErr(
+        async () =>
+          await emailClient.removeDraftAttachment(
+            {
+              draftID: params.draftID,
+              draftGeneration: params.draftGeneration,
+              attachmentID: params.attachmentID,
+            },
+            params.linkId
+          )
+      );
+    },
+    ...withCallbacks<void, Error, RemoveDraftAttachmentParams>(
+      {
+        onError() {
+          toast.failure('Failed to remove draft attachment');
+        },
+      },
+      callbacks
+    ),
+  }));
+};
+
+type AddForwardedAttachmentsParams = {
+  draftID: string;
+  draftGeneration?: number;
+  attachments: { attachmentID: string }[];
+  /** Target inbox for a non-primary inbox; sent as the X-Email-Link-Id header. */
+  linkId?: string;
+};
+
+export const useAddForwardedAttachmentsMutation = (
+  callbacks?: MutationCallbacks<void, Error, AddForwardedAttachmentsParams>
+) => {
+  return useMutation(() => ({
+    mutationFn: async (params: AddForwardedAttachmentsParams) => {
+      for (const att of params.attachments) {
+        await throwOnErr(
+          async () =>
+            await emailClient.addForwardedAttachment(
+              {
+                draftID: params.draftID,
+                draftGeneration: params.draftGeneration,
+                attachmentID: att.attachmentID,
+              },
+              params.linkId
+            )
+        );
+      }
+    },
+    ...withCallbacks<void, Error, AddForwardedAttachmentsParams>(
+      {
+        onError() {
+          toast.failure('Failed to add forwarded attachments');
+        },
+      },
+      callbacks
+    ),
+  }));
+};
+
+type RemoveForwardedAttachmentParams = {
+  draftID: string;
+  draftGeneration?: number;
+  attachmentID: string;
+  /** Target inbox for a non-primary inbox; sent as the X-Email-Link-Id header. */
+  linkId?: string;
+};
+
+export const useRemoveForwardedAttachmentMutation = (
+  callbacks?: MutationCallbacks<void, Error, RemoveForwardedAttachmentParams>
+) => {
+  return useMutation(() => ({
+    mutationFn: async (params: RemoveForwardedAttachmentParams) => {
+      await throwOnErr(
+        async () =>
+          await emailClient.removeForwardedAttachment(
+            {
+              draftID: params.draftID,
+              draftGeneration: params.draftGeneration,
+              attachmentID: params.attachmentID,
+            },
+            params.linkId
+          )
+      );
+    },
+    ...withCallbacks<void, Error, RemoveForwardedAttachmentParams>(
+      {
+        onError() {
+          toast.failure('Failed to remove forwarded attachment');
+        },
+      },
+      callbacks
+    ),
+  }));
+};
+
+/** Resolve a fresh authorized URL; provider IDs and storage keys stay server-side. */
+export async function getEmailAttachmentDownloadUrl(
+  id: string
+): Promise<string> {
+  const response = await throwOnErr(() => emailClient.getAttachmentUrl({ id }));
+  const url = response.attachment.data_url;
+  if (!url) throw new Error('Attachment download is unavailable');
+  return url;
+}

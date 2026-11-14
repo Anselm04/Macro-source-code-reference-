@@ -1,0 +1,690 @@
+/**
+ * The engine's browser row source: tables are read as Soup database rows through the
+ * normalized cache, newest first. People joins accept only bounded explicit keys
+ * and read them from local Turso; an unbounded directory request is refused.
+ */
+
+import { readRecordsByKeys, selectRecords } from '@app/lib/graphql-cache';
+import type {
+  DatabaseSqlFetchFailure,
+  DatabaseSqlSourceFailure,
+  RowSource,
+} from '@core/database-sql/driver';
+import type {
+  Bin,
+  Catalog,
+  Cell,
+  GqlQuery,
+  KeyHint,
+  Page,
+  Propf,
+  Row,
+} from '@core/database-sql/generated/types';
+import type { DatabaseSqlStepTrace } from '@core/database-sql/trace';
+import { abortedBy } from '@core/util/abort-signal';
+import type { CacheHost } from '@graphql-cache/host/types';
+import { buildGraphqlEntitySoupInput } from '@queries/soup/graphql/entity-input';
+import {
+  materializeReconciledSoup,
+  soupReconciliationBaseline,
+} from '@queries/soup/graphql/reconciliation';
+import {
+  type DatabaseRowFieldsFragment,
+  DatabaseRowFieldsFragmentDoc,
+  DatabaseRowsDocument,
+  type DatabaseRowsQuery,
+  type DatabaseRowsQueryVariables,
+  type GraphqlDatabaseRowExpr,
+  type GraphqlEntityFilterAst,
+  type GraphqlFilterPropertiesExpr,
+  GroupSoupDocument,
+  type GroupSoupQuery,
+  type GroupSoupQueryVariables,
+  type SoupInput,
+  type SoupPropertyValueFieldsFragment,
+} from '@service-storage/graphql/generated/graphql';
+import {
+  type AnyVariables,
+  type Client,
+  createRequest,
+  type DocumentInput,
+  getOperationName,
+  type OperationResult,
+  type RequestPolicy,
+  stringifyDocument,
+} from '@urql/core';
+import { err, errAsync, ok, okAsync, Result, ResultAsync } from 'neverthrow';
+import { match, P } from 'ts-pattern';
+import { NIL as NIL_UUID } from 'uuid';
+import {
+  concat,
+  filter,
+  fromValue,
+  map,
+  merge,
+  pipe,
+  take,
+  toPromise,
+} from 'wonka';
+
+interface GraphqlRowSourceCapabilities {
+  /** The app's GraphQL client; its exchanges decide cache or network. */
+  client: Client;
+  /** The statement's catalog, for the value kinds of grouped columns. */
+  catalog: Catalog;
+  requestPolicy: RequestPolicy;
+  /** Probe the cache without subscribing to a shared urql operation. */
+  cache?: Pick<CacheHost, 'readQuery'>;
+  /**
+   * Table membership as the local filter index knows it. A read from the
+   * network records each first page as evidence; a later read with
+   * `reconcile` set answers a table that fit in one page from the cache's
+   * index instead, so rows the cache learned about since show up.
+   */
+  membership?: LocalMembership;
+  /** Bounded keys only; this capability must never enumerate the directory. */
+  people?: (ids: string[]) => ResultAsync<Row[], DatabaseSqlSourceFailure>;
+  /** Ends the source's network reads once the run that made it is replaced. */
+  signal?: AbortSignal;
+}
+
+/** Local reconciliation for first pages, shared across runs of a statement. */
+export interface LocalMembership {
+  host: Pick<CacheHost, 'entityFilter' | 'readRecordsByKeys'>;
+  /** The last network first page for each Soup input. */
+  baselines: Map<
+    string,
+    { items: readonly DatabaseRowFieldsFragment[]; complete: boolean }
+  >;
+  reconcile: boolean;
+}
+
+/** Past this many join values a narrowed filter costs more than it saves. */
+const MAX_KEY_HINT_VALUES = 100;
+
+type DatabaseRowItem = Extract<
+  DatabaseRowFieldsFragment,
+  { __typename: 'GraphqlSoupDatabaseRow' }
+>;
+
+const rowSelection = selectRecords(DatabaseRowFieldsFragmentDoc);
+
+function fetchFailure(message: string): DatabaseSqlFetchFailure {
+  return { kind: 'fetch', message };
+}
+
+/** Anything the source could not read is a fetch failure, in its own words. */
+function thrownFetchFailure(thrown: unknown): DatabaseSqlFetchFailure {
+  return fetchFailure(
+    thrown instanceof Error ? thrown.message : String(thrown)
+  );
+}
+
+/** How a query settled: answered, ended without an answer, or aborted. */
+type QuerySettled<Data, Variables extends AnyVariables> =
+  | { kind: 'answered'; result: OperationResult<Data, Variables> }
+  | { kind: 'ended' }
+  | { kind: 'aborted' };
+
+/**
+ * One GraphQL read inside the step's trace; a GraphQL error or a missing
+ * answer is a fetch failure.
+ */
+function graphqlQuery<Data, Variables extends AnyVariables>(
+  client: Client,
+  document: DocumentInput<Data, Variables>,
+  variables: Variables,
+  requestPolicy: RequestPolicy,
+  name: string,
+  step: DatabaseSqlStepTrace,
+  cache?: Pick<CacheHost, 'readQuery'>,
+  signal?: AbortSignal
+): ResultAsync<Data, DatabaseSqlFetchFailure> {
+  step.request(stringifyDocument(document), variables);
+  const network = () =>
+    ResultAsync.fromPromise(
+      pipe(
+        merge<QuerySettled<Data, Variables>>([
+          concat<QuerySettled<Data, Variables>>([
+            pipe(
+              client.query(document, variables, {
+                requestPolicy:
+                  cache && requestPolicy === 'cache-first'
+                    ? 'network-only'
+                    : requestPolicy,
+                fetchOptions: { headers: step.headers() },
+              }),
+              // The answer, as urql's own toPromise takes it.
+              filter((result) => !result.stale && !result.hasNext),
+              map((result) => ({ kind: 'answered' as const, result }))
+            ),
+            fromValue({ kind: 'ended' as const }),
+          ]),
+          pipe(
+            abortedBy(signal),
+            map(() => ({ kind: 'aborted' as const }))
+          ),
+        ]),
+        take(1),
+        toPromise
+      ),
+      thrownFetchFailure
+    ).andThen((settled): Result<Data, DatabaseSqlFetchFailure> => {
+      if (settled.kind === 'aborted')
+        return err(fetchFailure(`the ${name} query was cancelled`));
+      if (settled.kind === 'ended')
+        return err(fetchFailure(`the ${name} query ended without data`));
+      const { result } = settled;
+      if (result.error) return err(fetchFailure(result.error.message));
+      if (!result.data)
+        return err(fetchFailure(`the ${name} query returned no data`));
+      return ok(result.data);
+    });
+  // Cache probes must not register an urql operation: a simultaneous refresh
+  // with the same key would join that probe and never send a network request.
+  if (
+    cache &&
+    (requestPolicy === 'cache-only' || requestPolicy === 'cache-first')
+  ) {
+    return ResultAsync.fromPromise(
+      cache.readQuery({
+        query: stringifyDocument(document),
+        operationName: getOperationName(
+          createRequest(document, variables).query
+        ),
+        variables: variables || undefined,
+      }),
+      thrownFetchFailure
+    )
+      .orElse(() => okAsync({ kind: 'miss' as const }))
+      .andThen((result) =>
+        result.kind === 'hit'
+          ? okAsync(result.data as Data)
+          : requestPolicy === 'cache-only'
+            ? errAsync(fetchFailure(`the ${name} query returned no data`))
+            : network()
+      );
+  }
+  return network();
+}
+
+function peoplePage(
+  ids: string[] | null,
+  cursor: string | null,
+  limit: number,
+  read: GraphqlRowSourceCapabilities['people']
+): ResultAsync<Page, DatabaseSqlSourceFailure> {
+  if (!ids || ids.length > MAX_KEY_HINT_VALUES)
+    return errAsync({
+      kind: 'rejected',
+      message:
+        'A people join requires bounded identity keys; narrow the preceding relation',
+    });
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500)
+    return errAsync({
+      kind: 'rejected',
+      message: 'Invalid people lookup limit',
+    });
+  const keys = [...new Set(ids)];
+  const offset = cursor === null ? 0 : Number(cursor);
+  if (
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    offset > keys.length ||
+    (cursor !== null && cursor !== String(offset))
+  )
+    return errAsync({
+      kind: 'rejected',
+      message: 'Invalid people lookup cursor',
+    });
+  if (offset === keys.length) return okAsync({ rows: [], next: null });
+  if (!read)
+    return errAsync({
+      kind: 'rejected',
+      message: 'Local people SQL is unavailable on this client',
+    });
+  const page = keys.slice(offset, offset + limit);
+  return read(page).map((rows) => ({
+    rows,
+    next:
+      offset + page.length < keys.length ? String(offset + page.length) : null,
+  }));
+}
+
+export function createGraphqlRowSource({
+  client,
+  catalog,
+  requestPolicy,
+  cache,
+  membership,
+  people,
+  signal,
+}: GraphqlRowSourceCapabilities): RowSource {
+  return {
+    page: (query, _needs, cursor, limit, step) =>
+      match(query)
+        .returnType<ResultAsync<Page, DatabaseSqlSourceFailure>>()
+        .with({ type: 'soup' }, (soup) =>
+          soupInput(soup, cursor, limit).asyncAndThen((input) =>
+            soupPage(
+              client,
+              requestPolicy,
+              input,
+              membership,
+              step,
+              cache,
+              signal
+            )
+          )
+        )
+        .with({ type: 'people' }, (query) =>
+          peoplePage(query.ids, cursor, limit, people)
+        )
+        .with({ type: 'groupSoup' }, () =>
+          errAsync(fetchFailure('a grouped query is read as bins, not pages'))
+        )
+        .exhaustive(() =>
+          errAsync(fetchFailure('an unknown query has no pages'))
+        ),
+    bins: (query, step) =>
+      match(query)
+        .returnType<ResultAsync<Bin[], DatabaseSqlFetchFailure>>()
+        .with({ type: 'groupSoup' }, (grouped) =>
+          groupBins(
+            client,
+            requestPolicy,
+            catalog,
+            grouped,
+            step,
+            cache,
+            signal
+          )
+        )
+        .with({ type: P.union('soup', 'people') }, () =>
+          errAsync(fetchFailure('only a grouped query has bins'))
+        )
+        .exhaustive(() =>
+          errAsync(fetchFailure('only a grouped query has bins'))
+        ),
+  };
+}
+
+/** Rows of one table and nothing else, with the pushed-down filter. */
+function tableFilters(
+  table: string,
+  propf: Propf | null,
+  keyHint: KeyHint | null
+): Result<GraphqlEntityFilterAst, DatabaseSqlFetchFailure> {
+  const base = buildGraphqlEntitySoupInput('DATABASE_ROW', NIL_UUID)?.initial
+    ?.filters;
+  if (!base)
+    return err(fetchFailure('a database row Soup input is unavailable'));
+  let rows: GraphqlDatabaseRowExpr = { literal: { tableId: table } };
+  let properties = propf ? propertiesExpression(propf) : undefined;
+  const hint = keyHint ? narrowing(keyHint) : undefined;
+  if (hint?.kind === 'rows')
+    rows = { and: { left: rows, right: hint.expression } };
+  if (hint?.kind === 'properties') {
+    properties = properties
+      ? { and: { left: properties, right: hint.expression } }
+      : hint.expression;
+  }
+  return ok({
+    ...base,
+    databaseRowFilter: rows,
+    ...(properties ? { propertiesFilter: properties } : {}),
+  });
+}
+
+function soupInput(
+  { table, propf, keyHint }: Extract<GqlQuery, { type: 'soup' }>,
+  cursor: string | null,
+  limit: number
+): Result<SoupInput, DatabaseSqlFetchFailure> {
+  if (cursor) {
+    return ok({
+      continuation: { cursor, expand: true, sortDirection: 'DESC' },
+    });
+  }
+  return tableFilters(table, propf, keyHint).map((filters) => ({
+    initial: {
+      limit,
+      expand: true,
+      sortMethod: 'CREATED_AT',
+      sortDirection: 'DESC',
+      filters,
+    },
+  }));
+}
+
+/** The engine's `propf` wire form as the GraphQL properties filter. */
+function propertiesExpression(propf: Propf): GraphqlFilterPropertiesExpr {
+  return match(propf)
+    .returnType<GraphqlFilterPropertiesExpr>()
+    .with({ '&': P.nonNullable }, ({ '&': [left, right] }) => ({
+      and: {
+        left: propertiesExpression(left),
+        right: propertiesExpression(right),
+      },
+    }))
+    .with({ '|': P.nonNullable }, ({ '|': [left, right] }) => ({
+      or: {
+        left: propertiesExpression(left),
+        right: propertiesExpression(right),
+      },
+    }))
+    .with({ '!': P.nonNullable }, ({ '!': inner }) => ({
+      not: propertiesExpression(inner),
+    }))
+    .with({ l: P.nonNullable }, ({ l: { pd, v } }) => ({
+      literal: {
+        propertyDefinitionId: pd,
+        value: match(v)
+          .with({ so: P.string }, ({ so }) => ({ selectOption: so }))
+          .with({ er: P.string }, ({ er }) => ({ entityRef: er }))
+          .exhaustive(() => ({ entityRef: NIL_UUID })),
+      },
+    }))
+    .exhaustive(() => ({
+      literal: {
+        propertyDefinitionId: NIL_UUID,
+        value: { entityRef: NIL_UUID },
+      },
+    }));
+}
+
+/** A balanced OR keeps a long list inside the filter depth limit. */
+function balancedOr<Expression>(
+  items: Expression[],
+  or: (left: Expression, right: Expression) => Expression
+): Expression | undefined {
+  if (items.length < 2) return items[0];
+  const middle = Math.floor(items.length / 2);
+  const left = balancedOr(items.slice(0, middle), or);
+  const right = balancedOr(items.slice(middle), or);
+  return left && right ? or(left, right) : (left ?? right);
+}
+
+/**
+ * A filter fetching only the joined rows the join can match. The fold
+ * applies the join regardless, so a hint that cannot be expressed fetches
+ * the whole table instead.
+ */
+function narrowing(
+  hint: KeyHint
+):
+  | { kind: 'rows'; expression: GraphqlDatabaseRowExpr }
+  | { kind: 'properties'; expression: GraphqlFilterPropertiesExpr }
+  | undefined {
+  type Member = { kind: 'entity' | 'option' | 'other'; id: string };
+  const members = hint.values.flatMap((value): Member[] =>
+    match(value)
+      .returnType<Member[]>()
+      .with({ type: 'entities' }, ({ value }) =>
+        value.map((id) => ({ kind: 'entity', id }))
+      )
+      .with({ type: 'row' }, ({ value }) => [{ kind: 'entity', id: value }])
+      .with({ type: 'options' }, ({ value }) =>
+        value.map((id) => ({ kind: 'option', id }))
+      )
+      .otherwise(() => [{ kind: 'other', id: '' }])
+  );
+  if (
+    members.length === 0 ||
+    members.length > MAX_KEY_HINT_VALUES ||
+    members.some((member) => member.kind === 'other')
+  )
+    return undefined;
+  const column = hint.column;
+  if (column === null) {
+    const expression = balancedOr<GraphqlDatabaseRowExpr>(
+      members.map(({ id }) => ({ literal: { id } })),
+      (left, right) => ({ or: { left, right } })
+    );
+    return expression && { kind: 'rows', expression };
+  }
+  const expression = balancedOr<GraphqlFilterPropertiesExpr>(
+    members.map(({ kind, id }) => ({
+      literal: {
+        propertyDefinitionId: column,
+        value: kind === 'option' ? { selectOption: id } : { entityRef: id },
+      },
+    })),
+    (left, right) => ({ or: { left, right } })
+  );
+  return expression && { kind: 'properties', expression };
+}
+
+function soupPage(
+  client: Client,
+  requestPolicy: RequestPolicy,
+  input: SoupInput,
+  membership: LocalMembership | undefined,
+  step: DatabaseSqlStepTrace,
+  cache?: Pick<CacheHost, 'readQuery'>,
+  signal?: AbortSignal
+): ResultAsync<Page, DatabaseSqlFetchFailure> {
+  const evidence = input.initial ? JSON.stringify(input) : undefined;
+  const local: ResultAsync<Page | undefined, DatabaseSqlFetchFailure> =
+    evidence && membership?.reconcile
+      ? reconciledPage(input, evidence, membership, step)
+      : okAsync(undefined);
+  return local.andThen((page) =>
+    page
+      ? okAsync(page)
+      : graphqlQuery<DatabaseRowsQuery, DatabaseRowsQueryVariables>(
+          client,
+          DatabaseRowsDocument,
+          { input },
+          requestPolicy,
+          'database rows',
+          step,
+          cache,
+          signal
+        ).andThen((data) => {
+          const { items, nextCursor } = data.user.soup;
+          if (evidence && membership && isNetworkRead(requestPolicy)) {
+            membership.baselines.set(evidence, {
+              items,
+              complete: nextCursor === null,
+            });
+          }
+          return tableRows(items, step).map((rows) => ({
+            rows,
+            next: nextCursor,
+          }));
+        })
+  );
+}
+
+function isNetworkRead(requestPolicy: RequestPolicy): boolean {
+  return (
+    requestPolicy === 'network-only' || requestPolicy === 'cache-and-network'
+  );
+}
+
+/**
+ * The first page as the local filter index reconciles it with the last
+ * network page, when that page held the whole table. `undefined` leaves the
+ * read to the GraphQL client.
+ */
+function reconciledPage(
+  input: SoupInput,
+  evidence: string,
+  { host, baselines }: LocalMembership,
+  step: DatabaseSqlStepTrace
+): ResultAsync<Page | undefined, DatabaseSqlFetchFailure> {
+  const initial = input.initial;
+  const baseline = baselines.get(evidence);
+  if (!initial || !baseline?.complete) return okAsync(undefined);
+  const limit = initial.limit ?? 0;
+  const baselineKeys = soupReconciliationBaseline(baseline.items, 'CREATED_AT');
+  if (!baselineKeys) return okAsync(undefined);
+  return ResultAsync.fromPromise(
+    host.entityFilter({
+      filters: initial.filters ?? {},
+      sortMethod: 'CREATED_AT',
+      sortDirection: 'DESC',
+      limit,
+      baseline: baselineKeys,
+    }),
+    thrownFetchFailure
+  ).andThen(
+    (result): ResultAsync<Page | undefined, DatabaseSqlFetchFailure> => {
+      if (result.kind !== 'reconciled' && result.kind !== 'complete')
+        return okAsync(undefined);
+      // A full page may continue past the limit; only the server's cursor knows.
+      if (result.keys.length >= limit) return okAsync(undefined);
+      return ResultAsync.fromPromise(
+        readRecordsByKeys<DatabaseRowFieldsFragment>(
+          host,
+          rowSelection,
+          result.keys
+        ),
+        thrownFetchFailure
+      ).andThen(({ records }) =>
+        tableRows(
+          materializeReconciledSoup(result.keys, records, baseline.items),
+          step
+        ).map((rows) => ({ rows, next: null }))
+      );
+    }
+  );
+}
+
+function tableRows(
+  items: readonly DatabaseRowFieldsFragment[],
+  step: DatabaseSqlStepTrace
+): Result<Row[], DatabaseSqlFetchFailure> {
+  return step.decode(items.length, () =>
+    Result.combine(
+      items.map((item) =>
+        item.__typename === 'GraphqlSoupDatabaseRow'
+          ? ok({ id: item.id, position: item.position, cells: rowCells(item) })
+          : err(fetchFailure(`a table query returned a ${item.__typename}`))
+      )
+    )
+  );
+}
+
+/** A row's cells by property definition; an empty property is no cell. */
+export function rowCells(item: DatabaseRowItem): Record<string, Cell> {
+  const cells: Record<string, Cell> = {};
+  for (const property of item.properties) {
+    const value = cell(property.value);
+    if (value) cells[property.propertyDefinitionId] = value;
+  }
+  return cells;
+}
+
+/** A property value as the engine reads it, matching the server's source. */
+function cell(
+  value: SoupPropertyValueFieldsFragment | null | undefined
+): Cell | undefined {
+  if (!value) return undefined;
+  return match(value)
+    .returnType<Cell | undefined>()
+    .with({ __typename: 'GraphqlBooleanPropertyValue' }, ({ boolValue }) => ({
+      type: 'bool',
+      value: boolValue,
+    }))
+    .with({ __typename: 'GraphqlNumberPropertyValue' }, ({ numberValue }) => ({
+      type: 'number',
+      value: numberValue,
+    }))
+    .with({ __typename: 'GraphqlStringPropertyValue' }, ({ stringValue }) => ({
+      type: 'text',
+      value: stringValue,
+    }))
+    .with({ __typename: 'GraphqlDatePropertyValue' }, ({ dateValue }) => ({
+      type: 'date',
+      value: dateValue,
+    }))
+    .with(
+      { __typename: 'GraphqlDateRangePropertyValue' },
+      ({ rangeStart, rangeEnd }) => ({
+        type: 'dateRange',
+        value: { start: rangeStart, end: rangeEnd },
+      })
+    )
+    .with(
+      { __typename: 'GraphqlSelectOptionPropertyValue' },
+      ({ optionIds }) => ({
+        type: 'options',
+        value: optionIds,
+      })
+    )
+    .with(
+      { __typename: 'GraphqlEntityReferencePropertyValue' },
+      ({ references }) => ({
+        type: 'entities',
+        value: references.map((reference) => reference.entityId),
+      })
+    )
+    .with({ __typename: 'GraphqlLinkPropertyValue' }, ({ urls }) => ({
+      type: 'text',
+      value: urls.join(' '),
+    }))
+    .exhaustive(() => undefined);
+}
+
+function groupBins(
+  client: Client,
+  requestPolicy: RequestPolicy,
+  catalog: Catalog,
+  { table, propf, groupBy }: Extract<GqlQuery, { type: 'groupSoup' }>,
+  step: DatabaseSqlStepTrace,
+  cache?: Pick<CacheHost, 'readQuery'>,
+  signal?: AbortSignal
+): ResultAsync<Bin[], DatabaseSqlFetchFailure> {
+  const kind = catalog.tables
+    .find((candidate) => candidate.id === table)
+    ?.columns.find((column) => column.id === groupBy)?.kind;
+  const binKey = (
+    key: string
+  ): Result<Cell | null, DatabaseSqlFetchFailure> => {
+    // Soup files rows with an empty cell under the empty key.
+    if (key === '') return ok(null);
+    return match(kind)
+      .returnType<Result<Cell, DatabaseSqlFetchFailure>>()
+      .with({ kind: 'select' }, () => ok({ type: 'options', value: [key] }))
+      .with({ kind: 'entity' }, () => ok({ type: 'entities', value: [key] }))
+      .otherwise(() =>
+        err(fetchFailure(`column ${groupBy} cannot be grouped by Soup`))
+      );
+  };
+  return tableFilters(table, propf, null)
+    .asyncAndThen((filters) =>
+      graphqlQuery<GroupSoupQuery, GroupSoupQueryVariables>(
+        client,
+        GroupSoupDocument,
+        {
+          input: {
+            initial: {
+              groupBy: {
+                field: 'PROPERTY',
+                propertyDefinitionId: groupBy,
+                entityType: 'DATABASE_ROW',
+              },
+              // The bins' totals answer the count; one item each is enough.
+              limit: 1,
+              sortMethod: 'CREATED_AT',
+              filters,
+            },
+          },
+        },
+        requestPolicy,
+        'grouped Soup',
+        step,
+        cache,
+        signal
+      )
+    )
+    .andThen((data) =>
+      Result.combine(
+        data.user.groupSoup.bins.map(({ key, totalCount }) =>
+          binKey(key).map((cell) => ({ key: cell, count: totalCount }))
+        )
+      )
+    );
+}

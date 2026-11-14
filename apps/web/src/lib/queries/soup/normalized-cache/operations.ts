@@ -1,0 +1,1085 @@
+import { QUERY_FILTERS_BASE } from '@app/features/next-soup/filters/query-filters';
+import {
+  enableGraphqlSoup,
+  isFeatureEnabled,
+} from '@core/constant/featureFlags';
+import { fireAndForget } from '@core/util/fireAndForget';
+import { Telemetry } from '@macro-inc/observability';
+import type { UnifiedSearchResponseItem } from '@service-search/generated/models';
+import type {
+  PostSoupRequest,
+  SoupApiItem,
+} from '@service-storage/generated/schemas';
+import type { SoupPage } from '@service-storage/generated/schemas/soupPage';
+import {
+  type InfiniteData,
+  partialMatchKey,
+  type Query,
+  type QueryKey,
+} from '@tanstack/solid-query';
+import { isAfter } from 'date-fns';
+import { match } from 'ts-pattern';
+import { queryClient } from '../../client';
+import { soupQueryExcludesDone } from '../excludes-done';
+import { refreshActiveGraphqlSoupQueries } from '../graphql/active-queries';
+import type { SoupAstItemsPage } from '../items';
+import { soupKeys } from '../keys';
+import {
+  insertGroupedPage,
+  insertGroupQueries,
+  removeGroupedPage,
+  removeGroupQueries,
+  syncGroupedParents,
+  syncGroupQueries,
+} from './grouped-operations';
+import {
+  getNormalizationObjectKey,
+  getSoupNormalizer,
+  type NormalizerData,
+  soupNormKey,
+  stripSoupNormPrefix,
+} from './normalizer';
+import { raiseNotifiedFloor } from './notified-floor';
+import { ownTouchStamp } from './own-touch';
+import { retainRestoredSoupItem } from './restored-membership';
+import type {
+  SoupEntityPartial,
+  SoupEntityTag,
+  SoupTransaction,
+} from './types';
+import { getSoupQueryMeta } from './utils';
+
+type SoupItemsInfiniteData = InfiniteData<SoupPage, unknown>;
+type SoupAstItemsInfiniteData = InfiniteData<SoupAstItemsPage, unknown>;
+type SoupSearchInfiniteData = InfiniteData<
+  { results: UnifiedSearchResponseItem[] },
+  unknown
+>;
+
+/**
+ * Cancel in-flight soup list refetches before an optimistic cache write.
+ *
+ * Only cancels queries that already have data. Cancelling an in-flight
+ * initial fetch (data === undefined) reverts it to a stuck pending/idle
+ * state, which leaves the soup view blank on refresh.
+ */
+function cancelSoupQueries() {
+  const predicate = (query: Query) => query.state.data !== undefined;
+  queryClient.cancelQueries({ queryKey: soupKeys.items._def, predicate });
+  queryClient.cancelQueries({
+    queryKey: soupKeys.astItems._def,
+    predicate,
+  });
+}
+
+/**
+ * Optimistically update a single soup entity across all queries that
+ * reference it. After normy's field merge, reconciles group membership in
+ * every grouped cache containing this entity (`itemIds`-only mutations;
+ * the items pool itself isn't moved between groups). Date and
+ * non-categorical groupings fall back to invalidation.
+ *
+ * Partial shape:
+ * - Channels: `{ tag: 'channel', data: { channel: { id, ...fields } }, frecency_score }`
+ * - Everything else: `{ tag, data: { id, ...fields }, frecency_score }`
+ */
+
+export function optimisticUpdateSoupEntity<T extends SoupEntityTag>(
+  partial: SoupEntityPartial<T>
+): SoupTransaction {
+  return updateSoupEntity(partial, true);
+}
+
+/** Server hydration must not cancel the list revalidation it accompanies. */
+function updateSoupEntity<T extends SoupEntityTag>(
+  partial: SoupEntityPartial<T>,
+  cancelRefetches: boolean
+): SoupTransaction {
+  const normalizer = getSoupNormalizer();
+  const normKey = getNormalizationObjectKey(partial);
+
+  const dependentKeys = normKey
+    ? normalizer.getDependentQueriesByIds([normKey])
+    : [];
+
+  // Cancel only the queries this patch touches. A blanket cancel strands
+  // unrelated in-flight refetches (e.g. an invalidated destination folder's
+  // list refetching on mount): the fetch dies and nothing retries it.
+  // Skip cold initial fetches (data === undefined); cancelling those can leave
+  // the query stuck pending, which is why cancelSoupQueries has the same guard.
+  // Hash the keys once and cancel in a single cache pass: an `exact` cancel
+  // per key re-hashes that key against every cached query.
+  const cancelHashes = new Set(
+    (cancelRefetches ? dependentKeys : [])
+      .filter(
+        (queryKey) =>
+          partialMatchKey(queryKey, soupKeys.items._def) ||
+          partialMatchKey(queryKey, soupKeys.astItems._def)
+      )
+      .map(
+        (queryKey) => queryClient.defaultQueryOptions({ queryKey }).queryHash
+      )
+  );
+  if (cancelHashes.size > 0) {
+    queryClient.cancelQueries({
+      predicate: (query) =>
+        query.state.data !== undefined && cancelHashes.has(query.queryHash),
+    });
+  }
+  const previousDependents = dependentKeys.map(
+    (key: QueryKey) =>
+      [key, queryClient.getQueryData<SoupItemsInfiniteData>(key)] as const
+  );
+  const previousAllSoup = snapshotSoup();
+
+  normalizer.setNormalizedData(partial as NormalizerData);
+
+  if (normKey) {
+    const entityId = stripSoupNormPrefix(normKey);
+    const entity = getSoupEntityById(entityId);
+    if (entity) {
+      syncGroupedParents(entityId, entity);
+      syncGroupQueries(entityId, entity);
+    }
+  }
+
+  return {
+    rollback: () => {
+      for (const [key, data] of previousDependents) {
+        queryClient.setQueryData(key, data);
+      }
+      restoreSnapshot(previousAllSoup);
+    },
+  };
+}
+
+/** Apply a row read from the server to every list holding it, without
+ * cancelling a list revalidation it may accompany. */
+export function hydrateSoupEntity<T extends SoupEntityTag>(
+  partial: SoupEntityPartial<T>
+): void {
+  updateSoupEntity(partial, false);
+}
+
+export function getSoupEntityById(entityId: string): SoupApiItem | undefined {
+  return (getSoupNormalizer().getObjectById(soupNormKey(entityId)) ??
+    undefined) as SoupApiItem | undefined;
+}
+
+/**
+ * Optimistically stamp the viewer's own touch on a cached entity so the
+ * touched_by_me (Recent) order moves it to the top immediately, ahead of the
+ * activity consumer. Call it only from mutations whose server side records
+ * an activity — see the allowlist rule in `own-touch.ts`, which also records
+ * the stamp as a floor so touched-mode refetches that outrun the consumer
+ * can't clobber the optimistic order; the floor clears once the server's
+ * value catches up. Non-touched responses omit the field entirely, so the
+ * field-merge never clears the stamp either.
+ */
+export function bumpSoupEntityTouchedAt(
+  entityId: string
+): SoupTransaction | undefined {
+  const current = getSoupEntityById(entityId);
+  if (!current) return undefined;
+  const touched_at = ownTouchStamp(entityId);
+  const frecency_score = current.frecency_score;
+
+  if (current.tag === 'channel') {
+    return optimisticUpdateSoupEntity({
+      tag: 'channel',
+      data: { channel: { id: current.data.channel.id } },
+      frecency_score,
+      touched_at,
+    });
+  }
+  if (current.tag === 'call') {
+    return optimisticUpdateSoupEntity({
+      tag: 'call',
+      data: { callId: current.data.callId },
+      frecency_score,
+      touched_at,
+    });
+  }
+  return optimisticUpdateSoupEntity({
+    tag: current.tag,
+    data: { id: current.data.id },
+    frecency_score,
+    touched_at,
+  } as SoupEntityPartial);
+}
+
+/**
+ * Stamp a freshly delivered notification's time on its cached entity so the
+ * inbox's notified_at order moves the row up (and re-buckets its date header)
+ * without waiting for a refetch. Newest wins: an out-of-order delivery never
+ * moves a row back down. The stamp is also recorded as a floor (see
+ * `notified-floor.ts`) so a notified page that was in flight when the
+ * notification landed cannot overwrite it with the previous stamp. The floor
+ * survives optimistic reads and overlapping refreshes for a bounded interval.
+ * Non-notified responses omit the field, so field merges preserve the stamp.
+ */
+export function bumpSoupEntityNotifiedAt(
+  entityId: string,
+  notifiedAt: string
+): SoupTransaction | undefined {
+  raiseNotifiedFloor(entityId, notifiedAt);
+  const current = getSoupEntityById(entityId);
+  if (!current) return undefined;
+  const existing = current.notified_at ?? undefined;
+  if (!shouldUpdateOptimisticTimestamp(existing, notifiedAt)) return undefined;
+  const frecency_score = current.frecency_score;
+
+  if (current.tag === 'channel') {
+    return optimisticUpdateSoupEntity({
+      tag: 'channel',
+      data: { channel: { id: current.data.channel.id } },
+      frecency_score,
+      notified_at: notifiedAt,
+    });
+  }
+  if (current.tag === 'call') {
+    return optimisticUpdateSoupEntity({
+      tag: 'call',
+      data: { callId: current.data.callId },
+      frecency_score,
+      notified_at: notifiedAt,
+    });
+  }
+  return optimisticUpdateSoupEntity({
+    tag: current.tag,
+    data: { id: current.data.id },
+    frecency_score,
+    notified_at: notifiedAt,
+  } as SoupEntityPartial);
+}
+
+/**
+ * Mark stale only the soup queries containing a specific entity.
+ * Prefer this over `invalidateAllSoup` when you know the affected entity ID.
+ */
+export function invalidateSoupEntity(entityId: string): void {
+  const normalizer = getSoupNormalizer();
+  const keys = normalizer.getDependentQueriesByIds([soupNormKey(entityId)]);
+  for (const queryKey of keys) {
+    // Normy JSON-roundtrips complete keys, turning undefined array slots into
+    // null. Exact matching uses the same hash; partial matching misses them.
+    queryClient.invalidateQueries({ queryKey, exact: true });
+  }
+}
+
+/** Mark stale soup queries whose query key references any of the given ids (e.g. project-scoped views). */
+export function invalidateSoupQueriesReferencing(ids: string[]): void {
+  if (ids.length === 0) return;
+  queryClient.invalidateQueries({
+    queryKey: ['soup'],
+    predicate: (query) => {
+      const serialized = JSON.stringify(query.queryKey);
+      return ids.some((id) => serialized.includes(id));
+    },
+  });
+}
+
+/** Mark every soup list query stale. Use `invalidateSoupEntity` when the entity ID is known. */
+export function invalidateAllSoup(): void {
+  queryClient.invalidateQueries({
+    queryKey: soupKeys.items._def,
+  });
+  queryClient.invalidateQueries({
+    queryKey: soupKeys.astItems._def,
+  });
+  // Expanded single-group caches back grouped views' rows (mail/inbox group
+  // by date); leaving them stale keeps removed rows hidden even after their
+  // parent queries refetch.
+  queryClient.invalidateQueries({
+    queryKey: soupKeys.groupedGroup._def,
+  });
+}
+
+export function hasSoupEntity(entityId: string): boolean {
+  return getSoupNormalizer().getObjectById(soupNormKey(entityId)) != null;
+}
+
+/** Channels nest the id under `data.channel.id`; call records under `data.callId`. */
+export function getSoupItemId(item: SoupApiItem): string {
+  switch (item.tag) {
+    case 'channel':
+      return item.data.channel.id;
+    case 'call':
+      return item.data.callId;
+    case 'channelThread':
+      return item.data.id;
+    default:
+      return item.data.id;
+  }
+}
+
+/**
+ * Insert a new entity into the first page of every active soup list query.
+ * Grouped pages: derive the item's target groups via `computeGroupKeysForItem`
+ * and upsert into each resolvable group. Date / unresolved labels invalidate.
+ */
+export function insertSoupEntity(item: SoupApiItem): SoupTransaction {
+  cancelSoupQueries();
+
+  const previous = snapshotSoup();
+  queryClient.setQueriesData<SoupItemsInfiniteData>(
+    {
+      predicate: (query) => {
+        if (!partialMatchKey(query.queryKey, soupKeys.items._def)) return false;
+        const meta = getSoupQueryMeta(query.meta);
+        if (meta.itemFilter && !meta.itemFilter(item)) return false;
+        return !meta.insertFilter || meta.insertFilter(item);
+      },
+    },
+    (prev) => {
+      if (!prev?.pages) return prev;
+      return {
+        ...prev,
+        pages: prev.pages.map((p, i) =>
+          i === 0 ? { ...p, items: [item, ...p.items] } : p
+        ),
+      };
+    }
+  );
+
+  const parents = queryClient.getQueriesData<SoupAstItemsInfiniteData>({
+    queryKey: soupKeys.astItems._def,
+  });
+
+  for (const [key, prev] of parents) {
+    if (!prev?.pages?.length) continue;
+
+    const meta = getSoupQueryMeta(
+      queryClient.getQueryCache().find({ queryKey: key })?.meta
+    );
+    const filter = meta.itemFilter;
+    if (filter && !filter(item)) continue;
+    if (meta.insertFilter && !meta.insertFilter(item)) continue;
+
+    const firstPage = prev.pages[0];
+
+    if (firstPage.kind === 'flat') {
+      queryClient.setQueryData<SoupAstItemsInfiniteData>(key, {
+        ...prev,
+        pages: prev.pages.map((p, i) =>
+          i === 0 && p.kind === 'flat' ? { ...p, items: [item, ...p.items] } : p
+        ),
+      });
+
+      continue;
+    }
+
+    const nextPage = insertGroupedPage(
+      firstPage,
+      item,
+      getSoupItemId(item),
+      meta.groupBy
+    );
+
+    if (!nextPage) {
+      queryClient.invalidateQueries({ queryKey: key });
+      continue;
+    }
+
+    queryClient.setQueryData<SoupAstItemsInfiniteData>(key, {
+      ...prev,
+      pages: [nextPage, ...prev.pages.slice(1)],
+    });
+  }
+
+  insertGroupQueries(item, getSoupItemId(item));
+
+  return { rollback: () => restoreSnapshot(previous) };
+}
+
+export function removeSoupEntities(
+  entityIds: Set<string>,
+  matches?: (item: SoupApiItem, id: string) => boolean
+): SoupTransaction {
+  cancelSoupQueries();
+
+  const previous = snapshotSoup();
+  const shouldRemove = (item: SoupApiItem) => {
+    const id = getSoupItemId(item);
+    return entityIds.has(id) && (!matches || matches(item, id));
+  };
+
+  queryClient.setQueriesData<SoupItemsInfiniteData>(
+    {
+      predicate: (q) => partialMatchKey(q.queryKey, soupKeys.items._def),
+    },
+    (prev) => {
+      if (!prev?.pages) return prev;
+      return {
+        ...prev,
+        pages: prev.pages.map((page) => {
+          const items = page.items.filter((item) => !shouldRemove(item));
+          if (items.length === page.items.length) return page;
+          return { ...page, items };
+        }),
+      };
+    }
+  );
+
+  queryClient.setQueriesData<SoupAstItemsInfiniteData>(
+    { queryKey: soupKeys.astItems._def },
+    (prev) => {
+      if (!prev?.pages?.length) return prev;
+
+      const firstPage = prev.pages[0];
+
+      if (firstPage.kind === 'flat') {
+        // Flat AST queries can have multiple pages; remove the ids from every
+        // page and preserve page references that were not affected.
+        let changed = false;
+        const pages = prev.pages.map((page) => {
+          if (page.kind !== 'flat') return page;
+
+          const items = page.items.filter((item) => !shouldRemove(item));
+
+          if (items.length === page.items.length) return page;
+
+          changed = true;
+          return { ...page, items };
+        });
+
+        return changed ? { ...prev, pages } : prev;
+      }
+
+      // Grouped AST queries only use the first parent page. Group membership is
+      // fully represented there by `groups[].itemIds`, so update that page once.
+      const nextPage = removeGroupedPage(firstPage, entityIds, matches);
+
+      return nextPage === firstPage
+        ? prev
+        : { ...prev, pages: [nextPage, ...prev.pages.slice(1)] };
+    }
+  );
+
+  removeGroupQueries(entityIds, undefined, matches);
+
+  return { rollback: () => restoreSnapshot(previous) };
+}
+
+/**
+ * Remove entities only from soup queries whose key references any of the
+ * given ids (e.g. a source folder's project-scoped views — the project UUID is
+ * embedded in their compiled filter AST). Other queries keep the entities.
+ */
+export function removeSoupEntitiesFromQueriesReferencing(
+  entityIds: Set<string>,
+  referenceIds: string[]
+): SoupTransaction {
+  if (referenceIds.length === 0) return { rollback: () => {} };
+
+  return removeSoupEntitiesWhere(entityIds, (key: QueryKey) => {
+    const serialized = JSON.stringify(key);
+    return referenceIds.some((id) => serialized.includes(id));
+  });
+}
+
+/**
+ * Remove entities from soup queries that filter out done content, leaving
+ * them in place everywhere else (e.g. mail "All", which shows done threads).
+ * Use with an entity-level done patch so the remaining rows reflect the new
+ * state.
+ */
+export function removeSoupEntitiesFromDoneFilteredQueries(
+  entityIds: Set<string>
+): SoupTransaction {
+  return removeSoupEntitiesWhere(entityIds, soupQueryExcludesDone);
+}
+
+/**
+ * Prepend a cached entity to the done-excluding soup queries (see
+ * `soupQueryExcludesDone`) whose pages don't contain it. A fresh notification
+ * puts its entity back into those feeds server-side, but the client row may
+ * have been optimistically removed when it was marked done — or the feed was
+ * fetched while the entity had nothing outstanding — and the normalized
+ * field merge only patches rows already present, so without this the feeds
+ * would not show the entity again until their next refetch. Grouped pages
+ * and expanded single-group caches (which back grouped views' rows and are
+ * cached with staleTime Infinity) are restored the same way; groups that
+ * can't be resolved locally (e.g. date buckets) invalidate instead.
+ */
+export function restoreSoupEntityToDoneFilteredQueries(
+  entityId: string,
+  incomingState: 'unseen' | 'seen' = 'unseen'
+): void {
+  const shouldRestore = (key: QueryKey) =>
+    soupQueryExcludesDone(key, incomingState);
+  const item = getSoupEntityById(entityId);
+  if (!item) return;
+
+  const cancelQuery = (key: QueryKey) =>
+    queryClient.cancelQueries({
+      queryKey: key,
+      exact: true,
+      predicate: (query) => query.state.data !== undefined,
+    });
+
+  const metaFor = (key: QueryKey) =>
+    getSoupQueryMeta(queryClient.getQueryCache().find({ queryKey: key })?.meta);
+
+  const containsEntity = (items: SoupApiItem[]) =>
+    items.some((existing) => getSoupItemId(existing) === entityId);
+
+  for (const [key, prev] of queryClient.getQueriesData<SoupItemsInfiniteData>({
+    queryKey: soupKeys.items._def,
+  })) {
+    if (!shouldRestore(key)) continue;
+    if (!prev?.pages?.length) continue;
+    if (prev.pages.some((page) => containsEntity(page.items))) continue;
+
+    const flatMeta = metaFor(key);
+    if (flatMeta.itemFilter && !flatMeta.itemFilter(item)) continue;
+    if (flatMeta.insertFilter && !flatMeta.insertFilter(item)) continue;
+
+    fireAndForget(cancelQuery(key), 'soup-normalized-cache');
+    queryClient.setQueryData<SoupItemsInfiniteData>(key, {
+      ...prev,
+      pages: prev.pages.map((page, index) =>
+        index === 0 ? { ...page, items: [item, ...page.items] } : page
+      ),
+    });
+    retainRestoredSoupItem(queryClient, key, item);
+  }
+
+  for (const [
+    key,
+    prev,
+  ] of queryClient.getQueriesData<SoupAstItemsInfiniteData>({
+    queryKey: soupKeys.astItems._def,
+  })) {
+    if (!shouldRestore(key)) continue;
+    if (!prev?.pages?.length) continue;
+
+    const meta = metaFor(key);
+    if (meta.itemFilter && !meta.itemFilter(item)) continue;
+    if (meta.insertFilter && !meta.insertFilter(item)) continue;
+
+    const firstPage = prev.pages[0];
+
+    if (firstPage.kind === 'flat') {
+      if (
+        prev.pages.some(
+          (page) => page.kind === 'flat' && containsEntity(page.items)
+        )
+      ) {
+        continue;
+      }
+
+      fireAndForget(cancelQuery(key), 'soup-normalized-cache');
+      queryClient.setQueryData<SoupAstItemsInfiniteData>(key, {
+        ...prev,
+        pages: prev.pages.map((page, index) =>
+          index === 0 && page.kind === 'flat'
+            ? { ...page, items: [item, ...page.items] }
+            : page
+        ),
+      });
+      retainRestoredSoupItem(queryClient, key, item);
+      continue;
+    }
+
+    // Grouped parents keep membership entirely on the first page.
+    if (containsEntity(Object.values(firstPage.items))) {
+      continue;
+    }
+
+    const nextPage = insertGroupedPage(firstPage, item, entityId, meta.groupBy);
+    if (!nextPage) {
+      queryClient.invalidateQueries({ queryKey: key });
+      continue;
+    }
+
+    fireAndForget(cancelQuery(key), 'soup-normalized-cache');
+    queryClient.setQueryData<SoupAstItemsInfiniteData>(key, {
+      ...prev,
+      pages: [nextPage, ...prev.pages.slice(1)],
+    });
+  }
+
+  insertGroupQueries(item, entityId, shouldRestore);
+}
+
+/** Remove entities from the soup queries whose key matches the predicate. */
+function removeSoupEntitiesWhere(
+  entityIds: Set<string>,
+  referencesIds: (key: QueryKey) => boolean
+): SoupTransaction {
+  // Scoped equivalent of cancelSoupQueries (same data !== undefined guard)
+  const cancelPredicate = (query: Query) =>
+    query.state.data !== undefined && referencesIds(query.queryKey);
+  queryClient.cancelQueries({
+    queryKey: soupKeys.items._def,
+    predicate: cancelPredicate,
+  });
+  queryClient.cancelQueries({
+    queryKey: soupKeys.astItems._def,
+    predicate: cancelPredicate,
+  });
+
+  const previous = snapshotSoup();
+
+  queryClient.setQueriesData<SoupItemsInfiniteData>(
+    {
+      predicate: (q) =>
+        partialMatchKey(q.queryKey, soupKeys.items._def) &&
+        referencesIds(q.queryKey),
+    },
+    (prev) => {
+      if (!prev?.pages) return prev;
+      return {
+        ...prev,
+        pages: prev.pages.map((page) => {
+          const items = page.items.filter(
+            (item) => !entityIds.has(getSoupItemId(item))
+          );
+          if (items.length === page.items.length) return page;
+          return { ...page, items };
+        }),
+      };
+    }
+  );
+
+  queryClient.setQueriesData<SoupAstItemsInfiniteData>(
+    {
+      queryKey: soupKeys.astItems._def,
+      predicate: (q) => referencesIds(q.queryKey),
+    },
+    (prev) => {
+      if (!prev?.pages?.length) return prev;
+
+      const firstPage = prev.pages[0];
+
+      if (firstPage.kind === 'flat') {
+        let changed = false;
+        const pages = prev.pages.map((page) => {
+          if (page.kind !== 'flat') return page;
+
+          const items = page.items.filter(
+            (item) => !entityIds.has(getSoupItemId(item))
+          );
+
+          if (items.length === page.items.length) return page;
+
+          changed = true;
+          return { ...page, items };
+        });
+
+        return changed ? { ...prev, pages } : prev;
+      }
+
+      const nextPage = removeGroupedPage(firstPage, entityIds);
+
+      return nextPage === firstPage
+        ? prev
+        : { ...prev, pages: [nextPage, ...prev.pages.slice(1)] };
+    }
+  );
+
+  removeGroupQueries(entityIds, referencesIds);
+
+  return { rollback: () => restoreSnapshot(previous) };
+}
+
+export function removeSearchEntities(
+  entityIds: Set<string>,
+  matches?: (item: UnifiedSearchResponseItem, id: string) => boolean
+): SoupTransaction {
+  queryClient.cancelQueries({ queryKey: soupKeys.search._def });
+
+  const previous = queryClient.getQueriesData<SoupSearchInfiniteData>({
+    queryKey: soupKeys.search._def,
+  });
+
+  queryClient.setQueriesData<SoupSearchInfiniteData>(
+    { queryKey: soupKeys.search._def },
+    (prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        pages: prev.pages.map((page) => {
+          const results = page.results.filter((result) => {
+            const id = getSearchResultId(result);
+            return (
+              !entityIds.has(id) ||
+              (matches !== undefined && !matches(result, id))
+            );
+          });
+          return results.length === page.results.length
+            ? page
+            : { ...page, results };
+        }),
+      };
+    }
+  );
+
+  return {
+    rollback: () => {
+      for (const [key, data] of previous) {
+        queryClient.setQueryData(key, data);
+      }
+    },
+  };
+}
+
+/**
+ * Fetch a single entity from the server and merge it into the cache.
+ * If the entity is already cached, updates it via normy (deep-merge).
+ * If it's new, prepends it to the first page of every active soup list query.
+ *
+ * `ownTouch` marks the refetch as caused by the viewer's own mutation (e.g.
+ * entity creation): the fetched item is stamped with an optimistic
+ * `touched_at` — the single-entity response never carries one — so the
+ * Recent feed's insert gate admits it, and the touched queries are spared
+ * from the follow-up invalidation, which would replace their pages with
+ * server state that can't include the entity until the activity consumer
+ * catches up.
+ *
+ * `refreshGraphql` also network-refreshes mounted GraphQL Soup operations.
+ * REST's normalized entity insertion cannot change GraphQL list or grouped-bin
+ * membership, so creation callers must request this transport revalidation.
+ *
+ * `created` marks an entity that did not exist a moment ago, so it sorts first
+ * in newest-first lists. It is inserted into the REST lists whose filters admit
+ * it, without refetching any list, in either transport.
+ *
+ * `notified` marks a new notification about the entity, which a mounted
+ * `notified_at` list must show even if the entity isn't cached yet.
+ */
+export async function refetchSoupEntity(
+  entityId: string,
+  entityType: SoupEntityTag,
+  options?: {
+    includeRoot?: boolean;
+    ownTouch?: boolean;
+    refreshGraphql?: boolean;
+    created?: boolean;
+    notified?: boolean;
+  }
+): Promise<void> {
+  if (options?.refreshGraphql) {
+    fireAndForget(refreshActiveGraphqlSoupQueries(), 'soup-normalized-cache');
+  }
+
+  // GraphQL lists never read this cache, so a miss means no REST list shows
+  // the entity. Own-touch inserts still land because Home's touched_by_me
+  // feed stays on REST, and notified ones because notified_at lists do.
+  if (
+    !options?.ownTouch &&
+    !options?.created &&
+    !(options?.notified && mountedNotifiedLists().length > 0) &&
+    isFeatureEnabled(enableGraphqlSoup) &&
+    !hasSoupEntity(entityId)
+  ) {
+    return;
+  }
+
+  const { storageServiceClient } = await import('@service-storage/client');
+
+  const filter = buildSingleEntityFilter(entityType, entityId, options);
+
+  const result = await storageServiceClient.getSoupItems({
+    params: {},
+    body: filter,
+  });
+
+  if (result.isErr()) {
+    console.error(
+      '[normalized-cache] operations: failed to fetch individual soup item',
+      result
+    );
+    return;
+  }
+
+  const page = result.value;
+  if (!page.items.length) return;
+
+  for (let item of page.items) {
+    const itemId = getSoupItemId(item);
+    if (options?.ownTouch) {
+      item = { ...item, touched_at: ownTouchStamp(itemId) };
+    }
+    if (hasSoupEntity(itemId)) {
+      updateSoupEntity(item, false);
+    } else {
+      insertSoupEntity(item);
+      if (options?.created) continue;
+      if (options?.ownTouch) {
+        invalidateAllSoupExceptTouched();
+      } else {
+        invalidateAllSoup();
+      }
+      if (options?.notified) {
+        fireAndForget(
+          rereadNotifiedListsAfterFirstRead(),
+          'soup-normalized-cache'
+        );
+      }
+    }
+  }
+}
+
+/** Lists on screen ordered by `notified_at`, which only REST serves. */
+function mountedNotifiedLists() {
+  return queryClient
+    .getQueryCache()
+    .findAll({ queryKey: soupKeys.astItems._def, type: 'active' })
+    .filter((query) => JSON.stringify(query.queryKey).includes('notified_at'));
+}
+
+/**
+ * A list's first read has no pages to insert into, and invalidating reuses it
+ * rather than restarting it, so its response can predate a new notification.
+ * Read each of those lists again once its own first read settles.
+ */
+async function rereadNotifiedListsAfterFirstRead(): Promise<void> {
+  const firstReads = mountedNotifiedLists().filter(
+    (query) =>
+      query.state.data === undefined && query.state.fetchStatus === 'fetching'
+  );
+  await Promise.allSettled(
+    firstReads.map(async (query) => {
+      await Promise.allSettled([query.promise]);
+      queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true });
+    })
+  );
+}
+
+/**
+ * `invalidateAllSoup` minus the touched_by_me queries: an own-touch insert
+ * must survive in the Recent feed until the activity consumer has recorded
+ * the touch, so those pages keep the optimistic row instead of refetching
+ * a server list that would drop it.
+ */
+function invalidateAllSoupExceptTouched(): void {
+  const notTouched = (query: Query) =>
+    !JSON.stringify(query.queryKey).includes('touched_by_me');
+  queryClient.invalidateQueries({
+    queryKey: soupKeys.items._def,
+    predicate: notTouched,
+  });
+  queryClient.invalidateQueries({
+    queryKey: soupKeys.astItems._def,
+    predicate: notTouched,
+  });
+  queryClient.invalidateQueries({
+    queryKey: soupKeys.groupedGroup._def,
+    predicate: notTouched,
+  });
+}
+
+/** @private */
+export function buildSingleEntityFilter(
+  entityType: SoupEntityTag,
+  entityId: string,
+  options?: { includeRoot?: boolean }
+): PostSoupRequest {
+  const base: PostSoupRequest = {
+    ...QUERY_FILTERS_BASE,
+    limit: 1,
+  };
+  return match(entityType)
+    .with('document', () => ({
+      ...base,
+      document_filters: { document_ids: [entityId] },
+    }))
+    .with('chat', () => ({ ...base, chat_filters: { chat_ids: [entityId] } }))
+    .with('channel', () => ({
+      ...base,
+      channel_filters: { channel_ids: [entityId] },
+    }))
+    .with('project', () => ({
+      ...base,
+      project_filters: {
+        project_ids: [entityId],
+        include_root: options?.includeRoot ?? false,
+      },
+    }))
+    .with('emailThread', () => ({
+      ...base,
+      email_filters: { email_thread_ids: [entityId] },
+    }))
+    .with('call', () => ({
+      ...base,
+      call_filters: { call_ids: [entityId] },
+    }))
+    .with('crmCompany', () => ({
+      ...base,
+      crm_company_filters: { company_ids: [entityId] },
+    }))
+    .with('foreignEntity', () => ({
+      ...base,
+      foreign_entity_filters: { ids: [entityId] },
+    }))
+    .with('channelThread', () => ({
+      ...base,
+      channel_thread_filters: { thread_ids: [entityId] },
+    }))
+    .with('calendarEvent', () => ({
+      ...base,
+      calendar_event_filters: { calendar_event_ids: [entityId] },
+    }))
+    .with('initiative', () => ({
+      ...base,
+      initiative_filters: { initiative_ids: [entityId] },
+    }))
+    .with('agentSession', () => ({
+      ...base,
+      agent_session_filters: { ids: [entityId] },
+    }))
+    .with('databaseRow', () => {
+      throw new Error('Database rows are read through GraphQL Soup only');
+    })
+    .with('crmContact', () => {
+      throw new Error('CRM contacts are read through GraphQL Soup only');
+    })
+    .with('harness', () => {
+      throw new Error('Runtimes are read through GraphQL Soup only');
+    })
+    .exhaustive(() => {
+      throw new Error(`Unknown soup entity type: ${entityType}`);
+    });
+}
+
+async function updateRecentlyViewedItemLazily(
+  itemId: string,
+  viewedAt: string
+): Promise<void> {
+  // Lazy import to break circular dependency
+  const { updateRecentlyViewedItem } = await import('../recently-viewed');
+  updateRecentlyViewedItem(itemId, viewedAt);
+}
+
+/**
+ * Optimistically update the viewedAt timestamp for a soup item.
+ * Updates the item across all soup queries if it exists.
+ */
+export function optimisticUpdateSoupItemViewedAt(itemId: string) {
+  const now = new Date().toISOString();
+
+  updateRecentlyViewedItemLazily(itemId, now).catch((error) =>
+    Telemetry.error(error, { surface: 'soup-normalized-cache' })
+  );
+
+  const current = getSoupEntityById(itemId);
+  if (!current) return;
+
+  if (current.tag === 'channel') {
+    optimisticUpdateSoupEntity({
+      tag: 'channel',
+      data: { channel: { id: itemId }, viewed_at: now },
+      frecency_score: current.frecency_score,
+    });
+  } else if (current.tag === 'call' || current.tag === 'foreignEntity') {
+    // Call records, foreign entities, and channel threads don't have viewedAt — skip.
+    return;
+  } else {
+    optimisticUpdateSoupEntity({
+      tag: current.tag,
+      data: { id: itemId, viewedAt: now },
+      frecency_score: current.frecency_score,
+    });
+  }
+}
+
+/**
+ * Optimistically update the updatedAt/updated_at timestamp for a soup item.
+ * Updates the item across all soup queries if it exists and matches the expected tag.
+ *
+ * Deliberately does NOT stamp `touched_at`: this helper's caller is the
+ * incoming-notification path, i.e. *other people's* actions (your own don't
+ * notify you). `updated_at` is global recency, `touched_at` is the viewer's
+ * own touch — stamping it here would pull entities a teammate mutated into
+ * the viewer's Recent feed. Own-mutation flows stamp `touched_at` at their
+ * call sites (see `bumpSoupEntityTouchedAt`).
+ */
+export function optimisticUpdateSoupItemUpdatedAt(
+  itemId: string,
+  tag: SoupEntityTag,
+  updatedAt: string
+): SoupTransaction | undefined {
+  const current = getSoupEntityById(itemId);
+  if (!current || current.tag !== tag) return;
+
+  if (current.tag === 'channel') {
+    if (
+      !shouldUpdateOptimisticTimestamp(
+        current.data.channel.updated_at,
+        updatedAt
+      )
+    )
+      return;
+
+    return optimisticUpdateSoupEntity({
+      tag: 'channel',
+      data: { channel: { id: itemId, updated_at: updatedAt } },
+      frecency_score: current.frecency_score,
+    });
+  } else if (current.tag === 'call') {
+    // Call records use endedAt/startedAt and channel threads nest message timestamps — skip.
+    return;
+  } else {
+    const timestamp =
+      current.tag === 'channelThread'
+        ? current.data.updated_at
+        : current.data.updatedAt;
+
+    if (!shouldUpdateOptimisticTimestamp(timestamp, updatedAt)) return;
+
+    return optimisticUpdateSoupEntity({
+      tag: current.tag,
+      data: { id: itemId, updatedAt },
+      frecency_score: current.frecency_score,
+    });
+  }
+}
+
+/** @private */
+function shouldUpdateOptimisticTimestamp(
+  currentUpdatedAt: string | undefined,
+  incomingUpdatedAt: string
+): boolean {
+  return currentUpdatedAt
+    ? isAfter(Date.parse(incomingUpdatedAt), Date.parse(currentUpdatedAt))
+    : true;
+}
+
+/** @private */
+function getSearchResultId(result: UnifiedSearchResponseItem): string {
+  return match(result)
+    .with({ type: 'document' }, (r) => r.document_id)
+    .with({ type: 'chat' }, (r) => r.chat_id)
+    .with({ type: 'channel' }, (r) => r.channel_id)
+    .with({ type: 'channelMessage' }, (r) => `${r.channel_id}:${r.message_id}`)
+    .with({ type: 'email' }, (r) => r.thread_id)
+    .with({ type: 'project' }, (r) => r.id)
+    .with({ type: 'call' }, (r) => r.call_id)
+    .with({ type: 'company' }, (r) => r.id)
+    .with({ type: 'calendarEvent' }, (r) => r.id)
+    .with({ type: 'agentSession' }, (r) => r.id)
+    .exhaustive(() => '');
+}
+
+/** @private Captures every soup-list-shaped query (legacy items, parent
+ * astItems, per-group caches) for full-range rollback. */
+function snapshotSoup(): [QueryKey, unknown][] {
+  return [
+    ...queryClient.getQueriesData<unknown>({ queryKey: soupKeys.items._def }),
+    ...queryClient.getQueriesData<unknown>({
+      queryKey: soupKeys.astItems._def,
+    }),
+    ...queryClient.getQueriesData<unknown>({
+      queryKey: soupKeys.groupedGroup._def,
+    }),
+  ];
+}
+
+/** @private */
+function restoreSnapshot(snapshot: [QueryKey, unknown][]): void {
+  for (const [key, data] of snapshot) {
+    queryClient.setQueryData(key, data);
+  }
+}

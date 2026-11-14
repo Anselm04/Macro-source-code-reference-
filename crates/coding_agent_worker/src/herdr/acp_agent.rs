@@ -1,0 +1,1530 @@
+//! `macrod herdr-acp`: an ACP agent whose sessions are live coding-agent TUIs
+//! (Claude Code or Codex) in herdr windows.
+//!
+//! macrod runs this as its harness like any other ACP agent, so sessions
+//! still open, prompt, stream, and stop through Macro's ACP infrastructure.
+//! Behind the protocol, each session is a real interactive `claude` or
+//! `codex` in its own herdr tab, rooted at the session's working directory:
+//!
+//! - the first `session/prompt` opens the tab and starts the agent there
+//!   with the session's model and Macro MCP servers;
+//! - prompts are typed into the TUI with `herdr agent prompt`;
+//! - the agent's own session transcript is tailed and streamed back as
+//!   `session/update`s, and its end-of-turn record ends the turn;
+//! - a permission dialog in the TUI becomes a `session/request_permission`,
+//!   answered by pressing the matching key (see `permission`);
+//!   `session/cancel` presses Esc.
+//!
+//! Anyone watching the herdr window can also type into the TUI directly.
+
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
+
+use super::HerdrSession;
+use super::cli::{AgentLaunch, HerdrCli, HerdrError};
+use super::hub::title_from;
+use super::store::{Record, Store, write_private};
+use super::tail::Cursor;
+use agent_client_protocol::schema::v1::{
+    ListSessionsRequest, ListSessionsResponse, SessionId, SessionInfo,
+};
+use agent_fold::domain::transcript::{Fold, LogEvent};
+use agent_runtime_protocol::domain::turn::{FailureNotice, FailureNoticeKind};
+use claude_fold::ClaudeLog;
+use codex_fold::CodexLog;
+
+mod commands;
+mod effort;
+mod models;
+mod permission;
+
+#[cfg(test)]
+use permission::permission_title;
+use permission::{OpenTool, track_open_tool};
+
+/// The subcommand macrod's harness config names to run this adapter.
+pub(crate) const SUBCOMMAND: &str = "herdr-acp";
+
+const MODEL_CONFIG_ID: &str = "model";
+/// Attempts to read one native agent's state while listing live sessions.
+const LIVE_SESSION_LOOKUPS: usize = 3;
+const DEFAULT_MODEL: &str = "default";
+const CLAUDE_MODELS: &[(&str, &str)] = &[
+    (DEFAULT_MODEL, "Default (Claude Code's choice)"),
+    ("opus", "Opus"),
+    ("sonnet", "Sonnet"),
+    ("haiku", "Haiku"),
+];
+const CODEX_MODELS: &[(&str, &str)] = &[
+    (DEFAULT_MODEL, "Default (Codex's choice)"),
+    ("gpt-6-astra", "GPT-6 Astra"),
+    ("gpt-5.6", "GPT-5.6"),
+    ("gpt-5.5", "GPT-5.5"),
+];
+const POLL: Duration = Duration::from_millis(250);
+/// Transcript polls per herdr status check.
+const STATUS_EVERY: u32 = 4;
+/// Consecutive ready status checks, with no transcript ending, that end a
+/// turn anyway (slash commands and interrupted turns write no final message).
+const SETTLED_CHECKS: u32 = 3;
+/// How long the transcript must stay quiet before a ready status ends a turn.
+const SETTLED_QUIET: Duration = Duration::from_secs(3);
+const QUIET_START: Duration = Duration::from_secs(20);
+const MISSING_AGENT_CHECKS: u32 = 5;
+/// Esc presses a cancel spends before the native turn is left to run.
+const INTERRUPT_PRESSES: u32 = 3;
+/// Status checks, one per [`POLL`], after each Esc press.
+const INTERRUPT_CHECKS: u32 = 4;
+/// Transcript polls per check, while idle, that the session's native agent
+/// still exists in herdr.
+const CLOSED_CHECK_EVERY: u32 = 20;
+/// How long that check may take before it is skipped as inconclusive.
+const CLOSED_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Which coding-agent TUI each session runs.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub(crate) enum TuiAgent {
+    /// Claude Code (`claude`).
+    #[default]
+    Claude,
+    /// OpenAI Codex (`codex`).
+    Codex,
+}
+
+impl TuiAgent {
+    /// herdr's `--kind` for the agent, which is also its command.
+    pub(crate) fn herdr_kind(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Whether the TUI reports its own status through OSC 7501, which
+    /// herdr-core relies on to see it working, blocked, or ready.
+    pub(crate) fn reports_status(self) -> bool {
+        match self {
+            Self::Claude => true,
+            Self::Codex => false,
+        }
+    }
+
+    fn models(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Claude => CLAUDE_MODELS,
+            Self::Codex => CODEX_MODELS,
+        }
+    }
+
+    fn log(self) -> Transcript {
+        match self {
+            Self::Claude => Transcript::Claude(ClaudeLog::default()),
+            Self::Codex => Transcript::Codex(CodexLog::default()),
+        }
+    }
+}
+
+/// A session transcript reader for the agent that writes it.
+enum Transcript {
+    Claude(ClaudeLog),
+    Codex(CodexLog),
+}
+
+impl Transcript {
+    fn entry(&mut self, line: &str) -> Vec<LogEvent> {
+        match self {
+            Self::Claude(log) => log.entry(line),
+            Self::Codex(log) => log.entry(line),
+        }
+    }
+}
+
+/// How `macrod herdr-acp` runs its agents.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AdapterOptions {
+    /// Private storage shared with the dispatcher's repository preparation.
+    pub state_dir: Option<PathBuf>,
+    /// Native model ID for new sessions.
+    pub model: Option<String>,
+    /// Sessions use dispatcher-managed worktrees.
+    pub managed_worktrees: bool,
+    /// The agent TUI sessions run.
+    pub kind: TuiAgent,
+    /// Passed to Claude Code as `--permission-mode`.
+    pub permission_mode: Option<String>,
+    /// Open session windows in the background instead of switching to them.
+    pub no_focus: bool,
+    /// Extra arguments for every agent launch, after the adapter's own.
+    pub agent_args: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RpcError {
+    code: i64,
+    message: String,
+    data: Option<Value>,
+}
+
+impl RpcError {
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: -32603,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    /// A prompt that was stopped before it was typed into the TUI. Answering
+    /// `cancelled` would read in Macro as a message the agent saw.
+    fn not_delivered() -> Self {
+        let notice = FailureNotice {
+            kind: FailureNoticeKind::PromptNotDelivered,
+            title: "Message not delivered".to_owned(),
+            body: "The turn running in Herdr was stopped before this message was typed in, so the agent never received it. Send it again.".to_owned(),
+            link: None,
+        };
+        Self {
+            code: -32603,
+            message: "the prompt was stopped before it reached the native agent".to_owned(),
+            data: serde_json::to_value(notice).ok(),
+        }
+    }
+}
+
+impl From<HerdrError> for RpcError {
+    fn from(error: HerdrError) -> Self {
+        Self::internal(error.to_string())
+    }
+}
+
+mod environment {
+    macro_env_var::maybe_env_var! {
+        pub struct Home;
+    }
+}
+
+/// Serve ACP on stdin/stdout until stdin closes.
+pub async fn run(options: AdapterOptions) -> rootcause::Result<()> {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(message) = out_rx.recv().await {
+            let mut line = message.to_string();
+            line.push('\n');
+            if stdout.write_all(line.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let herdr = HerdrSession::detect();
+    let home = environment::Home::new().and_then(|home| home.value().map(PathBuf::from));
+    let state_dir = options
+        .state_dir
+        .clone()
+        .or_else(|| {
+            home.as_ref()
+                .map(|home| home.join(".macrod/herdr/standalone"))
+        })
+        .ok_or_else(|| rootcause::report!("HOME or --state-dir is required"))?;
+    let shutdown = CancellationToken::new();
+    let adapter = Arc::new(Adapter {
+        out: out_tx,
+        pending: Mutex::new(HashMap::new()),
+        next_id: AtomicU64::new(0),
+        sessions: Mutex::new(HashMap::new()),
+        herdr: herdr.as_ref().map(HerdrSession::cli),
+        options,
+        home,
+        store: Store(state_dir),
+        shutdown: shutdown.clone(),
+        claimed: Mutex::new(std::collections::HashSet::new()),
+    });
+
+    let mut requests = tokio::task::JoinSet::new();
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    while let Some(line) = lines.next_line().await? {
+        while requests.try_join_next().is_some() {}
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let id = message.get("id").filter(|id| !id.is_null()).cloned();
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        match (message.get("method").and_then(Value::as_str), id) {
+            (Some(method), Some(id)) => {
+                let adapter = adapter.clone();
+                let method = method.to_owned();
+                requests.spawn(async move {
+                    let prompt_session = if method == "session/prompt" {
+                        adapter.session(&params).ok()
+                    } else {
+                        None
+                    };
+                    if prompt_session
+                        .as_ref()
+                        .is_some_and(|session| session.prompt_pending.swap(true, Ordering::SeqCst))
+                    {
+                        adapter.respond(
+                            id,
+                            Err(RpcError::invalid("a prompt is already in progress")),
+                        );
+                        return;
+                    }
+                    adapter.respond_to_request(id, &method, params).await;
+                    if let Some(session) = prompt_session {
+                        session.prompt_pending.store(false, Ordering::SeqCst);
+                    }
+                });
+            }
+            (Some("session/cancel"), None) => adapter.cancel(&params),
+            (Some(_), None) => {}
+            (None, Some(id)) => adapter.answered(&id, message),
+            (None, None) => {}
+        }
+    }
+    shutdown.cancel();
+    requests.abort_all();
+    while requests.join_next().await.is_some() {}
+    lock(&adapter.pending).clear();
+    drop(adapter);
+    let _ = writer.await;
+    Ok(())
+}
+
+struct Adapter {
+    store: Store,
+    shutdown: CancellationToken,
+    out: mpsc::UnboundedSender<Value>,
+    pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    next_id: AtomicU64,
+    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    herdr: Option<HerdrCli>,
+    options: AdapterOptions,
+    home: Option<PathBuf>,
+    /// Transcripts already bound to a session, so two sessions in the same
+    /// directory never read the same Codex rollout.
+    claimed: Mutex<std::collections::HashSet<PathBuf>>,
+}
+
+struct Session {
+    id: String,
+    cwd: PathBuf,
+    mcp_servers: Vec<Value>,
+    model: Mutex<String>,
+    effort: Mutex<Option<String>>,
+    native_id: Mutex<Option<String>>,
+    prompt_pending: AtomicBool,
+    live: tokio::sync::Mutex<Option<Live>>,
+    cancel: Mutex<Option<CancellationToken>>,
+    /// Tools a user in Macro chose to always allow for this session, where
+    /// the native dialog had no "don't ask again" answer of its own.
+    always_allowed: Mutex<std::collections::HashSet<String>>,
+}
+
+struct PermissionEpoch(Arc<AtomicU64>);
+impl Drop for PermissionEpoch {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct PromptCancellation<'a>(&'a Mutex<Option<CancellationToken>>);
+
+impl Drop for PromptCancellation<'_> {
+    fn drop(&mut self) {
+        lock(self.0).take();
+    }
+}
+
+/// A session's running TUI.
+struct Live {
+    session: String,
+    cwd: PathBuf,
+    started: std::time::SystemTime,
+    name: String,
+    log: Transcript,
+    path: Option<PathBuf>,
+    cursor: Cursor,
+    pending: VecDeque<LogEvent>,
+    /// This process launched the agent or saw it running. Only such an
+    /// agent's disappearance is a close: a session restored after herdr
+    /// itself restarted finds every agent gone without anyone closing them.
+    seen_alive: bool,
+    /// `_session/closed` was sent for this agent. A relaunch starts a new
+    /// `Live`, so a later close of the new agent is reported again.
+    closed_reported: bool,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Adapter {
+    fn send(&self, message: Value) {
+        let _ = self.out.send(message);
+    }
+
+    fn respond(&self, id: Value, result: Result<Value, RpcError>) {
+        self.send(match result {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err(error) => {
+                let mut body = json!({"code": error.code, "message": error.message});
+                if let Some(data) = error.data {
+                    body["data"] = data;
+                }
+                json!({"jsonrpc": "2.0", "id": id, "error": body})
+            }
+        });
+    }
+
+    fn notify_update(&self, session: &str, update: Value) {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": session, "update": update},
+        }));
+    }
+
+    /// Send a request to the client and wait for its answer.
+    async fn call(&self, method: &str, params: Value) -> Option<Value> {
+        let id = format!(
+            "macrod-herdr-{}",
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let (tx, rx) = oneshot::channel();
+        lock(&self.pending).insert(Value::String(id.clone()).to_string(), tx);
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let answer = tokio::select! {
+            answer = rx => answer.ok(),
+            () = self.shutdown.cancelled() => None,
+        };
+        lock(&self.pending).remove(&Value::String(id).to_string());
+        answer
+    }
+
+    fn answered(&self, id: &Value, message: Value) {
+        if let Some(waiter) = lock(&self.pending).remove(&id.to_string()) {
+            let _ = waiter.send(message);
+        }
+    }
+
+    fn session(&self, params: &Value) -> Result<Arc<Session>, RpcError> {
+        let id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid("missing sessionId"))?;
+        lock(&self.sessions)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| RpcError::invalid(format!("unknown session {id}")))
+    }
+
+    fn cancel(self: &Arc<Self>, params: &Value) {
+        let Ok(session) = self.session(params) else {
+            return;
+        };
+        if let Some(cancel) = lock(&session.cancel).as_ref() {
+            cancel.cancel();
+            return;
+        }
+        let Some(herdr) = self.herdr.clone() else {
+            return;
+        };
+        let name = agent_name(&session.id);
+        let native_id = lock(&session.native_id).clone();
+        tokio::spawn(async move {
+            let Ok(info) = herdr.agent_info(&name).await else {
+                return;
+            };
+            if native_id.is_none()
+                || info.session_id != native_id
+                || !matches!(info.status.as_str(), "working" | "blocked")
+            {
+                return;
+            }
+            match interrupt(&herdr, &name).await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(%name, "the native turn kept running after Esc"),
+                Err(error) => tracing::warn!(%error, "could not interrupt native turn"),
+            }
+        });
+    }
+
+    async fn request(self: &Arc<Self>, method: &str, params: Value) -> Result<Value, RpcError> {
+        match method {
+            "initialize" => Ok(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "sessionCapabilities": {"list": {}},
+                    "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
+                },
+                "authMethods": [],
+                "agentInfo": {"name": "macrod-herdr", "version": env!("CARGO_PKG_VERSION")},
+            })),
+            "session/list" => {
+                let request = serde_json::from_value::<ListSessionsRequest>(params)
+                    .map_err(|error| RpcError::invalid(error.to_string()))?;
+                serde_json::to_value(self.list_sessions(request.cwd.as_deref()).await)
+                    .map_err(|error| RpcError::internal(error.to_string()))
+            }
+            "session/new" => self.new_session(&params),
+            "session/load" => self.load_session(&params).await,
+            "session/set_config_option" => {
+                let session = self.session(&params)?;
+                let value = params
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::invalid("missing configuration value"))?;
+                match params.get("configId").and_then(Value::as_str) {
+                    Some(MODEL_CONFIG_ID) => self.set_model(&session, value).await,
+                    Some(effort::CONFIG_ID) if self.options.kind == TuiAgent::Codex => {
+                        self.set_effort(&session, value).await
+                    }
+                    _ => Err(RpcError::invalid("unsupported configuration option")),
+                }
+            }
+            "session/prompt" => {
+                let session = self.session(&params)?;
+                let text = prompt_text(params.get("prompt").unwrap_or(&Value::Null));
+                self.prompt(&session, &text)
+                    .await
+                    .map(|stop| json!({"stopReason": stop}))
+            }
+            _ => Err(RpcError {
+                code: -32601,
+                message: format!("{method} is not supported"),
+                data: None,
+            }),
+        }
+    }
+
+    /// `session/list`: stored sessions whose Herdr agent still runs, oldest
+    /// first, in `cwd` when given. Read-only: the client's following
+    /// `session/load` attaches them. A closed agent is not live, so it is
+    /// never reopened; other lookup failures are retried before a session is
+    /// left out. Each carries `updatedAt`, its transcript's last write, when
+    /// it has one: the client restores recently active sessions at once, so
+    /// work typed into the agent's pane keeps reaching Macro.
+    async fn list_sessions(&self, cwd: Option<&Path>) -> ListSessionsResponse {
+        use futures::StreamExt as _;
+        let Some(herdr) = &self.herdr else {
+            return ListSessionsResponse::new(Vec::new());
+        };
+        let mut records: Vec<Record> = futures::stream::iter(
+            self.store.list().into_iter().filter(|record| {
+                record.kind == self.options.kind && cwd.is_none_or(|cwd| record.cwd == cwd)
+            }),
+        )
+        .map(|record| async move {
+            let name = agent_name(&record.id);
+            for _ in 0..LIVE_SESSION_LOOKUPS {
+                match herdr.agent_info(&name).await {
+                    Ok(_) => return Some(record),
+                    Err(error) if error.missing_agent() => return None,
+                    Err(error) => {
+                        tracing::warn!(%name, %error, "could not tell whether a native agent still runs");
+                    }
+                }
+            }
+            None
+        })
+        .buffer_unordered(8)
+        .filter_map(std::future::ready)
+        .collect()
+        .await;
+        records.sort_by(|a, b| a.started.cmp(&b.started).then_with(|| a.id.cmp(&b.id)));
+        ListSessionsResponse::new(
+            records
+                .into_iter()
+                .map(|record| {
+                    let updated_at = record.transcript.as_deref().and_then(last_written);
+                    SessionInfo::new(SessionId::new(record.id), record.cwd).updated_at(updated_at)
+                })
+                .collect(),
+        )
+    }
+
+    fn new_session(self: &Arc<Self>, params: &Value) -> Result<Value, RpcError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let cwd = params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| RpcError::invalid("missing cwd"))?;
+        let session = Arc::new(Session {
+            id: id.clone(),
+            cwd,
+            mcp_servers: params
+                .get("mcpServers")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            model: Mutex::new(
+                self.options
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
+            ),
+            native_id: Mutex::new(None),
+            effort: Mutex::new(None),
+            prompt_pending: AtomicBool::new(false),
+            live: tokio::sync::Mutex::new(None),
+            cancel: Mutex::new(None),
+            always_allowed: Mutex::new(std::collections::HashSet::new()),
+        });
+        self.save(&session, None)?;
+        lock(&self.sessions).insert(id.clone(), session.clone());
+        self.observe(&session);
+        Ok(json!({"sessionId": id, "configOptions": self.session_options(&session)}))
+    }
+
+    fn save(&self, session: &Session, live: Option<&Live>) -> Result<(), RpcError> {
+        self.store
+            .save(&Record {
+                version: 1,
+                id: session.id.clone(),
+                kind: self.options.kind,
+                cwd: session.cwd.clone(),
+                model: lock(&session.model).clone(),
+                native_id: lock(&session.native_id).clone(),
+                transcript: live.and_then(|live| live.path.clone()),
+                started: live
+                    .map(|live| live.started)
+                    .unwrap_or_else(std::time::SystemTime::now)
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            })
+            .map_err(|error| RpcError::internal(format!("could not save native session: {error}")))
+    }
+
+    async fn load_session(self: &Arc<Self>, params: &Value) -> Result<Value, RpcError> {
+        let id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid("missing sessionId"))?;
+        let existing = lock(&self.sessions).get(id).cloned();
+        if let Some(existing) = &existing {
+            let mut live = existing
+                .live
+                .try_lock()
+                .map_err(|_| RpcError::invalid("cannot reload during a Macro prompt"))?;
+            if existing.prompt_pending.load(Ordering::SeqCst) {
+                return Err(RpcError::invalid("cannot reload during a Macro prompt"));
+            }
+            *live = None;
+            lock(&self.sessions).remove(id);
+        }
+        let record = self.store.load(id).map_err(|error| {
+            RpcError::internal(format!("could not restore native session: {error}"))
+        })?;
+        if record.kind != self.options.kind
+            || params.get("cwd").and_then(Value::as_str).map(Path::new)
+                != Some(record.cwd.as_path())
+        {
+            return Err(RpcError::invalid(
+                "saved session belongs to a different agent or workspace",
+            ));
+        }
+        let mut live = Live {
+            session: id.to_owned(),
+            cwd: record.cwd.clone(),
+            started: std::time::UNIX_EPOCH + Duration::from_secs(record.started),
+            name: agent_name(id),
+            log: self.options.kind.log(),
+            path: record.transcript,
+            cursor: Cursor::default(),
+            pending: VecDeque::new(),
+            seen_alive: false,
+            closed_reported: false,
+        };
+        if live.path.is_none() {
+            live.path = self.locate(&live, record.native_id.as_deref());
+        }
+        let session = Arc::new(Session {
+            id: id.to_owned(),
+            cwd: record.cwd,
+            mcp_servers: params
+                .get("mcpServers")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            model: Mutex::new(record.model.clone()),
+            effort: Mutex::new(None),
+            native_id: Mutex::new(record.native_id),
+            prompt_pending: AtomicBool::new(false),
+            live: tokio::sync::Mutex::new(None),
+            cancel: Mutex::new(None),
+            always_allowed: Mutex::new(std::collections::HashSet::new()),
+        });
+        // ACP load stages this complete history until our successful response.
+        loop {
+            let offset = live.cursor.offset;
+            self.forward(&session, &mut live, &mut None)?;
+            if offset == live.cursor.offset && live.pending.is_empty() {
+                break;
+            }
+        }
+        self.sync_model(&session, &live).await;
+        *session.live.lock().await = Some(live);
+        lock(&self.sessions).insert(id.to_owned(), session.clone());
+        self.observe(&session);
+        Ok(json!({"configOptions": self.session_options(&session)}))
+    }
+
+    fn observe(self: &Arc<Self>, session: &Arc<Session>) {
+        let adapter = Arc::downgrade(self);
+        let session = Arc::downgrade(session);
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticks = 0u32;
+            // A turn started in the TUI: only its transcript or a settled
+            // native status can end it.
+            let mut open = false;
+            let mut settled = 0u32;
+            let mut last_output = Instant::now();
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(POLL) => {}
+                }
+                let (Some(adapter), Some(session)) = (adapter.upgrade(), session.upgrade()) else {
+                    break;
+                };
+                if session.prompt_pending.load(Ordering::SeqCst) {
+                    continue;
+                }
+                // A Macro prompt owns the reader until its response is sent.
+                let Ok(mut guard) = session.live.try_lock() else {
+                    continue;
+                };
+                let Some(live) = guard.as_mut() else {
+                    continue;
+                };
+                ticks = ticks.wrapping_add(1);
+                match adapter.forward(&session, live, &mut None) {
+                    Ok((moved, ended)) => {
+                        if moved {
+                            last_output = Instant::now();
+                            settled = 0;
+                        }
+                        open = ended.is_none() && (open || moved);
+                    }
+                    Err(error) => {
+                        tracing::warn!(session = %session.id, error = %error.message, "native transcript observation stopped");
+                        adapter.turn_complete(&session.id, "failed");
+                        break;
+                    }
+                }
+                if ticks.is_multiple_of(STATUS_EVERY) {
+                    adapter.sync_model(&session, live).await;
+                    // Interrupted turns, killed CLIs, and CLI events nothing
+                    // answers write no turn end; herdr still sees the TUI idle.
+                    if open {
+                        settled = if adapter.native_idle(live).await {
+                            settled + 1
+                        } else {
+                            0
+                        };
+                        if settled >= SETTLED_CHECKS && last_output.elapsed() >= SETTLED_QUIET {
+                            tracing::info!(session = %session.id, "native turn settled without a transcript ending");
+                            adapter.turn_complete(&session.id, "end_turn");
+                            open = false;
+                            settled = 0;
+                        }
+                    }
+                }
+                if ticks.is_multiple_of(CLOSED_CHECK_EVERY)
+                    && let Some(herdr) = &adapter.herdr
+                {
+                    adapter.report_if_closed(herdr, &session, live).await;
+                }
+            }
+        });
+    }
+
+    /// Tell the client, once per native agent, that the agent was closed in
+    /// herdr - its tab or pane ended by the person or the agent. Only herdr's
+    /// explicit `agent_not_found` for an agent this process saw running
+    /// counts: a socket error, timeout, or unreadable answer may be transient,
+    /// and an agent missing since startup was lost, not closed. The next
+    /// prompt still relaunches the session.
+    async fn report_if_closed(&self, herdr: &HerdrCli, session: &Session, live: &mut Live) {
+        if live.closed_reported {
+            return;
+        }
+        let error =
+            match tokio::time::timeout(CLOSED_CHECK_TIMEOUT, herdr.agent_info(&live.name)).await {
+                Ok(Ok(_)) => {
+                    live.seen_alive = true;
+                    return;
+                }
+                Ok(Err(error)) => error,
+                Err(_) => return,
+            };
+        if !live.seen_alive || !error.missing_agent() {
+            return;
+        }
+        live.closed_reported = true;
+        tracing::info!(session = %session.id, "native agent was closed in herdr");
+        self.send(
+            json!({"jsonrpc":"2.0", "method":"_session/closed", "params":{"sessionId":session.id}}),
+        );
+    }
+
+    /// Whether herdr reports the session's native agent done with its turn.
+    async fn native_idle(&self, live: &Live) -> bool {
+        let Some(herdr) = &self.herdr else {
+            return false;
+        };
+        herdr
+            .agent_info(&live.name)
+            .await
+            .is_ok_and(|info| matches!(info.status.as_str(), "idle" | "done"))
+    }
+
+    fn turn_complete(&self, session: &str, stop: &str) {
+        let outcome = match stop {
+            "cancelled" => json!({"kind":"cancelled"}),
+            "failed" => {
+                json!({"kind":"failed", "message":"native transcript could not be read; reload the session"})
+            }
+            _ => json!({"kind":"finished"}),
+        };
+        self.send(json!({"jsonrpc":"2.0", "method":"_session/turn_complete", "params":{"sessionId":session, "outcome":outcome}}));
+    }
+
+    async fn prompt(
+        self: &Arc<Self>,
+        session: &Arc<Session>,
+        text: &str,
+    ) -> Result<&'static str, RpcError> {
+        let herdr = self.herdr.as_ref().ok_or_else(|| {
+            RpcError::internal("macrod herdr-acp needs a macrod started inside herdr")
+        })?;
+        let cancel = CancellationToken::new();
+        *lock(&session.cancel) = Some(cancel.clone());
+        let _cancellation = PromptCancellation(&session.cancel);
+
+        let mut guard = session.live.lock().await;
+        if let Some(live) = guard.as_mut() {
+            // Queued like input typed into the TUI mid-turn: the prompt waits
+            // for the native turn, which streams and asks for permission
+            // meanwhile, and a stop interrupts that turn.
+            let wait = tracing::info_span!(
+                "macrod.herdr.prompt_wait",
+                session_id = %session.id,
+                native_turns = tracing::field::Empty,
+                exit_dismissed = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+            );
+            let mut native_turns = 0u32;
+            let mut exit_dismissed = false;
+            let waited: Result<_, RpcError> = async {
+                loop {
+                    if cancel.is_cancelled() {
+                        return Ok(None);
+                    }
+                    let info = herdr.agent_info(&live.name).await;
+                    if !info
+                        .as_ref()
+                        .is_ok_and(|info| matches!(info.status.as_str(), "working" | "blocked"))
+                    {
+                        return Ok(Some(info));
+                    }
+                    if info.as_ref().is_ok_and(|info| info.status == "blocked")
+                        && self.stay(herdr, &live.name).await?
+                    {
+                        exit_dismissed = true;
+                        continue;
+                    }
+                    native_turns += 1;
+                    // An interrupted native turn ends "cancelled" too; only a
+                    // Stop from Macro drops the waiting prompt, which then
+                    // answers as not delivered.
+                    self.follow(herdr, session, live, &cancel, true).await?;
+                    if cancel.is_cancelled() {
+                        return Ok(None);
+                    }
+                }
+            }
+            .instrument(wait.clone())
+            .await;
+            wait.record("native_turns", native_turns);
+            wait.record("exit_dismissed", exit_dismissed);
+            let waited = waited.inspect_err(|error| {
+                wait.record("outcome", "failed");
+                tracing::warn!(parent: &wait, error = %error.message, "queued prompt failed while waiting");
+            })?;
+            let Some(info) = waited else {
+                wait.record("outcome", "not_delivered");
+                return Err(RpcError::not_delivered());
+            };
+            wait.record("outcome", "ready");
+            match info {
+                Ok(info) => {
+                    if info.cwd.as_ref().is_some_and(|cwd| cwd != &session.cwd)
+                        || info
+                            .session_id
+                            .as_ref()
+                            .zip(lock(&session.native_id).as_ref())
+                            .is_some_and(|(actual, expected)| actual != expected)
+                    {
+                        return Err(RpcError::invalid(
+                            "Herdr agent identity no longer matches this session",
+                        ));
+                    }
+                }
+                Err(error) if error.missing_agent() => {
+                    let old = guard.take().expect("live session was checked above");
+                    let mut restarted = self.launch(herdr, session, text).await?;
+                    restarted.path = old.path;
+                    restarted.cursor = old.cursor;
+                    restarted.log = old.log;
+                    restarted.pending = old.pending;
+                    *guard = Some(restarted);
+                    self.save(session, guard.as_ref())?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if guard.is_none() {
+            *guard = Some(self.launch(herdr, session, text).await?);
+            self.save(session, guard.as_ref())?;
+        }
+        let Some(live) = guard.as_mut() else {
+            return Err(RpcError::internal("the Claude Code window did not start"));
+        };
+
+        // Relay whatever the native session did before this prompt, so a
+        // turn end already in the transcript never ends this prompt's turn.
+        loop {
+            let offset = live.cursor.offset;
+            self.forward(session, live, &mut None)?;
+            if offset == live.cursor.offset && live.pending.is_empty() {
+                break;
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(RpcError::not_delivered());
+        }
+        // The observer cannot acquire this session until the turn ends. Publish
+        // native settings now, while the freshly started composer is visible.
+        self.sync_model(session, live).await;
+        if self.options.kind == TuiAgent::Codex
+            && let Some(requested) = effort::command(text)
+        {
+            let requested = requested?;
+            let message = tokio::select! {
+                () = cancel.cancelled() => return Ok("cancelled"),
+                result = tokio::time::timeout(Duration::from_secs(20), self.codex_effort(session, live, requested)) => {
+                    result.map_err(|_| RpcError::internal("effort change was not confirmed; check the native session in Herdr"))??
+                }
+            };
+            self.notify_update(
+                &session.id,
+                json!({
+                    "sessionUpdate":"agent_message_chunk", "content":{"type":"text","text":message},
+                }),
+            );
+            return Ok("end_turn");
+        }
+        herdr.prompt_agent(&live.name, text).await?;
+        if let Some(command) = commands::native_control(self.options.kind, text) {
+            // Herdr acknowledges PTY delivery, not the resulting setting. These
+            // commands need not write a transcript entry or start a model turn.
+            self.notify_update(&session.id, json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": format!(
+                    "Sent `{command}` to {} in Herdr. Check its response and complete any confirmation there.",
+                    self.options.kind.herdr_kind(),
+                )},
+            }));
+            return Ok("end_turn");
+        }
+        let outcome = self.follow(herdr, session, live, &cancel, false).await;
+        *lock(&session.cancel) = None;
+        self.save(session, guard.as_ref())?;
+        outcome
+    }
+
+    /// Dismiss the exit confirmation a second Ctrl-C in Herdr leaves behind,
+    /// so the prompt waiting on it can run. Returns whether it pressed Esc.
+    async fn stay(&self, herdr: &HerdrCli, name: &str) -> Result<bool, RpcError> {
+        let before = herdr.agent_info(name).await?;
+        let screen = herdr.read_agent(name).await?;
+        if !super::controls::exit_confirmation(self.options.kind, &screen) {
+            return Ok(false);
+        }
+        let after = herdr.agent_info(name).await?;
+        let current = herdr.read_agent(name).await?;
+        if !super::controls::same_dialog(
+            &screen,
+            &current,
+            before.state_change_seq,
+            after.state_change_seq,
+            &after.status,
+        ) {
+            return Ok(false);
+        }
+        herdr.send_keys(name, &["esc"]).await?;
+        tracing::info!(
+            agent = name,
+            "dismissed the native exit confirmation for a queued prompt"
+        );
+        tokio::time::sleep(POLL).await;
+        Ok(true)
+    }
+
+    /// Open the session's herdr window and start the agent in it.
+    async fn launch(
+        &self,
+        herdr: &HerdrCli,
+        session: &Session,
+        first_prompt: &str,
+    ) -> Result<Live, RpcError> {
+        let kind = self.options.kind;
+        let label = title_from(first_prompt).unwrap_or_else(|| kind.herdr_kind().to_owned());
+        let source = if self.options.managed_worktrees {
+            Some(
+                crate::outbound::git::primary_worktree(&session.cwd)
+                    .await
+                    .map_err(|error| RpcError::internal(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        let model = lock(&session.model).clone();
+        let mut args = Vec::new();
+        let resume = lock(&session.native_id).clone();
+        if let Some(id) = &resume {
+            args.extend([
+                if kind == TuiAgent::Claude {
+                    "--resume"
+                } else {
+                    "resume"
+                }
+                .to_owned(),
+                id.clone(),
+            ]);
+        }
+        if model != DEFAULT_MODEL && resume.is_none() {
+            args.extend(["--model".to_owned(), model.clone()]);
+        }
+        if kind == TuiAgent::Claude {
+            if resume.is_none() {
+                args.extend(["--session-id".to_owned(), session.id.clone()]);
+            }
+            if let Some(mode) = &self.options.permission_mode {
+                args.extend(["--permission-mode".to_owned(), mode.clone()]);
+            }
+            if let Some(config) = self.write_mcp_config(session)? {
+                args.extend([
+                    "--mcp-config".to_owned(),
+                    config.to_string_lossy().into_owned(),
+                ]);
+            }
+        }
+        let mut environment = None;
+        if kind == TuiAgent::Codex && !session.mcp_servers.is_empty() {
+            let prepared = super::mcp::codex(
+                &self.store.0.join("mcp").join(&session.id),
+                &session.mcp_servers,
+            )
+            .map_err(|error| RpcError::internal(error.to_string()))?;
+            args.extend(prepared.args);
+            environment = Some(prepared.environment);
+        }
+        args.extend(self.options.agent_args.iter().cloned());
+        let name = agent_name(&session.id);
+        let started = std::time::SystemTime::now();
+        let window = herdr
+            .launch_agent(&AgentLaunch {
+                name: &name,
+                kind: kind.herdr_kind(),
+                reports_status: kind.reports_status(),
+                cwd: &session.cwd,
+                label: &label,
+                focus: !self.options.no_focus,
+                worktree_source: source.as_deref(),
+                environment: environment.as_deref(),
+                args: &args,
+            })
+            .await?;
+        tracing::info!(
+            session = %session.id,
+            pane = %window.pane_id,
+            agent = kind.herdr_kind(),
+            "agent started in herdr"
+        );
+        if kind == TuiAgent::Claude {
+            *lock(&session.native_id) = Some(session.id.clone());
+        }
+        Ok(Live {
+            session: session.id.clone(),
+            cwd: session.cwd.clone(),
+            started,
+            name,
+            log: self.options.kind.log(),
+            path: None,
+            cursor: Cursor::default(),
+            pending: VecDeque::new(),
+            seen_alive: true,
+            closed_reported: false,
+        })
+    }
+
+    /// Hand Claude Code the MCP servers Macro gave the session, in a file
+    /// only this user can read: the entries carry session credentials.
+    fn write_mcp_config(&self, session: &Session) -> Result<Option<PathBuf>, RpcError> {
+        let servers = claude_mcp_servers(&session.mcp_servers);
+        if servers.is_empty() {
+            return Ok(None);
+        }
+        let dir = self.store.0.join("mcp");
+        std::fs::create_dir_all(&dir).map_err(|error| RpcError::internal(error.to_string()))?;
+        let path = dir.join(format!("{}.mcp.json", session.id));
+        let body = json!({"mcpServers": servers}).to_string();
+        write_private(&path, body.as_bytes())
+            .map_err(|error| RpcError::internal(error.to_string()))?;
+        Ok(Some(path))
+    }
+
+    /// Stream the turn from the transcript until it ends. `running` says
+    /// the native turn is known to have started, so it may end without
+    /// ever reporting `working` (a dialog dismissed in Herdr).
+    async fn follow(
+        self: &Arc<Self>,
+        herdr: &HerdrCli,
+        session: &Arc<Session>,
+        live: &mut Live,
+        cancel: &CancellationToken,
+        running: bool,
+    ) -> Result<&'static str, RpcError> {
+        let started = Instant::now();
+        let mut ticks = 0u32;
+        let mut settled = 0u32;
+        let mut missing = 0u32;
+        let mut active = running;
+        let mut open_tool: Option<OpenTool> = None;
+        // Bumped whenever a dialog is asked about or goes away, so a late
+        // answer from Macro never presses keys into a different dialog.
+        let generation = Arc::new(AtomicU64::new(0));
+        let mut asking = false;
+        let mut last_output = Instant::now();
+        let mut asked_seq = None;
+        let mut interrupt_failed = false;
+        let _epoch = PermissionEpoch(generation.clone());
+        loop {
+            tokio::select! {
+                () = cancel.cancelled(), if !interrupt_failed => {
+                    if interrupt(herdr, &live.name).await? {
+                        self.forward(session, live, &mut open_tool)?;
+                        return Ok("cancelled");
+                    }
+                    // Answering `cancelled` now would end the turn in Macro
+                    // while the agent keeps working; follow it to its end.
+                    tracing::warn!(session = %session.id, "the native turn kept running after Esc");
+                    interrupt_failed = true;
+                }
+                () = tokio::time::sleep(POLL) => {}
+            }
+            let (moved, ended) = self.forward(session, live, &mut open_tool)?;
+            if moved {
+                last_output = Instant::now();
+            }
+            if let Some(stop) = ended {
+                return Ok(stop);
+            }
+
+            ticks += 1;
+            if !ticks.is_multiple_of(STATUS_EVERY) {
+                continue;
+            }
+            // A startup screen may have hidden the footer before submission.
+            // Retry without waiting for a model response to release the observer.
+            let needs_settings = lock(&session.effort).is_none();
+            if needs_settings {
+                self.sync_model(session, live).await;
+            }
+            let info = match herdr.agent_info(&live.name).await {
+                Ok(info) => {
+                    missing = 0;
+                    if info.session_id.is_some() {
+                        *lock(&session.native_id) = info.session_id.clone();
+                    }
+                    if live.path.is_none() {
+                        live.path = self.locate(live, info.session_id.as_deref());
+                    }
+                    self.save(session, Some(live))?;
+                    info
+                }
+                Err(error) => {
+                    missing += 1;
+                    if missing >= MISSING_AGENT_CHECKS {
+                        return Err(RpcError::internal(format!(
+                            "the agent's herdr window is gone: {error}"
+                        )));
+                    }
+                    continue;
+                }
+            };
+            let status = info.status;
+            if asked_seq.is_some_and(|seq| seq != info.state_change_seq) {
+                asking = false;
+                generation.fetch_add(1, Ordering::SeqCst);
+            }
+            if status != "blocked" && std::mem::take(&mut asking) {
+                generation.fetch_add(1, Ordering::SeqCst);
+            }
+            match status.as_str() {
+                "working" => {
+                    active = true;
+                    settled = 0;
+                }
+                "blocked" => {
+                    settled = 0;
+                    if !std::mem::replace(&mut asking, true) {
+                        asked_seq = Some(info.state_change_seq);
+                        let current = generation.fetch_add(1, Ordering::SeqCst) + 1;
+                        self.ask_permission(session, live, open_tool.clone(), current, &generation);
+                    }
+                }
+                "idle" | "done" => {
+                    settled += 1;
+                    if active && settled >= SETTLED_CHECKS && last_output.elapsed() >= SETTLED_QUIET
+                    {
+                        self.forward(session, live, &mut open_tool)?;
+                        return Ok("end_turn");
+                    }
+                    if !active && started.elapsed() > QUIET_START {
+                        return Err(RpcError::internal(
+                            "the native TUI did not confirm prompt submission; check its input in Herdr",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Relay new transcript lines. Returns whether anything moved and the
+    /// stop reason if the turn ended.
+    fn forward(
+        &self,
+        session: &Session,
+        live: &mut Live,
+        open_tool: &mut Option<OpenTool>,
+    ) -> Result<(bool, Option<&'static str>), RpcError> {
+        let mut moved = false;
+        let mut ended = None;
+        if live.pending.is_empty() {
+            live.pending = self.drain(live)?.into();
+        }
+        while let Some(event) = live.pending.pop_front() {
+            match event {
+                LogEvent::ModelChanged(model) => {
+                    self.report_model(session, live, &model)?;
+                }
+                LogEvent::Update(update) => {
+                    moved = true;
+                    // Codex logs a command only once it has run, so its log
+                    // never names the call a permission dialog is about.
+                    if self.options.kind == TuiAgent::Claude {
+                        track_open_tool(open_tool, &update);
+                    }
+                    self.notify_update(&session.id, update);
+                }
+                LogEvent::TurnEnded(stop) => {
+                    self.turn_complete(&session.id, stop);
+                    ended = Some(stop);
+                    break;
+                }
+                // A waiting Macro prompt owns the next turn: the item joins
+                // it, and only the prompt's own turn end may answer it.
+                LogEvent::LateUpdate(update) => {
+                    moved = true;
+                    self.notify_update(&session.id, update);
+                    if !session.prompt_pending.load(Ordering::SeqCst) {
+                        self.turn_complete(&session.id, "end_turn");
+                    }
+                }
+            }
+        }
+        Ok((moved, ended))
+    }
+
+    /// Where the agent writes the session's transcript, once it exists.
+    /// Claude Code names it after the id this adapter gave it; Codex mints
+    /// its own id, which herdr reports once the session is live.
+    fn locate(&self, live: &Live, agent_session: Option<&str>) -> Option<PathBuf> {
+        let home = self.home.as_deref()?;
+        let path = match self.options.kind {
+            TuiAgent::Claude => find_claude_transcript(&home.join(".claude"), &live.session),
+            TuiAgent::Codex => {
+                let sessions = home.join(".codex").join("sessions");
+                let claimed = lock(&self.claimed);
+                agent_session
+                    .and_then(|id| find_codex_rollout(&sessions, id))
+                    .or_else(|| newest_codex_rollout(&sessions, &live.cwd, live.started, &claimed))
+            }
+        }?;
+        lock(&self.claimed).insert(path.clone());
+        Some(path)
+    }
+
+    /// Read whole new lines from the session's transcript.
+    fn drain(&self, live: &mut Live) -> Result<Vec<LogEvent>, RpcError> {
+        if live.path.is_none() {
+            live.path = self.locate(live, None);
+        }
+        let Some(path) = &live.path else {
+            return Ok(Vec::new());
+        };
+        let lines = live.cursor.read(path).map_err(|error| {
+            RpcError::internal(format!("could not read native transcript: {error}"))
+        })?;
+        Ok(lines
+            .into_iter()
+            .flat_map(|line| live.log.entry(&line))
+            .collect())
+    }
+}
+
+/// A herdr agent name for the session: `[a-z][a-z0-9_-]{0,31}`.
+/// Press Esc until herdr reports the agent `idle` or `done`, and say whether
+/// it is. One press is not proof: in Claude Code's vim editor mode the first
+/// Esc only leaves insert mode. No press follows a stop, since Esc at an idle
+/// Claude Code prompt opens its rewind menu.
+#[tracing::instrument(
+    name = "macrod.herdr.interrupt",
+    skip(herdr),
+    fields(herdr.agent = name, presses, stopped),
+    err
+)]
+async fn interrupt(herdr: &HerdrCli, name: &str) -> Result<bool, HerdrError> {
+    let span = tracing::Span::current();
+    for press in 1..=INTERRUPT_PRESSES {
+        span.record("presses", press);
+        herdr.send_keys(name, &["esc"]).await?;
+        for _ in 0..INTERRUPT_CHECKS {
+            tokio::time::sleep(POLL).await;
+            let status = herdr.agent_info(name).await?.status;
+            if matches!(status.as_str(), "idle" | "done") {
+                span.record("stopped", true);
+                return Ok(true);
+            }
+        }
+    }
+    span.record("stopped", false);
+    Ok(false)
+}
+
+/// When `transcript` was last written, as RFC 3339, or `None` when it cannot
+/// be read.
+fn last_written(transcript: &Path) -> Option<String> {
+    let modified = std::fs::metadata(transcript).ok()?.modified().ok()?;
+    Some(
+        chrono::DateTime::<chrono::Utc>::from(modified)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
+pub(crate) fn agent_name(session: &str) -> String {
+    let short: String = session
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    format!("macro-{short}")
+}
+
+fn config_options(kind: TuiAgent, current: &str) -> Value {
+    let mut options = kind
+        .models()
+        .iter()
+        .map(|(value, name)| json!({"value": value, "name": name}))
+        .collect::<Vec<_>>();
+    if !kind.models().iter().any(|(value, _)| *value == current) {
+        options.push(json!({"value": current, "name": current}));
+    }
+    json!([{
+        "id": MODEL_CONFIG_ID,
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": current,
+        "options": options,
+    }])
+}
+
+pub(crate) fn prompt_text(prompt: &Value) -> String {
+    prompt
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| match block.get("type").and_then(Value::as_str)? {
+            "text" => block.get("text").and_then(Value::as_str).map(str::to_owned),
+            "resource_link" => block
+                .get("uri")
+                .and_then(Value::as_str)
+                .map(|uri| format!("@{}", uri.strip_prefix("file://").unwrap_or(uri))),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// ACP `mcpServers` entries in Claude Code's `--mcp-config` shape.
+pub(crate) fn claude_mcp_servers(servers: &[Value]) -> serde_json::Map<String, Value> {
+    let pairs = |list: Option<&Value>| -> serde_json::Map<String, Value> {
+        list.and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|pair| {
+                Some((
+                    pair.get("name")?.as_str()?.to_owned(),
+                    pair.get("value")?.clone(),
+                ))
+            })
+            .collect()
+    };
+    servers
+        .iter()
+        .filter_map(|server| {
+            let name = server.get("name")?.as_str()?.to_owned();
+            let config = match server.get("type").and_then(Value::as_str) {
+                Some(kind @ ("http" | "sse")) => json!({
+                    "type": kind,
+                    "url": server.get("url")?,
+                    "headers": pairs(server.get("headers")),
+                }),
+                _ => json!({
+                    "command": server.get("command")?,
+                    "args": server.get("args").cloned().unwrap_or_else(|| json!([])),
+                    "env": pairs(server.get("env")),
+                }),
+            };
+            Some((name, config))
+        })
+        .collect()
+}
+
+fn codex_rollouts(sessions: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![sessions.to_owned()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// The newest unclaimed rollout Codex started in `cwd` since `since`, for
+/// when herdr cannot name the Codex session.
+fn newest_codex_rollout(
+    sessions: &Path,
+    cwd: &Path,
+    since: std::time::SystemTime,
+    claimed: &std::collections::HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    let since = since
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    codex_rollouts(sessions)
+        .into_iter()
+        .filter(|path| !claimed.contains(path))
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()?;
+            (modified >= since).then_some((modified, path))
+        })
+        .filter(|(_, path)| rollout_cwd(path).is_some_and(|dir| dir == cwd))
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+}
+
+/// The working directory in a rollout's leading `session_meta` record.
+fn rollout_cwd(path: &Path) -> Option<PathBuf> {
+    use std::io::BufRead as _;
+    let mut first = String::new();
+    std::io::BufReader::new(std::fs::File::open(path).ok()?)
+        .read_line(&mut first)
+        .ok()?;
+    let meta: Value = serde_json::from_str(&first).ok()?;
+    (meta.get("type")?.as_str()? == "session_meta")
+        .then(|| meta.pointer("/payload/cwd")?.as_str().map(PathBuf::from))
+        .flatten()
+}
+
+/// `rollout-<time>-<session>.jsonl` under Codex's dated session folders.
+fn find_codex_rollout(sessions: &Path, session: &str) -> Option<PathBuf> {
+    if session.is_empty() {
+        return None;
+    }
+    let suffix = format!("-{session}.jsonl");
+    codex_rollouts(sessions).into_iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&suffix))
+    })
+}
+
+fn find_claude_transcript(claude_home: &Path, session: &str) -> Option<PathBuf> {
+    if session.is_empty() {
+        return None;
+    }
+    let file = format!("{session}.jsonl");
+    std::fs::read_dir(claude_home.join("projects"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|project| project.path().join(&file))
+        .find(|path| path.is_file())
+}
+
+#[cfg(test)]
+mod test;

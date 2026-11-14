@@ -1,0 +1,176 @@
+//! What counts as activity in the calls domain.
+//!
+//! Note the ownership shape: "a call started in this channel" is *call*
+//! knowledge even though the activity targets a channel entity — so the
+//! call crate owns the [`DomainActivity`] impl targeting
+//! [`EntityType::Channel`]. Ownership follows the knowledge, not the entity
+//! kind.
+
+#[cfg(test)]
+mod test;
+
+use ::activity::{
+    Action, Activity, ActivitySource, Actor, CallStart, CommonAction, DomainActivity, EntityType,
+    Ingest,
+};
+use uuid::Uuid;
+
+use super::events::CallTopicEvent;
+
+/// A call started in a channel — a channel-targeted activity owned by the
+/// calls domain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallStartedActivity {
+    /// The channel the call started in.
+    pub channel_id: String,
+    /// The started call.
+    pub call_id: String,
+}
+
+impl DomainActivity for CallStartedActivity {
+    const ENTITY_TYPE: EntityType = EntityType::Channel;
+
+    fn entity_id(&self) -> &str {
+        &self.channel_id
+    }
+
+    fn into_action(self) -> Action {
+        Action::CallStarted(CallStart {
+            call_id: self.call_id,
+        })
+    }
+}
+
+/// Completion of a call whose channel row already shows the ending, so it is
+/// recorded against the call and stays out of the channel's timeline.
+struct CallThreadEndedActivity {
+    call_id: String,
+    end: ::activity::domain::models::CallEnd,
+}
+
+impl DomainActivity for CallThreadEndedActivity {
+    const ENTITY_TYPE: EntityType = EntityType::Call;
+    fn entity_id(&self) -> &str {
+        &self.call_id
+    }
+    fn into_action(self) -> Action {
+        Action::CallEnded(self.end)
+    }
+}
+
+/// Channel-targeted completion of a call.
+struct CallEndedActivity {
+    channel_id: String,
+    end: ::activity::domain::models::CallEnd,
+}
+
+impl DomainActivity for CallEndedActivity {
+    const ENTITY_TYPE: EntityType = EntityType::Channel;
+    fn entity_id(&self) -> &str {
+        &self.channel_id
+    }
+    fn into_action(self) -> Action {
+        Action::CallEnded(self.end)
+    }
+}
+
+impl ActivitySource for CallTopicEvent {
+    /// Maps one `macro.calls` event to its ingest outcome.
+    ///
+    /// Exhaustive on purpose: a new event variant fails compilation here
+    /// until someone classifies it or explicitly drops it.
+    fn ingest(&self, event_id: Uuid) -> Ingest {
+        match self {
+            // Only channel calls have a timeline to record the ending in.
+            CallTopicEvent::RecordArchived(m) if m.channel_thread => {
+                Ingest::Insert(vec![Activity::from_domain(
+                    event_id,
+                    0,
+                    Actor::new_from_user(m.created_by.clone()),
+                    None,
+                    CallThreadEndedActivity {
+                        call_id: m.call_id.to_string(),
+                        end: ::activity::domain::models::CallEnd {
+                            call_id: m.call_id.to_string(),
+                            duration_ms: m
+                                .duration_ms
+                                .unwrap_or_else(|| (m.ended_at - m.started_at).num_milliseconds())
+                                .max(0),
+                        },
+                    },
+                    m.ended_at,
+                )])
+            }
+            CallTopicEvent::RecordArchived(m) => match m.channel_id {
+                None => Ingest::Ignore,
+                Some(channel_id) => Ingest::Insert(vec![Activity::from_domain(
+                    event_id,
+                    0,
+                    Actor::new_from_user(m.created_by.clone()),
+                    None,
+                    CallEndedActivity {
+                        channel_id: channel_id.to_string(),
+                        end: ::activity::domain::models::CallEnd {
+                            call_id: m.call_id.to_string(),
+                            duration_ms: m
+                                .duration_ms
+                                .unwrap_or_else(|| (m.ended_at - m.started_at).num_milliseconds())
+                                .max(0),
+                        },
+                    },
+                    m.ended_at,
+                )]),
+            },
+            // Two activities: the call happened in the channel (timeline/feed),
+            // and the call itself is a new entity (soup item).
+            CallTopicEvent::Started(m) => {
+                let actor = Actor::new_from_user(m.created_by.clone());
+                let Some(channel_id) = m.channel_id else {
+                    return Ingest::Insert(vec![Activity::common(
+                        event_id,
+                        0,
+                        actor,
+                        None,
+                        EntityType::Call,
+                        m.call_id.to_string(),
+                        CommonAction::Created,
+                        m.created_at,
+                    )]);
+                };
+                Ingest::Insert(vec![
+                    Activity::from_domain(
+                        event_id,
+                        0,
+                        actor.clone(),
+                        None,
+                        CallStartedActivity {
+                            channel_id: channel_id.to_string(),
+                            call_id: m.call_id.to_string(),
+                        },
+                        m.created_at,
+                    ),
+                    Activity::common(
+                        event_id,
+                        1,
+                        actor,
+                        None,
+                        EntityType::Call,
+                        m.call_id.to_string(),
+                        CommonAction::Created,
+                        m.created_at,
+                    ),
+                ])
+            }
+            // Call-record deletion is a hard delete; purge the call's
+            // activities like other hard deletes.
+            CallTopicEvent::RecordDeleted(m) => {
+                Ingest::Purge(vec![(EntityType::Call, m.call_id.to_string())])
+            }
+            // Archival/processing pipeline and integration sync, not user activity.
+            CallTopicEvent::RecordUpdated(_)
+            | CallTopicEvent::RecordSummarized(_)
+            | CallTopicEvent::RecordingReady(_)
+            | CallTopicEvent::RecordImported(_) => Ingest::Ignore,
+        }
+    }
+}

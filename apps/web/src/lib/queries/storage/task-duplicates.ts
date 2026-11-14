@@ -1,0 +1,143 @@
+import { fireAndForget } from '@core/util/fireAndForget';
+import { markdownToEmbeddingText } from '@macro-inc/lexical-core/utils/parsers';
+import { queryClient } from '@queries/client';
+import {
+  storageServiceClient,
+  type TaskDuplicate,
+  type TaskSimilarityResult,
+} from '@service-storage/client';
+import {
+  keepPreviousData,
+  queryOptions,
+  useMutation,
+  useQuery,
+} from '@tanstack/solid-query';
+import type { Accessor } from 'solid-js';
+import { entityKeys, taskSimilaritySearchKeys } from './keys';
+
+type TaskDuplicateMatchesUpdatedPayload = {
+  documentId: string;
+};
+
+export function invalidateTaskDuplicates(documentId: string) {
+  return queryClient.invalidateQueries({
+    queryKey: entityKeys.taskDuplicates(documentId).queryKey,
+  });
+}
+
+export function handleTaskDuplicateMatchesUpdated(
+  payload: TaskDuplicateMatchesUpdatedPayload
+) {
+  if (typeof payload.documentId !== 'string') {
+    console.warn('Malformed task duplicate live update payload', payload);
+    return;
+  }
+  fireAndForget(
+    invalidateTaskDuplicates(payload.documentId),
+    'task-duplicates'
+  );
+}
+
+async function fetchTaskDuplicates(
+  documentId: string
+): Promise<TaskDuplicate[]> {
+  const result = await storageServiceClient.getTaskDuplicates({ documentId });
+  if (result.isErr()) {
+    throw new Error('Failed to fetch task duplicates');
+  }
+  return result.value;
+}
+
+function taskDuplicatesQueryOptions(documentId: string) {
+  return queryOptions({
+    queryKey: entityKeys.taskDuplicates(documentId).queryKey,
+    queryFn: () => fetchTaskDuplicates(documentId),
+    enabled: !!documentId,
+    staleTime: 30 * 1000,
+  });
+}
+
+export function useTaskDuplicatesQuery(documentId: Accessor<string>) {
+  return useQuery(() => taskDuplicatesQueryOptions(documentId()));
+}
+
+export function useDismissTaskDuplicatesMutation(documentId: Accessor<string>) {
+  return useMutation(() => ({
+    mutationFn: async (params: {
+      matchIds: string[];
+      otherDocumentIds?: string[];
+    }) => {
+      const result = await storageServiceClient.dismissTaskDuplicates({
+        documentId: documentId(),
+        matchIds: params.matchIds,
+      });
+      if (result.isErr()) throw new Error('Failed to dismiss duplicate');
+    },
+    onSuccess: (_data, params) => {
+      fireAndForget(invalidateTaskDuplicates(documentId()), 'task-duplicates');
+      for (const otherDocumentId of params.otherDocumentIds ?? []) {
+        fireAndForget(
+          invalidateTaskDuplicates(otherDocumentId),
+          'task-duplicates'
+        );
+      }
+    },
+  }));
+}
+
+type TaskSimilaritySearchInput = {
+  title: string;
+  markdown: string;
+};
+
+async function searchSimilarTasks(
+  input: TaskSimilaritySearchInput
+): Promise<TaskSimilarityResult[]> {
+  const result = await storageServiceClient.searchSimilarTasks({
+    taskName: input.title,
+    // The backend embeds this text as-is, so reduce mention tags to the
+    // compact embedding format up front rather than round-tripping through
+    // lexical-service on a latency-sensitive as-you-type search.
+    markdown: markdownToEmbeddingText(input.markdown),
+  });
+  if (result.isErr()) {
+    throw new Error('Failed to search for similar tasks');
+  }
+  return result.value;
+}
+
+function taskSimilaritySearchQueryOptions(input: TaskSimilaritySearchInput) {
+  return queryOptions({
+    queryKey: taskSimilaritySearchKeys.forInput(input).queryKey,
+    queryFn: () => searchSimilarTasks(input),
+    // Only query when there is something to search on: a title or a body.
+    enabled: input.title.trim().length > 0 || input.markdown.trim().length > 0,
+    staleTime: 30 * 1000,
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * Live, ephemeral similarity search used by the task composer. Hits the
+ * stateless `/documents/similarity_search` HTTP endpoint — nothing is
+ * persisted, so there is no cache invalidation or dismiss flow.
+ */
+export function useTaskSimilaritySearchQuery(
+  input: Accessor<TaskSimilaritySearchInput>
+) {
+  return useQuery(() => taskSimilaritySearchQueryOptions(input()));
+}
+
+export function useDeleteThisDuplicateTaskMutation(
+  documentId: Accessor<string>
+) {
+  return useMutation(() => ({
+    mutationFn: async (matchId: string) => {
+      const result = await storageServiceClient.deleteThisDuplicateTask({
+        documentId: documentId(),
+        matchId,
+      });
+      if (result.isErr()) throw new Error('Failed to delete task');
+    },
+  }));
+}

@@ -1,0 +1,283 @@
+use axum::{
+    body::Body,
+    extract::{FromRequest, Request},
+};
+use cool_asserts::assert_matches;
+
+use super::*;
+
+#[test]
+fn allowed_original_urls_are_accepted() {
+    for original_url in [
+        "macro://login",
+        "macro:///welcome",
+        "macro:///otherthing",
+        "macro://otherthing/path",
+        "tauri://localhost/app/login",
+        "http://tauri.localhost/app/login",
+        "https://tauri.localhost/app/login",
+        "http://localhost:3000/app/login",
+        "https://localhost/app/login",
+        "https://dev.macro.com/app/login",
+        "https://macro.com/app/login",
+        "https://www.macro.com/app/login",
+    ] {
+        let original_url = Url::parse(original_url).expect("test URL should parse");
+        assert!(
+            is_allowed_original_url(&original_url),
+            "{original_url} should be allowed"
+        );
+    }
+}
+
+#[test]
+fn untrusted_original_urls_are_rejected() {
+    for original_url in [
+        "https://example.com/app/login",
+        "https://macro.com.example.com/app/login",
+        "https://www.macro.com.example.com/app/login",
+        "https://staging.macro.com/app/login",
+        "http://macro.com/app/login",
+        "http://www.macro.com/app/login",
+        "http://dev.macro.com/app/login",
+        "tauri://example.com/app/login",
+        "http://127.0.0.1:3000/app/login",
+        "javascript:alert('redirected')",
+    ] {
+        let original_url = Url::parse(original_url).expect("test URL should parse");
+        assert!(
+            !is_allowed_original_url(&original_url),
+            "{original_url} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn microsoft_sign_in_asks_for_the_account_picker() {
+    assert_eq!(sign_in_prompt("microsoft"), Some("select_account"));
+    assert_eq!(sign_in_prompt("google"), None);
+    assert_eq!(sign_in_prompt("google_gmail"), None);
+    assert_eq!(sign_in_prompt("github"), None);
+}
+
+#[test]
+fn redacted_url_strips_credentials_query_and_fragment_but_keeps_path() {
+    let url =
+        Url::parse("https://alice:secret@evil.example.com/app/login?token=abc123#access_token=xyz")
+            .expect("test URL should parse");
+    let redacted = redact_original_url_for_logging(&url);
+    assert_eq!(redacted.as_str(), "https://evil.example.com/app/login");
+}
+
+#[test]
+fn redacted_url_handles_cannot_be_a_base_urls() {
+    let url = Url::parse("mailto:alice@example.com?subject=hi").expect("test URL should parse");
+    let redacted = redact_original_url_for_logging(&url);
+    assert_eq!(redacted.as_str(), "mailto:alice@example.com");
+}
+
+#[tokio::test]
+async fn it_works_with_no_params() {
+    let request = Request::builder()
+        .uri("https://example.com")
+        .body(Body::from(()))
+        .unwrap();
+
+    let extracted = Query::<LoginQueryParams>::from_request(request, &())
+        .await
+        .expect("it should extract");
+
+    assert_matches!(
+        extracted,
+        Query(LoginQueryParams {
+            idp_name: None,
+            idp_id: None,
+            login_hint: None,
+            original_url: None,
+            is_mobile: false,
+            referral_code: None,
+            is_agent: false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn it_works_with_mobile() {
+    let request = Request::builder()
+        .uri("https://example.com?is_mobile=true")
+        .body(Body::from(()))
+        .unwrap();
+
+    let extracted = Query::<LoginQueryParams>::from_request(request, &())
+        .await
+        .expect("it should extract");
+
+    assert_matches!(
+        extracted,
+        Query(LoginQueryParams {
+            idp_name: None,
+            idp_id: None,
+            login_hint: None,
+            original_url: None,
+            is_mobile: true,
+            referral_code: None,
+            is_agent: false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn it_works_with_mobile_false() {
+    let request = Request::builder()
+        .uri("https://example.com?is_mobile=false")
+        .body(Body::from(()))
+        .unwrap();
+
+    let extracted = Query::<LoginQueryParams>::from_request(request, &())
+        .await
+        .expect("it should extract");
+
+    assert_matches!(
+        extracted,
+        Query(LoginQueryParams {
+            idp_name: None,
+            idp_id: None,
+            login_hint: None,
+            original_url: None,
+            is_mobile: false,
+
+            referral_code: None,
+            is_agent: false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn it_fails_with_mobile_garbage() {
+    let request = Request::builder()
+        .uri("https://example.com?is_mobile=garbage")
+        .body(Body::from(()))
+        .unwrap();
+    let _rejection = Query::<LoginQueryParams>::from_request(request, &())
+        .await
+        .unwrap_err();
+}
+
+#[tokio::test]
+async fn it_works_with_everything() {
+    let request = Request::builder().uri("https://example.com?is_mobile=true&idp_name=testing&referral_code=code&idp_id=something&login_hint=myhint&original_url=https%3A%2F%2Fexample.com").body(Body::from(())).unwrap();
+
+    let extracted = Query::<LoginQueryParams>::from_request(request, &())
+        .await
+        .expect("it should extract");
+
+    assert_matches!(extracted, Query(LoginQueryParams {
+       idp_name: Some(idp_name),
+       idp_id: Some(idp_id),
+       login_hint: Some(login_hint),
+       original_url: Some(original_url),
+       is_mobile: true,
+        referral_code: Some(code),
+       is_agent: false
+    }) => {
+        assert_eq!(idp_name, "testing");
+        assert_eq!(idp_id, "something");
+        assert_eq!(login_hint, "myhint");
+        assert_eq!(original_url.0.as_str(), "https://example.com/");
+        assert_eq!(code, "code");
+    });
+}
+
+#[tokio::test]
+async fn it_works_with_macro_scheme() {
+    let request = Request::builder().uri("https://example.com/login/sso?original_url=macro%3A%2F%2Flogin&idp_name=google&is_mobile=true").body(Body::from(())).unwrap();
+
+    let extracted = Query::<LoginQueryParams>::from_request(request, &())
+        .await
+        .expect("it should extract");
+
+    assert_matches!(extracted, Query(LoginQueryParams {
+       idp_name: Some(idp_name),
+       idp_id: None,
+       login_hint: None,
+       original_url: Some(original_url),
+       is_mobile: true,
+       referral_code: _,
+       is_agent: false
+    }) => {
+        assert_eq!(idp_name, "google");
+        assert_eq!(original_url.0.as_str(), "macro://login");
+    });
+}
+
+#[tokio::test]
+async fn it_works_with_double_encoded_scheme() {
+    let request = Request::builder().uri("https://example.com/login/sso?original_url=https%253A%252F%252Fexample.com&idp_name=google&is_mobile=true").body(Body::from(())).unwrap();
+
+    let extracted = Query::<LoginQueryParams>::from_request(request, &())
+        .await
+        .expect("it should extract");
+
+    assert_matches!(extracted, Query(LoginQueryParams {
+       idp_name: Some(idp_name),
+       idp_id: None,
+       login_hint: None,
+       original_url: Some(original_url),
+       is_mobile: true,
+       referral_code: _,
+       is_agent: false
+    }) => {
+        assert_eq!(idp_name, "google");
+        assert_eq!(original_url.0.as_str(), "https://example.com/");
+    });
+}
+
+#[test]
+fn local_frontend_origin_is_accepted_only_when_configured() {
+    let origin = Url::parse("https://peter-dev:29809").unwrap();
+    for path in ["/app/login", "/app/inbox-link-callback"] {
+        let url = origin.join(path).unwrap();
+        assert!(is_allowed_original_url_with_local_origin(
+            &url,
+            Some(&origin)
+        ));
+        assert!(!is_allowed_original_url_with_local_origin(&url, None));
+    }
+}
+
+#[test]
+fn local_frontend_origin_requires_exact_https_origin_without_credentials() {
+    let origin = Url::parse("https://peter-dev:29809").unwrap();
+    for candidate in [
+        "http://peter-dev:29809/app/login",
+        "https://peter-dev:29810/app/login",
+        "https://peter-dev/app/login",
+        "https://peter-dev.evil.example:29809/app/login",
+        "https://evil.example:29809/app/login",
+        "https://user:password@peter-dev:29809/app/login",
+        "https://user@peter-dev:29809/app/login",
+    ] {
+        let url = Url::parse(candidate).unwrap();
+        assert!(
+            !is_allowed_original_url_with_local_origin(&url, Some(&origin)),
+            "{url}"
+        );
+    }
+    let http_origin = Url::parse("http://peter-dev:29809").unwrap();
+    assert!(!is_allowed_original_url_with_local_origin(
+        &http_origin,
+        Some(&http_origin)
+    ));
+}
+
+#[test]
+fn it_should_read_the_agent_signup_flag() {
+    let query: Query<LoginQueryParams> = Query::try_from_uri(
+        &"http://test/login/sso?idp_name=Google&is_agent=true"
+            .parse()
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert!(query.is_agent);
+}

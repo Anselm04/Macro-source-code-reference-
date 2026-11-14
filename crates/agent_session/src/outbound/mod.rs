@@ -1,0 +1,27 @@
+//! Adapters implementing the domain ports for external systems.
+
+pub mod postgres;
+
+/// Internal transport for coding agent discovery and dispatch.
+pub mod coding_agents_client;
+
+/// Haiku-backed automatic session naming.
+pub mod name_generator;
+
+/// Nemotron-backed live activity summaries.
+pub mod activity_summarizer;
+
+/// Streaming a live session's log to a channel's viewers.
+pub mod connection_gateway_realtime;
+
+/// Publishing lifecycle facts to the event broker.
+pub mod broker_lifecycle_publisher;
+
+/// Session actions through the owning harness service.
+mod session_actions_client;
+
+/// Durable system notifications.
+pub mod notifications;
+
+/// Runtime session reconciliation lookups.
+pub mod runtime_sessions;

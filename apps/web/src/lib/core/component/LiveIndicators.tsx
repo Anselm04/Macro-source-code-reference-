@@ -1,0 +1,59 @@
+import { useBlockId } from '@core/block';
+import { ENABLE_LIVE_INDICATORS } from '@core/constant/featureFlags';
+import { useUserId } from '@core/context/user';
+import { AvatarGroup, cn } from '@ui';
+import { type Accessor, createMemo, For, Show } from 'solid-js';
+import { useUserIndicators } from '../state/liveIndicators';
+import { UserIcon } from './UserIcon';
+
+const MAX_USER_INDICATORS = 3;
+
+export function LiveIndicators(props: {
+  userIds: string[];
+  currentUserId?: string;
+  class?: string;
+}) {
+  const userIds = createMemo(() =>
+    props.currentUserId
+      ? props.userIds.filter((id) => id !== props.currentUserId)
+      : props.userIds
+  );
+
+  const displayUserIds = () => userIds().slice(0, MAX_USER_INDICATORS);
+  const remaining = createMemo(() =>
+    Math.max(0, userIds().length - MAX_USER_INDICATORS)
+  );
+
+  return (
+    <Show when={userIds().length > 0}>
+      <AvatarGroup size="sm" class={cn('pl-2 pr-1', props.class)}>
+        <For each={displayUserIds()}>
+          {(userId) => (
+            <UserIcon id={userId} size="sm" showTooltip suppressClick />
+          )}
+        </For>
+
+        <Show when={remaining()}>
+          <AvatarGroup.Count size="sm">+{remaining()}</AvatarGroup.Count>
+        </Show>
+      </AvatarGroup>
+    </Show>
+  );
+}
+
+export function BlockLiveIndicators(
+  props: { entityId?: Accessor<string> } = {}
+) {
+  // Session hosts can supply their resolved identity without a legacy block.
+  const blockId = props.entityId ? undefined : useBlockId();
+  const indicators = useUserIndicators(
+    () => props.entityId?.() ?? blockId ?? ''
+  );
+  const userId = useUserId();
+
+  return (
+    <Show when={ENABLE_LIVE_INDICATORS}>
+      <LiveIndicators userIds={indicators() ?? []} currentUserId={userId()} />
+    </Show>
+  );
+}

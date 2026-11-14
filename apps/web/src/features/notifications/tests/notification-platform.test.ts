@@ -1,0 +1,469 @@
+import type { SplitManager } from '@components/app/split-layout/layoutManager';
+import { describe, expect, it, vi } from 'vitest';
+import type { PlatformNotificationState } from '../components/PlatformNotificationProvider';
+import { openNotification } from '../notification-navigation';
+import type { PlatformNotificationHandle } from '../notification-platform';
+import type { UnifiedNotification } from '../types';
+
+vi.mock('@app/util/favicon', () => ({
+  getFaviconUrl: () => 'favicon.ico',
+}));
+
+vi.mock('@macro-inc/lexical-core', () => ({
+  markdownToPlainText: (content: string) => content,
+}));
+
+vi.mock('../../theme/signals/themeSignals', () => ({
+  committedThemeAccent: () => 'oklch(0.8 0.1 100deg)',
+}));
+
+vi.mock('../notification-navigation', () => ({
+  openNotification: vi.fn(),
+}));
+
+vi.mock('../notification-resolvers', () => ({
+  DefaultDocumentNameResolver: vi.fn(async () => undefined),
+  DefaultUserNameResolver: vi.fn(async () => undefined),
+  DefaultUserAvatarResolver: vi.fn(async () => undefined),
+}));
+
+import {
+  maybeHandlePlatformNotification,
+  toPlatformNotificationData,
+} from '../notification-platform';
+
+function baseNotification(
+  overrides: Partial<UnifiedNotification>
+): UnifiedNotification {
+  const now = new Date().toISOString();
+
+  return {
+    id: 'notification-1',
+    entity_id: 'entity-1',
+    entity_type: 'channel',
+    created_at: now,
+    updated_at: now,
+    viewed_at: null,
+    deleted_at: null,
+    state: 'unseen',
+    sent: true,
+    sender_id: null,
+    ...overrides,
+  } as UnifiedNotification;
+}
+
+function createChannelInviteNotification(): UnifiedNotification {
+  return baseNotification({
+    notification_event_type: 'channel_invite',
+    notification_metadata: {
+      tag: 'channel_invite',
+      content: {
+        channelName: 'General',
+        invitedBy: 'user-1',
+      },
+    },
+  });
+}
+
+function createGithubPrNotification(): UnifiedNotification {
+  return baseNotification({
+    entity_id: '123e4567-e89b-12d3-a456-426614174000',
+    entity_type: 'foreign_entity',
+    notification_event_type: 'github_pr_status_changed',
+    notification_metadata: {
+      tag: 'github_pr_status_changed',
+      content: {
+        action: 'opened',
+        displayName: 'macro/macro#42',
+        foreignEntityId: '123e4567-e89b-12d3-a456-426614174000',
+        githubKey: 'macro/macro/pull/42',
+        number: 42,
+        owner: 'macro',
+        repo: 'macro',
+        status: 'open',
+        title: 'Add notification support',
+        url: 'https://github.com/macro/macro/pull/42',
+      },
+    },
+  });
+}
+
+function createGithubPrCheckRunNotification(): UnifiedNotification {
+  return baseNotification({
+    entity_id: '123e4567-e89b-12d3-a456-426614174000',
+    entity_type: 'foreign_entity',
+    notification_event_type: 'github_pr_check_run',
+    notification_metadata: {
+      tag: 'github_pr_check_run',
+      content: {
+        checkName: 'CI / tests',
+        checkRunGithubId: 987654321,
+        checkStatus: 'completed',
+        checkUrl: 'https://github.com/macro/macro/runs/987654321',
+        completedAt: '2026-06-15T20:00:00Z',
+        conclusion: 'success',
+        displayName: 'macro/macro#42',
+        foreignEntityId: '123e4567-e89b-12d3-a456-426614174000',
+        githubKey: 'macro/macro/pull/42',
+        number: 42,
+        owner: 'macro',
+        repo: 'macro',
+        state: 'completed',
+        title: 'Add notification support',
+        url: 'https://github.com/macro/macro/pull/42',
+      },
+    },
+  });
+}
+
+function createAgentSettledNotification(): UnifiedNotification {
+  return baseNotification({
+    entity_type: 'channel',
+    notification_event_type: 'agent_session_settled',
+    notification_metadata: {
+      tag: 'agent_session_settled',
+      content: {
+        sessionId: '01a00000-0000-7000-8000-00000000000a',
+        sessionName: 'Fix the flaky test',
+        botId: '01a00000-0000-7000-8000-0000000000b7',
+        botName: 'Macro Coder',
+        channelId: 'entity-1',
+        threadId: '01a00000-0000-7000-8000-000000000002',
+        turn: 3,
+        stopReason: 'end_turn',
+        excerpt: 'Done.',
+      },
+    },
+  });
+}
+
+function createReminderNotification(): UnifiedNotification {
+  return baseNotification({
+    entity_id: 'reminder-1',
+    entity_type: 'reminder',
+    notification_event_type: 'reminder',
+    notification_metadata: {
+      tag: 'reminder',
+      content: {
+        description: '**Review** the reminder flow',
+        reminderId: 'reminder-1',
+      },
+    },
+  });
+}
+
+function createNotificationInterface(
+  showNotification: PlatformNotificationState['showNotification']
+): PlatformNotificationState {
+  return {
+    permission: () => 'granted',
+    requestPermission: async () => 'granted',
+    unregisterNotification: async () => undefined,
+    showNotification,
+  };
+}
+
+function createNotificationHandle(): PlatformNotificationHandle {
+  return {
+    onClick: vi.fn(),
+    onDismiss: vi.fn(),
+    close: vi.fn(),
+  };
+}
+
+describe('maybeHandlePlatformNotification', () => {
+  it('formats a sender-less reminder without actor or document resolution', async () => {
+    const resolveUserName = vi.fn(async () => 'Unexpected actor');
+    const resolveDocumentName = vi.fn(async () => 'Unexpected document');
+
+    const result = await toPlatformNotificationData(
+      createReminderNotification(),
+      resolveUserName,
+      resolveDocumentName,
+      async () => undefined
+    );
+
+    expect(result).toEqual({
+      title: 'Reminder',
+      options: {
+        body: '**Review** the reminder flow',
+        icon: 'favicon.ico',
+      },
+    });
+    expect(resolveUserName).not.toHaveBeenCalled();
+    expect(resolveDocumentName).not.toHaveBeenCalled();
+  });
+
+  it('skips GitHub PR events so they do not render as browser notifications', async () => {
+    const showNotification = vi.fn<
+      PlatformNotificationState['showNotification']
+    >(async () => 'not-granted');
+    const notificationInterface = createNotificationInterface(showNotification);
+
+    await maybeHandlePlatformNotification(
+      createGithubPrNotification(),
+      notificationInterface,
+      {} as SplitManager
+    );
+
+    expect(showNotification).not.toHaveBeenCalled();
+  });
+
+  it('skips GitHub PR check-run events as browser notifications', async () => {
+    const showNotification = vi.fn<
+      PlatformNotificationState['showNotification']
+    >(async () => 'not-granted');
+    const notificationInterface = createNotificationInterface(showNotification);
+
+    await maybeHandlePlatformNotification(
+      createGithubPrCheckRunNotification(),
+      notificationInterface,
+      {} as SplitManager
+    );
+
+    expect(showNotification).not.toHaveBeenCalled();
+  });
+
+  it('still renders non-GitHub browser notifications', async () => {
+    const handle = createNotificationHandle();
+    const showNotification = vi.fn<
+      PlatformNotificationState['showNotification']
+    >(async () => handle);
+    const notificationInterface = createNotificationInterface(showNotification);
+
+    await maybeHandlePlatformNotification(
+      createChannelInviteNotification(),
+      notificationInterface,
+      {} as SplitManager
+    );
+
+    expect(showNotification).toHaveBeenCalledOnce();
+    expect(showNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Someone <General>',
+        notificationId: 'notification-1',
+        options: expect.objectContaining({
+          body: 'invited you to',
+        }),
+      })
+    );
+    expect(handle.onClick).toHaveBeenCalledOnce();
+  });
+
+  it('silences the system alert when Macro plays its own sound', async () => {
+    const showNotification = vi.fn<
+      PlatformNotificationState['showNotification']
+    >(async () => createNotificationHandle());
+    const notificationInterface = createNotificationInterface(showNotification);
+
+    await maybeHandlePlatformNotification(
+      createChannelInviteNotification(),
+      notificationInterface,
+      {} as SplitManager,
+      { silent: true }
+    );
+
+    expect(showNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({ silent: true }),
+      })
+    );
+  });
+
+  it('opens the original notification target only when its platform handle is clicked', async () => {
+    const focus = vi.spyOn(window, 'focus').mockImplementation(() => {});
+    vi.mocked(openNotification).mockClear();
+    try {
+      let click: (() => void) | undefined;
+      const handle = createNotificationHandle();
+      handle.onClick = (callback) => {
+        click = callback;
+      };
+      const notification = createChannelInviteNotification();
+      const layout = {} as SplitManager;
+      await maybeHandlePlatformNotification(
+        notification,
+        createNotificationInterface(async () => handle),
+        layout
+      );
+      expect(openNotification).not.toHaveBeenCalled();
+      expect(handle.close).not.toHaveBeenCalled();
+      expect(click).toBeDefined();
+      click!();
+      expect(focus).toHaveBeenCalledOnce();
+      expect(openNotification).toHaveBeenCalledExactlyOnceWith(
+        notification,
+        layout,
+        false,
+        undefined,
+        undefined,
+        { source: 'browser_push' }
+      );
+      expect(handle.close).toHaveBeenCalledOnce();
+    } finally {
+      focus.mockRestore();
+    }
+  });
+
+  it('names the bot, not "Someone", for an agent notification with no sender', async () => {
+    const handle = createNotificationHandle();
+    const showNotification = vi.fn<
+      PlatformNotificationState['showNotification']
+    >(async () => handle);
+    const notificationInterface = createNotificationInterface(showNotification);
+
+    await maybeHandlePlatformNotification(
+      createAgentSettledNotification(),
+      notificationInterface,
+      {} as SplitManager
+    );
+
+    expect(showNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Macro Coder <Fix the flaky test>',
+        options: expect.objectContaining({ body: 'Done.' }),
+      })
+    );
+  });
+});
+
+it('uses the project discussion bot display name for platform notifications', async () => {
+  const notification = baseNotification({
+    entity_type: 'initiative',
+    notification_metadata: {
+      tag: 'initiative_discussion',
+      content: {
+        projectName: 'Launch',
+        owner: 'macro|owner@example.com',
+        reason: 'mention',
+        messageId: '01992d2f-8444-7000-8000-000000000001',
+        threadId: '01992d2f-8444-7000-8000-000000000001',
+        text: 'Ready to ship',
+        senderDisplayName: 'Launch agent',
+      },
+    },
+  });
+  const result = await toPlatformNotificationData(
+    notification,
+    async () => undefined,
+    async () => undefined,
+    async () => undefined
+  );
+  expect(result?.title).toContain('Launch agent');
+  expect(JSON.stringify(result)).toContain('Launch');
+});
+
+describe('platform notification sender and conversation', () => {
+  function channelMessage(
+    channelType: 'public' | 'directMessage',
+    senderProfilePictureUrl?: string
+  ): UnifiedNotification {
+    return baseNotification({
+      entity_id: 'channel-1',
+      sender_id: 'macro|ada@example.com',
+      notification_event_type: 'channel_message_send',
+      notification_metadata: {
+        tag: 'channel_message_send',
+        content: {
+          messageId: 'message-1',
+          messageContent: 'Ship it',
+          sender: 'macro|ada@example.com',
+          channelType,
+          senderProfilePictureUrl,
+        },
+      },
+    } as Partial<UnifiedNotification>);
+  }
+
+  it('names the sender, their avatar, and the group conversation', async () => {
+    const resolveUserAvatar = vi.fn(
+      async () => 'https://cdn.example.com/ada.png'
+    );
+    const result = await toPlatformNotificationData(
+      channelMessage('public'),
+      async () => 'Ada',
+      async () => 'design',
+      resolveUserAvatar
+    );
+
+    expect(result).toMatchObject({
+      title: 'Ada <design>',
+      sender: {
+        id: 'macro|ada@example.com',
+        name: 'Ada',
+        avatarUrl: 'https://cdn.example.com/ada.png',
+      },
+      conversation: { id: 'channel-1', name: 'design' },
+    });
+    expect(resolveUserAvatar).toHaveBeenCalledExactlyOnceWith(
+      'macro|ada@example.com'
+    );
+  });
+
+  it('keeps a direct message unnamed and prefers the avatar the server sent', async () => {
+    const resolveUserAvatar = vi.fn(
+      async () => 'https://cdn.example.com/old.png'
+    );
+    const result = await toPlatformNotificationData(
+      channelMessage('directMessage', 'https://cdn.example.com/ada.png'),
+      async () => 'Ada',
+      async () => 'Ada, Grace',
+      resolveUserAvatar
+    );
+
+    expect(result?.title).toBe('Ada');
+    expect(result?.sender?.avatarUrl).toBe('https://cdn.example.com/ada.png');
+    expect(result?.conversation).toEqual({ id: 'channel-1', name: undefined });
+    expect(resolveUserAvatar).not.toHaveBeenCalled();
+  });
+
+  it('names the bot and the channel for a bot reply', async () => {
+    const result = await toPlatformNotificationData(
+      baseNotification({
+        entity_id: 'channel-1',
+        notification_event_type: 'channel_message_reply',
+        notification_metadata: {
+          tag: 'channel_message_reply',
+          content: {
+            threadId: 'thread-1',
+            messageId: 'message-1',
+            senderDisplayName: 'pickle',
+            messageContent: 'Task completed',
+            channelType: 'private',
+            channelName: 'bug-reports',
+          },
+        },
+      } as Partial<UnifiedNotification>),
+      async () => undefined,
+      async () => undefined,
+      async () => undefined
+    );
+
+    expect(result?.title).toBe('pickle <bug-reports>');
+    expect(result?.sender?.name).toBe('pickle');
+  });
+
+  it('leaves out a target it cannot name', async () => {
+    const result = await toPlatformNotificationData(
+      channelMessage('public'),
+      async () => 'Ada',
+      async () => undefined,
+      async () => undefined
+    );
+
+    expect(result?.title).toBe('Ada');
+    expect(result?.conversation?.name).toBeUndefined();
+  });
+
+  it('has no sender when nobody can be named', async () => {
+    const result = await toPlatformNotificationData(
+      createChannelInviteNotification(),
+      async () => undefined,
+      async () => undefined,
+      async () => undefined
+    );
+
+    expect(result?.title).toBe('Someone <General>');
+    expect(result?.sender).toBeUndefined();
+  });
+});

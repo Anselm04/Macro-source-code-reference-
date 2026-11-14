@@ -1,0 +1,76 @@
+//! Narrow, owner-authorized session operations for unattended routines.
+
+pub mod models;
+mod service;
+mod status;
+
+pub use models::*;
+pub use service::RoutineSessionsService;
+
+/// The only session operations available to routine execution.
+///
+/// Preparation and prompting are separate so callers can retain the session id
+/// for cleanup. Neither operation is safe to replay after an ambiguous failure:
+/// control deduplication covers queued/in-flight actions, not completed actions.
+pub trait RoutineSessions: Send + Sync + 'static {
+    /// Authorize a selection without provisioning or requiring a live runtime.
+    fn validate(
+        &self,
+        command: ValidateRoutineSession,
+    ) -> impl Future<Output = Result<ValidatedRoutineSession, RoutineSessionError>> + Send;
+
+    /// Reauthorize the persona and open an idle session with its selected model.
+    fn prepare(
+        &self,
+        command: PrepareRoutineSession,
+    ) -> impl Future<Output = Result<PreparedRoutineSession, RoutineSessionError>> + Send;
+
+    /// Submit the first prompt once through the normal control pipeline.
+    fn prompt(
+        &self,
+        command: PromptRoutineSession,
+    ) -> impl Future<Output = Result<RoutinePromptAccepted, RoutineSessionError>> + Send;
+
+    /// Read the initial action's progress, never the session's latest turn alone.
+    fn status(
+        &self,
+        command: RoutineSessionAction,
+    ) -> impl Future<Output = Result<RoutineActionStatus, RoutineSessionError>> + Send;
+
+    /// Request a stop; acceptance does not establish that work has stopped.
+    fn cancel(
+        &self,
+        command: RoutineSessionAction,
+    ) -> impl Future<Output = Result<(), RoutineSessionError>> + Send;
+
+    /// How much the session did so far: content-free counts.
+    fn activity(
+        &self,
+        command: RoutineSessionAction,
+    ) -> impl Future<Output = Result<RoutineActivity, RoutineSessionError>> + Send {
+        let _ = command;
+        async { Err(RoutineSessionError::OperationFailed) }
+    }
+
+    /// Delete a session the scheduler opened for its owner: a routine's run
+    /// (source `routine`), or a draft's background session once its drafter
+    /// is done with it (`AgentSession::is_background`). No other session can
+    /// be deleted this way.
+    fn delete(
+        &self,
+        command: RoutineSessionAction,
+    ) -> impl Future<Output = Result<(), RoutineSessionError>> + Send {
+        let _ = command;
+        async { Err(RoutineSessionError::OperationFailed) }
+    }
+}
+
+/// The Pipedream apps a user has connected and enabled for tool use, which
+/// is what the egress proxy treats as connected.
+pub trait ConnectedApps: Send + Sync + 'static {
+    /// App slugs of the user's enabled connections.
+    fn connected_app_slugs(
+        &self,
+        user: &macro_user_id::user_id::MacroUserIdStr<'static>,
+    ) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send;
+}

@@ -1,0 +1,351 @@
+//! The typed inventory of services the orchestrator manages.
+//!
+//! `RUST_SERVICES` is the single source of truth mapping each Compose service
+//! to its cargo binary, owning crate's package, host port, and the modes it
+//! participates in. It encodes the two non-obvious bin↔crate mappings
+//! (`document_upload_finalizer_local_worker` is built by the
+//! `document_upload_finalizer_handler` crate; `pubsub_workers` by the
+//! `email_service` crate) and makes "a port on a portless worker"
+//! unrepresentable (`host_port: None` == portless worker).
+
+use super::Mode;
+use super::google_emulator;
+use super::instance::Port;
+use super::microsoft_emulator;
+
+/// OpenBao release with namespaces, KV v2, JWT auth, and TOTP support.
+pub const OPENBAO_IMAGE: &str = "openbao/openbao:2.7.2";
+
+/// A Rust service whose binary the orchestrator builds on the host and mounts
+/// into the runtime image at `/app/out/<cargo_bin>`. Several fields document
+/// the inventory and back validation/diagnostics rather than the hot path.
+#[derive(Clone, Copy, Debug)]
+pub struct RustService {
+    /// The service key in `docker/docker-compose.yml` (e.g. `authentication-service`).
+    pub compose_name: &'static str,
+    /// The cargo binary name (e.g. `authentication_service`). Run as
+    /// `/app/out/<cargo_bin>`. Bin names are unique workspace-wide, so
+    /// `cargo build --bin <cargo_bin>` resolves the package automatically.
+    pub cargo_bin: &'static str,
+    /// The owning crate's package name (for documentation / `--package`).
+    pub package: &'static str,
+    /// The instance host port, or `None` for a portless worker.
+    pub host_port: Option<Port>,
+    /// The reverse-proxy path prefix the frontend reaches this service through
+    /// (e.g. `/auth`), or `None` when it isn't proxied — a portless worker, or
+    /// `static_file_service` whose route is the bespoke CDN block in `proxy`.
+    /// This is the single source for the generated Caddy routes; it must match
+    /// the matching `proxyServers()` entry in `apps/web/.../servers.ts` (guarded by a
+    /// test).
+    pub path_prefix: Option<&'static str>,
+    /// Whether the proxy route must upgrade WebSockets (Caddy `@matcher` shape).
+    pub is_websocket: bool,
+    /// The run modes this service starts in by default. Empty for opt-in
+    /// services, which start only with an explicit profile.
+    pub modes: &'static [Mode],
+    /// Opt-in services (e.g. `search_processing_service`) only start with an
+    /// explicit profile and are never converted to the runtime image.
+    pub opt_in: bool,
+}
+
+impl RustService {
+    /// Whether this service starts by default in the given mode.
+    pub fn in_mode(&self, mode: Mode) -> bool {
+        self.modes.contains(&mode)
+    }
+
+    /// Opt-in services (e.g. `search_processing_service`) only start with an
+    /// explicit profile and are never converted to the runtime image.
+    pub fn is_opt_in(&self) -> bool {
+        self.opt_in
+    }
+
+    /// Cargo features this service's local build enables (empty = none).
+    ///
+    /// Passed package-qualified (`<package>/<feature>`) so they compose with
+    /// every other binary in the same invocation. Keep them additive: a service
+    /// that needs its own invocation costs a second build of the whole tree.
+    ///
+    /// `authentication_service` opts into local passwordless code responses and
+    /// out of the login-code throttles; `search_processing_service` opts out of
+    /// pdfium, whose bundled library is amd64-only and absent from the runtime
+    /// image.
+    pub fn local_features(&self) -> &'static [&'static str] {
+        match self.cargo_bin {
+            "authentication_service" => &["return_passwordless_code", "no_rate_limit"],
+            "search_processing_service" => &["no_pdf"],
+            _ => &[],
+        }
+    }
+}
+
+/// The full service inventory of the local service binaries.
+pub const RUST_SERVICES: &[RustService] = &[
+    RustService {
+        compose_name: "slack_import_worker",
+        cargo_bin: "slack_import_worker",
+        package: "slack_import_worker",
+        host_port: None,
+        path_prefix: None,
+        is_websocket: false,
+        // Explicit local Compose profile only; never consume shared-dev queues.
+        modes: &[],
+        opt_in: true,
+    },
+    RustService {
+        compose_name: "authentication-service",
+        cargo_bin: "authentication_service",
+        package: "authentication_service",
+        host_port: Some(Port::Auth),
+        path_prefix: Some("/auth"),
+        is_websocket: false,
+        modes: &[Mode::Local, Mode::Dev],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "connection_gateway",
+        cargo_bin: "connection_gateway_service",
+        package: "connection_gateway",
+        host_port: Some(Port::ConnGateway),
+        path_prefix: Some("/connection-gateway"),
+        is_websocket: true,
+        modes: &[Mode::Local, Mode::Dev],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "contacts_service",
+        cargo_bin: "contacts_service",
+        package: "contacts_service",
+        host_port: Some(Port::Contacts),
+        path_prefix: Some("/contacts"),
+        is_websocket: false,
+        modes: &[Mode::Local, Mode::Dev],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "document_storage_service",
+        cargo_bin: "document_storage_service",
+        package: "document_storage_service",
+        host_port: Some(Port::DocStorage),
+        path_prefix: Some("/dss"),
+        is_websocket: false,
+        modes: &[Mode::Local, Mode::Dev],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "document_upload_finalizer",
+        // Built by the document_upload_finalizer_handler crate (src/bin/local_worker.rs),
+        // NOT a crate named document_upload_finalizer.
+        cargo_bin: "document_upload_finalizer_local_worker",
+        package: "document_upload_finalizer_handler",
+        host_port: None,
+        path_prefix: None,
+        is_websocket: false,
+        modes: &[Mode::Local],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "email_service",
+        cargo_bin: "email_service",
+        package: "email_service",
+        host_port: Some(Port::Email),
+        path_prefix: Some("/email"),
+        is_websocket: false,
+        modes: &[Mode::Local, Mode::Dev],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "email_pubsub_workers",
+        // The pubsub_workers bin is built by the email_service crate
+        // (src/bin/pubsub_workers/pubsub_workers.rs).
+        cargo_bin: "pubsub_workers",
+        package: "email_service",
+        host_port: None,
+        path_prefix: None,
+        is_websocket: false,
+        modes: &[Mode::Local],
+        opt_in: false,
+    },
+    RustService {
+        // Not a service: the seed CLI binary, shipped into /app/out so the
+        // gmail_forwarder sidecar (a bespoke gen_compose block, hence no
+        // modes) can run `seed_cli gmail forward` inside the stack.
+        compose_name: "gmail_forwarder",
+        cargo_bin: "seed_cli",
+        package: "seed_cli",
+        host_port: None,
+        path_prefix: None,
+        is_websocket: false,
+        modes: &[],
+        opt_in: false,
+    },
+    RustService {
+        // Not a service of ours: the Gmail emulator binary, shipped into
+        // /app/out for the gmail_emulator sidecar (a bespoke gen_compose
+        // block, hence no modes) that stands in for Google on a stack with
+        // no real Google client.
+        compose_name: google_emulator::SERVICE,
+        cargo_bin: "gmail_emulator",
+        package: "gmail_emulator",
+        host_port: None,
+        path_prefix: None,
+        is_websocket: false,
+        modes: &[],
+        opt_in: false,
+    },
+    RustService {
+        // Not a service of ours: the Outlook emulator binary, shipped into
+        // /app/out for the outlook_emulator sidecar (a bespoke gen_compose
+        // block, hence no modes) that stands in for Microsoft on a stack
+        // with no real Microsoft client.
+        compose_name: microsoft_emulator::SERVICE,
+        cargo_bin: "outlook_emulator",
+        package: "outlook_emulator",
+        host_port: None,
+        path_prefix: None,
+        is_websocket: false,
+        modes: &[],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "calendar_service",
+        cargo_bin: "calendar_service",
+        package: "calendar_service",
+        host_port: Some(Port::Calendar),
+        path_prefix: Some("/calendar"),
+        is_websocket: false,
+        // Local-only: the backfill SQS workers spawn unconditionally (not gated
+        // on CALENDAR_SYNC_ENABLED), so running the binary under `run-dev`
+        // against shared-dev resources would race the deployed calendar-service
+        // for its backfill queue — the same reason scheduled_action is local-only.
+        modes: &[Mode::Local],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "notification_service",
+        cargo_bin: "notification_service",
+        package: "notification_service",
+        host_port: Some(Port::Notification),
+        path_prefix: Some("/notification"),
+        is_websocket: false,
+        modes: &[Mode::Local, Mode::Dev],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "static_file_service",
+        cargo_bin: "static_file_service",
+        package: "static_file_service",
+        host_port: Some(Port::StaticFile),
+        // Routed by the bespoke `/static-file` CDN block in `proxy` (S3 fan-out),
+        // not the generic generated route — so no generic prefix here.
+        path_prefix: None,
+        is_websocket: false,
+        modes: &[Mode::Local, Mode::Dev],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "unfurl_service",
+        cargo_bin: "unfurl_service",
+        package: "unfurl_service",
+        host_port: Some(Port::Unfurl),
+        path_prefix: Some("/unfurl"),
+        is_websocket: false,
+        modes: &[Mode::Local, Mode::Dev],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "image_proxy_service",
+        cargo_bin: "image_proxy_service",
+        package: "image_proxy_service",
+        host_port: Some(Port::ImageProxy),
+        path_prefix: Some("/image-proxy"),
+        is_websocket: false,
+        modes: &[Mode::Local, Mode::Dev],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "search_processing_service",
+        cargo_bin: "search_processing_service",
+        package: "search_processing_service",
+        host_port: Some(Port::SearchProcessing),
+        path_prefix: None,
+        is_websocket: false,
+        // Local-only. The default `pdf` feature bundles an amd64-only libpdfium,
+        // so local builds opt out with `no_pdf`. Dev/prod still deploy from the
+        // dedicated Dockerfile with PDF parsing on.
+        modes: &[Mode::Local],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "agent_harness_service",
+        cargo_bin: "agent_harness_service",
+        package: "agent_harness_service",
+        host_port: Some(Port::AgentHarness),
+        path_prefix: Some("/agent-harness"),
+        is_websocket: false,
+        // Local stacks default to DEV_DANGEROUS_LOCAL_CONTAINERS, so managed
+        // sandboxes run on the host Docker daemon. Daytona is opt-in via
+        // DEV_DANGEROUS_LOCAL_CONTAINERS=false DAYTONA_API_KEY=... just run_local.
+        modes: &[Mode::Local],
+        opt_in: false,
+    },
+    RustService {
+        compose_name: "whatsapp_session_service",
+        cargo_bin: "whatsapp_session_service",
+        package: "whatsapp_session_service",
+        // Nothing calls it: it only dials out (WhatsApp, Postgres, KMS).
+        host_port: None,
+        path_prefix: None,
+        is_websocket: false,
+        // Local-only: under `run-dev` it would take leases on shared-dev
+        // accounts from the deployed replicas.
+        modes: &[Mode::Local],
+        opt_in: false,
+    },
+];
+
+/// The Rust services that participate in `mode` (opt-in services list no modes,
+/// so they are naturally excluded).
+pub fn services_for_mode(mode: Mode) -> impl Iterator<Item = &'static RustService> {
+    RUST_SERVICES.iter().filter(move |s| s.in_mode(mode))
+}
+
+/// The cargo binaries to build for a fully local stack (every non-opt-in
+/// service's bin, deduplicated). Used to validate a binaries dir.
+pub fn local_binaries() -> Vec<&'static str> {
+    let mut bins: Vec<&'static str> = RUST_SERVICES
+        .iter()
+        .filter(|s| !s.is_opt_in())
+        .map(|s| s.cargo_bin)
+        .collect();
+    bins.sort_unstable();
+    bins.dedup();
+    bins
+}
+
+/// The services `names` refer to in `mode`, by compose name or cargo binary
+/// (`contacts_service`, `authentication-service`), for `--services`.
+pub fn services_named(mode: Mode, names: &[String]) -> anyhow::Result<Vec<&'static RustService>> {
+    let mut found: Vec<&'static RustService> = Vec::new();
+    for name in names.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        let Some(svc) =
+            services_for_mode(mode).find(|s| s.compose_name == name || s.cargo_bin == name)
+        else {
+            let known: Vec<&str> = services_for_mode(mode).map(|s| s.compose_name).collect();
+            anyhow::bail!(
+                "no local service named {name}. Name one of: {}",
+                known.join(", ")
+            );
+        };
+        if !found.iter().any(|f| f.compose_name == svc.compose_name) {
+            found.push(svc);
+        }
+    }
+    if found.is_empty() {
+        anyhow::bail!("--services needs at least one service name");
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
+mod test;

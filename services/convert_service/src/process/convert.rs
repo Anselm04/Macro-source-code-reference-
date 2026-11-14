@@ -1,0 +1,321 @@
+use nix::{
+    libc::{_exit, exit},
+    unistd::{ForkResult, fork},
+};
+use rs_libreoffice_bindings::Office;
+use std::{borrow::Cow, fs::File, io::Write, path::Path, thread, time::Duration};
+
+use anyhow::Context;
+use model::convert::ConvertQueueMessage;
+
+use crate::{
+    config::{LOK_PATH, WEB_SOCKET_RESPONSE_LAMBDA},
+    model::{BomPart, DocxUploadJobData, DocxUploadJobResult, DocxUploadJobSuccessDataInner},
+    utils::{
+        cleanup_folder, conversion_timeout, get_lok_filter_from_file_types, resolve_file_type,
+    },
+};
+
+pub(super) fn is_docx_key(key: &str) -> bool {
+    key.to_ascii_lowercase().ends_with(".docx")
+}
+
+/// Processes a message from the convert queue
+/// Returns the job id and the convert queue message
+///
+/// The span is errored by the returned error. Cleaning up a folder that was
+/// never created does not error it, so a job that failed before creating its
+/// folder still shows that failure; any other cleanup failure logs an error
+/// and errors the span.
+#[tracing::instrument(err(Debug), skip(worker, s3_client, lambda_client, message), fields(message_id = message.message_id))]
+pub async fn process_message(
+    worker: &sqs_worker::SQSWorker,
+    s3_client: &s3_client::S3,
+    lambda_client: &lambda_client::Lambda,
+    message: &aws_sdk_sqs::types::Message,
+) -> anyhow::Result<()> {
+    tracing::info!("processing message");
+
+    let job_id = if let Some(attributes) = message.message_attributes.as_ref() {
+        let job_id = attributes
+            .get("job_id")
+            .map(|job_id| {
+                tracing::trace!(job_id=?job_id, "found job_id in message attributes");
+                job_id.string_value().unwrap_or_default()
+            })
+            .context("job_id should be a message attribute")?;
+
+        job_id.to_string()
+    } else {
+        worker
+            .cleanup_message(message)
+            .await
+            .context("failed to cleanup message")?;
+        anyhow::bail!("required message attributes not found");
+    };
+
+    tracing::info!(job_id=%job_id, "message attributes");
+
+    let req = if let Some(body) = message.body.as_ref() {
+        tracing::trace!(job_id=%job_id, body=%body, "found body in message");
+        serde_json::from_str::<ConvertQueueMessage>(body)
+            .context("failed to deserialize message")?
+    } else {
+        worker
+            .cleanup_message(message)
+            .await
+            .context("failed to cleanup message")?;
+        anyhow::bail!("message body not provided");
+    };
+
+    tracing::info!(job_id=%job_id, message_body=?req, "message body");
+
+    let result = convert(&job_id, &req, s3_client).await;
+
+    if let Err(e) = cleanup_folder(&job_id) {
+        tracing::error!(error=?e, job_id=%job_id, "unable to cleanup folder");
+    }
+
+    if let Some(update) = job_update(&job_id, &req, result.is_ok()) {
+        tracing::trace!(status=%update.status, "sending job update to lambda");
+        lambda_client
+            .invoke_event(&WEB_SOCKET_RESPONSE_LAMBDA, &update)
+            .await?;
+    }
+
+    result?;
+
+    if let Err(e) = worker.cleanup_message(message).await {
+        tracing::error!(error=?e, job_id=&job_id, "failed to cleanup message");
+    }
+
+    Ok(())
+}
+
+/// The job update to send for a finished conversion, if a client job is
+/// waiting on it.
+pub(super) fn job_update<'a>(
+    job_id: &'a str,
+    req: &ConvertQueueMessage,
+    converted: bool,
+) -> Option<DocxUploadJobResult<'a>> {
+    if !req.notify_job || !is_docx_key(&req.from_key) {
+        return None;
+    }
+
+    // TODO: will need to pass in job type to the convert message eventually
+    let job_type = "docx_upload".into();
+
+    if !converted {
+        return Some(DocxUploadJobResult {
+            job_id: Cow::Borrowed(job_id),
+            status: "Failed".into(),
+            job_type,
+            data: DocxUploadJobData {
+                error: true,
+                message: Some("error converting document".to_string()),
+                data: None,
+            },
+        });
+    }
+
+    Some(DocxUploadJobResult {
+        job_id: Cow::Borrowed(job_id),
+        status: "Completed".into(),
+        job_type,
+        data: DocxUploadJobData {
+            error: false,
+            message: None,
+            data: Some(DocxUploadJobSuccessDataInner {
+                converted: true,
+                bom_parts: vec![BomPart {
+                    sha: "bogus".to_string(),
+                    path: "bogus".to_string(),
+                    id: "bogus".to_string(),
+                    document_bom_id: 1,
+                }],
+            }),
+        },
+    })
+}
+
+pub async fn convert(
+    job_id: &str,
+    req: &ConvertQueueMessage,
+    s3_client: &s3_client::S3,
+) -> anyhow::Result<()> {
+    let from_file_type = resolve_file_type(req.from_file_type, &req.from_key)?;
+    let to_file_type = resolve_file_type(req.to_file_type, &req.to_key)?;
+
+    let filter = get_lok_filter_from_file_types(&from_file_type, &to_file_type)
+        .context("unable to get lok filter")?;
+
+    let directory = format!("./{}", job_id);
+    let in_file_path = format!("{directory}/IN.{}", from_file_type.as_str());
+    let out_file_path = format!("{directory}/OUT.{}", to_file_type.as_str());
+
+    // Make directory of job_id
+    let file_content = s3_client
+        .get(&req.from_bucket, &req.from_key)
+        .await
+        .context("unable to get object from S3")?;
+
+    std::fs::create_dir(&directory)
+        .map_err(|e| anyhow::anyhow!("unable to create directory {}: {}", directory, e))?;
+
+    let mut file = File::create(&in_file_path).context("unable to create input file")?;
+
+    file.write_all(&file_content)
+        .context("unable to write to input file")?;
+
+    let max_wait = conversion_timeout(&from_file_type, &to_file_type);
+    run_lok_conversion(
+        job_id,
+        &LOK_PATH,
+        &in_file_path,
+        &out_file_path,
+        to_file_type.as_str(),
+        &filter,
+        max_wait,
+    )?;
+
+    let file_content = std::fs::read(out_file_path).context("unable to read result file")?;
+
+    s3_client
+        .put(&req.to_bucket, &req.to_key, &file_content)
+        .await
+        .context("unable to upload file")?;
+
+    Ok(())
+}
+
+/// Converts `in_file_path` to `out_file_path` with LibreOfficeKit in a forked
+/// child process, killing it after `max_wait`.
+///
+/// The child process keeps a LibreOffice crash or hang from taking down the
+/// worker. LibreOffice writes its scratch files into the input file's folder,
+/// so removing that folder cleans up after the child however it ended.
+pub(crate) fn run_lok_conversion(
+    job_id: &str,
+    office_path: &str,
+    in_file_path: &str,
+    out_file_path: &str,
+    to_format: &str,
+    filter: &str,
+    max_wait: Duration,
+) -> anyhow::Result<()> {
+    let job_folder = Path::new(in_file_path)
+        .parent()
+        .map(std::path::absolute)
+        .context("input file should be inside a job folder")?
+        .context("unable to resolve job folder")?;
+
+    let mut child_pids = vec![];
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { child }) => {
+            tracing::info!(job_id=%job_id, "parent process: spawned child with PID: {}", child);
+            child_pids.push(child);
+        }
+        Ok(ForkResult::Child) => unsafe {
+            tracing::info!(job_id=%job_id, "child process: initializing lok");
+            let result: anyhow::Result<()> = (|| {
+                std::env::set_var("SAL_LOG", "");
+                // LibreOffice deletes its TMPDIR scratch files only in its own
+                // teardown, which a child killed at its timeout, crashed, or
+                // ended with `_exit` below never runs.
+                std::env::set_var("TMPDIR", &job_folder);
+                let office = Office::new(office_path)
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .context("unable to initialize lok")?;
+                tracing::trace!("office initialized");
+
+                let document = office
+                    .load_document(in_file_path)
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .context("unable to load document")?;
+                tracing::trace!("document loaded");
+
+                document
+                    .save_as(out_file_path, to_format, filter)
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .context("unable to save document")?;
+                tracing::trace!("document saved");
+
+                // The child exits right after this, so skip LibreOffice's
+                // teardown: Writer can crash while destroying a document it
+                // has already saved, which would fail a finished conversion.
+                std::mem::forget(document);
+                std::mem::forget(office);
+
+                Ok(())
+            })();
+
+            match result {
+                // `_exit` skips LibreOffice's exit handlers, which can hang
+                // after the teardown skipped above.
+                Ok(_) => _exit(0),
+                Err(e) => {
+                    tracing::error!(job_id=%job_id, error=?e, "unable to convert");
+                    exit(1)
+                }
+            }
+        },
+        Err(err) => {
+            tracing::error!(job_id=%job_id, error=?err, "fork failed");
+            anyhow::bail!("fork failed");
+        }
+    }
+
+    // Assume failure
+    let mut status_code = 1;
+    let start_time = std::time::Instant::now();
+    loop {
+        if child_pids.is_empty() {
+            break;
+        }
+
+        // Check if we've exceeded the timeout
+        if start_time.elapsed() > max_wait {
+            tracing::error!(job_id=%job_id, "conversion timed out");
+            // Kill any remaining child processes
+            for &pid in &child_pids {
+                tracing::trace!(job_id=%job_id, pid=%pid, "killing pid");
+                if let Err(e) = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid.into()),
+                    nix::sys::signal::Signal::SIGKILL,
+                ) {
+                    tracing::error!(job_id=%job_id, error=?e, "failed to kill child process {}", pid);
+                }
+            }
+        }
+
+        // Prevent locking
+        thread::sleep(Duration::from_millis(200));
+
+        // check for completed children
+        child_pids.retain(|&pid| {
+            match nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(pid.into()),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+            ) {
+                Ok(nix::sys::wait::WaitStatus::StillAlive) => true,
+                Ok(nix::sys::wait::WaitStatus::Exited(_, status)) => {
+                    tracing::debug!(job_id=%job_id, status=status, "pid {} completed", pid);
+                    status_code = status;
+                    false
+                }
+                _ => {
+                    // This is called when the child process was forcefully killed above.
+                    false
+                }
+            }
+        });
+    }
+
+    if status_code != 0 {
+        tracing::error!(job_id=%job_id, status=status_code, "conversion failed with non-zero status code");
+        anyhow::bail!("conversion failed");
+    }
+
+    Ok(())
+}

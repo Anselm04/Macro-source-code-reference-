@@ -1,0 +1,181 @@
+/**
+ * Where a message's parts fold for display: consecutive ordinary tool calls
+ * and their thinking blocks share a group, everything else stays visible.
+ * The group starts at the run's first part, a thought before its first call
+ * included, so receiving another call does not replace the first call's host
+ * in the middle of its animation.
+ * Subagents and user tools stay outside groups so delegated work and user
+ * interactions remain visible regardless of the surrounding tool traffic.
+ * Tools with their own answer or session view always break the run, including
+ * while their arguments are still arriving.
+ *
+ * Thoughts after a run's last call belong to the run, at the tail of the
+ * message too: the run's live line says `Thinking` while the tail thought
+ * streams, so the turn never looks finished, and a settled turn reads as one
+ * row however it ended. A run of thoughts alone has no call to fold and
+ * stays visible.
+ *
+ * Whitespace-only prose is not a passage (as in the fold's own segments): a
+ * newline the agent emits between two calls renders nothing, so it must not
+ * split their run in two or strand the thoughts around it outside the fold.
+ *
+ * Segments are half-open index ranges into the parts array, so a grouped call
+ * keeps its position for the tool render context.
+ */
+
+import type { MessagePart } from '@service-agent-fold/generated/types';
+
+export type PartSegment = {
+  kind: 'part' | 'tools';
+  start: number;
+  /** Exclusive. A `part` segment spans exactly one index. */
+  end: number;
+};
+
+/**
+ * Macro tools whose call renders the answer itself rather than a card about
+ * it. `GenerateImage` shows the generated
+ * image document. `DispatchCodingAgent` shows the dispatched session's Magic Chip.
+ *
+ * Folding one of these into a group would put the answer behind a closed
+ * caret, indented inside a row of muted tool chips — so they break the run
+ * and stand on their own, like a paragraph of the reply.
+ */
+const SELF_RENDERING_TOOLS: ReadonlySet<string> = new Set([
+  'DispatchCodingAgent',
+  'GenerateImage',
+]);
+
+/**
+ * Whether a part is a tool call that renders its own view (see
+ * {@link SELF_RENDERING_TOOLS}). Only Macro's own tools do: the fold names
+ * them, and the chat component library is what renders them.
+ */
+export function rendersOwnView(part: MessagePart | undefined): boolean {
+  if (part?.kind !== 'tool_use') return false;
+  if (presentedReviewId(part) || part.detail.kind === 'view') return true;
+  const macroTool =
+    part.detail.kind === 'macro' ||
+    (part.detail.kind === 'other' &&
+      part.name.kind === 'mcp' &&
+      part.name.server === 'macro');
+  if (!macroTool) return false;
+  // The tool's own name, without the MCP server namespace the fold already
+  // separated out (mirrors `toolLabel` in `component/parts/shared.ts`).
+  const name = part.name.kind === 'mcp' ? part.name.tool : part.name.name;
+  return SELF_RENDERING_TOOLS.has(name);
+}
+
+/** Prose with nothing to read: it renders nothing and separates nothing. */
+export function isBlankText(part: MessagePart | undefined): boolean {
+  return part?.kind === 'text' && part.text.trim() === '';
+}
+
+/** Whether a part may be folded into a collapsed run with its neighbours. */
+function isGroupable(part: MessagePart | undefined): boolean {
+  return (
+    part?.kind === 'thought' ||
+    isBlankText(part) ||
+    (part?.kind === 'tool_use' &&
+      part.detail.kind !== 'subagent' &&
+      part.detail.kind !== 'user_tool' &&
+      !rendersOwnView(part))
+  );
+}
+
+export function segmentParts(parts: readonly MessagePart[]): PartSegment[] {
+  const segments: PartSegment[] = [];
+  let start = 0;
+  while (start < parts.length) {
+    if (!isGroupable(parts[start])) {
+      segments.push({ kind: 'part', start, end: start + 1 });
+      start += 1;
+      continue;
+    }
+
+    let end = start;
+    let calls = false;
+    while (isGroupable(parts[end])) {
+      if (parts[end].kind === 'tool_use') calls = true;
+      end += 1;
+    }
+    if (calls) {
+      segments.push({ kind: 'tools', start, end });
+      start = end;
+    }
+    // Thought-only runs never become groups: a group needs an actual call.
+    while (start < end) {
+      segments.push({ kind: 'part', start, end: start + 1 });
+      start += 1;
+    }
+  }
+  return segments;
+}
+
+/**
+ * The one run an open turn is in, by its position in `segments`, or -1: the
+ * last run, when it closes the message or only the person's answer to one of
+ * its calls (a permission, an approval, a question) follows it. An earlier
+ * run is history even if the log left one of its calls running, so a turn
+ * never shows two runs working at once.
+ */
+export function liveToolSegment(
+  parts: readonly MessagePart[],
+  segments: readonly PartSegment[]
+): number {
+  const index = segments.findLastIndex((segment) => segment.kind === 'tools');
+  const run = segments[index];
+  if (!run) return -1;
+  const waiting = parts
+    .slice(run.end)
+    .every(
+      (part) =>
+        part.kind === 'permission' ||
+        part.kind === 'tool_approval' ||
+        part.kind === 'elicitation'
+    );
+  if (!waiting) return -1;
+  if (run.end === parts.length) return index;
+  const callOut = parts
+    .slice(run.start, run.end)
+    .some(
+      (part) =>
+        part.kind === 'tool_use' &&
+        (part.status === 'pending' || part.status === 'running')
+    );
+  return callOut ? index : -1;
+}
+
+/** Only Macro's session-authenticated internal server may select this view. */
+export function isCodeExecution(part: MessagePart): boolean {
+  return (
+    part.kind === 'tool_use' &&
+    part.name.kind === 'mcp' &&
+    part.name.server === 'macro_internal' &&
+    part.name.tool === 'ExecuteCode'
+  );
+}
+
+/** Only the server-authored presentation call selects a persisted review card.
+ * The normal PresentReview invocation still renders its ordinary receipt.
+ */
+export function presentedReviewId(part: MessagePart): string | undefined {
+  if (
+    part.kind !== 'tool_use' ||
+    part.name.kind !== 'mcp' ||
+    part.name.server !== 'macro_internal' ||
+    part.name.tool !== 'PresentReview' ||
+    !('input' in part.detail)
+  )
+    return;
+  const input = part.detail.input;
+  if (
+    !input ||
+    typeof input !== 'object' ||
+    !('reviewId' in input) ||
+    typeof input.reviewId !== 'string' ||
+    !/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(input.reviewId)
+  )
+    return;
+  return part.id === `review_${input.reviewId}` ? input.reviewId : undefined;
+}

@@ -1,0 +1,411 @@
+use std::time::Duration;
+
+use anyhow::Context;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use reqwest::Url;
+
+use crate::{
+    Result, UnauthedClient,
+    error::{FusionAuthClientError, GenericErrorResponse},
+};
+
+/// Mail and address-book consent. Calendar access is requested only by calendar entry points.
+pub const MICROSOFT_SCOPES: &str = "openid email offline_access profile User.Read Mail.ReadWrite Mail.Send MailboxSettings.ReadWrite Contacts.Read";
+
+/// The delegated scopes a consent request asks for.
+pub(crate) fn consent_scopes(calendar: bool) -> String {
+    if calendar {
+        format!("{MICROSOFT_SCOPES} Calendars.ReadWrite")
+    } else {
+        MICROSOFT_SCOPES.to_owned()
+    }
+}
+
+#[derive(serde::Serialize)]
+struct MicrosoftTokenExchangeRequest<'a> {
+    client_id: &'a str,
+    client_secret: &'a str,
+    code: &'a str,
+    grant_type: &'static str,
+    redirect_uri: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code_verifier: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+struct MicrosoftTokenExchangePayload {
+    refresh_token: String,
+    id_token: String,
+    access_token: String,
+    expires_in: u64,
+    scope: String,
+}
+
+/// Tokens returned by a Microsoft authorization-code exchange.
+pub struct MicrosoftExchangeTokenResponse {
+    /// The refresh token used to request future Microsoft Graph access tokens.
+    pub refresh_token: String,
+    /// The ID token containing the linked Microsoft identity.
+    pub id_token: String,
+    /// Graph access token from the same authorization-code exchange.
+    pub access_token: String,
+    /// Access-token lifetime in seconds.
+    pub expires_in: u64,
+    /// Delegated permissions actually granted by the account.
+    pub scope: String,
+}
+
+#[derive(serde::Deserialize)]
+struct MicrosoftIdTokenClaims {
+    iss: String,
+    tid: String,
+    sub: String,
+    email: Option<String>,
+    preferred_username: Option<String>,
+    nonce: Option<String>,
+    oid: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct MicrosoftOpenIdConfiguration {
+    issuer: String,
+    jwks_uri: String,
+}
+
+#[derive(serde::Deserialize)]
+struct MicrosoftJsonWebKeySet {
+    keys: Vec<MicrosoftJsonWebKey>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct MicrosoftJsonWebKey {
+    pub(crate) kid: String,
+    pub(crate) kty: String,
+    pub(crate) n: String,
+    pub(crate) e: String,
+    pub(crate) issuer: Option<String>,
+}
+
+/// The tenant's OIDC issuer and current signing keys, resolved through Microsoft OIDC discovery.
+#[derive(Debug)]
+pub(crate) struct MicrosoftSigningKeys {
+    pub(crate) issuer: String,
+    pub(crate) keys: Vec<MicrosoftJsonWebKey>,
+}
+
+/// Validated identity details extracted from a Microsoft ID token.
+#[derive(Debug, Eq, PartialEq)]
+pub struct MicrosoftUserInfo {
+    /// Verified tenant identity, including the Microsoft consumer tenant.
+    pub tenant_id: String,
+    /// Directory object identity, when the issuer supplies it.
+    pub object_id: Option<String>,
+    /// The tenant-specific Microsoft subject identifier.
+    pub sub: String,
+    /// The email claim, or `preferred_username` when the email claim is absent.
+    pub email: Option<String>,
+}
+
+pub(crate) fn construct_authorize_url(
+    login_page_url: &str,
+    client_id: &str,
+    tenant_id: &str,
+    redirect_uri: &str,
+    state: &str,
+) -> anyhow::Result<String> {
+    let mut url = endpoint_url(login_page_url, tenant_id, "authorize")?;
+
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("response_type", "code")
+        .append_pair("scope", MICROSOFT_SCOPES)
+        .append_pair("state", state)
+        .append_pair("prompt", "select_account");
+
+    Ok(url.to_string())
+}
+
+/// The tenant-wide admin-consent page for `tenant_id`.
+///
+/// Admin consent is a directory operation, so the `common` audience is not
+/// accepted there: a multi-tenant app asks `organizations` and lets the
+/// administrator pick their directory. A fixed tenant or `organizations` is
+/// used as configured. On success Microsoft returns to `redirect_uri` with
+/// `admin_consent=True&tenant={id}&state={state}`.
+pub(crate) fn construct_admin_consent_url(
+    login_page_url: &str,
+    client_id: &str,
+    tenant_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    calendar: bool,
+) -> anyhow::Result<String> {
+    let tenant = match tenant_id {
+        "common" | "consumers" => "organizations",
+        tenant => tenant,
+    };
+    let mut url = Url::parse(login_page_url).context("invalid Microsoft OAuth base URL")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("Microsoft OAuth base URL must support path segments"))?
+        .pop_if_empty()
+        .extend([tenant, "v2.0", "adminconsent"]);
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", &consent_scopes(calendar))
+        .append_pair("state", state);
+
+    Ok(url.to_string())
+}
+
+pub(crate) async fn exchange_code_for_tokens(
+    login_url: &str,
+    client_id: &str,
+    client_secret: &str,
+    tenant_id: &str,
+    redirect_uri: &str,
+    code: &str,
+    code_verifier: Option<&str>,
+) -> Result<MicrosoftExchangeTokenResponse> {
+    let token_endpoint =
+        endpoint_url(login_url, tenant_id, "token").map_err(FusionAuthClientError::from)?;
+    let request = MicrosoftTokenExchangeRequest {
+        client_id,
+        client_secret,
+        code,
+        grant_type: "authorization_code",
+        redirect_uri,
+        code_verifier,
+    };
+
+    let response = super::runtime::client()
+        .map_err(|_| generic_error("Microsoft token exchange unavailable"))?
+        .post(token_endpoint)
+        .form(&request)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|_| generic_error("Microsoft token exchange unavailable"))?;
+    let status = response.status();
+
+    if !status.is_success() {
+        return Err(generic_error(format!(
+            "Microsoft token exchange failed with status {status}"
+        )));
+    }
+
+    let payload = response
+        .json::<MicrosoftTokenExchangePayload>()
+        .await
+        .map_err(|_| generic_error("invalid Microsoft token response"))?;
+
+    if payload.refresh_token.trim().is_empty() {
+        return Err(generic_error(
+            "Microsoft token response did not include a refresh token",
+        ));
+    }
+    if payload.id_token.trim().is_empty() {
+        return Err(generic_error(
+            "Microsoft token response did not include an ID token",
+        ));
+    }
+    if payload.access_token.is_empty() || payload.expires_in == 0 {
+        return Err(generic_error(
+            "Microsoft token response did not include a usable access token",
+        ));
+    }
+
+    Ok(MicrosoftExchangeTokenResponse {
+        refresh_token: payload.refresh_token,
+        id_token: payload.id_token,
+        access_token: payload.access_token,
+        expires_in: payload.expires_in,
+        scope: payload.scope,
+    })
+}
+
+pub(crate) async fn fetch_microsoft_signing_keys(
+    client: &UnauthedClient,
+    login_base_url: &str,
+    tenant_id: &str,
+) -> anyhow::Result<MicrosoftSigningKeys> {
+    let discovery_url = discovery_url(login_base_url, tenant_id)?;
+    let configuration: MicrosoftOpenIdConfiguration =
+        fetch_json(client, discovery_url, "OpenID configuration").await?;
+
+    let jwks_uri = Url::parse(&configuration.jwks_uri)
+        .context("Microsoft OpenID configuration contains an invalid JWKS URI")?;
+    let trusted_origin = Url::parse(login_base_url)?.origin();
+    if jwks_uri.origin() != trusted_origin
+        || !jwks_uri.username().is_empty()
+        || jwks_uri.password().is_some()
+        || jwks_uri.fragment().is_some()
+    {
+        anyhow::bail!("Microsoft signing-key URL is outside the configured authority");
+    }
+    let jwks: MicrosoftJsonWebKeySet = fetch_json(client, jwks_uri, "JWKS").await?;
+    if jwks.keys.is_empty() {
+        anyhow::bail!("Microsoft JWKS response did not contain any signing keys");
+    }
+
+    Ok(MicrosoftSigningKeys {
+        issuer: configuration.issuer,
+        keys: jwks.keys,
+    })
+}
+
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    _client: &UnauthedClient,
+    url: Url,
+    resource: &str,
+) -> anyhow::Result<T> {
+    let response = super::runtime::client()?
+        .get(url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch Microsoft {resource}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("Microsoft {resource} request failed with status {status}");
+    }
+
+    response
+        .json::<T>()
+        .await
+        .with_context(|| format!("failed to parse Microsoft {resource} response"))
+}
+
+pub(crate) fn decode_microsoft_id_token(
+    id_token: &str,
+    signing_keys: &MicrosoftSigningKeys,
+    expected_audience: &str,
+    expected_tenant_id: &str,
+) -> anyhow::Result<MicrosoftUserInfo> {
+    decode_bound_microsoft_id_token(
+        id_token,
+        signing_keys,
+        expected_audience,
+        expected_tenant_id,
+        None,
+    )
+}
+
+pub(crate) fn decode_bound_microsoft_id_token(
+    id_token: &str,
+    signing_keys: &MicrosoftSigningKeys,
+    expected_audience: &str,
+    expected_tenant_id: &str,
+    expected_nonce: Option<&str>,
+) -> anyhow::Result<MicrosoftUserInfo> {
+    let header = jsonwebtoken::decode_header(id_token)
+        .context("failed to decode Microsoft ID-token header")?;
+    if header.alg != Algorithm::RS256 {
+        anyhow::bail!("Microsoft ID token is not signed with an approved algorithm");
+    }
+    let kid = header
+        .kid
+        .context("Microsoft ID-token header does not contain a key ID")?;
+    let signing_key = signing_keys
+        .keys
+        .iter()
+        .find(|key| key.kid == kid)
+        .context("Microsoft ID token is not signed with a known signing key")?;
+    if signing_key.kty != "RSA" {
+        anyhow::bail!("Microsoft ID-token signing key is not an RSA key");
+    }
+
+    let decoding_key = DecodingKey::from_rsa_components(&signing_key.n, &signing_key.e)
+        .context("failed to construct a decoding key from the Microsoft signing key")?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_required_spec_claims(&["exp", "nbf", "aud", "iss"]);
+    validation.validate_nbf = true;
+    validation.set_audience(&[expected_audience]);
+    // Tenant-independent discovery publishes an issuer template. Verify the
+    // signature first, then bind the issuer and signing key to the verified tid.
+
+    let claims =
+        jsonwebtoken::decode::<MicrosoftIdTokenClaims>(id_token, &decoding_key, &validation)
+            .context("Microsoft ID token failed signature or claims validation")?
+            .claims;
+
+    let multi_tenant = matches!(expected_tenant_id, "common" | "organizations" | "consumers");
+    const CONSUMER_TENANT: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
+    if multi_tenant {
+        uuid::Uuid::parse_str(&claims.tid).context("Microsoft tenant is not a UUID")?;
+        if (expected_tenant_id == "organizations" && claims.tid == CONSUMER_TENANT)
+            || (expected_tenant_id == "consumers" && claims.tid != CONSUMER_TENANT)
+        {
+            anyhow::bail!("Microsoft account type is not allowed");
+        }
+    } else if claims.tid != expected_tenant_id {
+        anyhow::bail!("Microsoft ID-token tenant does not match the configured tenant");
+    }
+    let expected_issuer = signing_keys.issuer.replace("{tenantid}", &claims.tid);
+    if claims.iss != expected_issuer
+        || claims.iss != format!("https://login.microsoftonline.com/{}/v2.0", claims.tid)
+    {
+        anyhow::bail!("Microsoft ID-token issuer does not match its tenant");
+    }
+    match &signing_key.issuer {
+        Some(issuer) if issuer.replace("{tenantid}", &claims.tid) != claims.iss => {
+            anyhow::bail!("Microsoft signing key is not valid for this issuer");
+        }
+        None if multi_tenant => anyhow::bail!("Microsoft signing key has no issuer scope"),
+        _ => {}
+    }
+    if let Some(expected) = expected_nonce
+        && claims.nonce.as_deref() != Some(expected)
+    {
+        anyhow::bail!("Microsoft ID-token nonce does not match this linking attempt");
+    }
+    if claims.sub.trim().is_empty() {
+        anyhow::bail!("Microsoft ID token does not contain a subject");
+    }
+
+    let email = claims
+        .email
+        .filter(|email| !email.trim().is_empty())
+        .or_else(|| {
+            claims
+                .preferred_username
+                .filter(|username| !username.trim().is_empty())
+        });
+
+    Ok(MicrosoftUserInfo {
+        tenant_id: claims.tid,
+        object_id: claims.oid,
+        sub: claims.sub,
+        email,
+    })
+}
+
+/// An OAuth endpoint of `tenant_id` under a Microsoft login host.
+pub(super) fn endpoint_url(
+    login_url: &str,
+    tenant_id: &str,
+    endpoint: &str,
+) -> anyhow::Result<Url> {
+    let mut url = Url::parse(login_url).context("invalid Microsoft OAuth base URL")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("Microsoft OAuth base URL must support path segments"))?
+        .pop_if_empty()
+        .extend([tenant_id, "oauth2", "v2.0", endpoint]);
+    Ok(url)
+}
+
+fn discovery_url(login_base_url: &str, tenant_id: &str) -> anyhow::Result<Url> {
+    let mut url = Url::parse(login_base_url).context("invalid Microsoft OAuth base URL")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("Microsoft OAuth base URL must support path segments"))?
+        .pop_if_empty()
+        .extend([tenant_id, "v2.0", ".well-known", "openid-configuration"]);
+    Ok(url)
+}
+
+fn generic_error(message: impl Into<String>) -> FusionAuthClientError {
+    FusionAuthClientError::Generic(GenericErrorResponse {
+        message: message.into(),
+    })
+}

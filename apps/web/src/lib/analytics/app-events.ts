@@ -1,0 +1,520 @@
+/**
+ * Payload shared by the generic entity lifecycle events (`create_entity`,
+ * `update_entity`, `delete_entity`, `share_entity`).
+ *
+ * Only the identifying fields are structured; any event-specific context
+ * (e.g. `hasDueDate` on task creation, `newProjectId` on a move) rides along
+ * as unstructured extra properties instead of minting a new event type.
+ */
+export type EntityEventPayload = {
+  /**
+   * Coarse entity/block type: 'md' | 'task' | 'snippet' | 'code' | 'canvas' |
+   * 'chat' | 'project' | 'channel' | 'email' | 'document' | ... Open-ended on
+   * purpose — different layers know the entity at different granularities.
+   */
+  entityType: string;
+  entityId?: string;
+  /** UI surface the action originated from (e.g. 'launcher', 'mobile_dock'). */
+  source?: string;
+} & Record<string, unknown>;
+
+/** A normalized reason selected before deleting an account. */
+export type AccountDeletionReason =
+  | 'not_using_enough'
+  | 'missing_features'
+  | 'difficult_to_use'
+  | 'bugs_or_performance'
+  | 'too_expensive'
+  | 'prefer_another_product'
+  | 'privacy_or_security_concerns'
+  | 'other';
+
+export type AppEvents = {
+  // --- Acquisition & auth -------------------------------------------------
+  /**
+   * Account creation, browser side (GA only). The authoritative PostHog
+   * `sign_up` is emitted server-side from the create-user webhook; the
+   * browser fires this GA event plus the ad conversions when the backend
+   * flags the session via the `signed_up=true` redirect param. See
+   * signupCompletion.ts.
+   */
+  sign_up: Record<string, unknown>;
+  /** Signup intent: user clicked a sign-up CTA (pre-redirect, may not convert). */
+  sign_up_click: { method?: string } & Record<string, unknown>;
+  login: Record<string, unknown>; // payload - include link status
+  sign_out: Record<string, unknown>;
+  account_deletion_feedback: {
+    reason: AccountDeletionReason | 'not_provided';
+    feedback?: string;
+  };
+  login_from_onboarding: Record<string, unknown>;
+  mobile_web_welcome_viewed: Record<string, unknown>;
+  mobile_web_signup_sent_viewed: Record<string, unknown>;
+
+  // --- Interactive tutorial (optional; decoupled from acquisition) ---------
+  tutorial_started: { isFirstTime: boolean };
+  tutorial_step: {
+    id: string;
+    index: number;
+    state: 'viewed' | 'completed' | 'skipped';
+  };
+  tutorial_completed: { isFirstTime: boolean };
+  tutorial_skipped: Record<string, unknown>;
+
+  // --- Onboarding v4 (the full-screen /onboarding stepper) -----------------
+  /** A GTM invite welcome page resolved its link (`/invite?token=`). */
+  gtm_invite_opened: { status: string };
+  /** The recipient pressed Continue on the welcome page. */
+  gtm_invite_continue: { authenticated: boolean };
+  /** An account was attributed to an invite link and granted its offer. */
+  gtm_invite_redeemed: { link_id: string; promo_code: string };
+  /** The plan step showed the free-month offer instead of the picker. */
+  gtm_invite_offer_viewed: { link_id: string; promo_code: string };
+  /** Staff created an invite link in the internal portal. */
+  gtm_invite_link_created: { link_id: string };
+  /**
+   * Flow entered. `signup_method` is inferred from the inbox state at
+   * entry: a Google signup arrives with its inbox already linked, an
+   * email-code signup with none. `entry_step` is the step shown first:
+   * a checkout return, saved progress, a `?step` link, or welcome.
+   */
+  onboarding_v4_started: {
+    signup_method: 'google' | 'email_code';
+    entry_step: string;
+  };
+  /** One per step transition: viewed on entry, completed/skipped on exit. */
+  onboarding_v4_step: {
+    step: string;
+    index: number;
+    state: 'viewed' | 'completed' | 'skipped';
+  };
+  /** A connect-inbox row was clicked (OAuth may still be abandoned). */
+  onboarding_v4_email_connect_clicked: { slot: string };
+  /** An inbox finished linking while onboarding. */
+  onboarding_v4_email_connected: { connected_count: number };
+  /** A connector completed OAuth from its step. */
+  onboarding_v4_connector_connected: { connector: string };
+  /** How the last step's routine suggestions were left. */
+  onboarding_v4_routines: {
+    suggested: number;
+    /** Switched on before the person changed anything. */
+    recommended: number;
+    enabled: number;
+    recommended_kept: number;
+    /** Of those turned on, how many AI suggested for the person. */
+    for_you_enabled: number;
+  };
+  /** The last step's list settled: AI finished, or the wait ran out. */
+  onboarding_v4_routines_shown: {
+    shown: number;
+    /** Suggested by AI for the person, not Macro's templates. */
+    for_you: number;
+    on_by_default: number;
+    /** AI gave none in time, so only Macro's templates showed. */
+    fallback: boolean;
+    /** The wait ran out before AI finished. */
+    waited_out: boolean;
+    /** The generation's status when it settled. */
+    status: string;
+    /** From the step opening to AI's first suggestion showing; null if none did. */
+    first_suggestion_ms: number | null;
+  };
+  /** What happened on the team step. */
+  onboarding_v4_team: {
+    action:
+      | 'created'
+      | 'joined_invite'
+      | 'already_on_team'
+      | 'invite_link_copied'
+      | 'referrals_sent'
+      | 'referral_link_copied';
+    invites_sent?: number;
+    /** Same-domain teammates the step pre-added to the invite list. */
+    invites_prefilled?: number;
+    /** How many of those the user removed before creating the team. */
+    invites_removed?: number;
+    used_domain_suggestion?: boolean;
+    /** Whether people on the work domain may join. */
+    allow_domain_join?: boolean;
+    /** Whether the domain notice was requested; only with domain join. */
+    notify_domain?: boolean;
+  };
+  /**
+   * The flow finished (free, premium, or plan skipped) with a rollup of
+   * everything connected along the way.
+   */
+  onboarding_v4_completed: {
+    plan: 'free' | 'premium' | 'max';
+    plan_skipped: boolean;
+    emails_connected: number;
+    connectors_connected: string[];
+  };
+  /** A @macro.com account used the staff Bypass button; `step` is where. */
+  onboarding_v4_bypassed: { step: string };
+
+  subscription_start: Record<string, unknown>;
+  subscription_cancel: Record<string, unknown>;
+  subscription_success: Record<string, unknown>;
+
+  sidebar_click: Record<string, unknown>;
+  notifications_toggled: Record<string, unknown>;
+
+  share_menu_open: { blockType: string };
+
+  copy_share_link: Record<string, unknown>;
+  download: Record<string, unknown>;
+  comment_create: { blockType: string };
+  comment_update: { blockType: string };
+  comment_delete: { blockType: string };
+  upload_file: {
+    fileType?: string;
+    fileName?: string;
+    fileSize?: number;
+    destination: 'dss' | 'static';
+    folder?: boolean;
+  };
+  upload_error: {
+    type: string;
+    destination?: 'dss' | 'static';
+  };
+
+  command_menu_open: { from: string };
+  command_menu_use: { itemType: string };
+  create_menu_open: { from: string };
+  hotkey_use: Record<string, unknown>;
+  mentions_menu_use: { itemType: string };
+  snippets_menu_use: Record<string, unknown>;
+  /**
+   * An agent's `macro.ui.open` reached this tab: `opened` a new pane,
+   * `shown` one already open, `no_room`, `cancelled`, or
+   * `not_allowed_route` (refused here). `route` is the route id, never the path.
+   */
+  agent_ui_command: { kind: 'open'; outcome: string; route?: string };
+  /**
+   * The person pressed Undo on a pane an agent opened: `undone`, or `kept`
+   * when a leave guard (unsaved edits) or a newer navigation kept the pane.
+   */
+  agent_ui_command_undone: { route: string; outcome: 'undone' | 'kept' };
+  /** `side` is where a split opened beside another; absent, it opened at the end. */
+  split_created: { from: string; side?: 'left' | 'right' | 'above' | 'below' };
+
+  // --- Entity lifecycle ----------------------------------------------------
+  // Fired at data-layer chokepoints (core/util/create.ts, FileList
+  // itemOperations, property-save mutations, share/forward flows, BlockLoader)
+  // so every UI surface is covered without per-surface instrumentation.
+  /**
+   * An entity was opened in a split (md, task, pdf, chat, email, channel,
+   * canvas, code, project, company, contact, ...). Fired from BlockLoader on
+   * successful load; nested blocks and preview-panel peeks are excluded.
+   * Route-owned detail views fire it themselves: documents from
+   * FileDetailLoadGate, channels from ChannelDetail, calls and PRs from their
+   * detail views. Blocks without an open history row fire it only when they
+   * set `openAnalyticsEnabled` (database); calendar does not, since it loads
+   * one fixed id and `open_view` already counts it.
+   */
+  open_entity: EntityEventPayload;
+  /**
+   * A top-level view was opened (soup list views like inbox/mail/documents/
+   * tasks/channels, plus home, search, and the compose views). Fired from the
+   * split-layout component registry.
+   */
+  open_view: { viewId: string } & Record<string, unknown>;
+  /**
+   * Agent sessions report create, rename (`update_entity`) and delete as
+   * `entityType: 'agent'`, the type their `open_entity` carries. The retired
+   * AI chat reported `chat`; count both for AI conversations over time.
+   */
+  create_entity: EntityEventPayload;
+  update_entity: EntityEventPayload & {
+    /** Which property changed: 'name' | 'parent_project' | 'status' | ... */
+    property: string;
+  };
+  delete_entity: EntityEventPayload & { deleteType?: 'soft' | 'permanent' };
+  share_entity: EntityEventPayload & {
+    shareMethod?:
+      | 'public_link'
+      | 'team_link'
+      | 'channel'
+      | 'forward'
+      | 'attachment_public'
+      | (string & {});
+    linkShare?: 'PUBLIC' | 'TEAM';
+  };
+
+  task_copy_branch_name: Record<string, unknown>;
+
+  theme_changed: { themeId: string };
+
+  /**
+   * A message sent to AI, with `attachmentCount` files. `surface` is 'chat'
+   * for the legacy AI chat and 'agent' for an accepted agent-session prompt
+   * (AgentSession.sendPrompt), which also carries `agentSessionId`,
+   * `agentId`, `newSession`, `submitSurface` and `queued`. Events before the
+   * agent tracking have no `surface`.
+   */
+  ai_message_sent: Record<string, unknown>;
+  /**
+   * A file added to the legacy AI chat's input, on upload or drop. Agent
+   * sessions report attachments as `ai_message_sent.attachmentCount` instead.
+   */
+  ai_attachment_add: Record<string, unknown>;
+  /** A paid user opened Stripe Checkout for an AI credit pack. */
+  ai_credits_checkout_start: { amountCents: number };
+  /** A payer changed their AI usage billing (overage) settings. */
+  ai_overage_updated: { enabled: boolean; limitCents: number };
+  /** An existing subscriber moved between Premium and Max. */
+  plan_changed: { plan: 'premium' | 'max'; from?: string };
+
+  /**
+   * An email the user sent, counted once when the outbox accepts it. Undo
+   * does not retract it. Older events have no properties.
+   */
+  email_message_sent: { isReply: boolean };
+  /**
+   * How the inbox-link OAuth callback ended. `already_connected` is a plain add
+   * whose account chooser returned an inbox the user already had; `connected`
+   * still covers reconnects and calendar upgrades of an existing inbox.
+   */
+  email_link_callback_result: {
+    outcome:
+      | 'connected'
+      | 'already_connected'
+      | 'already_initialized'
+      | 'shared_inbox_conflict'
+      | 'payment_required'
+      | 'no_gmail_grant'
+      | 'gmail_not_granted'
+      | 'failed'
+      | 'exception'
+      | 'missing_link_id';
+  };
+
+  channel_message_sent: Record<string, unknown>;
+  channel_messages_load: {
+    channelId: string;
+    path: 'full';
+    reason: 'no_cache' | 'cache_not_at_latest' | 'load_around' | 'revalidate';
+  };
+  channel_reaction: {
+    emoji: string;
+    action: 'add' | 'remove';
+  };
+
+  // In-product tutorial videos (the pinned row at the top of an inbox).
+  tutorial_video: {
+    /** `macro-<id>` for each id in features/video-tutorials/core/tutorial-id.ts. */
+    tutorial:
+      | 'macro-mail'
+      | 'macro-home'
+      | 'macro-chat'
+      | 'macro-tasks'
+      | 'macro-docs'
+      | 'macro-spreadsheets'
+      | 'macro-databases'
+      | 'macro-canvas'
+      | 'macro-drive'
+      | 'macro-crm'
+      | 'macro-calendar'
+      | 'macro-calls'
+      | 'macro-agents'
+      | 'macro-macrod'
+      | 'macro-github'
+      | 'macro-scheduling'
+      | 'macro-whatsapp';
+    /** `support_clicked`: the dialog's "Talk to us" link under the video. */
+    action: 'opened' | 'played' | 'dismissed' | 'support_clicked';
+  };
+
+  // --- Calls ---------------------------------------------------------------
+  // Frontend call interactions only. Recordings, transcripts and summaries
+  // are produced server-side and send no PostHog events yet; the call service
+  // publishes them only to Kafka (`call.recording_ready`, `call.record_summarized`).
+  call_action: {
+    action:
+      | 'join_clicked'
+      | 'started'
+      | 'joined'
+      | 'left'
+      | 'screen_share_toggled';
+    channelId: string;
+    callId?: string;
+    /** On `left`: seconds since this client joined the call. */
+    secondsInCall?: number;
+  } & Record<string, unknown>;
+  // Mic audio-processing state transitions (noise suppression attach /
+  // detach / fallback). `constraintMismatch` flags engines that report
+  // different track settings than were requested (mode changes that silently
+  // no-oped); `sampleRate` <= 16000 indicates a Bluetooth HFP capture path.
+  call_audio_processing: {
+    event: string;
+    channelId: string;
+    preferredMode: string;
+    activeMode: string;
+    constraintMismatch: boolean;
+  } & Record<string, unknown>;
+  // Per-call summary of remote-audio decode health, flushed at room teardown.
+  // High concealment alongside clean capture-side state points a "muddled
+  // voices" report at the network/playback leg, not noise suppression.
+  call_audio_receiver_stats: {
+    channelId: string;
+    callId?: string;
+    sampledIntervals: number;
+    badIntervals: number;
+    maxConcealmentRate: number;
+  } & Record<string, unknown>;
+
+  block_pdf_definition_open: Record<string, unknown>;
+  block_pdf_section_open: Record<string, unknown>;
+
+  // --- Databases -----------------------------------------------------------
+  /** A committed ops batch wrote rows of a database (grid, board, forms). */
+  database_rows_edited: {
+    databaseId: string;
+    insertedRows: number;
+    updatedRows: number;
+    deletedRows: number;
+  };
+  /**
+   * A database grid read its view: once when a view opens (a view switch
+   * included) and once per filter or sort change that settles for a second.
+   * Refreshes, live updates and layout edits are not counted. `host` tells a
+   * database's own page from a grid embedded in a document or a form's
+   * responses; only `block` opens are database opens.
+   */
+  database_query_run: {
+    databaseId: string;
+    tableId: string;
+    viewId: string;
+    host: 'block' | 'document' | 'form';
+    trigger: 'open' | 'query_change';
+    /** Top-level filter conditions; 0 when unfiltered. */
+    filterConditions: number;
+    sortKeys: number;
+  };
+
+  // --- Calendar ------------------------------------------------------------
+  calendar_event_created: {
+    eventId: string;
+    attendees: number;
+    recurring: boolean;
+    macroCall: boolean;
+    conference: boolean;
+  };
+  calendar_event_rsvp: {
+    response: 'accepted' | 'declined' | 'tentative';
+    scope: 'all' | 'this_event';
+  };
+
+  // --- Notifications -------------------------------------------------------
+  /**
+   * A notification was opened: from the app's lists and stacks (`in_app`), a
+   * browser notification, a native iOS, Android or macOS notification tap
+   * (`native_push`, counted once its navigation applies; `macro_device` tells
+   * the platforms apart), or a home recommendation that opens through its
+   * notification (`home_recommendation`, not a notification-driven open).
+   */
+  notification_opened: {
+    source: 'in_app' | 'browser_push' | 'native_push' | 'home_recommendation';
+    notificationType: string;
+    entityType: string;
+  };
+
+  // --- Search --------------------------------------------------------------
+  /**
+   * One service search per settled query: a query whose results stay
+   * unreplaced for 1.5s, or the last one when the surface closes. Refetches
+   * and later pages of the same query are not counted; no query text is sent.
+   */
+  search_performed: {
+    /** View id ('search', 'email', 'tasks', ...), 'home', or 'mobile_search'. */
+    surface: string;
+    matchType: 'exact' | 'partial';
+    /** First page only: '0' | '1-9' | '10-49' | '50+'. */
+    resultCount: string;
+  };
+
+  // --- CRM -----------------------------------------------------------------
+  crm_company_created: { companyId: string };
+  crm_contact_created: { companyId?: string; contactId: string };
+  /**
+   * A committed pipeline write: inserted rows are entries added, updated
+   * rows include stage moves and other cell edits.
+   */
+  crm_pipeline_entries_edited: {
+    pipelineId: string;
+    recordType?: 'company' | 'contact' | 'generic';
+    /** The pipeline editor or the record page's pipeline cards. */
+    surface: 'pipeline' | 'record';
+    insertedRows: number;
+    updatedRows: number;
+    deletedRows: number;
+  };
+
+  // --- Routines ------------------------------------------------------------
+  // Client-side until the scheduled_action service reports to PostHog;
+  // scheduled and event-triggered runs are not counted yet.
+  routine_created: {
+    routineId?: string;
+    source: 'new' | 'duplicate' | 'suggestion';
+    /** The routine suggestion it was saved from. */
+    suggestionId?: string;
+    triggerType: string;
+    /** A single agent's model or agent, or `steps` for a routine with steps. */
+    targetKind?: 'agent' | 'model' | 'steps';
+  };
+  /** The suggestions for a sidebar or the Routines page were opened. */
+  routine_suggestions_opened: {
+    surface: string;
+    suggestions: number;
+  };
+  /** A sidebar's suggestions card was closed on every device. */
+  routine_suggestions_card_dismissed: { surface: string };
+  /** Undo right after closing a sidebar's suggestions card. */
+  routine_suggestions_card_restored: { surface: string };
+  /** A suggestion's card was on screen in an opened list. */
+  routine_suggestion_shown: RoutineSuggestionEvent;
+  /** Turned on in one click from its card; `edited` if changed there first. */
+  routine_suggestion_enabled: RoutineSuggestionEvent & {
+    routineId: string;
+    edited: boolean;
+  };
+  /** First change to one of a suggestion's knob values on its card. */
+  routine_suggestion_edited: RoutineSuggestionEvent;
+  /** Opened in the full routine editor before saving. */
+  routine_suggestion_customized: RoutineSuggestionEvent & { edited: boolean };
+  /** "Not interested": dismissed on every surface. */
+  routine_suggestion_dismissed: RoutineSuggestionEvent;
+  /** A manual Run now the server accepted, not the run's outcome. */
+  routine_run: {
+    routineId: string;
+    trigger: 'manual';
+    targetKind?: 'agent' | 'model' | 'steps';
+  };
+
+  // --- Saved email views ---------------------------------------------------
+  /** A confirmed create, by where the definition started. */
+  email_saved_view_created: {
+    savedViewId: string;
+    source: 'builder' | 'save_filters' | 'duplicate';
+  };
+  /** Opened from the sidebar or picker; `viewCount` is how many the viewer has. */
+  email_saved_view_opened: {
+    savedViewId: string;
+    viewCount: number;
+  };
+};
+
+export type AppEventNames = keyof AppEvents;
+
+/** Which suggestion, where it showed, and who suggested what kind. */
+type RoutineSuggestionEvent = {
+  suggestionId: string;
+  /** The sidebar's surface, or the suggestion's main one on the Routines page. */
+  surface: string;
+  placement: 'sidebar' | 'routines';
+  /** `for_you` from AI, `macro` for Macro's templates. */
+  from: 'for_you' | 'macro';
+  /** A catalog routine with AI's values, or a routine AI drafted. */
+  kind: 'catalog' | 'routine';
+  catalogKey?: string;
+};

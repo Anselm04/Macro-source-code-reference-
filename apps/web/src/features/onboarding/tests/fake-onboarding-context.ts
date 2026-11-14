@@ -1,0 +1,479 @@
+import type { PaidPlanTier } from '@app/features/paywall/plans';
+import { createEmptyDraft } from '@app/features/routines/core/routine-draft';
+import type { RoutineTemplate } from '@app/features/routines/core/routine-templates';
+import { TEST_CATALOG } from '@app/features/routines/tests/catalog';
+import type { AiPlanCatalog } from '@service-auth/ai-billing-types';
+import type { ServerResponse } from '@service-cognition/generated/schemas';
+import type { RoutineSuggestions } from '@service-scheduled-action/generated/schemas';
+import { createSignal } from 'solid-js';
+import { createStore, produce, unwrap } from 'solid-js/store';
+import type {
+  InviteOffer,
+  Loadable,
+  OnboardingContext,
+  OnboardingRecord,
+  Team,
+  TeamInvite,
+  Tool,
+  ViewerState,
+} from '../context/onboarding-context';
+import type { EmailAccount } from '../core/email-accounts';
+import {
+  catalogSuggestionDraft,
+  suggestionByline,
+} from '../core/routine-suggestions';
+import {
+  nativeToolSlug,
+  onboardingConnectedTools,
+  onboardingToolState,
+} from '../queries/connected-tools';
+import { fixtureConnectorIcon } from './connector-icons';
+
+/** Everything the fake backend knows. Plain JSON, so a harness can persist it. */
+export type FakeOnboardingWorld = {
+  viewer: {
+    id: string;
+    email: string;
+    tutorialComplete: boolean;
+    licensed: boolean;
+  } | null;
+  emailAccounts: EmailAccount[];
+  /** Addresses the next inbox connects link, in order. */
+  inboxesToConnect: string[];
+  /** Whether the server lets this user connect an Outlook inbox. */
+  outlookAvailable: boolean;
+  record: OnboardingRecord;
+  teams: Team[];
+  invites: TeamInvite[];
+  contacts: string[];
+  catalog: Tool[];
+  connectedTools: string[];
+  githubLinkStatus: 'linked' | 'unlinked' | 'reauthentication_required';
+  nativeTools: ServerResponse[];
+  connectionFailures: ('pipedream' | 'native' | 'github')[];
+  githubStars: number | undefined;
+  inviteOffer: InviteOffer | null;
+  trialEligible: boolean;
+  existingSubscription: boolean;
+  planCatalog: AiPlanCatalog;
+  /** License refreshes left before the Stripe webhook lands; undefined when none is pending. */
+  webhookPollsRemaining: number | undefined;
+  /** How many refreshes a checkout's webhook takes to land. */
+  webhookDelayPolls: number;
+  accent: string | undefined;
+  /** Suggestions are on, so the flow ends with the routines step. */
+  routineSuggestionsEnabled: boolean;
+  /** The scheduler's answer; undefined until it is first read. */
+  routineSuggestions: RoutineSuggestions | undefined;
+  routineCatalog: RoutineTemplate[];
+  /** Suggestions whose routine fails to be created. */
+  routineCreateFailures: string[];
+  /** Routines created from suggestions, by suggestion id. */
+  routinesCreated: string[];
+  /** Capabilities that fail, with the message they report. */
+  failures: Partial<
+    Record<
+      | 'emailAccounts'
+      | 'record'
+      | 'teams'
+      | 'catalog'
+      | 'createTeam'
+      | 'joinTeam'
+      | 'teamInviteLink'
+      | 'referralInvites'
+      | 'referralLink'
+      | 'planCatalog'
+      | 'trialEligibility'
+      | 'checkout'
+      | 'completion',
+      string
+    >
+  >;
+};
+
+export type FakeEvent = { event: string; data: unknown };
+
+export const FAKE_VIEWER_ID = 'macro|ada@acme.com';
+
+export function defaultFakeWorld(): FakeOnboardingWorld {
+  return {
+    viewer: {
+      id: FAKE_VIEWER_ID,
+      email: 'ada@acme.com',
+      tutorialComplete: false,
+      licensed: false,
+    },
+    emailAccounts: [],
+    inboxesToConnect: ['ada@acme.com', 'ada.personal@gmail.com'],
+    outlookAvailable: false,
+    record: { status: 'active', suggestedTeamDomain: 'acme.com' },
+    teams: [],
+    invites: [],
+    contacts: ['grace@acme.com', 'alan@acme.com', 'friend@gmail.com'],
+    catalog: ['Linear', 'Notion', 'GitHub', 'Slack', 'Figma', 'HubSpot'].map(
+      (name) => ({
+        slug: name.toLowerCase(),
+        name,
+        iconUrl: fixtureConnectorIcon(name.toLowerCase()),
+      })
+    ),
+    connectedTools: [],
+    githubLinkStatus: 'unlinked',
+    nativeTools: [],
+    connectionFailures: [],
+    githubStars: 12_345,
+    inviteOffer: null,
+    trialEligible: true,
+    existingSubscription: false,
+    planCatalog: {
+      plans: [
+        {
+          tier: 'free',
+          monthly_price_cents: 0,
+          included_ai_cents_per_seat: 100,
+          purchasable: false,
+        },
+        {
+          tier: 'premium',
+          monthly_price_cents: 4000,
+          included_ai_cents_per_seat: 2000,
+          purchasable: true,
+        },
+        {
+          tier: 'max',
+          monthly_price_cents: 20000,
+          included_ai_cents_per_seat: 10000,
+          purchasable: true,
+        },
+      ],
+      credit_packs_cents: [],
+      overage_limit_min_cents: 0,
+      overage_limit_max_cents: 0,
+    },
+    webhookPollsRemaining: undefined,
+    webhookDelayPolls: 1,
+    accent: undefined,
+    routineSuggestionsEnabled: false,
+    routineSuggestions: { status: 'none', suggestions: [] },
+    routineCatalog: TEST_CATALOG,
+    routineCreateFailures: [],
+    routinesCreated: [],
+    failures: {},
+  };
+}
+
+/** How a recorded createTeam call marks domain join: `:closed` without it,
+ * `:quiet` with it but no notice, nothing when both are on. */
+function domainSuffix(allowDomainJoin: boolean, notifyDomain: boolean) {
+  if (!allowDomainJoin) return ':closed';
+  if (!notifyDomain) return ':quiet';
+  return '';
+}
+
+/**
+ * An in-memory onboarding backend behind the real contract. `onChange` lets a
+ * harness persist the world; `roundTrip` models the inbox OAuth redirect by
+ * applying the change and then, say, reloading.
+ */
+export function createFakeOnboarding(
+  overrides: Partial<FakeOnboardingWorld> = {},
+  options: {
+    onChange?: (world: FakeOnboardingWorld) => void;
+    roundTrip?: (apply: () => void) => Promise<void>;
+    checkoutUrl?: (tier: PaidPlanTier) => string;
+    /** Report the sources as loading this long, like a cold page load. */
+    latencyMs?: number;
+    /** The viewer's own delay; a host that just resolved sign-in already has it. */
+    viewerLatencyMs?: number;
+  } = {}
+) {
+  const [world, setWorld] = createStore<FakeOnboardingWorld>({
+    ...defaultFakeWorld(),
+    ...overrides,
+  });
+  const [events, setEvents] = createSignal<FakeEvent[]>([]);
+  const [notifications, setNotifications] = createSignal<string[]>([]);
+  const [calls, setCalls] = createSignal<string[]>([]);
+
+  const update = (change: (draft: FakeOnboardingWorld) => void) => {
+    setWorld(produce(change));
+    options.onChange?.(structuredClone(unwrap(world)));
+  };
+  const call = (name: string) => setCalls((list) => [...list, name]);
+  const roundTrip = options.roundTrip ?? (async (apply) => apply());
+  const fail = (key: keyof FakeOnboardingWorld['failures']) => {
+    const message = world.failures[key];
+    if (message === undefined) return;
+    throw new Error(message);
+  };
+  const [settled, setSettled] = createSignal(!options.latencyMs);
+  if (options.latencyMs) setTimeout(() => setSettled(true), options.latencyMs);
+  const loadable = <T>(
+    failure: keyof FakeOnboardingWorld['failures'],
+    value: () => T
+  ): Loadable<T> =>
+    !settled()
+      ? { t: 'loading' }
+      : world.failures[failure] !== undefined
+        ? { t: 'error' }
+        : { t: 'ready', value: value() };
+
+  const [viewerSettled, setViewerSettled] = createSignal(
+    !options.viewerLatencyMs
+  );
+  if (options.viewerLatencyMs)
+    setTimeout(() => setViewerSettled(true), options.viewerLatencyMs);
+  const viewerState = (): ViewerState =>
+    !viewerSettled()
+      ? { t: 'loading' }
+      : world.viewer
+        ? { t: 'signed-in', viewer: { ...world.viewer } }
+        : { t: 'signed-out' };
+
+  const context: OnboardingContext = {
+    viewer: viewerState,
+    refreshViewer: async () => {
+      call('refreshViewer');
+      const remaining = world.webhookPollsRemaining;
+      if (remaining !== undefined)
+        update((draft) => {
+          draft.webhookPollsRemaining =
+            remaining > 1 ? remaining - 1 : undefined;
+          if (remaining <= 1 && draft.viewer) draft.viewer.licensed = true;
+        });
+      return viewerState();
+    },
+    createOnboardingRecord: () => () => loadable('record', () => world.record),
+    createEmailAccounts: () => ({
+      accounts: () => loadable('emailAccounts', () => world.emailAccounts),
+      refresh: async () => {},
+    }),
+    connectInbox: (provider) => {
+      call(provider ? `connectInbox:${provider}` : 'connectInbox');
+      return roundTrip(() =>
+        update((draft) => {
+          const address = draft.inboxesToConnect.shift();
+          if (!address) return;
+          draft.emailAccounts.push({
+            address,
+            isPrimary: draft.emailAccounts.length === 0,
+            ownerId: draft.viewer?.id ?? FAKE_VIEWER_ID,
+          });
+        })
+      );
+    },
+    createOutlookAvailability: () => () => world.outlookAvailable,
+    createToolCatalog: () => {
+      const [search, setSearch] = createSignal('');
+      return {
+        search,
+        setSearch,
+        entries: () =>
+          world.failures.catalog !== undefined
+            ? []
+            : world.catalog.filter((tool) =>
+                tool.name.toLowerCase().includes(search().trim().toLowerCase())
+              ),
+        fetching: () => false,
+        failed: () => world.failures.catalog !== undefined,
+        hasMore: () => false,
+        loadMore: () => {},
+        retry: () => call('retryCatalog'),
+      };
+    },
+    createConnectedTools: () => ({
+      connected: () =>
+        onboardingConnectedTools(
+          new Set(world.connectedTools),
+          world.nativeTools,
+          world.githubLinkStatus === 'linked'
+        ),
+      state: (slug) =>
+        onboardingToolState(
+          slug,
+          world.connectionFailures.includes('pipedream')
+            ? { t: 'error' }
+            : {
+                t: 'ready',
+                value: world.connectedTools.map((app_slug) => ({
+                  app_slug,
+                  enabled: true,
+                })),
+              },
+          world.connectionFailures.includes('native')
+            ? { t: 'error' }
+            : { t: 'ready', value: world.nativeTools },
+          world.connectionFailures.includes('github')
+            ? { t: 'error' }
+            : { t: 'ready', value: world.githubLinkStatus }
+        ),
+      retry: () => call('retryConnections'),
+    }),
+    configureGithubRepositories: () => call('configureGithubRepositories'),
+    // Native GitHub OAuth returns to the current step; Pipedream stays in an iframe.
+    connectTool: async (tool) => {
+      if (tool.slug === 'github') {
+        if (world.githubLinkStatus === 'linked') return;
+        call('connectNativeGithub');
+        return roundTrip(() =>
+          update((draft) => {
+            draft.githubLinkStatus = 'linked';
+          })
+        );
+      }
+      const native = world.nativeTools.find(
+        (server) => server.authenticated && nativeToolSlug(server) === tool.slug
+      );
+      if (native) {
+        update((draft) => {
+          const server = draft.nativeTools.find((s) => s.url === native.url);
+          if (server) server.enabled = true;
+        });
+        return;
+      }
+      call(`connectTool:${tool.slug}`);
+      update((draft) => {
+        draft.connectedTools.push(tool.slug);
+      });
+    },
+    createTeamDirectory: () => ({
+      teams: () => loadable('teams', () => world.teams),
+      invites: () => loadable('teams', () => world.invites),
+      contacts: () => ({ t: 'ready', value: world.contacts }),
+      retry: () => call('retryTeams'),
+    }),
+    createTeam: async ({ name, invites, allowDomainJoin, notifyDomain }) => {
+      call(
+        `createTeam:${name}:${invites.join(',')}${domainSuffix(allowDomainJoin, notifyDomain)}`
+      );
+      fail('createTeam');
+      update((draft) => {
+        draft.teams = [{ name }];
+      });
+    },
+    joinTeam: async (inviteId) => {
+      call(`joinTeam:${inviteId}`);
+      fail('joinTeam');
+      update((draft) => {
+        const invite = draft.invites.find((item) => item.id === inviteId);
+        draft.invites = draft.invites.filter((item) => item.id !== inviteId);
+        if (invite) draft.teams = [{ name: `${invite.invitedBy}'s team` }];
+      });
+    },
+    copyTeamInviteLink: async () => {
+      call('copyTeamInviteLink');
+      fail('teamInviteLink');
+    },
+    sendReferralInvites: async (emails) => {
+      call(`sendReferralInvites:${emails.join(',')}`);
+      fail('referralInvites');
+    },
+    copyReferralLink: async () => {
+      call('copyReferralLink');
+      fail('referralLink');
+    },
+    createInviteOffer: () => () => ({ t: 'ready', value: world.inviteOffer }),
+    createTrialEligibility: () => ({
+      eligibility: () =>
+        loadable('trialEligibility', () => world.trialEligible),
+      existingSubscription: () => world.existingSubscription,
+      managing: () => false,
+      manage: async () => {
+        call('manageSubscription');
+      },
+      retry: () => call('retryTrialEligibility'),
+    }),
+    createPlanCatalog: () => ({
+      catalog: () => loadable('planCatalog', () => world.planCatalog),
+      retry: () => call('retryPlanCatalog'),
+    }),
+    startCheckout: async (tier, terms) => {
+      call(`startCheckout:${tier}:${terms}`);
+      fail('checkout');
+      update((draft) => {
+        draft.webhookPollsRemaining = draft.webhookDelayPolls;
+      });
+      return (
+        options.checkoutUrl?.(tier) ?? `https://checkout.stripe.test/${tier}`
+      );
+    },
+    completeOnboarding: async ({ skipped }) => {
+      call(skipped ? 'completeOnboarding:skipped' : 'completeOnboarding');
+      if (world.failures.completion !== undefined) return { t: 'failed' };
+      update((draft) => {
+        draft.record.status = 'completed';
+        if (draft.viewer) draft.viewer.tutorialComplete = true;
+      });
+      return { t: 'completed' };
+    },
+    routineSuggestionsEnabled: () => world.routineSuggestionsEnabled,
+    generateRoutineSuggestions: () => call('generateRoutineSuggestions'),
+    createRoutinesStep: () => ({
+      answer: () => world.routineSuggestions,
+      failed: () => false,
+      refresh: async () => call('refreshRoutineSuggestions'),
+      row: (suggestion) => {
+        const byline = suggestionByline(suggestion);
+        const surface = suggestion.surfaces[0] ?? 'agents';
+        if (suggestion.kind === 'routine')
+          return {
+            id: suggestion.id,
+            surface,
+            title: suggestion.routine.name,
+            does: suggestion.routine.description ?? '',
+            byline,
+          };
+        const entry = world.routineCatalog.find(
+          (routine) => routine.key === suggestion.key
+        );
+        if (!entry) return undefined;
+        const draft = catalogSuggestionDraft(
+          suggestion,
+          entry,
+          { ...createEmptyDraft('model'), triggers: [], enabled: true },
+          { target: { kind: 'model', model: 'model' }, codeSteps: true }
+        );
+        return {
+          id: suggestion.id,
+          surface,
+          title: entry.title,
+          does: draft.description || entry.description,
+          byline,
+        };
+      },
+      create: async (suggestion, edits) => {
+        call(`createRoutine:${suggestion.id}:${edits.name}`);
+        if (world.routineCreateFailures.includes(suggestion.id))
+          throw new Error('create failed');
+        update((draft) => {
+          draft.routinesCreated.push(suggestion.id);
+        });
+        return `routine-${suggestion.id}`;
+      },
+    }),
+    repairTutorial: async () => {
+      call('repairTutorial');
+      update((draft) => {
+        if (draft.viewer) draft.viewer.tutorialComplete = true;
+      });
+    },
+    applyAccent: (color) => {
+      call(`applyAccent:${color}`);
+      update((draft) => {
+        draft.accent = color;
+      });
+    },
+    createGithubStars: () => () => world.githubStars,
+    track: (event, data) => setEvents((list) => [...list, { event, data }]),
+    notifyFailure: (message) => setNotifications((list) => [...list, message]),
+  };
+
+  return {
+    context,
+    world,
+    update,
+    events,
+    notifications,
+    calls,
+  };
+}

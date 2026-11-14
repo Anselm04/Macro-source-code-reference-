@@ -1,0 +1,372 @@
+import { canDirectMessagePersona } from '@app/features/agent-dms/core/personas';
+import { useOpenAgentDm } from '@app/features/agent-dms/open-agent-dm';
+import { LoadingSpinner } from '@core/component/LoadingSpinner';
+import { toast } from '@core/component/Toast/Toast';
+import { ENABLE_AGENT_DMS } from '@core/constant/featureFlags';
+import { useChannelsContext } from '@core/context/channels';
+import { useUserId } from '@core/context/user';
+import { fireAndForget } from '@core/util/fireAndForget';
+import CaretLeftIcon from '@icon/system/regular/caret-left.svg';
+import {
+  useBotChannelsQuery,
+  useBotQuery,
+  useDeleteBotMutation,
+  useUpdateBotMutation,
+} from '@queries/bots/bots';
+import { useSyncBotChannelsMutation } from '@queries/channel/channel-bots';
+import {
+  useCurrentTeamQuery,
+  useIsTeamAdmin,
+  useIsTeamOwner,
+} from '@queries/team/teams';
+import { Button } from '@ui';
+import { createEffect, createMemo, createSignal, on, Show } from 'solid-js';
+import { createStore } from 'solid-js/store';
+import { useChatV3AgentsFlag } from '../use-chat-v3-agents-flag';
+import { BotAdvancedSection } from './BotAdvancedSection';
+import { BotAgentSection } from './BotAgentSection';
+import { BotAvatar } from './BotAvatar';
+import { BotDeleteDialog } from './BotDeleteDialog';
+import { BotDetailActions } from './BotDetailActions';
+import { BotFormSection } from './BotFormSection';
+import { BotProfileFields } from './BotProfileFields';
+import { BotWebhooksSection } from './BotWebhooksSection';
+import { sameChannelSelection } from './botChannelOptions';
+import {
+  type BotFormErrors,
+  botToFormValues,
+  EMPTY_BOT_FORM,
+  slugBotHandle,
+  validateBotForm,
+} from './botForm';
+import { canDeleteBot } from './botPermissions';
+import { ChannelMultiSelect } from './ChannelMultiSelect';
+import { CreateBotTokenDialog } from './CreateBotTokenDialog';
+import { createBotAvatarUpload } from './createBotAvatarUpload';
+
+export function BotDetail(props: { botId: string; onBack: () => void }) {
+  const agentsEnabled = useChatV3AgentsFlag();
+  const agentDm = ENABLE_AGENT_DMS ? useOpenAgentDm() : undefined;
+  const channelsContext = useChannelsContext();
+  const currentUserId = useUserId();
+  const currentTeamQuery = useCurrentTeamQuery();
+  const isTeamOwner = useIsTeamOwner();
+  const isTeamAdmin = useIsTeamAdmin();
+  const botQuery = useBotQuery(() => props.botId);
+  const botChannelsQuery = useBotChannelsQuery(() => props.botId);
+  const updateBotMutation = useUpdateBotMutation();
+  const deleteBotMutation = useDeleteBotMutation();
+  const syncChannelsMutation = useSyncBotChannelsMutation();
+  const [initialized, setInitialized] = createSignal(false);
+  const [saving, setSaving] = createSignal(false);
+  const [tokenOpen, setTokenOpen] = createSignal(false);
+  const [deleteOpen, setDeleteOpen] = createSignal(false);
+  const [errors, setErrors] = createSignal<BotFormErrors>({});
+  const [channelIds, setChannelIds] = createSignal<string[]>([]);
+  const [initialChannelIds, setInitialChannelIds] = createSignal<string[]>([]);
+  const [initialForm, setInitialForm] = createSignal({ ...EMPTY_BOT_FORM });
+  const [form, setForm] = createStore({ ...EMPTY_BOT_FORM });
+  const avatarUpload = createBotAvatarUpload((url) =>
+    setForm('avatarUrl', url)
+  );
+
+  createEffect(
+    on(
+      [() => botQuery.data, () => botChannelsQuery.data],
+      ([bot, channels]) => {
+        if (!bot || channels === undefined) return;
+        const serverChannelIds = channels.map((channel) => channel.channel_id);
+        if (!initialized()) {
+          const nextForm = botToFormValues(bot);
+          setForm(nextForm);
+          setInitialForm(nextForm);
+          setChannelIds(serverChannelIds);
+          setInitialChannelIds(serverChannelIds);
+          setInitialized(true);
+          return;
+        }
+        // Later refetches (e.g. the bot joined a channel elsewhere) refresh
+        // the selection, but never clobber unsaved edits.
+        if (!sameChannelSelection(channelIds(), initialChannelIds())) return;
+        if (sameChannelSelection(serverChannelIds, channelIds())) return;
+        setChannelIds(serverChannelIds);
+        setInitialChannelIds(serverChannelIds);
+      }
+    )
+  );
+
+  const assignedChannels = createMemo(() => {
+    const channelsById = channelsContext.channelsById();
+    return (botChannelsQuery.data ?? []).map((channel) => ({
+      id: channel.channel_id,
+      name:
+        channelsById[channel.channel_id]?.name?.trim() ||
+        channel.name?.trim() ||
+        'Unnamed channel',
+    }));
+  });
+  const isDirty = createMemo(() => {
+    const original = initialForm();
+    const sameForm =
+      form.name === original.name &&
+      form.handle === original.handle &&
+      form.description === original.description &&
+      form.avatarUrl === original.avatarUrl &&
+      form.hasAgent === original.hasAgent;
+    return (
+      !sameForm || !sameChannelSelection(initialChannelIds(), channelIds())
+    );
+  });
+  const pending = () =>
+    saving() || avatarUpload.uploading() || deleteBotMutation.isPending;
+  const canDelete = () => {
+    const bot = botQuery.data;
+    return (
+      bot !== undefined &&
+      canDeleteBot(
+        bot,
+        currentUserId(),
+        currentTeamQuery.data?.team.id,
+        isTeamOwner(),
+        isTeamAdmin()
+      )
+    );
+  };
+
+  const leave = () => {
+    if (pending()) return;
+    props.onBack();
+  };
+
+  const save = async () => {
+    const parsed = validateBotForm(form);
+    if (!parsed.success) {
+      setErrors(parsed.errors);
+      return;
+    }
+
+    setSaving(true);
+    setErrors({});
+    try {
+      const bot = await updateBotMutation.mutateAsync({
+        botId: props.botId,
+        name: parsed.data.name,
+        handle: parsed.data.handle,
+        description: parsed.data.description ?? '',
+        avatarUrl: parsed.data.avatarUrl ?? '',
+        hasAgent: parsed.data.hasAgent,
+      });
+      const channelResult = await syncChannelsMutation.mutateAsync({
+        botId: props.botId,
+        currentChannelIds: initialChannelIds(),
+        nextChannelIds: channelIds(),
+      });
+      const nextForm = botToFormValues(bot);
+      setForm(nextForm);
+      setInitialForm(nextForm);
+      if (channelResult.failedCount > 0) {
+        const refreshed = await botChannelsQuery.refetch();
+        const actualChannelIds =
+          refreshed.data?.map((channel) => channel.channel_id) ??
+          initialChannelIds();
+        setChannelIds(actualChannelIds);
+        setInitialChannelIds(actualChannelIds);
+        toast.failure(
+          `${channelResult.failedCount} channel change${channelResult.failedCount === 1 ? '' : 's'} could not be saved`
+        );
+      } else {
+        setInitialChannelIds([...channelIds()]);
+        toast.success('Bot updated');
+      }
+    } catch {
+      toast.failure('Failed to update bot');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const deleteBot = async () => {
+    try {
+      await deleteBotMutation.mutateAsync({
+        botId: props.botId,
+        channelIds: (botChannelsQuery.data ?? []).map(
+          (channel) => channel.channel_id
+        ),
+      });
+      setDeleteOpen(false);
+      toast.success('Bot deleted');
+      props.onBack();
+    } catch {
+      toast.failure('Failed to delete bot');
+    }
+  };
+
+  return (
+    <>
+      <div class="size-full overflow-y-auto bg-panel text-ink">
+        {/* Mobile chrome insets live inside the scroll content so the page is
+            full-frame, matching SettingsPage (this detail view only renders
+            inside the settings panel). */}
+        <main class="mx-auto w-full max-w-[560px] px-8 pt-4 pb-24 touch:px-5 touch:pt-[calc(var(--mobile-content-inset-top,0px)+2rem)] touch:pb-[calc(var(--mobile-content-inset-bottom,0px)+3rem)]">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            class="-ml-2 mb-7"
+            disabled={pending()}
+            onClick={leave}
+          >
+            <CaretLeftIcon class="size-3 touch:size-6 shrink-0 pointer-events-none" />
+            Back to bots
+          </Button>
+          <Show
+            when={initialized() && botQuery.data}
+            fallback={
+              <div class="flex min-h-96 items-center justify-center">
+                <LoadingSpinner class="size-16 p-4" />
+              </div>
+            }
+          >
+            {(bot) => (
+              <form
+                class="flex flex-col gap-5"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  fireAndForget(save(), 'channel-bots');
+                }}
+              >
+                <header class="flex items-center gap-3">
+                  <BotAvatar
+                    bot={{
+                      name: form.name || bot().name,
+                      avatar_url: form.avatarUrl || undefined,
+                    }}
+                    size="lg"
+                  />
+                  <div class="min-w-0">
+                    <h1 class="truncate text-lg font-semibold tracking-[-0.01em]">
+                      {form.name || bot().name}
+                    </h1>
+                    <p class="mt-0.5 truncate text-sm text-ink-muted">
+                      @{form.handle || bot().handle}
+                    </p>
+                  </div>
+                  <Show
+                    when={
+                      agentDm &&
+                      bot().has_agent &&
+                      canDirectMessagePersona(
+                        bot().owner,
+                        currentUserId(),
+                        currentTeamQuery.data?.team.id
+                      )
+                    }
+                  >
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      class="ml-auto"
+                      disabled={agentDm?.pending()}
+                      onClick={() =>
+                        fireAndForget(
+                          agentDm?.open(props.botId),
+                          'channel-bots'
+                        )
+                      }
+                    >
+                      Message
+                    </Button>
+                  </Show>
+                </header>
+
+                <BotFormSection
+                  class="mt-3"
+                  title="Profile"
+                  description="Update how this bot appears in channels and mentions."
+                >
+                  <BotProfileFields
+                    value={form}
+                    errors={errors()}
+                    uploadingAvatar={avatarUpload.uploading()}
+                    onUploadAvatar={avatarUpload.open}
+                    onNameChange={(value) => {
+                      setForm('name', value);
+                      setErrors((current) => ({
+                        ...current,
+                        name: undefined,
+                      }));
+                    }}
+                    onHandleChange={(value) => {
+                      setForm('handle', slugBotHandle(value));
+                      setErrors((current) => ({
+                        ...current,
+                        handle: undefined,
+                      }));
+                    }}
+                    onDescriptionChange={(value) =>
+                      setForm('description', value)
+                    }
+                  />
+                </BotFormSection>
+
+                <BotFormSection
+                  title="Channels"
+                  description="Choose every channel this bot can post to."
+                >
+                  <ChannelMultiSelect
+                    channelIds={channelIds()}
+                    assignedChannels={assignedChannels()}
+                    onChange={setChannelIds}
+                    disabled={saving()}
+                  />
+                  <p class="mt-2 text-xs text-ink-muted">
+                    Each assigned channel has a separate webhook URL.
+                  </p>
+                </BotFormSection>
+
+                <BotWebhooksSection
+                  channels={assignedChannels()}
+                  onNewToken={() => setTokenOpen(true)}
+                />
+
+                <Show when={agentsEnabled()}>
+                  <BotAdvancedSection>
+                    <BotAgentSection
+                      checked={form.hasAgent}
+                      disabled={saving()}
+                      onChange={(checked) => setForm('hasAgent', checked)}
+                    />
+                  </BotAdvancedSection>
+                </Show>
+
+                <BotDetailActions
+                  canDelete={canDelete()}
+                  dirty={isDirty()}
+                  pending={pending()}
+                  saving={saving()}
+                  onBack={leave}
+                  onDelete={() => setDeleteOpen(true)}
+                />
+              </form>
+            )}
+          </Show>
+        </main>
+      </div>
+
+      <CreateBotTokenDialog
+        open={tokenOpen()}
+        onOpenChange={setTokenOpen}
+        bot={botQuery.data}
+      />
+
+      <BotDeleteDialog
+        open={deleteOpen()}
+        botName={botQuery.data?.name}
+        pending={deleteBotMutation.isPending}
+        onClose={() => setDeleteOpen(false)}
+        onConfirm={() => fireAndForget(deleteBot(), 'channel-bots')}
+      />
+    </>
+  );
+}

@@ -1,0 +1,64 @@
+import Plus from '@icon/system/regular/plus.svg';
+import XIcon from '@icon/system/regular/x.svg';
+import { Button, cn, Dropdown, Layer } from '@ui';
+import { createSignal, For, Show } from 'solid-js';
+import {
+  type ConsolidatedFilter,
+  ConsolidatedFilterChip,
+} from './consolidated-filter-chip';
+import { UnifiedFilterDropdown } from './unified-filter-dropdown';
+
+interface SoupActiveFiltersBarProps {
+  filters: ConsolidatedFilter[];
+  onClearAll: () => void;
+  class?: string;
+}
+
+/**
+ * A dedicated filter bar that appears at the top of the soup view when there are active filters.
+ * Contains filter chips on the left, and add/clear buttons on the right.
+ */
+const AddFilterButton = () => (
+  <Dropdown.Trigger variant="ghost" size="icon-sm" tooltip="Add filters">
+    <Plus class="size-3.5 touch:size-6 shrink-0 pointer-events-none" />
+  </Dropdown.Trigger>
+);
+
+export function SoupActiveFiltersBar(props: SoupActiveFiltersBarProps) {
+  const [addFilterOpen, setAddFilterOpen] = createSignal(false);
+
+  return (
+    <Show when={props.filters.length > 0}>
+      <Layer depth={0}>
+        {/* Chips sit directly below the header, like Linear's filter row. */}
+        <div class={cn('w-full px-4 py-2', props.class)}>
+          <div class="flex items-start font-medium">
+            {/* Filter chips and add button - flex left */}
+            <div class="flex items-center gap-2 flex-wrap flex-1 min-w-0">
+              <For each={props.filters}>
+                {(filter) => <ConsolidatedFilterChip filter={filter} />}
+              </For>
+              <UnifiedFilterDropdown
+                open={() => addFilterOpen()}
+                onOpenChange={setAddFilterOpen}
+                customTrigger={<AddFilterButton />}
+              />
+            </div>
+
+            <div class="flex items-center shrink-0">
+              <Button
+                onClick={() => props.onClearAll()}
+                variant="secondary"
+                size="sm"
+                tooltip="Clear active filters"
+              >
+                <XIcon class="size-3 touch:size-6 shrink-0 pointer-events-none" />
+                <span class="hidden @min-[300px]/split:inline">Clear all</span>
+              </Button>
+            </div>
+          </div>
+        </div>
+      </Layer>
+    </Show>
+  );
+}

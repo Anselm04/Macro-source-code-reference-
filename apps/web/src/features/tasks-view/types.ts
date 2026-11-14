@@ -1,0 +1,66 @@
+import type { FacetSelection, SortSelection } from '@app/features/soup';
+import type { TaskComposerContext } from '../task-composer/core/context';
+import type { TaskDueDateFilter } from './core/task-due-date';
+
+export type TaskCreateOptions = {
+  dueDate?: Date;
+  composerContext?: TaskComposerContext;
+};
+
+export type ProjectTab = 'projects' | 'my-projects' | 'created-projects';
+export type TaskTab = 'my-tasks' | 'created-by-me' | 'team-tasks' | ProjectTab;
+export type TasksTab = TaskTab;
+
+export type TaskGroupBy =
+  | 'none'
+  | 'status'
+  | 'priority'
+  | 'assignee'
+  | 'project'
+  | 'date'
+  | 'due_date';
+
+export type TaskSortId =
+  | 'updated_at'
+  | 'created_at'
+  | 'viewed_at'
+  | 'status'
+  | 'priority'
+  | 'due_date_earliest'
+  | 'due_date_latest';
+
+/** Scopes a task list to tasks whose entity-reference property points at an entity. */
+export type TaskReferenceScope = {
+  propertyDefinitionId: string;
+  entityId: string;
+};
+
+/**
+ * Scopes a task list to tasks associated with a CRM record. The server
+ * resolves the membership: the record's Companies or Contacts property, a
+ * reference to the record, or (for a company) either for any of its contacts.
+ */
+export type TaskCrmScope =
+  | { type: 'company' | 'contact'; id: string }
+  | { type: 'activity' };
+
+export type TaskDetailTarget = {
+  id: string;
+  fallbackName?: string;
+};
+
+export type TasksViewState = {
+  layout: 'list' | 'board' | 'gantt';
+  tab: TasksTab;
+  search: string;
+  groupBy: TaskGroupBy;
+  sort: SortSelection<TaskSortId>[];
+  facets: FacetSelection;
+  dueDate?: TaskDueDateFilter;
+  collapsedGroupIds: string[];
+  collapsedSidebarSectionIds: string[];
+  /** Transient marker: never persist saved-view filter drafts in entry history. */
+  savedViewActive?: boolean;
+};
+
+export type TasksViewStateOptions = Partial<TasksViewState>;

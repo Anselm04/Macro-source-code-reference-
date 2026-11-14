@@ -1,0 +1,25 @@
+//! The in-memory agent's domain: the turn engine seam, per-session state, and
+//! the ACP agent surface.
+
+pub mod admission;
+pub mod agent;
+/// Which model an Auto turn runs on.
+pub mod auto_model;
+pub mod engine;
+/// Whether a code-mode turn routes SDK entities and their guidance.
+pub mod entity_routing;
+pub mod mcp;
+pub mod model_access;
+/// ACP session configuration generated from the turn engine catalog.
+pub mod model_options;
+/// Models this runtime advertises, including routed Fireworks and Gemini ids.
+pub mod models;
+pub mod replay;
+pub mod session;
+/// Which of the user's skills a turn loads on its own, and where they sit.
+pub mod skill_routing;
+/// Whether one of Macro's own tools may run in this turn.
+pub mod tool_gate;
+pub mod tool_mode;
+pub mod tool_stream;
+pub mod user_input;

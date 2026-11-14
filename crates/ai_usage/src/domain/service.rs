@@ -1,0 +1,207 @@
+//! The cost service: resolves pricing, records usage, and answers queries.
+
+use std::collections::BTreeMap;
+
+use chrono::Utc;
+
+use super::counting::AiUsageEnforcement;
+use super::ports::*;
+
+/// The existing Macro-admin policy for usage reporting and price changes.
+fn require_admin(actor: &macro_user_id::user_id::MacroUserIdStr<'_>) -> Result<()> {
+    if actor.email_str().ends_with("@macro.com") {
+        Ok(())
+    } else {
+        Err(UsageError::Forbidden)
+    }
+}
+
+/// Usage paid for by an agent's own API key never counts toward a quota.
+fn counts(enforcement: AiUsageEnforcement, event: &UsageEvent) -> bool {
+    event.agent_api_key_id.is_none() && enforcement.should_count(&event.user, event.feature)
+}
+
+/// The cost service. Generic over the storage [`UsageRepo`].
+///
+/// Implements:
+/// - [`UsageRecorder`] for the agent crate (fire-and-forget recording), and
+/// - [`UsageService`] for the inbound admin API (querying and re-pricing).
+#[derive(Clone)]
+pub struct UsageServiceImpl<Repo> {
+    repo: Repo,
+    enforcement: AiUsageEnforcement,
+}
+
+impl<Repo> UsageServiceImpl<Repo> {
+    /// Construct the service with prospective quota counting disabled.
+    pub fn new(repo: Repo) -> Self {
+        Self {
+            repo,
+            enforcement: AiUsageEnforcement::Disabled,
+        }
+    }
+
+    /// Set the policy used to count new usage toward user quotas.
+    /// Existing rows and admin analytics are unaffected.
+    pub fn with_enforcement(mut self, enforcement: AiUsageEnforcement) -> Self {
+        self.enforcement = enforcement;
+        self
+    }
+
+    /// Whether this recorder will persist the event as quota-counted usage.
+    /// Settlement wrappers use the same policy as persistence, never a second flag.
+    pub fn counts_usage(&self, event: &UsageEvent) -> bool {
+        counts(self.enforcement, event)
+    }
+}
+
+impl<Repo> UsageServiceImpl<Repo>
+where
+    Repo: UsageRepo + Clone,
+{
+    /// Resolve pricing and persist a single event. Separated out so [`record`]
+    /// can run it on a background task.
+    ///
+    /// [`record`]: UsageRecorder::record
+    #[tracing::instrument(name = "ai_usage.record", skip_all, err, fields(
+        feature = %event.feature,
+        model = %event.model,
+        user_id = %event.user,
+        usage = ?event.amount,
+        usage.cost_usd = tracing::field::Empty,
+        usage.priced = tracing::field::Empty,
+    ))]
+    async fn record_event(
+        repo: &Repo,
+        enforcement: AiUsageEnforcement,
+        event: UsageEvent,
+    ) -> Result<()> {
+        let count_usage = counts(enforcement, &event);
+        // Store and price by the bare api id; chat hands us `provider/model`.
+        let model = normalize_model_id(&event.model).to_string();
+        let mut cost = Usage {
+            amount: event.amount,
+            model: model.clone(),
+            price: None,
+            created_at: Utc::now(),
+        };
+
+        if let Some(pricing) = repo.get_pricing(&model).await? {
+            cost.price = Price::compute(pricing, cost.amount);
+            if cost.price.is_none() {
+                tracing::error!(
+                    ?pricing,
+                    "ai usage left unpriced: the model has no rate for a dimension it used"
+                );
+            }
+        }
+        let span = tracing::Span::current();
+        span.record("usage.priced", cost.price.is_some());
+        if let Some(price) = cost.price {
+            span.record("usage.cost_usd", price.total);
+            // Every priced call, unsampled, for the provider spend monitors in
+            // infra/stacks/monitoring/monitors/ai-providers.ts: their log-based
+            // metric sums `cost_usd` by `provider`. Keep the message and fields.
+            tracing::info!(
+                provider = model_provider(&event.model),
+                model,
+                cost_usd = price.total,
+                "ai usage priced"
+            );
+        }
+
+        let row = CompletionUsage {
+            feature: event.feature,
+            user: event.user,
+            entity: event.entity,
+            agent_api_key_id: event.agent_api_key_id,
+            agent_session_id: event.agent_session_id,
+            cost,
+        };
+
+        repo.insert_usage(&row, count_usage).await
+    }
+
+    /// Resolve pricing and persist `event`, returning once the row is written.
+    ///
+    /// [`UsageRecorder::record`] is the fire-and-forget form. Callers that
+    /// need to act after the row exists (billing settlement) await this one.
+    pub async fn record_now(&self, event: UsageEvent) -> Result<()> {
+        Self::record_event(&self.repo, self.enforcement, event).await
+    }
+}
+
+impl<Repo> UsageRecorder for UsageServiceImpl<Repo>
+where
+    Repo: UsageRepo + Clone + 'static,
+{
+    fn record(&self, event: UsageEvent) {
+        let repo = self.repo.clone();
+        let enforcement = self.enforcement;
+        // Recording must never fail or delay the originating call.
+        tokio::spawn(tracing::Instrument::in_current_span(async move {
+            if let Err(e) = Self::record_event(&repo, enforcement, event).await {
+                tracing::error!(error = ?e, "failed to record ai usage");
+            }
+        }));
+    }
+}
+
+impl<Repo> UsageService for UsageServiceImpl<Repo>
+where
+    Repo: UsageRepo + Clone + 'static,
+{
+    #[tracing::instrument(skip(self), err)]
+    async fn get_usage(
+        &self,
+        actor: macro_user_id::user_id::MacroUserIdStr<'static>,
+        params: UsageApiParams,
+    ) -> Result<UsageSummary> {
+        require_admin(&actor)?;
+        let rows = self.repo.query_usage(&params).await?;
+        Ok(summarize(rows))
+    }
+
+    #[tracing::instrument(skip(self), err)]
+    async fn set_pricing(
+        &self,
+        actor: macro_user_id::user_id::MacroUserIdStr<'static>,
+        model: String,
+        pricing: ModelPricing,
+    ) -> Result<()> {
+        require_admin(&actor)?;
+        let pricing = pricing.validate()?;
+        self.repo.set_pricing(&model, pricing).await
+    }
+}
+
+/// Group recorded completions by feature and roll up dollar totals.
+fn summarize(rows: Vec<CompletionUsage>) -> UsageSummary {
+    let mut by_feature: BTreeMap<AiFeature, Vec<CompletionUsage>> = BTreeMap::new();
+    for row in rows {
+        by_feature.entry(row.feature).or_default().push(row);
+    }
+
+    let mut entries = Vec::with_capacity(by_feature.len());
+    let mut grand_total = 0.0_f32;
+    for (feature, completions) in by_feature {
+        let total: f32 = completions
+            .iter()
+            .filter_map(|c| c.cost.price.as_ref().map(|p| p.total))
+            .sum();
+        grand_total += total;
+        entries.push(FeatureUsage {
+            feature,
+            entries: completions,
+            total,
+        });
+    }
+
+    UsageSummary {
+        entries,
+        total: grand_total,
+    }
+}
+
+#[cfg(test)]
+mod test;

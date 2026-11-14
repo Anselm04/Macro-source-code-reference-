@@ -1,0 +1,43 @@
+import type { IUser } from '@core/user';
+import type { EntityType } from '@service-properties/generated/schemas/entityType';
+import type { Accessor } from 'solid-js';
+
+export type SelectableOption = { id: string; label: string };
+
+export type OptionSelectorConfig = {
+  isMultiSelect: boolean;
+  placeholder: string;
+  inputType?: 'text' | 'number';
+  canAddOption?: (query: string) => boolean;
+};
+
+/** One picker over several entity types, in its own wording. */
+export type EntityPickerOptions = {
+  entityTypes: EntityType[];
+  placeholder: string;
+  emptyMessage: string;
+};
+
+export type EntitySelectorConfig = {
+  isMultiSelect: boolean;
+  placeholder: string;
+  /** Replaces "No {entity type} found". */
+  emptyMessage?: string;
+  specificEntityType?: EntityType | EntityType[] | null;
+  selfFilter?: { entityType: EntityType; blockId?: string };
+  /** Entities already linked to the destination are not selectable again. */
+  excludedIds?: Accessor<ReadonlySet<string>>;
+  /** Explicit pool for USER pickers (e.g. company owner → team members);
+   * replaces the default quick-access people list. */
+  users?: Accessor<IUser[]>;
+  /** Additional principals offered alongside the default people pool. */
+  additionalUsers?: Accessor<IUser[]>;
+  /** When the query is a valid email that is not already in the pool,
+   * offer it as an "Add {email}" row (calendar guests, share sheets). */
+  allowCustomEmail?: boolean;
+  /** Show every row's checkbox, not only the checked one's. */
+  visibleCheckboxes?: boolean;
+  /** Let the list fill a sized container, such as a sheet, instead of
+   * capping it at the popover height. */
+  fillHeight?: boolean;
+};

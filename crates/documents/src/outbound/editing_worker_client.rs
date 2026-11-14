@@ -1,0 +1,610 @@
+//! Outbound adapter for the AI editing worker.
+
+#[cfg(feature = "ai_tools")]
+use crate::domain::ports::editing::MarkdownWrite;
+use crate::domain::ports::editing::{
+    EditMode, EditResult, EditUsage, EditingWorkerService, EditorName,
+};
+use anyhow::Context;
+use macro_sync_service_jwt::DocumentPermissionToken;
+use reqwest::Client;
+use std::sync::Arc;
+
+/// The meaning of a failed spreadsheet worker response: a 400 or 413 is an
+/// invalid request and a 409 a stale revision, both saving nothing; anything
+/// else may follow a save.
+#[cfg(feature = "ai_tools")]
+async fn spreadsheet_error(
+    response: reqwest::Response,
+) -> crate::domain::spreadsheet::SpreadsheetError {
+    use crate::domain::spreadsheet::SpreadsheetError;
+
+    let status = response.status();
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_default();
+    let message = body
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Spreadsheet operation failed. Read the workbook again before retrying an edit.")
+        .to_owned();
+    match status {
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
+            SpreadsheetError::Invalid(message)
+        }
+        reqwest::StatusCode::CONFLICT => SpreadsheetError::RevisionConflict(message),
+        _ => SpreadsheetError::Failed(anyhow::anyhow!("{message} (HTTP {status})")),
+    }
+}
+
+#[cfg(test)]
+mod test;
+
+/// Reqwest-backed client for the AI editing worker.
+#[derive(Clone)]
+pub struct ReqwestEditingWorkerClient {
+    worker_url: String,
+    client: Arc<Client>,
+    internal_auth_key: Option<String>,
+}
+
+impl ReqwestEditingWorkerClient {
+    /// Construct a new client.
+    pub fn new(worker_url: String, client: Arc<Client>) -> Self {
+        Self {
+            worker_url,
+            client,
+            internal_auth_key: None,
+        }
+    }
+
+    /// Construct a client backed by a fresh default reqwest client.
+    pub fn from_url(worker_url: String) -> Self {
+        Self::new(worker_url, Arc::new(Client::new()))
+    }
+
+    /// Set the internal auth key used to authenticate `delete_traces` calls.
+    pub fn with_internal_auth_key(mut self, internal_auth_key: Option<String>) -> Self {
+        self.internal_auth_key = internal_auth_key;
+        self
+    }
+}
+
+impl ReqwestEditingWorkerClient {
+    #[cfg(feature = "ai_tools")]
+    async fn markdown(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+        request: serde_json::Value,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        macro_tower_layers::inject_trace_headers(&mut headers);
+        Ok(self
+            .client
+            .post(format!("{}/markdown", self.worker_url))
+            .headers(headers)
+            .timeout(std::time::Duration::from_secs(45))
+            .json(&serde_json::json!({
+                "documentId": document_id,
+                "documentToken": document_token.as_str(),
+                "request": request,
+            }))
+            .send()
+            .await?)
+    }
+
+    #[cfg(feature = "ai_tools")]
+    async fn comment_mark(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+        change: serde_json::Value,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        macro_tower_layers::inject_trace_headers(&mut headers);
+        Ok(self
+            .client
+            .post(format!("{}/comment-mark", self.worker_url))
+            .headers(headers)
+            .timeout(std::time::Duration::from_secs(30))
+            .json(&serde_json::json!({
+                "documentId": document_id,
+                "documentToken": document_token.as_str(),
+                "change": change,
+            }))
+            .send()
+            .await?)
+    }
+}
+
+/// The worker's `error` message, or a generic one when its body has none.
+#[cfg(feature = "ai_tools")]
+async fn worker_error(response: reqwest::Response) -> String {
+    response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|body| body.get("error")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "The editing worker failed".to_owned())
+}
+
+impl EditingWorkerService for ReqwestEditingWorkerClient {
+    #[cfg(feature = "ai_tools")]
+    #[tracing::instrument(skip_all, fields(document_id), err)]
+    async fn canvas(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+        request: &crate::domain::canvas::CanvasRequest,
+        artifacts: bool,
+    ) -> Result<crate::domain::canvas::CanvasResult, crate::domain::canvas::CanvasError> {
+        use crate::domain::canvas::CanvasError;
+        // Sent only when on: a worker that predates the field rejects unknown keys.
+        let mut body = serde_json::json!({ "documentId": document_id, "documentToken": document_token.as_str(), "request": request });
+        if artifacts {
+            body["artifacts"] = serde_json::Value::Bool(true);
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        macro_tower_layers::inject_trace_headers(&mut headers);
+        let response = self
+            .client
+            .post(format!("{}/canvas", self.worker_url))
+            .headers(headers)
+            .timeout(std::time::Duration::from_secs(130))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| CanvasError::Failed(error.into()))?;
+        let status = response.status();
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| CanvasError::Failed(error.into()))?;
+        if !status.is_success() {
+            let error = body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Canvas operation failed")
+                .to_owned();
+            let outcome = body.get("outcome").and_then(serde_json::Value::as_str);
+            return Err(match (status.as_u16(), outcome) {
+                (409, Some("conflict")) => CanvasError::Conflict(error),
+                (422, Some("rejected")) => CanvasError::Rejected(error),
+                _ => CanvasError::Failed(anyhow::anyhow!(
+                    "{error} (HTTP {status}). Read the canvas before retrying; earlier edits may have applied."
+                )),
+            });
+        }
+        let usage = body
+            .get("usage")
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| EditUsage {
+                        model: entry["model"].as_str().unwrap_or_default().to_owned(),
+                        input_tokens: entry["inputTokens"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .try_into()
+                            .unwrap_or(u32::MAX),
+                        output_tokens: entry["outputTokens"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .try_into()
+                            .unwrap_or(u32::MAX),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(crate::domain::canvas::CanvasResult {
+            failure: body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            response: serde_json::from_value(body)
+                .map_err(|error| CanvasError::Failed(error.into()))?,
+            usage,
+        })
+    }
+
+    #[cfg(feature = "ai_tools")]
+    #[tracing::instrument(skip_all, fields(document_id), err)]
+    async fn spreadsheet(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+        request: &crate::domain::spreadsheet::SpreadsheetRequest,
+    ) -> Result<
+        crate::domain::spreadsheet::SpreadsheetResponse,
+        crate::domain::spreadsheet::SpreadsheetError,
+    > {
+        use crate::domain::spreadsheet::SpreadsheetError;
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        macro_tower_layers::inject_trace_headers(&mut headers);
+        let response = self
+            .client
+            .post(format!("{}/spreadsheet", self.worker_url))
+            .headers(headers)
+            .timeout(std::time::Duration::from_secs(45))
+            .json(&serde_json::json!({
+                "documentId": document_id,
+                "documentToken": document_token.as_str(),
+                "request": request,
+            }))
+            .send()
+            .await
+            .map_err(|error| SpreadsheetError::Failed(error.into()))?;
+        if response.status().is_success() {
+            return response
+                .json()
+                .await
+                .map_err(|error| SpreadsheetError::Failed(error.into()));
+        }
+        Err(spreadsheet_error(response).await)
+    }
+
+    #[cfg(feature = "ai_tools")]
+    #[tracing::instrument(skip_all, fields(document_id), err)]
+    async fn spreadsheet_instructions(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+        instructions: &str,
+    ) -> Result<
+        crate::domain::spreadsheet::SpreadsheetWriterResult,
+        crate::domain::spreadsheet::SpreadsheetError,
+    > {
+        use crate::domain::spreadsheet::{
+            SpreadsheetError, SpreadsheetWriterOutcome, SpreadsheetWriterResult,
+        };
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Usage {
+            model: String,
+            input_tokens: u32,
+            output_tokens: u32,
+        }
+        #[derive(serde::Deserialize)]
+        struct Body {
+            #[serde(flatten)]
+            outcome: SpreadsheetWriterOutcome,
+            usage: Vec<Usage>,
+        }
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        macro_tower_layers::inject_trace_headers(&mut headers);
+        let response = self
+            .client
+            .post(format!("{}/spreadsheet/instructions", self.worker_url))
+            .headers(headers)
+            // Above the worker's own 120 s budget, so it reports its outcome.
+            .timeout(std::time::Duration::from_secs(130))
+            .json(&serde_json::json!({
+                "documentId": document_id,
+                "documentToken": document_token.as_str(),
+                "instructions": instructions,
+            }))
+            .send()
+            .await
+            .map_err(|error| SpreadsheetError::Failed(error.into()))?;
+        if !response.status().is_success() {
+            return Err(spreadsheet_error(response).await);
+        }
+
+        let body: Body = response
+            .json()
+            .await
+            .map_err(|error| SpreadsheetError::Failed(error.into()))?;
+        Ok(SpreadsheetWriterResult {
+            outcome: body.outcome,
+            usage: body
+                .usage
+                .into_iter()
+                .map(|usage| EditUsage {
+                    model: usage.model,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                })
+                .collect(),
+        })
+    }
+
+    #[cfg(feature = "ai_tools")]
+    #[tracing::instrument(skip_all, fields(document_id), err)]
+    async fn word_document(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+        request: &crate::domain::word_document::WordDocumentRequest,
+    ) -> anyhow::Result<crate::domain::word_document::WordDocumentResponse> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        macro_tower_layers::inject_trace_headers(&mut headers);
+        let response = self
+            .client
+            .post(format!("{}/docx", self.worker_url))
+            .headers(headers)
+            .timeout(std::time::Duration::from_secs(45))
+            .json(&serde_json::json!({
+                "documentId": document_id,
+                "documentToken": document_token.as_str(),
+                "request": request,
+            }))
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_default();
+            let message = body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Word document operation failed. Read the document again before retrying an edit.");
+            // The editor refused the request (an unknown id, text not found); nothing changed.
+            if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                return Err(
+                    crate::domain::word_document::WordDocumentRejected(message.to_owned()).into(),
+                );
+            }
+            anyhow::bail!("{message} (HTTP {status})");
+        }
+        Ok(response.json().await?)
+    }
+
+    #[cfg(feature = "ai_tools")]
+    #[tracing::instrument(skip_all, fields(document_id), err)]
+    async fn read_markdown(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+    ) -> anyhow::Result<crate::domain::markdown_body::DocumentMarkdown> {
+        let response = self
+            .markdown(
+                document_id,
+                document_token,
+                serde_json::json!({ "action": "read" }),
+            )
+            .await?;
+        let status = response.status();
+        anyhow::ensure!(
+            status.is_success(),
+            "{} (HTTP {status})",
+            worker_error(response).await
+        );
+        Ok(response.json().await?)
+    }
+
+    #[cfg(feature = "ai_tools")]
+    #[tracing::instrument(skip_all, fields(document_id), err)]
+    async fn write_markdown(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+        expected_revision: &str,
+        markdown: &str,
+    ) -> anyhow::Result<MarkdownWrite> {
+        let response = self
+            .markdown(
+                document_id,
+                document_token,
+                serde_json::json!({
+                    "action": "write",
+                    "expectedRevision": expected_revision,
+                    "markdown": markdown,
+                }),
+            )
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::CONFLICT {
+            return Ok(MarkdownWrite::Conflict);
+        }
+        anyhow::ensure!(
+            status.is_success(),
+            "{} (HTTP {status})",
+            worker_error(response).await
+        );
+        Ok(MarkdownWrite::Written(response.json().await?))
+    }
+
+    #[cfg(feature = "ai_tools")]
+    #[tracing::instrument(skip_all, fields(document_id, %mark_id), err)]
+    async fn add_comment_mark(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+        mark_id: uuid::Uuid,
+        text: &str,
+        occurrence: Option<u32>,
+    ) -> anyhow::Result<crate::domain::ports::editing::CommentMarkPlacement> {
+        use crate::domain::ports::editing::CommentMarkPlacement;
+
+        let mut change = serde_json::json!({
+            "action": "add",
+            "markId": mark_id,
+            "text": text,
+        });
+        if let Some(occurrence) = occurrence {
+            change["occurrence"] = occurrence.into();
+        }
+        let response = self
+            .comment_mark(document_id, document_token, change)
+            .await?;
+        let status = response.status();
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or_default();
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            && let Some(reason) = body.get("error").and_then(serde_json::Value::as_str)
+        {
+            return Ok(CommentMarkPlacement::Refused(reason.to_owned()));
+        }
+        if !status.is_success() {
+            anyhow::bail!("editing worker returned {status}: {body}");
+        }
+        Ok(CommentMarkPlacement::Placed {
+            marked_text: body["markedText"].as_str().unwrap_or_default().to_owned(),
+        })
+    }
+
+    #[cfg(feature = "ai_tools")]
+    #[tracing::instrument(skip_all, fields(document_id, %mark_id), err)]
+    async fn remove_comment_mark(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+        mark_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        let response = self
+            .comment_mark(
+                document_id,
+                document_token,
+                serde_json::json!({ "action": "remove", "markId": mark_id }),
+            )
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("editing worker returned {status}: {body}");
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all, fields(document_id), err)]
+    async fn edit(
+        &self,
+        document_id: &str,
+        document_token: &DocumentPermissionToken,
+        instructions: &str,
+        mode: EditMode,
+        editor: Option<EditorName>,
+    ) -> anyhow::Result<EditResult> {
+        let mut request_body = serde_json::json!({
+            "documentToken": document_token.as_str(),
+            "documentId": document_id,
+            "prompt": instructions,
+            "mode": match mode {
+                EditMode::Supervised => "supervised",
+                EditMode::Fast => "fast",
+            },
+            "models": {
+                "supervisor": [
+                    { "provider": "anthropic", "model": "claude-opus-4-8" },
+                    { "provider": "anthropic", "model": "claude-sonnet-4-6" },
+                    { "provider": "openai", "model": "gpt-5.5" },
+                ],
+                "interpret": [
+                    { "provider": "cerebras", "model": "zai-glm-4.7" },
+                    { "provider": "anthropic", "model": "claude-sonnet-4-6" },
+                ],
+                // gpt-5.5 leads the coding chain on testbench evidence: replaying
+                // the same 16 prod sessions in the animated (production)
+                // configuration, against the cerebras/haiku chain it cut the
+                // coder retry rate from 37% to 9% (coders retrying 16 -> 2),
+                // runCode calls -63%, input tokens -61%, cost -35%, and judged
+                // quality improved (fully correct 12/16 -> 14/16, purpose met
+                // 14/16 -> 15/16) with no damaging sessions either way.
+                //
+                // haiku stays as the fallback: OpenAI throttles hard under
+                // concurrency, and a throttled bench run at 4-way parallelism
+                // timed out on 24 of 40 cases where a serial run had none.
+                "coding": [
+                    { "provider": "openai", "model": "gpt-5.5" },
+                    { "provider": "anthropic", "model": "claude-haiku-4-5" },
+                ],
+                // The fast path's single model; mirrors the web client's chain
+                // (apps/web ai-editing-worker/client.ts). Gemini 3.8 Flash ran
+                // a real inline edit in 1.5-5 s with no thinking tokens where
+                // 3.7 Flash took 3.8-5.4 s; Haiku is the provider-error fallback.
+                "fast": [
+                    { "provider": "google", "model": "gemini-3.8-flash" },
+                    { "provider": "anthropic", "model": "claude-haiku-4-5" },
+                ],
+            },
+            "interpret": false,
+        });
+        if let Some(editor) = editor {
+            request_body["editor"] = serde_json::json!({ "name": editor.as_str() });
+        }
+
+        // Propagate the current trace so the worker's spans join this
+        // service's trace instead of rooting their own.
+        let mut headers = reqwest::header::HeaderMap::new();
+        macro_tower_layers::inject_trace_headers(&mut headers);
+
+        let edit_resp = self
+            .client
+            .post(format!("{}/edit", self.worker_url))
+            .headers(headers)
+            .json(&request_body)
+            .send()
+            .await
+            .context("editing worker request failed")?;
+
+        let status = edit_resp.status();
+        if !status.is_success() {
+            // The worker returns `{ "error": "..." }` with the real cause; surface
+            // it instead of just the status so failures are debuggable.
+            let body = edit_resp.text().await.unwrap_or_default();
+            anyhow::bail!("editing worker returned {}: {}", status, body);
+        }
+
+        let body = edit_resp.json::<serde_json::Value>().await?;
+
+        // The worker reports `usage` as an array of per-model entries
+        // (`{ model, inputTokens, outputTokens }`, camelCase) — one per model it
+        // ran (supervisor, interpret, coder).
+        let usage = body["usage"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| EditUsage {
+                        model: e["model"].as_str().unwrap_or_default().to_owned(),
+                        input_tokens: e["inputTokens"].as_u64().unwrap_or(0) as u32,
+                        output_tokens: e["outputTokens"].as_u64().unwrap_or(0) as u32,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(EditResult {
+            edits_applied: body["ops"].as_array().map(|a| a.len()).unwrap_or(0),
+            usage,
+            clarification: body["clarification"].as_str().map(str::to_owned),
+            revision: body["revision"].as_str().map(str::to_owned),
+        })
+    }
+
+    #[tracing::instrument(skip_all, fields(document_id), err)]
+    async fn delete_traces(&self, document_id: &str) -> anyhow::Result<()> {
+        let Some(internal_auth_key) = self.internal_auth_key.as_deref() else {
+            anyhow::bail!("editing worker client has no internal auth key configured");
+        };
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        macro_tower_layers::inject_trace_headers(&mut headers);
+
+        let resp = self
+            .client
+            .delete(format!("{}/traces/{}", self.worker_url, document_id))
+            .headers(headers)
+            .header("x-internal-auth-key", internal_auth_key)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("editing worker returned {}: {}", status, body);
+        }
+
+        Ok(())
+    }
+}

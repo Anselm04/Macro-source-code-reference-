@@ -1,0 +1,342 @@
+//! The clap-based CLI for the local/dev orchestration surface. The repo's other
+//! xtask verbs (deps/workflows/...) keep their slice-pattern match in main.rs;
+//! everything else routes here.
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::{Args, Parser, Subcommand};
+
+use super::Mode;
+
+#[derive(Parser)]
+#[command(name = "cargo-x", about = "Macro local & dev orchestration")]
+struct Cli {
+    #[command(subcommand)]
+    command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Start a fully local stack (infra + binaries + proxy + frontend), attached
+    /// to a terminal or in the background without one, or control a running one.
+    RunLocal(RunLocalArgs),
+    /// Run local binaries against shared dev resources.
+    RunDev(RunLocalArgs),
+    /// Build the local service binaries natively with cargo.
+    BuildServices,
+    /// Build the minimal runtime image.
+    RuntimeImage(ForceArg),
+    /// Render the per-instance compose override and print its path.
+    GenCompose(ComposeArgs),
+    /// Print the inventoried backend path prefixes for an external Vite launcher.
+    FrontendProxyRoutes,
+    /// Render merged compose and assert the no-build / runtime-image invariants.
+    ValidateLocalCompose(ComposeArgs),
+    /// Resolve env layers and assert mode-appropriate invariants.
+    ValidateLocalEnv(ValidateEnvArgs),
+    /// Create the declared Kafka event topics on the instance's local broker.
+    KafkaProvision(InstanceArgs),
+    /// Restore missing local AWS resources without resetting databases or volumes.
+    LocalstackProvision(InstanceArgs),
+    /// Preflight checks (docker, toolchain, ports, env sources, images).
+    DoctorLocal(InstanceArgs),
+    /// Show an instance's endpoints and container states without starting anything.
+    StatusLocal(InstanceArgs),
+    /// Emit host-facing connection env for seeding an instance (eval in a shell).
+    SeedEnv(InstanceArgs),
+    /// Run a seed scenario against an instance's host-facing endpoints.
+    SeedScenario(SeedScenarioArgs),
+    /// Stop an instance's containers (keep volumes).
+    StopLocal(InstanceArgs),
+    /// Drop, recreate, and migrate the instance database.
+    ResetLocal(InstanceArgs),
+    /// Remove an instance's containers, networks, and volumes.
+    DestroyLocal(InstanceArgs),
+    /// Start, seed, and test an isolated local E2E stack.
+    LocalE2e(super::e2e::LocalE2eArgs),
+    /// Lower-level stack control for Cursor Cloud and bakes. `stack up` always
+    /// wipes; prefer `run-local`, which runs without a terminal too.
+    #[command(subcommand)]
+    Stack(StackCmd),
+}
+
+#[derive(Subcommand)]
+pub enum StackCmd {
+    /// Delete the instance's data, bring a full stack up with a static frontend,
+    /// and return (only containers keep running).
+    Up(super::stack::UpArgs),
+    /// Adopt a new build into the running stack. Data survives.
+    Update(super::stack::UpdateArgs),
+    /// Report the instance's containers, health, and URLs (`--json` for machines).
+    Status(super::stack::StatusArgs),
+    /// Tear the instance down: containers, volumes, and state.
+    Down(super::stack::DownArgs),
+}
+
+/// `just run_local`: start flags, or a subcommand acting on a running stack.
+#[derive(Args, Clone, Default)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct RunLocalArgs {
+    #[command(flatten)]
+    pub run: RunArgs,
+    #[command(flatten)]
+    pub flags: super::supervisor::RunLocalFlags,
+    #[command(subcommand)]
+    pub action: Option<super::supervisor::RunAction>,
+}
+
+#[derive(Args, Clone, Default)]
+pub struct InstanceArgs {
+    /// Stack name. Absent (or `macro`) is the default instance.
+    #[arg(long)]
+    pub instance: Option<String>,
+    /// Use this port window instead of an automatically allocated one. Later
+    /// commands find it without the flag.
+    #[arg(long)]
+    pub port_base: Option<u16>,
+}
+
+/// An instance plus the computers fleet its compose is rendered for.
+#[derive(Args, Clone, Default)]
+pub struct ComposeArgs {
+    #[command(flatten)]
+    pub instance: InstanceArgs,
+    #[command(flatten)]
+    pub computers: super::computers::ComputersArgs,
+}
+
+#[derive(Args, Clone, Default)]
+pub struct EnvArgs {
+    /// Skip the optional Doppler layer entirely.
+    #[arg(long)]
+    pub no_doppler: bool,
+    /// Overlay this dotenv (above defaults + Doppler, below process env).
+    #[arg(long)]
+    pub env_file: Option<PathBuf>,
+}
+
+#[derive(Args, Clone, Default)]
+pub struct BuildArgs {
+    /// Skip building; reuse whatever is in the target dir.
+    #[arg(long)]
+    pub no_build: bool,
+    /// Rebuild every repository-built local Docker service.
+    #[arg(long)]
+    pub build_aux_services: bool,
+    /// Use this dir as the `/app/out` source instead of building.
+    #[arg(long)]
+    pub binaries_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Clone, Default)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub instance: InstanceArgs,
+    #[command(flatten)]
+    pub env: EnvArgs,
+    #[command(flatten)]
+    pub build: BuildArgs,
+    #[command(flatten)]
+    pub computers: super::computers::ComputersArgs,
+    /// Do not start or serve the frontend.
+    #[arg(long)]
+    pub no_frontend: bool,
+    /// Stream subprocess output and show per-step timings.
+    #[arg(long, short)]
+    pub verbose: bool,
+    /// Neither restore from nor save an init snapshot — always run the full
+    /// DB migrate / FusionAuth kickstart / index creation.
+    #[arg(long)]
+    pub no_snapshot: bool,
+    /// Which local OTLP collector to start and wire services to. Defaults to
+    /// the LGTM stack (Grafana/Tempo/Loki); pass `off` to run without tracing
+    /// — see `docker/docker-compose.yml` for what each backend does.
+    #[arg(long, default_value = "lgtm")]
+    pub traces: TracesBackend,
+    /// Start the shared agent browser (Chromium with CDP on 9222, watchable
+    /// over noVNC on 6080) — see the `headless-chrome` service in
+    /// `docker/docker-compose.yml`. Global, one per machine, left running.
+    #[arg(long)]
+    pub with_chrome: bool,
+    /// Open Cloudflare quick tunnels into this stack: one for `@cursor`
+    /// sessions (a public egress service URL) and one sharing the app itself
+    /// through the reverse proxy. Off by default — nothing dials out and the
+    /// stack stays localhost-only. `run_local` only. A detached run keeps its
+    /// background process alive to hold them.
+    #[arg(long)]
+    pub with_cf_tunnel: bool,
+}
+
+/// Which OTLP trace collector `--traces` should bring up.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TracesBackend {
+    /// Grafana + Tempo + Loki + Prometheus in one container (the default).
+    /// UI at http://localhost:3001, no account needed.
+    #[default]
+    Lgtm,
+    /// Fully local trace viewer at http://localhost:16686, no account needed.
+    Jaeger,
+    /// Forwards to Datadog APM (us5); requires `DD_API_KEY`.
+    Datadog,
+    /// No collector: services and frontend run with telemetry export off.
+    Off,
+}
+
+impl TracesBackend {
+    /// Whether this run wants a collector at all.
+    pub fn enabled(self) -> bool {
+        self != TracesBackend::Off
+    }
+
+    /// The compose service name gated by this backend's profile.
+    pub fn compose_service(self) -> Option<&'static str> {
+        match self {
+            TracesBackend::Lgtm => Some("lgtm"),
+            TracesBackend::Jaeger => Some("jaeger"),
+            TracesBackend::Datadog => Some("datadog-agent"),
+            TracesBackend::Off => None,
+        }
+    }
+
+    /// The compose profile gating this backend's service.
+    pub fn compose_profile(self) -> Option<&'static str> {
+        match self {
+            TracesBackend::Lgtm => Some("lgtm"),
+            TracesBackend::Jaeger => Some("jaeger"),
+            TracesBackend::Datadog => Some("datadog"),
+            TracesBackend::Off => None,
+        }
+    }
+
+    /// Env var the backend needs to forward telemetry, if any. Checked
+    /// before starting the collector so a missing key fails loud instead of
+    /// silently dropping everything at the intake.
+    pub fn required_env(self) -> Option<&'static str> {
+        match self {
+            TracesBackend::Lgtm | TracesBackend::Jaeger | TracesBackend::Off => None,
+            TracesBackend::Datadog => Some("DD_API_KEY"),
+        }
+    }
+}
+
+#[derive(Args, Clone, Default)]
+pub struct ValidateEnvArgs {
+    #[command(flatten)]
+    pub instance: InstanceArgs,
+    #[command(flatten)]
+    pub env: EnvArgs,
+    /// Validate against dev-mode requirements instead of local.
+    #[arg(long)]
+    pub dev: bool,
+}
+
+#[derive(Args, Clone, Default)]
+pub struct ForceArg {
+    /// Rebuild without BuildKit's layer cache.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Clone)]
+#[command(trailing_var_arg = true)]
+pub struct SeedScenarioArgs {
+    #[command(flatten)]
+    pub instance: InstanceArgs,
+    /// Arguments forwarded to `seed_cli scenario`.
+    #[arg(required = true, allow_hyphen_values = true)]
+    pub scenario_args: Vec<OsString>,
+}
+
+/// Parse and run a local-orchestration command, or fall back to the legacy
+/// usage message on unknown input.
+pub fn dispatch(raw: &[String], legacy_usage: &str) -> Result<()> {
+    let argv = std::iter::once("cargo-x".to_string()).chain(raw.iter().cloned());
+    let cli = match Cli::try_parse_from(argv) {
+        Ok(c) => c,
+        Err(e) => {
+            // For an unrecognized subcommand, also surface the legacy verbs.
+            if e.kind() == clap::error::ErrorKind::InvalidSubcommand
+                || e.kind() == clap::error::ErrorKind::UnknownArgument
+            {
+                eprintln!("{legacy_usage}\n");
+            }
+            e.print().ok();
+            std::process::exit(e.exit_code());
+        }
+    };
+    run(cli)
+}
+
+fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Cmd::RunLocal(args) => super::run_stack(Mode::Local, &args),
+        Cmd::RunDev(args) => super::run_stack(Mode::Dev, &args),
+        Cmd::BuildServices => super::build_services_only(),
+        Cmd::RuntimeImage(a) => super::runtime_image_only(a.force),
+        Cmd::GenCompose(a) => super::gen_compose_only(&a),
+        Cmd::FrontendProxyRoutes => {
+            println!("{}", super::proxy::frontend_path_prefixes().join(","));
+            Ok(())
+        }
+        Cmd::ValidateLocalCompose(a) => {
+            let instance = super::instance::Instance::resolve(
+                a.instance.instance.as_deref(),
+                a.instance.port_base,
+            )?;
+            let computers = super::computers::Computers::new(
+                Mode::Local,
+                a.computers.fleet(super::computers::Fleet::Docker),
+                &instance,
+            );
+            super::validate::local_compose(&instance, Mode::Local, &computers)
+        }
+        Cmd::ValidateLocalEnv(a) => {
+            let instance = super::instance::Instance::resolve(
+                a.instance.instance.as_deref(),
+                a.instance.port_base,
+            )?;
+            let mode = if a.dev { Mode::Dev } else { Mode::Local };
+            super::validate::local_env(&instance, mode, a.env.no_doppler, a.env.env_file.as_deref())
+        }
+        Cmd::KafkaProvision(a) => {
+            super::kafka::ensure_available("kafka-provision")?;
+            let instance = super::instance::Instance::resolve(a.instance.as_deref(), a.port_base)?;
+            super::kafka::provision(&instance)
+        }
+        Cmd::LocalstackProvision(a) => {
+            let instance = super::instance::Instance::resolve(a.instance.as_deref(), a.port_base)?;
+            super::localstack::provision(&instance)
+        }
+        Cmd::DoctorLocal(a) => super::doctor::run(&a),
+        Cmd::StatusLocal(a) => {
+            let instance = super::instance::Instance::resolve(a.instance.as_deref(), a.port_base)?;
+            super::status::run(&instance)
+        }
+        Cmd::SeedEnv(a) => {
+            let instance = super::instance::Instance::resolve(a.instance.as_deref(), a.port_base)?;
+            super::seed_env::emit(&instance)
+        }
+        Cmd::SeedScenario(a) => {
+            let instance = super::instance::Instance::resolve(
+                a.instance.instance.as_deref(),
+                a.instance.port_base,
+            )?;
+            super::seed_env::run_scenario(&instance, &a.scenario_args)
+        }
+        Cmd::StopLocal(a) => super::stop(&a),
+        Cmd::ResetLocal(a) => super::reset(&a),
+        Cmd::DestroyLocal(a) => super::destroy(&a),
+        Cmd::LocalE2e(a) => super::e2e::run(&a),
+        Cmd::Stack(cmd) => match cmd {
+            StackCmd::Up(a) => super::stack::up(Mode::Local, &a).map(|_| ()),
+            StackCmd::Update(a) => super::stack::update(&a),
+            StackCmd::Status(a) => super::stack::status(&a),
+            StackCmd::Down(a) => super::stack::down(&a),
+        },
+    }
+}
+
+#[cfg(test)]
+mod test;

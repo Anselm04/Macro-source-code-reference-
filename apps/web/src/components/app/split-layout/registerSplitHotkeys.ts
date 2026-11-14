@@ -1,0 +1,169 @@
+import { t } from '@app/lib/i18n';
+import { globalSplitManager } from '@app/signal/splitLayout';
+import { registerHotkey } from '@core/hotkey/hotkeys';
+import { TOKENS } from '@core/hotkey/tokens';
+import type { SplitContent } from './layoutManager';
+import { focusAdjacentSplit } from './layoutUtils';
+import { canSpotlight } from './utils/canSpotlight';
+
+/**
+ * A focused control that uses Shift+Arrow itself keeps those keys: sliders,
+ * and controls marked `data-owns-arrow-keys` (the database grid, the slide
+ * stage and rail). App hotkeys see keys before the focused element does.
+ */
+function focusOwnsArrowKeys(event: KeyboardEvent | undefined) {
+  if (!event?.key.startsWith('Arrow')) return false;
+
+  return !!document.activeElement?.closest(
+    '[data-owns-arrow-keys], [role="slider"]'
+  );
+}
+
+export function registerSplitHotkeys(args: {
+  splitHotkeyScope: string;
+  insertSplit: (content: SplitContent) => void;
+  closeSplit: () => void;
+  toggleSpotlight: () => void;
+  canGoBack: () => boolean;
+  goBack: () => void;
+  canGoForward: () => boolean;
+  goForward: () => void;
+  goToList: () => void;
+  splitName: () => string;
+  getSplitCount: () => number;
+  isNotUnifiedList: () => boolean;
+}) {
+  const {
+    splitHotkeyScope,
+    closeSplit,
+    toggleSpotlight,
+    canGoBack,
+    goBack,
+    canGoForward,
+    goForward,
+    splitName,
+    getSplitCount,
+    isNotUnifiedList,
+    goToList,
+  } = args;
+  registerHotkey({
+    scopeId: splitHotkeyScope,
+    hotkey: ['cmd+escape', 'opt+escape'],
+    condition: () => isNotUnifiedList() || getSplitCount() > 1,
+    description: () =>
+      isNotUnifiedList() ? t('commands.backToList') : t('commands.closeSplit'),
+    keyDownHandler: () => {
+      if (isNotUnifiedList()) {
+        goToList();
+      } else if (getSplitCount() > 1) {
+        closeSplit();
+      }
+      return true;
+    },
+    hotkeyToken: TOKENS.split.close,
+    runWithInputFocused: true,
+  });
+
+  // Spotlight (maximize split) - legacy binding.
+  registerHotkey({
+    scopeId: splitHotkeyScope,
+    hotkey: 'shift+escape',
+    hotkeyToken: TOKENS.window.spotlight.toggle,
+    description: () => t('commands.maximizeSplit', { name: splitName() }),
+    condition: () => {
+      const splitManager = globalSplitManager();
+      if (!splitManager) return false;
+      return canSpotlight(splitManager);
+    },
+    keyDownHandler: () => {
+      toggleSpotlight();
+      return true;
+    },
+    runWithInputFocused: true,
+  });
+
+  // History back/forward - legacy bindings.
+  registerHotkey({
+    scopeId: splitHotkeyScope,
+    hotkeyToken: TOKENS.split.go.back,
+    hotkey: 'opt+[',
+    condition: () => canGoBack(),
+    description: () => t('commands.goBack'),
+    keyDownHandler: () => {
+      goBack();
+      return true;
+    },
+    runWithInputFocused: true,
+  });
+
+  registerHotkey({
+    scopeId: splitHotkeyScope,
+    hotkeyToken: TOKENS.split.go.forward,
+    hotkey: 'opt+]',
+    condition: () => canGoForward(),
+    description: () => t('commands.goForward'),
+    keyDownHandler: () => {
+      goForward();
+      return true;
+    },
+    runWithInputFocused: true,
+  });
+
+  registerHotkey({
+    hotkeyToken: TOKENS.window.focusSplitRight,
+    hotkey: ['shift+l', 'shift+arrowright'],
+    scopeId: splitHotkeyScope,
+    description: () => t('commands.focusSplitRight'),
+    condition: () => getSplitCount() > 1,
+    keyDownHandler: (event) => {
+      if (focusOwnsArrowKeys(event)) return false;
+      focusAdjacentSplit('right');
+      return true;
+    },
+    registrationType: 'add',
+  });
+
+  registerHotkey({
+    hotkeyToken: TOKENS.window.focusSplitLeft,
+    hotkey: ['shift+h', 'shift+arrowleft'],
+    scopeId: splitHotkeyScope,
+    description: () => t('commands.focusSplitLeft'),
+    condition: () => getSplitCount() > 1,
+    keyDownHandler: (event) => {
+      if (focusOwnsArrowKeys(event)) return false;
+      focusAdjacentSplit('left');
+      return true;
+    },
+    registrationType: 'add',
+  });
+
+  registerHotkey({
+    hotkeyToken: TOKENS.window.focusSplitDown,
+    hotkey: ['shift+j', 'shift+arrowdown'],
+    scopeId: splitHotkeyScope,
+    description: () => t('commands.focusSplitDown'),
+    condition: () => getSplitCount() > 1,
+    keyDownHandler: (event) => {
+      if (focusOwnsArrowKeys(event)) return false;
+      focusAdjacentSplit('down');
+      return true;
+    },
+    registrationType: 'add',
+  });
+
+  registerHotkey({
+    hotkeyToken: TOKENS.window.focusSplitUp,
+    hotkey: ['shift+k', 'shift+arrowup'],
+    scopeId: splitHotkeyScope,
+    description: () => t('commands.focusSplitUp'),
+    condition: () => getSplitCount() > 1,
+    keyDownHandler: (event) => {
+      if (focusOwnsArrowKeys(event)) return false;
+      focusAdjacentSplit('up');
+      return true;
+    },
+    registrationType: 'add',
+  });
+
+  return {};
+}

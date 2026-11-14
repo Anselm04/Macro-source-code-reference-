@@ -1,0 +1,101 @@
+import { processEmailColors, stripColorSchemeMediaQueries } from '@core/email';
+import { interceptMailtoLinks } from '@core/util/interceptMailtoLinks';
+import { sanitizeEmailHtml } from '@macro-inc/email-renderer';
+import type { HtmlRenderDecoratorProps } from '@macro-inc/lexical-core/nodes/HtmlRenderNode';
+import {
+  type Component,
+  createEffect,
+  createMemo,
+  createSignal,
+  onMount,
+  untrack,
+} from 'solid-js';
+import { Portal } from 'solid-js/web';
+import { createEmailTheme } from '../../../../../../features/email-message/theme';
+
+export const HtmlRender: Component<HtmlRenderDecoratorProps> = (props) => {
+  const theme = createEmailTheme();
+  let marker: HTMLDivElement | undefined;
+  const [shadowContainer, setShadowContainer] = createSignal<HTMLElement>();
+  const [content, setContent] = createSignal<HTMLDivElement>();
+  // Memoized: theme changes re-run the effect below, not the parse.
+  const safeHtml = createMemo(() => sanitizeEmailHtml(props.html));
+
+  onMount(() => {
+    const host = marker?.parentElement;
+    if (!host) {
+      return;
+    }
+
+    const shadowRoot = host.shadowRoot ?? host.attachShadow({ mode: 'open' });
+
+    // Base style mirroring the email message view's shadow root
+    if (!shadowRoot.querySelector('style')) {
+      const styleEl = document.createElement('style');
+      styleEl.textContent =
+        'img{max-width:100% !important;height:auto !important;}' +
+        'blockquote{margin-block:0.75em!important;margin-inline-start:1.5em!important;margin-inline-end:0!important;max-width:100%!important;box-sizing:border-box;}';
+      shadowRoot.appendChild(styleEl);
+    }
+
+    // Ensure a stable container for portal mounting
+    let container = shadowRoot.querySelector<HTMLDivElement>(
+      '[data-html-render-container]'
+    );
+    if (!container) {
+      container = document.createElement('div');
+      container.setAttribute('data-html-render-container', 'true');
+      shadowRoot.appendChild(container);
+    }
+    setShadowContainer(container);
+  });
+
+  // Match the message view's rendering: strip light backgrounds and adapt
+  // text colors to the theme (or force a white panel for table-layout emails).
+  // Display-only — the node's raw html is what exportDOM sends.
+  createEffect(() => {
+    const colors = theme();
+    const el = content();
+    if (!el) return;
+    // Reset to the sanitized html so recoloring never compounds
+    el.innerHTML = safeHtml();
+    // Raw mailto: anchors open the in-app composer instead of the OS mail client
+    interceptMailtoLinks(el);
+    for (const styleEl of el.querySelectorAll('style')) {
+      styleEl.textContent = stripColorSchemeMediaQueries(
+        styleEl.textContent ?? ''
+      );
+    }
+    const adapt = props.adaptColors ?? !el.querySelector('table');
+    queueMicrotask(() => {
+      untrack(() => {
+        if (!el.isConnected) return;
+        if (adapt) {
+          el.style.removeProperty('background-color');
+          el.style.removeProperty('color');
+          processEmailColors(el, colors);
+        } else {
+          el.style.setProperty('background-color', 'white', 'important');
+          // Some emails don't set a color, so force black for readability
+          // against the forced white background
+          el.style.setProperty('color', 'black');
+        }
+      });
+    });
+  });
+
+  return (
+    <>
+      <div ref={marker} style={{ display: 'contents' }} />
+      <Portal mount={shadowContainer()}>
+        {/* contain: floats/positioned content in email HTML must size and
+            paint within this node, not over siblings below the editor */}
+        <div
+          ref={setContent}
+          data-html-render="true"
+          style={{ contain: 'layout' }}
+        />
+      </Portal>
+    </>
+  );
+};

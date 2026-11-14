@@ -1,0 +1,163 @@
+import { MarkMessageNotifications } from '@notifications/components/MarkMessageNotifications';
+import type {
+  Message as EntityMessage,
+  MessageParent,
+} from '@service-storage/messages';
+import {
+  type Accessor,
+  createMemo,
+  createSignal,
+  For,
+  onCleanup,
+  onMount,
+  Show,
+} from 'solid-js';
+import type { MessageEditor } from '../Channel/create-message-editor';
+import type { NewMessageCheckable } from '../Channel/util';
+import {
+  ChannelMessage,
+  type MessageActions,
+  type MessageData,
+} from '../Message';
+import { createTargetReplyScroller } from './create-target-reply-scroller';
+import {
+  type MessageElementMount,
+  notifyElementOnMount,
+} from './message-element-lifecycle';
+import { buildThreadReplyListMeta } from './reply-list-meta';
+import { ThreadReplyMonorail } from './ThreadReplyMonorail';
+import { ThreadReplyRail } from './ThreadReplyRail';
+
+export type ThreadReplyListHandle = {
+  scrollToIndex: (index: number, onSettled: () => void) => boolean;
+  cancelScroll: () => void;
+};
+
+export function ThreadReplyList(props: {
+  parent: MessageParent;
+  inputMode?: 'inline' | 'unified';
+  threadId: string;
+  replies: Array<EntityMessage>;
+  getMessageActions?: (message: MessageData) => MessageActions | undefined;
+  messageEditor?: MessageEditor;
+  isNewMessage?: (message: NewMessageCheckable) => boolean;
+  onMessageMount?: MessageElementMount;
+  onReady?: (handle: ThreadReplyListHandle) => void;
+  positionTarget?: (
+    threadRow: HTMLElement,
+    targetReply: HTMLElement
+  ) => boolean;
+  selectedReplyId?: Accessor<string | undefined>;
+  /**
+   * Reply targeted by channel navigation or referenced by the unified input.
+   */
+  targetedReplyId?: Accessor<string | undefined>;
+  isThreadFocused?: Accessor<boolean>;
+  onSelectReply?: (replyId: string) => void;
+  /** Keep replies on the root's rail instead of branching each one off it. */
+  monorail?: boolean;
+  hideRail?: boolean;
+  /** Show each reply's avatar and header as a root message. */
+  asRoots?: boolean;
+  /** An inline composer or footer continues the rail after the replies. */
+  railContinues?: boolean;
+}) {
+  const listMetaByReplyId = createMemo(() =>
+    buildThreadReplyListMeta(props.replies, props.isNewMessage)
+  );
+  const repliesById = createMemo(
+    () => new Map(props.replies.map((reply) => [reply.id, reply]))
+  );
+  const lastAvatarIndex = createMemo(() =>
+    props.replies.findLastIndex(
+      (reply) => !listMetaByReplyId()[reply.id]?.isGroupedWithPrevious
+    )
+  );
+  const replyElements = new Map<string, HTMLElement>();
+  const targetReplyScroller = createTargetReplyScroller({
+    getTarget: (index) => replyElements.get(props.replies[index]?.id),
+    positionTarget: props.positionTarget,
+  });
+
+  onMount(() => {
+    props.onReady?.({
+      scrollToIndex: targetReplyScroller.scrollToIndex,
+      cancelScroll: targetReplyScroller.cancel,
+    });
+  });
+
+  onCleanup(targetReplyScroller.dispose);
+
+  const displayMeta = (id: string) => {
+    const meta = listMetaByReplyId()[id];
+    if (!props.asRoots) return meta;
+    return { ...meta, isGroupedWithPrevious: false };
+  };
+  return (
+    <For each={[...repliesById().keys()]}>
+      {(id) => {
+        const [element, setElement] = createSignal<HTMLDivElement>();
+        onCleanup(() => replyElements.delete(id));
+        const replyMessage = () => ({
+          ...repliesById().get(id)!,
+          thread_id: props.threadId,
+        });
+
+        const isReplySelected = () =>
+          !!props.isThreadFocused?.() && props.selectedReplyId?.() === id;
+
+        return (
+          <div
+            ref={(element) => {
+              setElement(element);
+              replyElements.set(id, element);
+              notifyElementOnMount(props.onMessageMount, id, element);
+            }}
+            class="relative"
+          >
+            <Show when={!props.hideRail}>
+              <Show
+                when={props.monorail}
+                fallback={
+                  <ThreadReplyRail
+                    grouped={listMetaByReplyId()[id].isGroupedWithPrevious}
+                    terminal={
+                      !props.railContinues &&
+                      listMetaByReplyId()[id].index >= lastAvatarIndex()
+                    }
+                  />
+                }
+              >
+                <Show when={listMetaByReplyId()[id].index <= lastAvatarIndex()}>
+                  <ThreadReplyMonorail
+                    grouped={listMetaByReplyId()[id].isGroupedWithPrevious}
+                    terminal={
+                      listMetaByReplyId()[id].index === lastAvatarIndex()
+                    }
+                  />
+                </Show>
+              </Show>
+            </Show>
+            <MarkMessageNotifications
+              messageId={id}
+              parent={props.parent}
+              element={element()}
+            >
+              <ChannelMessage
+                parent={props.parent}
+                inputMode={props.inputMode}
+                message={replyMessage()}
+                actions={props.getMessageActions?.(replyMessage())}
+                listMeta={displayMeta(id)}
+                messageEditor={props.messageEditor}
+                onClick={() => props.onSelectReply?.(id)}
+                selected={isReplySelected()}
+                targeted={props.targetedReplyId?.() === id}
+              />
+            </MarkMessageNotifications>
+          </div>
+        );
+      }}
+    </For>
+  );
+}

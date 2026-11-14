@@ -1,0 +1,129 @@
+import { DatePicker } from '@core/component/DatePicker';
+import {
+  formatRelativeDay,
+  formatTooltipDate,
+  parseMentionDate,
+} from '@core/util/dateParser';
+import ClockIcon from '@icon/system/regular/clock.svg';
+import type { DateMentionDecoratorProps } from '@macro-inc/lexical-core';
+import { $isDateMentionNode } from '@macro-inc/lexical-core';
+import {
+  $getNodeByKey,
+  COMMAND_PRIORITY_NORMAL,
+  KEY_ENTER_COMMAND,
+} from 'lexical';
+import { createMemo, createSignal, Show, useContext } from 'solid-js';
+import { Portal } from 'solid-js/web';
+import { LexicalWrapperContext } from '../../context/LexicalWrapperContext';
+import { floatWithElement } from '../../directive/floatWithElement';
+import { autoRegister } from '../../plugins';
+import { MentionTooltip } from './MentionTooltip';
+
+false && floatWithElement;
+
+export function DateMention(props: DateMentionDecoratorProps) {
+  const lexicalWrapper = useContext(LexicalWrapperContext);
+  const editor = lexicalWrapper?.editor;
+  const selection = () => lexicalWrapper?.selection;
+
+  const [datePickerOpen, setDatePickerOpen] = createSignal(false);
+  const [hovered, setHovered] = createSignal(false);
+  let mentionRef!: HTMLSpanElement;
+
+  const displayFormat = createMemo(() => {
+    return formatRelativeDay(parseMentionDate(props.date));
+  });
+
+  const isSelectedAsNode = () => {
+    const sel = selection();
+    if (!sel) return false;
+    return sel.type === 'node' && sel.nodeKeys.has(props.key);
+  };
+
+  const handleDateChange = (newDate: Date) => {
+    const editor = lexicalWrapper?.editor;
+    if (!editor) return;
+
+    editor.update(() => {
+      const node = $getNodeByKey(props.key);
+      if ($isDateMentionNode(node)) {
+        node.setDate(newDate.toISOString());
+        node.setDisplayFormat(formatRelativeDay(newDate));
+      }
+    });
+
+    setDatePickerOpen(false);
+  };
+
+  if (editor) {
+    autoRegister(
+      editor.registerCommand(
+        KEY_ENTER_COMMAND,
+        () => {
+          if (isSelectedAsNode()) {
+            setDatePickerOpen(true);
+            return true;
+          }
+          return false;
+        },
+        COMMAND_PRIORITY_NORMAL
+      ),
+      editor.registerUpdateListener(() => {
+        if (!isSelectedAsNode()) {
+          setDatePickerOpen(false);
+        }
+      })
+    );
+  }
+
+  const currentDate = () => parseMentionDate(props.date);
+
+  return (
+    <>
+      <span
+        ref={mentionRef}
+        class="relative p-0.5 rounded-md bg-accent/8 hover:bg-accent/20 focus:bg-accent/20 text-accent cursor-default"
+        classList={{
+          'bg-active': isSelectedAsNode(),
+        }}
+        onClick={() => setDatePickerOpen(true)}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+      >
+        <span class="relative top-[0.125em] size-[1em] inline-flex mx-0.5">
+          <ClockIcon class="size-full" />
+        </span>
+        <span
+          data-date={props.date}
+          data-display-format={displayFormat()}
+          data-date-mention="true"
+        >
+          {displayFormat()}
+        </span>
+        <MentionTooltip show={isSelectedAsNode()} text="Edit" />
+      </span>
+
+      <Show when={hovered() && !datePickerOpen()}>
+        <Portal>
+          <div
+            class="absolute select-none z-tool-tip bg-surface p-1.5 text-ink-muted text-xs wrap-break-word rounded-sm border border-edge-muted shadow-md shadow-[#000]/5"
+            use:floatWithElement={{ element: () => mentionRef }}
+          >
+            {formatTooltipDate(parseMentionDate(props.date))}
+          </div>
+        </Portal>
+      </Show>
+
+      <Show when={datePickerOpen()}>
+        <Portal>
+          <DatePicker
+            value={currentDate()}
+            onChange={handleDateChange}
+            onClose={() => setDatePickerOpen(false)}
+            anchorRef={mentionRef}
+          />
+        </Portal>
+      </Show>
+    </>
+  );
+}

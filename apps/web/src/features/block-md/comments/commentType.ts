@@ -1,0 +1,56 @@
+import type {
+  CommentId,
+  Reply,
+  Root,
+  ThreadId,
+} from '@core/comments/commentType';
+import type { Message } from '@service-storage/messages';
+import type { NodeKey } from 'lexical';
+import type { DraftPublication } from './LocalCommentDraft';
+
+export type MarkId = string; // uuid
+
+export type ThreadPayload = {
+  threadId: ThreadId;
+  rootId: CommentId;
+  anchorId: string; // uuid
+  comments: Message[];
+  /** Total live replies when the source reports it; comments holds the loaded preview. */
+  replyCount?: number;
+  isResolved: boolean;
+};
+
+type MarkNodeStore = Partial<Record<NodeKey, HTMLElement>>;
+export type Mark = {
+  id: MarkId;
+  markNodes: MarkNodeStore;
+  existsOnServer: boolean;
+  owner: string;
+  isDraft: boolean;
+  peerId?: string;
+  thread?: ThreadPayload;
+  publication?: DraftPublication;
+};
+export type MarkStore = Partial<Record<MarkId, Mark>>;
+
+export type CommentStore = Partial<Record<CommentId, Root | Reply>>;
+export type ThreadStore = Partial<Record<ThreadId, Root>>;
+export type ThreadHeights = Partial<Record<ThreadId, number>>;
+export type ThreadPositions = Partial<Record<MarkId, CommentLayout<{}>>>;
+
+export type Overflow = null | 'top' | 'bottom';
+export type Layout = {
+  calculatedYPos: number;
+  overflow: Overflow;
+  height: number;
+};
+
+// represents a comment layout after it has been positioned
+export type CommentLayout<T> = T & { layout: Layout };
+export type CommentViewerLayoutInfo = {
+  originalYPosition: number;
+};
+// represents an initial comment layout in the viewer
+export type CommentViewerInitialLayout<T> = T & {
+  layout: CommentViewerLayoutInfo;
+};

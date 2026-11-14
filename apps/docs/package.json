@@ -1,0 +1,12 @@
+{
+  "name": "@macro/docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "mint dev",
+    "lint": "mint broken-links"
+  },
+  "devDependencies": {
+    "mint": "^4.2.63"
+  }
+}

@@ -1,0 +1,795 @@
+use super::*;
+use pollster::block_on;
+
+mod calendar;
+mod people;
+mod soup;
+mod watch;
+
+const QUERY: &str = r#"query Soup($input: SoupInput!) {
+    user { id soup(input: $input) { nextCursor items { __typename id } } }
+}"#;
+
+const HYDRATION_QUERY: &str = r#"query Soup($input: SoupInput!) {
+    user {
+        id @cacheOnly
+        soup(input: $input) {
+            nextCursor
+            items @cacheOnly { __typename id }
+        }
+    }
+}"#;
+
+fn variables() -> Variables {
+    let serde_json::Value::Object(vars) = serde_json::json!({"input": {"limit": 1}}) else {
+        unreachable!()
+    };
+    vars
+}
+
+fn soup_data(has_next_page: bool) -> serde_json::Value {
+    serde_json::json!({
+        "user": {
+            "id": "user-1",
+            "soup": {
+                "nextCursor": has_next_page.then_some("cursor-1"),
+                "items": [{"__typename": "GraphqlSoupDocument", "id": "doc-1"}]
+            }
+        }
+    })
+}
+
+fn spawn_handle() -> EngineHandle {
+    let storage = TursoStorage::open_in_memory("scope-1").unwrap();
+    EngineHandle::new(storage, None)
+}
+
+#[test]
+fn scoped_native_hydration_rejects_late_pages_after_clear() {
+    let handle = spawn_handle();
+    let scope = HydrationScope {
+        contact_fence: None,
+        storage_generation: block_on(handle.current_storage_generation())
+            .unwrap()
+            .parse()
+            .unwrap(),
+        identity: "viewer".into(),
+    };
+    let hydrate = || {
+        block_on(handle.hydrate_query(
+            "{ user { id } }".into(),
+            None,
+            Variables::new(),
+            serde_json::json!({"user":{"id":"viewer"}}),
+            Some("viewer".into()),
+            Some(scope.clone()),
+        ))
+    };
+    assert!(!hydrate().unwrap().write_result.reset);
+    block_on(handle.clear()).unwrap();
+    assert_eq!(
+        hydrate().err().as_deref(),
+        Some("cache hydration scope changed")
+    );
+    assert_ne!(
+        block_on(handle.current_storage_generation()).unwrap(),
+        scope.storage_generation.to_string()
+    );
+}
+
+#[test]
+fn storage_generation_survives_native_reopening_and_rotates_after_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = cache_turso::TursoFileDatabase::new(dir.path().join("cache.turso")).unwrap();
+    let handle = EngineHandle::new(database.open_or_reset("scope-1").unwrap(), None);
+    let first = block_on(handle.current_storage_generation()).unwrap();
+    assert_eq!(
+        block_on(handle.clone().current_storage_generation()).unwrap(),
+        first
+    );
+    handle.shutdown().unwrap();
+    let handle = EngineHandle::new(database.open_or_reset("scope-1").unwrap(), None);
+    assert_eq!(
+        block_on(handle.current_storage_generation()).unwrap(),
+        first
+    );
+    block_on(handle.clear()).unwrap();
+    let replacement = block_on(handle.current_storage_generation()).unwrap();
+    assert_ne!(replacement, first);
+    assert_eq!(
+        block_on(handle.current_storage_generation()).unwrap(),
+        replacement
+    );
+    handle.shutdown().unwrap();
+}
+
+fn write(
+    handle: &EngineHandle,
+    origin: Option<&str>,
+    data: serde_json::Value,
+    identity: Option<&str>,
+) -> WriteResultWire {
+    block_on(handle.write(WriteRequest {
+        origin_op_id: origin.map(str::to_string),
+        registration: None,
+        query: QUERY.to_string(),
+        operation_name: Some("Soup".to_string()),
+        variables: variables(),
+        data,
+        identity: identity.map(str::to_string),
+    }))
+    .unwrap()
+}
+
+fn read(handle: &EngineHandle, op_id: Option<&str>) -> ReadResultWire {
+    block_on(handle.read(
+        op_id.map(str::to_string),
+        QUERY.to_string(),
+        Some("Soup".to_string()),
+        variables(),
+        Vec::new(),
+    ))
+    .unwrap()
+}
+
+fn empty_write_result() -> WriteResultWire {
+    WriteResultWire {
+        unchanged_views: None,
+        field_changes: None,
+        identity_errors: Vec::new(),
+        mutation_uuid: None,
+        revision: "0".to_string(),
+        revision_advanced: false,
+        search_changed_buckets: None,
+        changed: Vec::new(),
+        affected_ops: Vec::new(),
+        reset: false,
+        revalidations: Vec::new(),
+    }
+}
+
+#[test]
+fn query_writes_preserve_search_proof_and_viewer_field_scope_through_native_wire() {
+    let handle = spawn_handle();
+    write(&handle, None, soup_data(false), Some("viewer"));
+    read(&handle, Some("client:1"));
+    let mut other = variables();
+    other.insert("input".into(), serde_json::json!({"limit":2}));
+    let result = block_on(handle.write(WriteRequest {
+        origin_op_id: None,
+        registration: None,
+        query: QUERY.into(),
+        operation_name: Some("Soup".into()),
+        variables: other,
+        data: soup_data(false),
+        identity: Some("viewer".into()),
+    }))
+    .unwrap();
+    assert!(result.revision_advanced);
+    assert!(result.affected_ops.is_empty());
+    assert_eq!(
+        serde_json::to_value(result).unwrap()["searchChangedBuckets"],
+        serde_json::json!([])
+    );
+    let reset = write(&handle, None, soup_data(false), Some("new-viewer"));
+    assert!(reset.reset);
+    assert!(
+        serde_json::to_value(reset)
+            .unwrap()
+            .get("searchChangedBuckets")
+            .is_none()
+    );
+    handle.shutdown().unwrap();
+}
+
+#[test]
+fn tagged_wire_enum_fields_are_camel_case() {
+    let mut committed = empty_write_result();
+    committed
+        .identity_errors
+        .push("missing identity response object".into());
+    let value =
+        serde_json::to_value(CommitOptimisticWriteResultWire::Committed { result: committed })
+            .unwrap();
+    assert_eq!(value["kind"], "committed");
+    assert_eq!(
+        value["identityErrors"],
+        serde_json::json!(["missing identity response object"])
+    );
+    assert_eq!(
+        serde_json::to_value(MutationUpsertKindWire::ReplacedPending {
+            removed_transaction_id: "1".to_string(),
+        })
+        .unwrap(),
+        serde_json::json!({"kind": "replaced-pending", "removedTransactionId": "1"})
+    );
+    assert_eq!(
+        serde_json::to_value(MutationUpsertKindWire::AppendedAfterActive {
+            active_transaction_id: "2".to_string(),
+        })
+        .unwrap(),
+        serde_json::json!({"kind": "appended-after-active", "activeTransactionId": "2"})
+    );
+    assert_eq!(
+        serde_json::to_value(DeferOptimisticWriteResultWire::DiscardedSuperseded {
+            replacement_transaction_id: "3".to_string(),
+            result: empty_write_result(),
+        })
+        .unwrap()["replacementTransactionId"],
+        "3"
+    );
+    assert_eq!(
+        serde_json::to_value(CommitOptimisticWriteResultWire::CommittedSuperseded {
+            replacement_transaction_id: "4".to_string(),
+            result: empty_write_result(),
+        })
+        .unwrap()["replacementTransactionId"],
+        "4"
+    );
+    for replacement_transaction_id in [None, Some("4".to_string())] {
+        let value = serde_json::to_value(CommitOptimisticWriteResultWire::Failed {
+            error: "missing identity response id".to_string(),
+            replacement_transaction_id: replacement_transaction_id.clone(),
+            result: empty_write_result(),
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "failed");
+        assert_eq!(value["error"], "missing identity response id");
+        assert_eq!(
+            value
+                .get("replacementTransactionId")
+                .and_then(serde_json::Value::as_str),
+            replacement_transaction_id.as_deref()
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(RollbackOptimisticWriteResultWire::DiscardedSuperseded {
+            replacement_transaction_id: "5".to_string(),
+            result: empty_write_result(),
+        })
+        .unwrap()["replacementTransactionId"],
+        "5"
+    );
+}
+
+#[test]
+fn write_then_read_round_trips() {
+    let handle = spawn_handle();
+    assert!(matches!(read(&handle, None), ReadResultWire::Miss));
+
+    let result = write(&handle, None, soup_data(false), None);
+    assert!(!result.changed.is_empty());
+    assert!(!result.reset);
+
+    let ReadResultWire::Hit { data } = read(&handle, None) else {
+        panic!("expected hit");
+    };
+    assert_eq!(data, soup_data(false));
+}
+
+#[test]
+fn identical_hydration_does_not_advance_the_native_revision() {
+    let handle = spawn_handle();
+    let hydrate = || {
+        block_on(handle.hydrate_query(
+            HYDRATION_QUERY.to_string(),
+            Some("Soup".to_string()),
+            variables(),
+            soup_data(true),
+            None,
+            None,
+        ))
+        .unwrap()
+        .write_result
+    };
+    let first = hydrate();
+    let duplicate = hydrate();
+    assert!(first.revision_advanced);
+    assert!(!duplicate.revision_advanced);
+    assert_eq!(first.revision, duplicate.revision);
+}
+
+#[test]
+fn hydration_returns_only_unmarked_fields_and_retains_entities_without_pages() {
+    let handle = spawn_handle();
+    let result = block_on(handle.hydrate_query(
+        HYDRATION_QUERY.to_string(),
+        Some("Soup".to_string()),
+        variables(),
+        soup_data(true),
+        None,
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        result.data,
+        Some(serde_json::json!({
+            "user": { "soup": { "nextCursor": "cursor-1" } }
+        }))
+    );
+    assert!(!result.write_result.changed.is_empty());
+    assert!(matches!(read(&handle, None), ReadResultWire::Miss));
+    let ReadResultWire::Hit { data } = block_on(handle.read(
+        None,
+        "query Viewer { user { id } }".to_string(),
+        Some("Viewer".to_string()),
+        Variables::new(),
+        Vec::new(),
+    ))
+    .unwrap() else {
+        panic!("expected hydrated viewer");
+    };
+    assert_eq!(data, serde_json::json!({"user": {"id": "user-1"}}));
+    let records = block_on(handle.read_records_by_keys(
+        "fragment Document on GraphqlSoupDocument { __typename id }".to_string(),
+        "Document".to_string(),
+        vec!["GraphqlSoupDocument:doc-1".to_string()],
+    ))
+    .unwrap();
+    assert_eq!(records.records.len(), 1);
+    assert_eq!(
+        records.records[0].record,
+        serde_json::json!({"__typename": "GraphqlSoupDocument", "id": "doc-1"})
+    );
+}
+
+#[test]
+fn entity_resolvers_cross_the_native_engine_boundary() {
+    let handle = spawn_handle();
+    write(
+        &handle,
+        None,
+        serde_json::json!({
+            "user": {
+                "id": "user-1",
+                "soup": {
+                    "nextCursor": null,
+                    "items": [{
+                        "__typename": "GraphqlSoupEmailThread",
+                        "id": "thread-1"
+                    }]
+                }
+            }
+        }),
+        None,
+    );
+    let query = r#"query Email($input: EmailThreadInput!) {
+        user { id emailThread(input: $input) { __typename id } }
+    }"#;
+    let serde_json::Value::Object(variables) =
+        serde_json::json!({"input": {"threadId": "thread-1"}})
+    else {
+        unreachable!()
+    };
+    let result = block_on(handle.read(
+        Some("webview:1".to_string()),
+        query.to_string(),
+        Some("Email".to_string()),
+        variables,
+        vec![EntityResolver {
+            parent_type: "GraphqlUser".to_string(),
+            field_name: "emailThread".to_string(),
+            target_type: "GraphqlSoupEmailThread".to_string(),
+            argument_path: vec!["input".to_string(), "threadId".to_string()],
+        }],
+    ))
+    .unwrap();
+    let ReadResultWire::Hit { data } = result else {
+        panic!("expected resolver hit")
+    };
+    assert_eq!(data["user"]["emailThread"]["id"], "thread-1");
+}
+
+#[test]
+fn explicit_key_selection_returns_native_cache_entities() {
+    let handle = spawn_handle();
+    let query = r#"query Soup($input: SoupInput!) {
+        user {
+            id
+            soup(input: $input) {
+                items {
+                    __typename
+                    id
+                    ... on GraphqlSoupDocument {
+                        id name fileType createdAt updatedAt viewedAt deletedAt
+                        subType { kind isCompleted }
+                    }
+                }
+                nextCursor
+            }
+        }
+    }"#;
+    let data = serde_json::json!({
+        "user": {
+            "id": "user-1",
+            "soup": {
+                "items": [{
+                    "__typename": "GraphqlSoupDocument",
+                    "id": "doc-1",
+                    "name": "A note",
+                    "fileType": "md",
+                    "createdAt": "1970-01-01T00:00:01Z",
+                    "updatedAt": "1970-01-01T00:00:02Z",
+                    "viewedAt": "1970-01-01T00:00:03Z",
+                    "deletedAt": null,
+                    "subType": null
+                }],
+                "nextCursor": null
+            }
+        }
+    });
+    block_on(handle.write(WriteRequest {
+        origin_op_id: None,
+        registration: None,
+        query: query.to_string(),
+        operation_name: Some("Soup".to_string()),
+        variables: variables(),
+        data,
+        identity: None,
+    }))
+    .unwrap();
+
+    let records = block_on(handle.read_records_by_keys(
+        "fragment Document on GraphqlSoupDocument { id name }".to_string(),
+        "Document".to_string(),
+        vec!["GraphqlSoupDocument:doc-1".to_string()],
+    ))
+    .unwrap();
+    assert_eq!(
+        records.records[0].record,
+        serde_json::json!({"id": "doc-1", "name": "A note"})
+    );
+}
+
+#[test]
+fn search_uses_native_materialized_projection() {
+    let handle = spawn_handle();
+    let query = r#"query Soup($input: SoupInput!) {
+        user {
+            id
+            soup(input: $input) {
+                items {
+                    __typename
+                    id
+                    ... on GraphqlSoupDocument { name updatedAt }
+                }
+                nextCursor
+            }
+        }
+    }"#;
+    block_on(handle.write(WriteRequest {
+        origin_op_id: None,
+        registration: None,
+        query: query.to_string(),
+        operation_name: Some("Soup".to_string()),
+        variables: variables(),
+        data: serde_json::json!({
+            "user": {
+                "id": "user-1",
+                "soup": {
+                    "items": [{
+                        "__typename": "GraphqlSoupDocument",
+                        "id": "doc-1",
+                        "name": "Quarterly Plan",
+                        "updatedAt": "2025-01-02T03:04:05Z"
+                    }],
+                    "nextCursor": null
+                }
+            }
+        }),
+        identity: None,
+    }))
+    .unwrap();
+
+    let page = block_on(handle.search(SearchRequest {
+        profile: cache_core::search::SearchProfile::QuickAccessV1,
+        buckets: vec!["document".into()],
+        query: "quarter".into(),
+        cursor: None,
+        limit: 20,
+        now_ms: 1_735_787_046_000,
+    }))
+    .unwrap();
+    assert_eq!(page.documents.len(), 1);
+    assert_eq!(
+        page.documents[0].record_key.as_ref(),
+        "GraphqlSoupDocument:doc-1"
+    );
+}
+
+#[test]
+fn query_inspection_serializes_generated_variables_and_value() {
+    let handle = spawn_handle();
+    write(&handle, None, soup_data(false), None);
+
+    let instances = block_on(handle.inspect_query(
+        QUERY.to_string(),
+        Some("Soup".to_string()),
+        vec!["user".to_string(), "soup".to_string()],
+        Vec::new(),
+    ))
+    .unwrap();
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0].variables, variables());
+    assert_eq!(
+        instances[0].value.as_ref().unwrap()["nextCursor"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        serde_json::to_value(&instances).unwrap(),
+        serde_json::json!([{
+            "variables": {"input": {"limit": 1}},
+            "value": {
+                "nextCursor": null,
+                "items": [{"__typename": "GraphqlSoupDocument", "id": "doc-1"}]
+            }
+        }])
+    );
+}
+
+#[test]
+fn query_variant_inspection_serializes_only_generated_variables() {
+    let handle = spawn_handle();
+    write(&handle, None, soup_data(false), None);
+
+    let variants = block_on(handle.inspect_query_variants(
+        QUERY.to_string(),
+        Some("Soup".to_string()),
+        vec!["user".to_string(), "soup".to_string()],
+    ))
+    .unwrap();
+    assert_eq!(variants.len(), 1);
+    assert_eq!(variants[0].variables, variables());
+    assert_eq!(
+        serde_json::to_value(&variants).unwrap(),
+        serde_json::json!([{"variables": {"input": {"limit": 1}}}])
+    );
+}
+
+#[test]
+fn registered_op_is_affected_by_later_writes() {
+    let handle = spawn_handle();
+    block_on(handle.write(WriteRequest {
+        origin_op_id: Some("client:1".to_string()),
+        registration: Some(WriteRegistration {
+            op_id: "client:1".to_string(),
+            entity_resolvers: Vec::new(),
+        }),
+        query: QUERY.to_string(),
+        operation_name: Some("Soup".to_string()),
+        variables: variables(),
+        data: soup_data(false),
+        identity: None,
+    }))
+    .unwrap();
+
+    // The registered write avoids a read and still observes a later change.
+    let result = write(&handle, Some("client:2"), soup_data(true), None);
+    assert_eq!(result.affected_ops, vec!["client:1".to_string()]);
+
+    // Torn-down operations stop being reported.
+    block_on(handle.teardown("client:1".to_string())).unwrap();
+    let result = write(&handle, Some("client:2"), soup_data(false), None);
+    assert!(result.affected_ops.is_empty());
+}
+
+#[test]
+fn identity_mismatch_resets() {
+    let handle = spawn_handle();
+    let result = write(&handle, None, soup_data(false), Some("user-1"));
+    assert!(!result.reset);
+
+    read(&handle, Some("client:1"));
+    let result = write(&handle, Some("client:2"), soup_data(true), Some("user-2"));
+    assert!(result.reset);
+    assert_eq!(result.affected_ops, vec!["client:1".to_string()]);
+}
+
+#[test]
+fn optimistic_layer_commits_durably() {
+    let handle = spawn_handle();
+    write(&handle, None, soup_data(false), None);
+    read(&handle, Some("client:1"));
+
+    let optimistic = block_on(handle.enqueue_optimistic_mutation(
+        Some("client:2".to_string()),
+        "00000000-0000-4000-8000-000000000001".to_string(),
+        QUERY.to_string(),
+        Some("Soup".to_string()),
+        variables(),
+        soup_data(true),
+        vec![],
+        vec![],
+        vec![],
+        0,
+        "runner".to_string(),
+        10,
+        1_000,
+        Some(serde_json::json!({"draftRevision": 10})),
+        vec![],
+    ))
+    .unwrap();
+    assert_eq!(optimistic.result.affected_ops, vec!["client:1".to_string()]);
+    let serialized = serde_json::to_value(&optimistic).unwrap();
+    assert_eq!(serialized["upsertKind"]["kind"], "inserted");
+    assert_eq!(serialized["initialClaim"]["kind"], "claimed");
+    assert_eq!(
+        serialized["initialClaim"]["mutation"]["transactionId"],
+        optimistic.transaction_id
+    );
+    let InitialMutationClaimWire::Claimed { mutation: claimed } = optimistic.initial_claim else {
+        panic!("new queue head should be claimed")
+    };
+    assert_eq!(claimed.transaction_id, optimistic.transaction_id);
+    assert_eq!(claimed.uuid, "00000000-0000-4000-8000-000000000001");
+    assert!(!claimed.superseded);
+    assert!(!claimed.requires_confirmation);
+    assert_eq!(
+        claimed.client_metadata,
+        Some(serde_json::json!({"draftRevision": 10}))
+    );
+    let inspected = block_on(handle.inspect_mutations()).unwrap();
+    assert_eq!(inspected[0].client_metadata, claimed.client_metadata);
+    assert_eq!(inspected[0].transaction_id, claimed.transaction_id);
+    assert!(
+        block_on(handle.claim_next_mutation("another-runner".into(), 20, 100))
+            .unwrap()
+            .is_none()
+    );
+
+    // The optimistic view answers reads.
+    let ReadResultWire::Hit { data } = read(&handle, None) else {
+        panic!("expected hit");
+    };
+    assert_eq!(data, soup_data(true));
+
+    let committed = block_on(handle.commit_optimistic_write(
+        optimistic.transaction_id,
+        "runner".to_string(),
+        claimed.lease_generation,
+        QUERY.to_string(),
+        Some("Soup".to_string()),
+        variables(),
+        soup_data(true),
+    ))
+    .unwrap();
+    let CommitOptimisticWriteResultWire::Committed { result: committed } = committed else {
+        panic!("current transaction was reported as superseded")
+    };
+    assert!(!committed.changed.is_empty());
+
+    let ReadResultWire::Hit { data } = read(&handle, None) else {
+        panic!("expected hit");
+    };
+    assert_eq!(data, soup_data(true));
+}
+
+#[test]
+fn rollback_drops_optimistic_contribution() {
+    let handle = spawn_handle();
+    write(&handle, None, soup_data(false), None);
+
+    let optimistic = block_on(handle.enqueue_optimistic_mutation(
+        None,
+        "00000000-0000-4000-8000-000000000002".to_string(),
+        QUERY.to_string(),
+        Some("Soup".to_string()),
+        variables(),
+        soup_data(true),
+        vec![],
+        vec![],
+        vec![],
+        0,
+        "runner".to_string(),
+        10,
+        1_000,
+        None,
+        vec![],
+    ))
+    .unwrap();
+    let InitialMutationClaimWire::Claimed { mutation: claimed } = optimistic.initial_claim else {
+        panic!("new queue head should be claimed")
+    };
+
+    block_on(handle.rollback_optimistic_write(
+        optimistic.transaction_id,
+        "runner".to_string(),
+        claimed.lease_generation,
+    ))
+    .unwrap();
+    let ReadResultWire::Hit { data } = read(&handle, None) else {
+        panic!("expected hit");
+    };
+    assert_eq!(data, soup_data(false));
+}
+
+#[test]
+fn invalidate_reports_dependent_ops() {
+    let handle = spawn_handle();
+    let written = write(&handle, None, soup_data(false), None);
+    read(&handle, Some("client:1"));
+
+    let affected = block_on(handle.invalidate(written.changed)).unwrap();
+    assert_eq!(affected.affected_ops, vec!["client:1".to_string()]);
+}
+
+#[test]
+fn clear_wipes_everything() {
+    let handle = spawn_handle();
+    write(&handle, None, soup_data(false), None);
+    block_on(handle.clear()).unwrap();
+    assert!(matches!(read(&handle, None), ReadResultWire::Miss));
+}
+
+#[test]
+fn sole_engine_handle_shuts_turso_down_explicitly() {
+    spawn_handle().shutdown().unwrap();
+}
+
+#[test]
+fn bad_transaction_id_is_an_error() {
+    let handle = spawn_handle();
+    let error = block_on(handle.rollback_optimistic_write(
+        "not-a-number".to_string(),
+        "runner".to_string(),
+        "1".to_string(),
+    ))
+    .unwrap_err();
+    assert!(error.contains("invalid optimistic transaction id"));
+}
+
+#[test]
+fn native_runtime_schema_persists_across_ota_and_rejects_conflicts_without_data_loss() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schema.json");
+        let database = cache_turso::TursoFileDatabase::new(dir.path().join("cache.turso")).unwrap();
+        let handle = EngineHandle::new(database.open_or_reset("scope-1").unwrap(), None);
+        let generation = handle.current_storage_generation().await.unwrap();
+        let sdl = format!(
+            "{}\nextend type GraphqlUser {{ runtimeLabel: String }}",
+            cache_core::meta::BUNDLED_SCHEMA_SDL
+        );
+        let schema = cache_core::meta::Schema::from_sdl(&sdl).unwrap();
+        handle.install_schema(&schema, &path).await.unwrap();
+        let query = "query { user { id runtimeLabel } }";
+        let data = serde_json::json!({"user": {"id": "viewer", "runtimeLabel": "OTA"}});
+        handle
+            .write(WriteRequest {
+                origin_op_id: None,
+                registration: None,
+                query: query.into(),
+                operation_name: None,
+                variables: Variables::new(),
+                data: data.clone(),
+                identity: None,
+            })
+            .await
+            .unwrap();
+        // Older windows/bundles may initialize again without downgrading metadata.
+        handle
+            .install_schema(&cache_core::meta::bundled_schema(), &path)
+            .await
+            .unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        let conflict = cache_core::meta::Schema::from_sdl(
+            &sdl.replace("runtimeLabel: String", "runtimeLabel: [String]"),
+        )
+        .unwrap();
+        assert!(handle.install_schema(&conflict, &path).await.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), persisted);
+        handle.shutdown().unwrap();
+        let schema = cache_core::meta::Schema::from_json(&persisted).unwrap();
+        let reopened =
+            EngineHandle::with_schema(database.open_or_reset("scope-1").unwrap(), None, schema);
+        assert_eq!(
+            reopened.current_storage_generation().await.unwrap(),
+            generation
+        );
+        assert!(
+            matches!(reopened.read(None, query.into(), None, Variables::new(), vec![]).await.unwrap(), ReadResultWire::Hit { data: actual } if actual == data)
+        );
+        reopened.shutdown().unwrap();
+    });
+}

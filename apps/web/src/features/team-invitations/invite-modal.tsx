@@ -1,0 +1,142 @@
+import { toast } from '@core/component/Toast/Toast';
+import { useReferralCode } from '@core/context/user';
+import { getWebOrigin } from '@core/util/webOrigin';
+import ClipboardIcon from '@icon/system/regular/clipboard.svg';
+import CloseIcon from '@icon/system/regular/x.svg';
+import { Telemetry } from '@macro-inc/observability';
+import { useSendReferralInvitesMutation } from '@queries/team/referrals';
+import { Button, Dialog, Input, Panel } from '@ui';
+import { createSignal, Show } from 'solid-js';
+
+function parseEmails(raw: string): string[] {
+  return raw
+    .split(/[,\n\s]/)
+    .map((s) => s.trim())
+    .filter((s) => s.includes('@'));
+}
+
+const [inviteModalOpen, setInviteModalOpen] = createSignal(false);
+
+export { setInviteModalOpen };
+
+export const InviteModal = () => {
+  const [value, setValue] = createSignal('');
+  const [copied, setCopied] = createSignal(false);
+  const sendInvites = useSendReferralInvitesMutation();
+  const sending = () => sendInvites.isPending;
+  const referralCode = useReferralCode();
+
+  const referralUrl = () => {
+    const code = referralCode();
+    if (!code) return undefined;
+    return `${getWebOrigin()}/app/signup?referral_code=${code}`;
+  };
+
+  const copyReferralUrl = async (url: string) => {
+    await navigator.clipboard.writeText(url);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleCopy = () => {
+    const url = referralUrl();
+    if (!url) return;
+    copyReferralUrl(url).catch((error) => {
+      Telemetry.error(error, { surface: 'team-invitations' });
+      toast.failure('Failed to copy link');
+    });
+  };
+
+  const handleSend = async () => {
+    const emails = parseEmails(value());
+    if (!emails.length) return;
+    await sendInvites.mutateAsync(emails);
+    setValue('');
+    setInviteModalOpen(false);
+  };
+
+  const handleClose = () => {
+    setValue('');
+    setInviteModalOpen(false);
+  };
+
+  return (
+    <Dialog open={inviteModalOpen()} onOpenChange={(o) => !o && handleClose()}>
+      <Panel depth={2} class="max-h-[75vh] text-ink rounded-xl">
+        <Panel.Header class="px-2 gap-1">
+          <Dialog.CloseButton as={Button} variant="ghost" size="icon-sm">
+            <CloseIcon class="size-3.5 touch:size-6 shrink-0 pointer-events-none" />
+          </Dialog.CloseButton>
+          <Dialog.Title as="span" class="text-sm font-medium p-0 m-0">
+            Invite
+          </Dialog.Title>
+        </Panel.Header>
+
+        <Panel.Body scroll class="p-3 flex flex-col gap-3">
+          <p>
+            Invite friends and teammates to Macro. You'll get $10 of AI credit
+            for each person who signs up.
+          </p>
+          <div class="flex flex-col gap-2">
+            <textarea
+              ref={(el) => {
+                requestAnimationFrame(() =>
+                  requestAnimationFrame(() => el.focus())
+                );
+              }}
+              placeholder="name@company.com&#10;colleague@company.com"
+              value={value()}
+              onInput={(e) => setValue(e.currentTarget.value)}
+              rows={4}
+              class="w-full px-3 py-2 text-sm/relaxed border border-edge-muted rounded-lg bg-surface text-ink placeholder:text-ink-placeholder outline-none focus:border-accent resize-none"
+            />
+          </div>
+
+          <div class="flex justify-end gap-1 pt-2">
+            <Button variant="ghost" onClick={handleClose}>
+              Cancel
+            </Button>
+            <Button
+              onClick={handleSend}
+              variant="primary"
+              disabled={sending() || !parseEmails(value()).length}
+              class="font-semibold"
+            >
+              {sending() ? 'Sending…' : 'Send Invites'}
+            </Button>
+          </div>
+
+          <Show when={referralUrl()}>
+            {(url) => (
+              <div class="flex flex-col gap-1.5 pt-3">
+                <p class="text-xs text-ink/50">
+                  Or share your personal referral link:
+                </p>
+                <div class="flex items-stretch gap-2">
+                  <Input
+                    size="sm"
+                    type="text"
+                    readOnly
+                    value={url()}
+                    class="flex-1 select-all text-ink-muted"
+                    onClick={(e) => e.currentTarget.select()}
+                  />
+                  <Button
+                    type="button"
+                    onClick={handleCopy}
+                    size="md"
+                    variant="secondary"
+                    class="font-medium border px-2"
+                  >
+                    <ClipboardIcon class="size-3" />
+                    {copied() ? 'Copied!' : 'Copy'}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </Show>
+        </Panel.Body>
+      </Panel>
+    </Dialog>
+  );
+};

@@ -1,0 +1,52 @@
+// Core components
+
+import { Layout } from './core/Layout';
+import { Root } from './core/Root';
+import { Slot } from './core/Slot';
+import { EntityEmailParticipants } from './extractors/entity-email-participants';
+import { EntityIcon } from './extractors/entity-icon';
+import { EntityTimestamp } from './extractors/entity-timestamp';
+import { EntityTitle } from './extractors/entity-title';
+import {
+  MobileNotificationStackRows,
+  NotificationContent,
+  NotificationCount,
+  NotificationDescription,
+  NotificationIcon,
+  NotificationSender,
+  NotificationStackRow,
+  NotificationStacks,
+  NotificationTimestamp,
+} from './extractors-notification';
+// Property components
+import { EntityKeyProperties } from './extractors-property';
+// Search components
+import { ContentHits } from './extractors-search';
+
+/**
+ * Entity composable component namespace.
+ */
+export const Entity = {
+  Root,
+  Layout,
+  Slot,
+  Icon: EntityIcon,
+  Title: EntityTitle,
+  Timestamp: EntityTimestamp,
+  EmailParticipants: EntityEmailParticipants,
+  Search: {
+    ContentHits: ContentHits,
+  },
+  Notification: {
+    StackRow: NotificationStackRow,
+    Stacks: NotificationStacks,
+    MobileStackRows: MobileNotificationStackRows,
+    Icon: NotificationIcon,
+    Sender: NotificationSender,
+    Content: NotificationContent,
+    Timestamp: NotificationTimestamp,
+    Description: NotificationDescription,
+    Count: NotificationCount,
+  },
+  Properties: EntityKeyProperties,
+};

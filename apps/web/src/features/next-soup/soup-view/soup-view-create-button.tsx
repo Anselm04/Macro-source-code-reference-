@@ -1,0 +1,237 @@
+import { ViewCreateButton } from '@app/components/view-shell/ViewCreateButton';
+import { isListViewID, type ListView } from '@app/constants/list-views';
+import {
+  CREATABLE_BLOCKS,
+  type CreatableName,
+  useCreatableEnabled,
+  useCreateAction,
+} from '@app/features/command/Launcher';
+import { openCreateCompanyModal } from '@app/features/crm/creation-adapter';
+import { type TranslationKey, t } from '@app/lib/i18n';
+import { useHandleFileUpload } from '@app/util/handleFileUpload';
+import { openNewChannelModal } from '@channel/CreateChannelModal';
+import { useSplitPanelOrThrow } from '@components/app/split-layout/layoutUtils';
+import type { BlockName } from '@core/block';
+import { EntityIcon } from '@core/component/EntityIcon';
+import {
+  handleFolderSelect,
+  openFilePicker,
+  openFolderPicker,
+} from '@core/util/upload';
+import BuildingsIcon from '@icon/system/regular/buildings.svg';
+import UploadIcon from '@icon/system/regular/upload-simple.svg';
+import { Dropdown } from '@ui';
+import { createMemo, For, Show } from 'solid-js';
+import { NewCallButton } from './NewCallButton';
+import { useMaybeSoupView } from './soup-view-context';
+
+// Which blocks to show as create options per view, in order
+const VIEW_CREATE_BLOCKNAMES: Partial<Record<ListView, CreatableName[]>> = {
+  documents: ['md', 'snippet', 'spreadsheet', 'canvas', 'code', 'project'],
+  tasks: ['task'],
+  agents: ['agent', 'routine', 'skill'],
+  mail: ['email'],
+  channels: ['channel'],
+  folders: ['project'],
+};
+
+type CreateOption = {
+  id: CreatableName | 'import-file' | 'import-folder' | 'create-company';
+  label: string;
+};
+
+const IMPORT_FILE_OPTION: CreateOption = {
+  id: 'import-file',
+  get label() {
+    return t('create.importFile');
+  },
+};
+const IMPORT_FOLDER_OPTION: CreateOption = {
+  id: 'import-folder',
+  get label() {
+    return t('create.importFolder');
+  },
+};
+// Companies aren't blocks, so the Customers view gets a bespoke option
+// that opens the create-company modal instead of a create action.
+const CREATE_COMPANY_OPTION: CreateOption = {
+  id: 'create-company',
+  get label() {
+    return t('create.companyLabel');
+  },
+};
+
+/**
+ * Fallback labels for blocks that shouldn't appear in the global launcher
+ * (and thus aren't in CREATABLE_BLOCKS) but still need a create entry in
+ * specific list views.
+ */
+const VIEW_ONLY_BLOCK_LABELS: Partial<Record<CreatableName, TranslationKey>> = {
+  routine: 'create.routineLabel',
+};
+
+const VIEW_CREATE_LABELS: Partial<Record<ListView, TranslationKey>> = {
+  agents: 'create.agentLabel',
+  channels: 'create.channelLabel',
+  companies: 'create.companyLabel',
+  documents: 'create.new',
+  folders: 'create.folderLabel',
+  mail: 'create.emailLabel',
+  tasks: 'create.taskLabel',
+};
+
+function getViewCreateOptions(
+  view: ListView,
+  isCreatableEnabled: (name: CreatableName) => boolean
+): CreateOption[] {
+  const createNames = VIEW_CREATE_BLOCKNAMES[view] ?? [];
+  const options: CreateOption[] = createNames.flatMap((name) => {
+    const block = CREATABLE_BLOCKS.find((b) => b.blockName === name);
+    if (block) {
+      // A flagged-off entry is not offered here either, the same as in the
+      // create menus — `runCreateAction` would decline it anyway. Asked
+      // reactively, so an option appears once its flag resolves.
+      if (!isCreatableEnabled(block.blockName)) return [];
+      return [{ id: block.blockName, label: block.label }];
+    }
+    const viewOnlyLabel = VIEW_ONLY_BLOCK_LABELS[name];
+    if (viewOnlyLabel) return [{ id: name, label: t(viewOnlyLabel) }];
+    return [];
+  });
+  if (view === 'documents') {
+    options.push(IMPORT_FILE_OPTION);
+    options.push(IMPORT_FOLDER_OPTION);
+  }
+  if (view === 'folders') {
+    options.push(IMPORT_FOLDER_OPTION);
+  }
+  if (view === 'companies') {
+    options.push(CREATE_COMPANY_OPTION);
+  }
+  return options;
+}
+
+function CreateOptionIcon(props: { id: CreateOption['id'] }) {
+  return (
+    <Show
+      when={props.id !== 'import-file' && props.id !== 'import-folder'}
+      fallback={<UploadIcon class="size-3.5" />}
+    >
+      <Show
+        when={props.id !== 'create-company'}
+        fallback={<BuildingsIcon class="size-3.5" />}
+      >
+        <EntityIcon
+          targetType={props.id as BlockName}
+          size="xs"
+          class="touch:size-6"
+        />
+      </Show>
+    </Show>
+  );
+}
+
+export const SoupViewCreateButton = () => {
+  const runCreateAction = useCreateAction();
+  const panel = useSplitPanelOrThrow();
+  const handleFileUpload = useHandleFileUpload();
+  const isCreatableEnabled = useCreatableEnabled();
+  const _soupView = useMaybeSoupView();
+
+  const currentView = createMemo(() => {
+    const content = panel.handle.content();
+    if (content.type !== 'component') return undefined;
+    return isListViewID(content.id) ? content.id : undefined;
+  });
+
+  // The inbox's Reminders tab is not a ListView of its own, but it offers the
+  // same create button the standalone Reminders view does — a reminder is the
+  // one thing you make from that list rather than triage into it.
+  const createView = createMemo(() => {
+    const view = currentView();
+    return view;
+  });
+
+  const options = createMemo<CreateOption[]>(() => {
+    const view = createView();
+    if (!view) return [];
+    return getViewCreateOptions(view, isCreatableEnabled);
+  });
+  const createLabel = createMemo(() => {
+    const view = createView();
+    const label = view ? VIEW_CREATE_LABELS[view] : undefined;
+    return t(label ?? 'create.create');
+  });
+
+  const handleSelect = (option: CreateOption) => {
+    if (currentView() === 'channels' && option.id === 'channel') {
+      openNewChannelModal();
+      return;
+    }
+    if (option.id === 'create-company') {
+      openCreateCompanyModal();
+      return;
+    }
+    if (option.id === 'import-file') {
+      openFilePicker({ multiple: true }, async (files) => {
+        await handleFileUpload(files, false);
+      });
+      return;
+    }
+    if (option.id === 'import-folder') {
+      openFolderPicker({}, async (files) => {
+        await handleFolderSelect(files, async (fileEntries) => {
+          await handleFileUpload(fileEntries, false);
+        });
+      });
+      return;
+    }
+    runCreateAction(option.id);
+  };
+
+  const SingleOptionButton = () => (
+    <ViewCreateButton
+      presentation="toolbar"
+      aria-label={createLabel()}
+      onClick={() => handleSelect(options()[0])}
+    />
+  );
+
+  const MultiOptionButton = () => (
+    <Dropdown placement="bottom-end">
+      <Dropdown.Trigger
+        as={ViewCreateButton}
+        presentation="toolbar"
+        menu
+        aria-label={createLabel()}
+      />
+      <Dropdown.Content>
+        <Dropdown.Group>
+          <For each={options()}>
+            {(item) => (
+              <Dropdown.Item onSelect={() => handleSelect(item)}>
+                <span class="size-3.5 flex items-center justify-center shrink-0 text-ink-muted">
+                  <CreateOptionIcon id={item.id} />
+                </span>
+                <span class="flex-1 truncate text-ink-muted">{item.label}</span>
+              </Dropdown.Item>
+            )}
+          </For>
+        </Dropdown.Group>
+      </Dropdown.Content>
+    </Dropdown>
+  );
+
+  return (
+    <>
+      <Show when={currentView() === 'calls'}>
+        <NewCallButton />
+      </Show>
+      <Show when={options().length > 0}>
+        <Show when={options().length > 1} fallback={<SingleOptionButton />}>
+          <MultiOptionButton />
+        </Show>
+      </Show>
+    </>
+  );
+};

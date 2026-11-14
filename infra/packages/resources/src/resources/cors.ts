@@ -1,0 +1,58 @@
+import { stack } from '../../../shared';
+
+const PROD_LOCAL_ORIGINS = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://localhost:3003',
+  'http://localhost:3004',
+  'http://localhost:3005',
+  'http://localhost:3006',
+  'http://localhost:3007',
+  'http://localhost:3008',
+  'http://localhost:3009',
+  'https://localhost:3000',
+  'https://localhost:3001',
+  'https://localhost:3002',
+  'https://localhost:3003',
+  'https://localhost:3004',
+  'https://localhost:3005',
+  'https://localhost:3006',
+  'https://localhost:3007',
+  'https://localhost:3008',
+  'https://localhost:3009',
+];
+
+// Browsers upload straight to presigned S3 URLs, so a local frontend on any
+// port needs CORS against non-prod buckets.
+const NON_PROD_LOCAL_ORIGINS = ['http://localhost:*', 'https://localhost:*'];
+
+const SHARED_ORIGINS = [
+  'http://host.local:3000',
+  'https://app-dev.macro.com',
+  'https://app-staging.macro.com',
+  'https://app-prod.macro.com',
+  'https://app.macro.com',
+  'https://dev.macro.com',
+  'https://chat-dev.macro.com',
+  'https://chat.macro.com',
+  'https://staging.macro.com',
+  'https://prod.macro.com',
+  'https://www.macro.com',
+  'https://macro.com',
+  'https://website-dev.macro.com',
+  'https://website-staging.macro.com',
+  'https://website-prod.macro.com',
+  'https://apollo-testing.macro.com',
+  // S3 CORS supports a single wildcard in AllowedOrigin. This lets feature
+  // preview apps (for example, https://branch.preview.macro.com) load
+  // presigned S3 media such as call recordings.
+  'https://*.preview.macro.com',
+  'tauri://localhost',
+];
+
+/** Browser origins allowed by S3 bucket CORS rules on the current Pulumi stack. */
+export const ALLOWED_ORIGINS = [
+  ...(stack === 'prod' ? PROD_LOCAL_ORIGINS : NON_PROD_LOCAL_ORIGINS),
+  ...SHARED_ORIGINS,
+];

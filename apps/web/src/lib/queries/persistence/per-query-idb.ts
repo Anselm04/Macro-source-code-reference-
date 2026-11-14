@@ -1,0 +1,213 @@
+import { fireAndForget } from '@core/util/fireAndForget';
+import type { QueryKey } from '@tanstack/query-core';
+import { RecoverableIDB } from '../../persistence/recoverable-idb';
+
+export type PersistedQueryEntry = Readonly<{
+  queryHash: string;
+  queryKey: QueryKey;
+  data: unknown;
+  dataUpdatedAt: number;
+  persistedAt: number;
+  buster: string;
+}>;
+
+export type PerQueryPersistence = {
+  get: (queryHash: string) => Promise<PersistedQueryEntry | undefined>;
+  set: (entry: PersistedQueryEntry) => void;
+  remove: (queryHash: string) => void;
+  /** Delete every stored entry `keep` rejects. */
+  prune: (keep: (entry: PersistedQueryEntry) => boolean) => Promise<void>;
+  flush: (options?: { throwOnError?: boolean }) => Promise<void>;
+};
+
+export type ClearablePerQueryPersistence = PerQueryPersistence & {
+  /** Clear durable entries and fence pending/in-flight writes. */
+  clear: () => Promise<void>;
+};
+
+type PerQueryPersistenceOptions = Readonly<{
+  dbName: string;
+  debounceMs?: number;
+}>;
+
+const STORE_NAME = 'queries';
+const DEFAULT_DEBOUNCE_MS = 1000;
+
+const dbCache = new Map<string, RecoverableIDB>();
+
+function database(dbName: string): RecoverableIDB {
+  const cached = dbCache.get(dbName);
+  if (cached) return cached;
+  const db = new RecoverableIDB(dbName, 1, (db) => {
+    db.createObjectStore(STORE_NAME);
+  });
+  dbCache.set(dbName, db);
+  return db;
+}
+
+async function withStore<T>(
+  dbName: string,
+  mode: IDBTransactionMode,
+  fn: (store: IDBObjectStore) => IDBRequest<T>
+): Promise<T> {
+  const tx = await database(dbName).transaction(STORE_NAME, mode);
+  return new Promise<T>((resolve, reject) => {
+    const store = tx.objectStore(STORE_NAME);
+    const req = fn(store);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+export function createPerQueryIDBStore(
+  options: PerQueryPersistenceOptions
+): ClearablePerQueryPersistence {
+  const { dbName } = options;
+  const debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
+
+  const pendingPuts = new Map<string, PersistedQueryEntry>();
+  const pendingDeletes = new Set<string>();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let generation = 0;
+  let writes: Promise<void> = Promise.resolve();
+
+  async function settle(operation: Promise<unknown>): Promise<void> {
+    try {
+      await operation;
+    } catch {
+      // The caller handles failures; later transactions must still run.
+    }
+  }
+
+  function enqueueWrite(operation: () => Promise<void>): Promise<void> {
+    const previous = writes;
+    const next = (async () => {
+      await previous;
+      await operation();
+    })();
+    writes = settle(next);
+    return next;
+  }
+
+  const flush = async (throwOnError = false) => {
+    const currentGeneration = generation;
+    const puts = new Map(pendingPuts);
+    const deletes = new Set(pendingDeletes);
+    pendingPuts.clear();
+    pendingDeletes.clear();
+
+    if (puts.size === 0 && deletes.size === 0) return;
+
+    try {
+      await enqueueWrite(async () => {
+        const tx = await database(dbName).transaction(STORE_NAME, 'readwrite');
+        if (generation !== currentGeneration) return;
+        const store = tx.objectStore(STORE_NAME);
+
+        for (const [hash, entry] of puts) {
+          store.put(entry, hash);
+        }
+        for (const hash of deletes) {
+          store.delete(hash);
+        }
+
+        await new Promise<void>((resolve, reject) => {
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+        });
+      });
+    } catch (err) {
+      if (generation !== currentGeneration) return;
+      for (const [hash, entry] of puts) {
+        if (!pendingPuts.has(hash)) pendingPuts.set(hash, entry);
+      }
+      for (const hash of deletes) {
+        if (!pendingPuts.has(hash)) pendingDeletes.add(hash);
+      }
+      console.error('[query] IDB persistence flush failed', err);
+      if (throwOnError) throw err;
+    }
+  };
+
+  const scheduleFlush = () => {
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      fireAndForget(flush(), 'query-persistence');
+    }, debounceMs);
+  };
+
+  return {
+    get: async (queryHash) => {
+      await writes;
+      return withStore<PersistedQueryEntry | undefined>(
+        dbName,
+        'readonly',
+        (store) => store.get(queryHash)
+      );
+    },
+
+    set: (entry) => {
+      pendingDeletes.delete(entry.queryHash);
+      pendingPuts.set(entry.queryHash, entry);
+      scheduleFlush();
+    },
+
+    remove: (queryHash) => {
+      pendingPuts.delete(queryHash);
+      pendingDeletes.add(queryHash);
+      scheduleFlush();
+    },
+
+    prune: (keep) => {
+      const currentGeneration = generation;
+      return enqueueWrite(async () => {
+        const tx = await database(dbName).transaction(STORE_NAME, 'readwrite');
+        if (generation !== currentGeneration) return;
+        const cursorRequest = tx.objectStore(STORE_NAME).openCursor();
+        cursorRequest.onsuccess = () => {
+          const cursor = cursorRequest.result;
+          if (!cursor) return;
+          if (!keep(cursor.value as PersistedQueryEntry)) cursor.delete();
+          cursor.continue();
+        };
+
+        await new Promise<void>((resolve, reject) => {
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+        });
+      });
+    },
+
+    flush: async (options) => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      // Background failures requeue their writes before this barrier retries them.
+      if (options?.throwOnError) await writes;
+      await flush(options?.throwOnError);
+      await writes;
+    },
+
+    clear: async () => {
+      generation += 1;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      pendingPuts.clear();
+      pendingDeletes.clear();
+      await enqueueWrite(async () => {
+        const tx = await database(dbName).transaction(STORE_NAME, 'readwrite');
+        tx.objectStore(STORE_NAME).clear();
+        await new Promise<void>((resolve, reject) => {
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+        });
+      });
+    },
+  };
+}

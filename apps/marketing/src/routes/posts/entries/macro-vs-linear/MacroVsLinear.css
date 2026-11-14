@@ -1,0 +1,19 @@
+/* Article typography must not leak into the shared product UI. */
+@scope (:root) to (.post-product-ui) {
+.linear-post .mvn-graphic-frame {
+  background: transparent;
+  border-color: #292929;
+  border-radius: 12px;
+  padding: 0;
+}
+
+.linear-post .mvn-graphic-frame::before {
+  content: none;
+}
+
+.linear-post .mvn-graphic-inner {
+  border: 0;
+  border-radius: inherit;
+}
+
+}

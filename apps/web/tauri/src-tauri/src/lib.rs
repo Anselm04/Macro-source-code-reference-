@@ -1,0 +1,817 @@
+use device::{IsIpad, detect_is_ipad, is_ipad};
+use logger::Logger;
+use macro_bundle_updater_plugin::domain::{
+    asset_service::BundleAssetResolver, bundle_routes::BundleRoutes,
+};
+#[cfg(feature = "auto_apply_update")]
+use macro_bundle_updater_plugin::inbound::plugin::apply_completed_update_from;
+#[cfg(mobile)]
+use macro_bundle_updater_plugin::inbound::plugin::retry_waiting_for_wifi;
+#[cfg(all(mobile, feature = "auto_apply_update"))]
+use macro_bundle_updater_plugin::inbound::plugin::{allow_update_reload_retry, start_update_check};
+use macro_bundle_updater_plugin::outbound::fs::FileSystem;
+use navigation_plugin::scheme::MacroScheme;
+use navigation_plugin::{MacroNavigationPlugin, NavigatePayload};
+use reqwest::cookie::CookieStore;
+use reqwest::header::{COOKIE, ORIGIN};
+use rootcause::{Report, report};
+use share_target::{
+    PendingShareFilesState, clear_shared_files, get_pending_share_filenames, is_share_deep_link,
+    maybe_handle_share_deep_link, pop_shared_files, read_shared_file_text,
+};
+use staged_upload::cleanup_stale_staged_files;
+use tauri::http::{HeaderMap, HeaderValue};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime};
+
+#[cfg(target_os = "android")]
+mod android_tls;
+mod tauri_protocol;
+
+pub(crate) const APP_SCHEME: &str = "macro";
+use tauri_plugin_deep_link::DeepLinkExt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use url::Url;
+
+#[cfg(desktop)]
+mod desktop;
+mod desktop_update;
+mod device;
+mod diagnostics;
+#[cfg(target_os = "linux")]
+mod linux_notification;
+mod logging;
+#[cfg(target_os = "macos")]
+mod macos_notification_permission;
+#[cfg(feature = "cef")]
+pub mod screen_capture;
+mod share_target;
+mod staged_upload;
+mod whatsapp_passkey;
+#[cfg(desktop)]
+mod window_state;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppEnvironment {
+    Development,
+    Production,
+}
+
+impl AppEnvironment {
+    fn current() -> Self {
+        match env!("MACRO_TAURI_APP_ENV") {
+            "development" => Self::Development,
+            "production" => Self::Production,
+            other => unreachable!("invalid MACRO_TAURI_APP_ENV: {other}"),
+        }
+    }
+
+    fn auth_service_url(self) -> &'static str {
+        match self {
+            Self::Development => "https://dev-gateway.macro.com/auth/",
+            Self::Production => "https://gateway.macro.com/auth/",
+        }
+    }
+
+    fn bundle_update_base_url(self) -> &'static str {
+        option_env!("MACRO_BUNDLE_UPDATE_BASE_URL")
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| self.auth_service_url())
+    }
+
+    fn web_origin(self) -> &'static str {
+        match self {
+            Self::Development => "https://dev.macro.com",
+            Self::Production => "https://macro.com",
+        }
+    }
+}
+
+fn embedded_bundle_build() -> u64 {
+    env!("MACRO_EMBEDDED_BUNDLE_BUILD")
+        .parse()
+        .expect("MACRO_EMBEDDED_BUNDLE_BUILD must be an unsigned integer")
+}
+
+/// When this native binary was compiled, in Unix milliseconds. Unlike the
+/// JavaScript build time, OTA bundle updates do not change it.
+#[tauri::command]
+fn get_native_build_time() -> u64 {
+    env!("MACRO_NATIVE_BUILD_TIME_MS")
+        .parse()
+        .expect("MACRO_NATIVE_BUILD_TIME_MS must be an unsigned integer")
+}
+
+/// This module provides debuging utilities and should not be compiled in prodiction builds
+#[cfg(debug_assertions)] // do not remove this
+mod debug;
+
+/// domains which the tauri webview can render.
+/// This should be as restrictive as possible.
+/// If the webview attempts to naviate to other domains,
+/// they will be opened in the systems default browser
+static ALLOWED_DOMAINS: &[&str] = &[
+    "https://tauri.localhost",
+    "http://tauri.localhost",
+    "tauri://localhost",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:3002",
+    "http://localhost:3003",
+    "http://localhost:3004",
+    "http://localhost:3005",
+    "http://localhost:3006",
+    "http://localhost:3007",
+    "http://localhost:3008",
+    "http://localhost:3009",
+];
+
+/// Third-party pages the SPA renders in an iframe. Keep in sync with
+/// `CONNECT_UI_URL` in `apps/web/src/lib/core/pipedream/connect-ui.ts`.
+static EMBEDDED_DOCUMENTS: &[&str] = &["https://pipedream.com/_static/connect.html"];
+
+/// hosts whose `/app` urls are Macro app links. Main-frame navigations to
+/// these are routed through the SPA router instead of loading the remote
+/// site in the webview. Keep in parity with the deep-link hosts in
+/// tauri.conf.json.
+static APP_LINK_HOSTS: &[&str] = &["macro.com", "dev.macro.com", "staging.macro.com"];
+
+type Type = std::sync::OnceLock<
+    Box<dyn Fn(&str, http::Request<Vec<u8>>, tauri::UriSchemeResponder) + Send + Sync + 'static>,
+>;
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    run_with(tauri::Builder::default(), configured_window);
+}
+
+/// The startup window as configured, for runtimes without extra window options.
+fn configured_window<'a>(
+    window: tauri::WebviewWindowBuilder<'a, AppRuntime, AppHandle<AppRuntime>>,
+) -> tauri::WebviewWindowBuilder<'a, AppRuntime, AppHandle<AppRuntime>> {
+    window
+}
+
+/// The runtime type behind the default `tauri::Builder`: wry everywhere, except
+/// the macOS Chromium build, whose Tauri selects the runtime at startup.
+#[cfg(not(feature = "cef"))]
+pub type AppRuntime = tauri::Wry;
+#[cfg(feature = "cef")]
+pub type AppRuntime = tauri::DynRuntime;
+
+/// Applies runtime-specific options to each startup window before it is built.
+pub type ConfigureWindow =
+    for<'a> fn(
+        tauri::WebviewWindowBuilder<'a, AppRuntime, AppHandle<AppRuntime>>,
+    ) -> tauri::WebviewWindowBuilder<'a, AppRuntime, AppHandle<AppRuntime>>;
+
+/// Runs the app on a builder whose webview runtime is already selected.
+/// `desktop-cef` passes a Chromium builder and its window options; every other
+/// build calls [`run`].
+pub fn run_with(builder: tauri::Builder<AppRuntime>, configure_window: ConfigureWindow) {
+    use tracing_subscriber::EnvFilter;
+
+    #[cfg(mobile)]
+    let _ = configure_window;
+
+    let diagnostics = diagnostics::Diagnostics::from_launch();
+    let recording = diagnostics.is_recording();
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| logging::default_filter(cfg!(debug_assertions)));
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_file(true)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .with_line_number(true)
+        .pretty();
+
+    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    #[cfg(target_os = "ios")]
+    let registry = registry.with(tracing_oslog::OsLogger::new(
+        "com.macro.app.prod",
+        "default",
+    ));
+
+    registry.init();
+
+    // UIKit must be queried on the main thread, and `run()` is called straight
+    // from `main()` (`ffi::start_app()` on iOS), so this is it. The idiom never
+    // changes at runtime, so a one-shot snapshot is enough.
+    let is_ipad_device = detect_is_ipad();
+
+    let embedded_bundle_build = embedded_bundle_build();
+    let bundle_routes = BundleRoutes::new(embedded_bundle_build);
+    let bundle_asset_resolver = BundleAssetResolver::new(bundle_routes.clone(), FileSystem);
+    let context = tauri::generate_context!();
+    #[cfg(desktop)]
+    let (context, startup_windows) = {
+        let mut context = context;
+        // Install the popup handler before the first page loads. Leave mobile
+        // window creation to Tauri and preserve all configured window options.
+        let mut windows = Vec::new();
+        for config in &mut context.config_mut().app.windows {
+            if config.create {
+                windows.push(config.clone());
+                config.create = false;
+            }
+        }
+        (context, windows)
+    };
+    let navigation = MacroNavigationPlugin::new(ALLOWED_DOMAINS)
+        .expect("Domains must be valid urls")
+        .with_app_link_hosts(APP_LINK_HOSTS)
+        .with_embedded_documents(EMBEDDED_DOCUMENTS)
+        .expect("Embedded documents must be valid urls");
+    let mut builder = builder;
+
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    {
+        let on_terminate = |webview: &tauri::Webview<AppRuntime>| {
+            tracing::warn!(webview = %webview.label(), "WebContent process terminated; reloading");
+            if let Some(state) = webview.try_state::<diagnostics::Diagnostics>() {
+                let _ = state.record_web_content_termination().inspect_err(|error| {
+                    tracing::warn!(%error, "Failed to record WebContent termination");
+                });
+            }
+            // Preserve Tauri's default recovery, but retain the cause in the
+            // native process so the replacement document can report it.
+            let _ = webview.reload().inspect_err(|error| {
+                tracing::error!(%error, "Failed to reload terminated WebContent process");
+            });
+        };
+        #[cfg(feature = "cef")]
+        {
+            builder = builder
+                .on_web_content_process_terminate(move |webview, _details| on_terminate(webview));
+        }
+        #[cfg(not(feature = "cef"))]
+        {
+            builder = builder.on_web_content_process_terminate(on_terminate);
+        }
+    }
+
+    #[cfg(desktop)]
+    {
+        // single instance plugin should always be the first registered
+        tracing::debug!("register single instance plugin");
+        builder = builder
+            .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+                tracing::debug!("single instance callback with argv: {argv:?}");
+                desktop::main_window::reveal(app);
+            }))
+            .plugin(window_state::plugin());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder
+            .manage(linux_notification::LinuxNotifications::default())
+            .on_window_event(|window, event| {
+                if matches!(event, tauri::WindowEvent::Destroyed) {
+                    window
+                        .state::<linux_notification::LinuxNotifications>()
+                        .close_window(window.label());
+                }
+            });
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+        builder = builder
+            .plugin(tauri_plugin_auth::init())
+            .plugin(tauri_plugin_virtual_keyboard::init())
+            .plugin(tauri_plugin_edit_menu::init())
+            .plugin(tauri_plugin_file_export::init())
+            .plugin(tauri_plugin_input_accessory::init())
+            .plugin(tauri_plugin_network_status::init())
+            .plugin(tauri_plugin_pasteboard::init())
+            .plugin(tauri_plugin_photo_library::init())
+            .plugin(tauri_plugin_call_kit::init());
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        builder = builder
+            .plugin(tauri_plugin_android_auth::init())
+            .plugin(tauri_plugin_android_mobile::init())
+            .plugin(tauri_plugin_android_push::init())
+            .plugin(tauri_plugin_call_kit::init())
+            .plugin(tauri_plugin_network_status::init());
+    }
+
+    // register the rest of the common plugins
+    // The log plugin with "tracing" feature emits tracing::event! directly,
+    // so logs from the webview will go through our tracing subscriber
+    builder = builder
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Debug)
+                .skip_logger() // Don't set up log crate logger, we only want the tracing events
+                .build(),
+        )
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_device_info::init())
+        .plugin(tauri_plugin_http::init_with_cookie_store_dir(
+            "$APPLOCALDATA",
+        ))
+        .plugin(
+            tauri_plugin_websocket::Builder::new()
+                .merge_header_callback(Box::new(merge_header_callback))
+                .build(),
+        )
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                // Desktop handles actual webview navigation, not bubbling DOM
+                // clicks. Mobile does not support Tauri's on_new_window hook.
+                .open_js_links_on_click(cfg!(mobile))
+                .build(),
+        )
+        .plugin(navigation.clone())
+        .manage(navigation.clone())
+        .plugin(
+            macro_bundle_updater_plugin::inbound::plugin::MacroBundleUpdaterPlugin::new(
+                AppEnvironment::current()
+                    .bundle_update_base_url()
+                    .parse()
+                    .expect("valid url"),
+                embedded_bundle_build,
+                bundle_routes.clone(),
+            )
+            // Builds without this feature (just ios-dev, ios-build-no-update)
+            // must never check for or apply OTA bundles on their own; manual
+            // checks from settings still work.
+            .with_auto_update(cfg!(feature = "auto_apply_update") && !recording),
+        );
+
+    #[cfg(target_os = "ios")]
+    {
+        // Both notification plugins assign UNUserNotificationCenter.delegate.
+        // Initialize push last: the local-notification delegate ignores remote
+        // pushes, so leaving it installed drops taps before frontend navigation.
+        builder = builder.plugin(tauri_plugin_notifications::init());
+    }
+
+    #[cfg(mobile)]
+    {
+        // register mobile specific plugins
+        builder = builder.plugin(tauri_plugin_haptics::init());
+    }
+
+    // Window origin differs by platform:
+    // macOS/iOS/Linux: tauri://localhost
+    // Windows/Android: https://tauri.localhost (or http://)
+    // Chromium (the `cef` feature): http://tauri.localhost
+    let window_origin = if cfg!(feature = "cef") {
+        "http://tauri.localhost"
+    } else if cfg!(any(target_os = "windows", target_os = "android")) {
+        "https://tauri.localhost"
+    } else {
+        "tauri://localhost"
+    };
+
+    let app = builder
+        .register_asynchronous_uri_scheme_protocol("tauri", {
+            // Build this outside the closure so we only create it once.
+            // We need the AppHandle which isn't available until setup, but
+            // register_asynchronous_uri_scheme_protocol gives us UriSchemeContext.
+            // However, tauri_protocol::get needs AppHandle upfront.
+            // Use a lazy init pattern via the context.
+            let window_origin = window_origin.to_string();
+            let handler: Type = std::sync::OnceLock::new();
+
+            move |ctx, request, responder| {
+                let h = handler.get_or_init(|| {
+                    let app = ctx.app_handle();
+                    tauri_protocol::get(app.clone(), &window_origin, bundle_asset_resolver.clone())
+                });
+                h(ctx.webview_label(), request, responder);
+            }
+        })
+        .manage(PendingShareFilesState::default())
+        .manage(DeepLinkDelivery::default())
+        .manage(graphql_cache_plugin::CacheState::default())
+        .manage(IsIpad(is_ipad_device))
+        .invoke_handler(tauri::generate_handler![
+            whatsapp_passkey::whatsapp_passkey_authenticate,
+            desktop_update::get_native_update_status,
+            desktop_update::restart_native_update,
+            diagnostics::read_desktop_diagnostics,
+            diagnostics::record_frontend_diagnostic,
+            open_external_url,
+            #[cfg(target_os = "linux")]
+            linux_notification::send_linux_notification,
+            #[cfg(target_os = "linux")]
+            linux_notification::close_linux_notification,
+            #[cfg(target_os = "macos")]
+            macos_notification_permission::get_macos_notification_permission,
+            #[cfg(target_os = "macos")]
+            macos_notification_permission::request_macos_notification_permission,
+            #[cfg(target_os = "macos")]
+            macos_notification_permission::send_macos_notification,
+            #[cfg(feature = "cef")]
+            screen_capture::list_screen_capture_sources,
+            #[cfg(feature = "cef")]
+            screen_capture::request_screen_capture_access,
+            #[cfg(feature = "cef")]
+            screen_capture::allow_screen_capture,
+            graphql_cache_plugin::commands::graphql_cache_init,
+            graphql_cache_plugin::commands::graphql_cache_init_with_schema,
+            graphql_cache_plugin::commands::graphql_cache_current_revision,
+            graphql_cache_plugin::commands::graphql_cache_current_storage_generation,
+            graphql_cache_plugin::commands::graphql_cache_read,
+            graphql_cache_plugin::commands::graphql_cache_watch,
+            graphql_cache_plugin::commands::graphql_cache_read_records_by_keys,
+            graphql_cache_plugin::commands::graphql_cache_search,
+            graphql_cache_plugin::commands::graphql_cache_people_context,
+            graphql_cache_plugin::commands::graphql_cache_people_update,
+            graphql_cache_plugin::commands::graphql_cache_people_search,
+            graphql_cache_plugin::commands::graphql_cache_people_resolve_references,
+            graphql_cache_plugin::commands::graphql_cache_people_read_sql,
+            graphql_cache_plugin::commands::graphql_cache_contact_snapshot,
+            graphql_cache_plugin::commands::graphql_cache_contact_reconcile,
+            graphql_cache_plugin::commands::graphql_cache_entity_filter,
+            graphql_cache_plugin::commands::graphql_cache_entity_filter_resume,
+            graphql_cache_plugin::commands::graphql_cache_calendar_range,
+            graphql_cache_plugin::commands::graphql_cache_calendar_commit,
+            graphql_cache_plugin::commands::graphql_cache_write,
+            graphql_cache_plugin::commands::graphql_cache_hydrate,
+            graphql_cache_plugin::commands::graphql_cache_hydrate_scoped,
+            graphql_cache_plugin::commands::graphql_cache_enqueue_optimistic_mutation,
+            graphql_cache_plugin::commands::graphql_cache_inspect_mutations,
+            graphql_cache_plugin::commands::graphql_cache_inspect_query_variants,
+            graphql_cache_plugin::commands::graphql_cache_inspect_query,
+            graphql_cache_plugin::commands::graphql_cache_claim_next_mutation,
+            graphql_cache_plugin::commands::graphql_cache_defer_optimistic_write,
+            graphql_cache_plugin::commands::graphql_cache_commit_optimistic_write,
+            graphql_cache_plugin::commands::graphql_cache_rollback_optimistic_write,
+            graphql_cache_plugin::commands::graphql_cache_invalidate,
+            graphql_cache_plugin::commands::graphql_cache_delete_records,
+            graphql_cache_plugin::commands::graphql_cache_teardown,
+            graphql_cache_plugin::commands::graphql_cache_clear,
+            macro_bundle_updater_plugin::inbound::plugin::grant_bundle_update,
+            macro_bundle_updater_plugin::inbound::plugin::perform_update,
+            macro_bundle_updater_plugin::inbound::plugin::ack_bundle_update_reload,
+            macro_bundle_updater_plugin::inbound::plugin::set_bundle_reload_hold,
+            macro_bundle_updater_plugin::inbound::plugin::check_for_update,
+            macro_bundle_updater_plugin::inbound::plugin::get_bundle_debug_info,
+            macro_bundle_updater_plugin::inbound::plugin::get_bundle_update_status,
+            macro_bundle_updater_plugin::inbound::plugin::clear_bundle,
+            is_ipad,
+            get_native_build_time,
+            get_pending_share_filenames,
+            pop_shared_files,
+            clear_shared_files,
+            read_shared_file_text,
+            flush_launch_deep_link,
+            staged_upload::upload_staged_file_to_presigned_url,
+            #[cfg(desktop)]
+            desktop::macrod::macrod_support,
+            #[cfg(desktop)]
+            desktop::macrod::macrod_detect_agents,
+            #[cfg(desktop)]
+            desktop::macrod::macrod_inspect,
+            #[cfg(desktop)]
+            desktop::macrod::macrod_start,
+            #[cfg(desktop)]
+            desktop::macrod::macrod_stop,
+            #[cfg(desktop)]
+            desktop::macrod::macrod_status,
+            #[cfg(desktop)]
+            desktop::pasteboard::stage_desktop_pasteboard_files,
+        ])
+        .setup(move |app| {
+            #[cfg(desktop)]
+            {
+                let windows = desktop::main_window::StartupWindows::new(
+                    startup_windows,
+                    navigation.clone(),
+                    configure_window,
+                );
+                desktop::main_window::create_all(app.handle(), &windows)?;
+                app.manage(windows);
+            }
+            #[cfg(desktop)]
+            desktop_update::setup(app, recording)?;
+            diagnostics::setup(app, diagnostics);
+            #[cfg(any(target_os = "linux", all(windows, debug_assertions)))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                app.deep_link()
+                    .register_all()
+                    .inspect(|_| tracing::debug!("attached scheme handler"))
+                    .log_and_consume();
+            }
+
+            app.chain(attach_deep_link_handler);
+            cleanup_stale_staged_files(&app.handle());
+            #[cfg(desktop)]
+            {
+                app.manage(desktop::macrod::MacrodState::default());
+                desktop::macrod::autostart(&app.handle());
+            }
+
+            Ok(())
+        })
+        .build(context)
+        .expect("error while building tauri application");
+    // Install before the event loop finishes launching the app: macOS can
+    // deliver the notification response that launched it before setup runs.
+    #[cfg(target_os = "macos")]
+    macos_notification_permission::install_delegate(app.handle());
+    app.run(move |app_handle, event| match &event {
+        RunEvent::Ready if !recording => {
+            #[cfg(feature = "auto_apply_update")]
+            {
+                let app = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    match apply_completed_update_from(&app, "run_event_ready").await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!("Failed to auto-apply bundle update on ready: {e}");
+                        }
+                    }
+                });
+            }
+        }
+        // Tao 0.37 delivers mobile foreground transitions per window, not
+        // through the top-level event-loop Resumed event or focus changes.
+        #[cfg(mobile)]
+        RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Resumed,
+            ..
+        } => {
+            tracing::debug!(window_label = %label, "mobile window resumed");
+            if let Some(state) = app_handle.try_state::<diagnostics::Diagnostics>() {
+                state.record_native_event(diagnostics::events::NativeEvent::Foreground);
+            }
+            let app = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = retry_waiting_for_wifi(&app).await {
+                    tracing::warn!("Failed to retry bundle update Wi-Fi wait on resume: {e}");
+                }
+            });
+            #[cfg(feature = "auto_apply_update")]
+            {
+                let app = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = allow_update_reload_retry(&app).await {
+                        tracing::warn!("Failed to allow bundle update reload retry on resume: {e}");
+                    }
+                    match apply_completed_update_from(&app, "run_event_resumed").await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if let Err(e) = start_update_check(&app).await {
+                                tracing::error!(
+                                    "Failed to start bundle update check on resume: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to auto-apply bundle update: {e}");
+                        }
+                    }
+                });
+            }
+        }
+        #[cfg(mobile)]
+        RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Suspended,
+            ..
+        } => {
+            if let Some(state) = app_handle.try_state::<diagnostics::Diagnostics>() {
+                state.record_native_event(diagnostics::events::NativeEvent::Background);
+            }
+        }
+        #[cfg(desktop)]
+        RunEvent::ExitRequested { api, .. } => {
+            window_state::save(app_handle);
+            desktop_update::on_exit_requested(app_handle, api)
+        }
+        RunEvent::Exit => {
+            #[cfg(desktop)]
+            if let Some(state) = app_handle.try_state::<desktop::macrod::MacrodState>() {
+                // The daemon also exits on its own when its stdin pipe
+                // closes with this process; the kill is the fast path.
+                desktop::macrod::kill_now(&state);
+            }
+            if let Some(state) = app_handle.try_state::<graphql_cache_plugin::CacheState>() {
+                state
+                    .shutdown()
+                    .inspect_err(
+                        |error| tracing::error!(error=?error, "failed to close graphql cache"),
+                    )
+                    .ok();
+            }
+        }
+        _ => {}
+    });
+}
+
+/// fn to merge the headers from the http cookie store into the initial
+/// GET request to open a websocket
+fn merge_header_callback<R: Runtime>(url: String, headers: &mut HeaderMap, handle: &AppHandle<R>) {
+    let Ok(mut parsed_url) = Url::parse(&url) else {
+        return;
+    };
+
+    // These services (including the macroverse.workers.dev sync service) validate
+    // Origin for auth, so set it to our web origin unconditionally — independent of
+    // whether cookie state is available.
+    match parsed_url.host_str() {
+        Some("services.macro.com")
+        | Some("services-dev.macro.com")
+        | Some("macroverse.workers.dev") => {
+            headers.insert(
+                ORIGIN,
+                HeaderValue::from_static(AppEnvironment::current().web_origin()),
+            );
+        }
+        _ => {}
+    }
+
+    // Cookie forwarding requires the HTTP plugin's cookie jar.
+    let Some(s) = handle.try_state::<tauri_plugin_http::Http>() else {
+        return;
+    };
+    parsed_url
+        .set_scheme(match parsed_url.scheme() {
+            "ws" => "http",
+            _ => "https",
+        })
+        .ok();
+    tracing::trace!("checking cookies for {parsed_url}");
+
+    if let Some(cookie) = s.inner().cookies_jar.as_ref().cookies(&parsed_url) {
+        tracing::trace!("inserting cookie value for {parsed_url}");
+        headers.insert(COOKIE, cookie);
+    }
+}
+
+trait AppChain {
+    fn chain(&mut self, f: impl FnOnce(&mut Self)) -> &mut Self;
+}
+
+impl AppChain for tauri::App {
+    fn chain(&mut self, f: impl FnOnce(&mut Self)) -> &mut Self {
+        f(self);
+        self
+    }
+}
+
+/// Buffers deep links until the frontend can receive them. `on_open_url`
+/// starts firing during startup, before the webview has registered its
+/// `navigate` listener, so an early link would be emitted into the void; it is
+/// held here instead (latest wins) and delivered when the frontend signals
+/// readiness by calling `flush_launch_deep_link`. After that, links emit
+/// directly.
+#[derive(Default)]
+struct DeepLinkDelivery {
+    launch: std::sync::Mutex<LaunchState>,
+}
+
+#[derive(Default)]
+enum LaunchState {
+    /// Frontend `navigate` listener not registered yet; no link has arrived.
+    #[default]
+    NotReady,
+    /// Frontend listener not registered yet and a link arrived; held for the
+    /// flush (latest wins).
+    PendingNavigation(Url),
+    /// Frontend is ready; links emit directly.
+    Ready,
+}
+
+/// Opens a URL from `openExternalUrl` on desktop through the navigation
+/// policy, without a popup request (which WebKitGTK drops once the click's
+/// user gesture has expired) or a page navigation (which runs `beforeunload`).
+/// Returns false when the page must open it as a popup itself.
+#[tauri::command]
+fn open_external_url(
+    app: AppHandle<AppRuntime>,
+    navigation: tauri::State<'_, MacroNavigationPlugin>,
+    url: Url,
+) -> bool {
+    navigation.open_external(&app, &url)
+}
+
+/// Convert a deep link url into a `navigate` event for the frontend router.
+#[tracing::instrument(err, skip(handle, url))]
+fn emit_navigate_for_deep_link(url: Url, handle: &AppHandle) -> Result<(), Report> {
+    // Auth callbacks belong exclusively to the native browser session. They
+    // must not reach SPA routing or application logs, even via an explicit intent.
+    if url.scheme() == APP_SCHEME && url.host_str() == Some("android-auth") {
+        return Ok(());
+    }
+    // Universal/App links come in as https:// URLs, custom scheme links come in as macro://
+    let macro_scheme = match url.scheme() {
+        s if s == APP_SCHEME => MacroScheme::new(url)?,
+        "http" | "https" if navigation_plugin::is_app_link(APP_LINK_HOSTS, &url) => {
+            MacroScheme::from_url(&url)?
+        }
+        scheme => {
+            return Err(report!("unexpected deep link scheme: {}", scheme));
+        }
+    };
+
+    let payload = NavigatePayload {
+        path: macro_scheme.0.path(),
+        query: macro_scheme.0.query().unwrap_or_default(),
+        fragment: macro_scheme.0.fragment(),
+    };
+    // we send a navigate event instead of calling navigate directly
+    // because navigate performs a full browser navigation
+
+    Ok(handle.emit("navigate", payload)?)
+}
+
+fn deliver_deep_link(url: Url, handle: &AppHandle) {
+    let delivery = handle.state::<DeepLinkDelivery>();
+    let to_emit = {
+        let Ok(mut state) = delivery.launch.lock() else {
+            tracing::error!("deep link state mutex poisoned; dropping deep link");
+            return;
+        };
+        match &*state {
+            // Emitting now would be lost — hold the link for the flush.
+            LaunchState::NotReady | LaunchState::PendingNavigation(_) => {
+                tracing::trace!("frontend not ready; buffering deep link");
+                *state = LaunchState::PendingNavigation(url);
+                None
+            }
+            LaunchState::Ready => Some(url),
+        }
+    };
+    if let Some(url) = to_emit {
+        emit_navigate_for_deep_link(url, handle).log_and_consume();
+    }
+}
+
+fn attach_deep_link_handler(app: &mut tauri::App) {
+    app.deep_link().on_open_url({
+        let handle = app.handle().clone();
+        move |ev| {
+            let urls = ev.urls();
+            let Some(url) = urls.into_iter().next() else {
+                tracing::warn!("open url event contained no urls");
+                return;
+            };
+            if maybe_handle_share_deep_link(&handle, &url) {
+                return;
+            }
+
+            deliver_deep_link(url, &handle);
+        }
+    });
+}
+
+/// Delivers any deep link that arrived before the frontend registered its
+/// `navigate` listener, and switches subsequent links to direct delivery. The
+/// frontend calls this once its listener exists. Only the first call delivers —
+/// a later call (listener remount, SPA reload) must not re-navigate to a stale
+/// launch link.
+#[tauri::command]
+fn flush_launch_deep_link(app: AppHandle, delivery: tauri::State<'_, DeepLinkDelivery>) {
+    // The link that launched the app, as recorded by the deep-link plugin.
+    // Needed when the launch link's open-url event fires before our listener
+    // in setup() exists and so was never buffered — on Windows/Linux the
+    // plugin processes the launch argv during its own init, and on Android the
+    // native intent can arrive equally early. Share deep links are skipped:
+    // their native handling already ran at launch and the frontend pulls the
+    // files through the share commands.
+    // The plugin's vec is not a history: it holds the URLs of the most recent
+    // open event only (usually one; macOS can batch several in one event) and
+    // is replaced wholesale per event. Within a batch, prefer the last entry
+    // as the most recent, falling back past any share links.
+    let launch_url = match app.deep_link().get_current() {
+        Ok(Some(urls)) => urls.into_iter().rev().find(|url| !is_share_deep_link(url)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error=?e, "failed to read launch deep link");
+            None
+        }
+    };
+
+    let to_emit = {
+        let Ok(mut state) = delivery.launch.lock() else {
+            tracing::error!("deep link state mutex poisoned; dropping launch deep link");
+            return;
+        };
+        match std::mem::replace(&mut *state, LaunchState::Ready) {
+            // A buffered link is newer than the launch link, so it wins.
+            LaunchState::PendingNavigation(url) => Some(url),
+            LaunchState::NotReady => launch_url,
+            LaunchState::Ready => None,
+        }
+    };
+
+    if let Some(url) = to_emit {
+        tracing::debug!("flushing launch deep link");
+        emit_navigate_for_deep_link(url, &app).log_and_consume();
+    }
+}

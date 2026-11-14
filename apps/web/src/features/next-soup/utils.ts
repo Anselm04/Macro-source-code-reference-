@@ -1,0 +1,1654 @@
+import { isListViewID } from '@app/constants/list-views';
+import { getPreferredCalendarPeriodView } from '@app/features/calendar/calendar-preferences';
+import { openCalendarView } from '@app/features/calendar-view/calendar-navigation';
+import {
+  type CalendarEventTime,
+  createCalendarRange,
+} from '@app/features/calendar-view/calendar-range';
+import {
+  calendarFocusedEventSearchKey,
+  calendarPath,
+} from '@app/features/calendar-view/calendar-url';
+import {
+  CALENDAR_VIEW_ID,
+  type CalendarViewTarget,
+} from '@app/features/calendar-view/types';
+import { callsHostedContent } from '@app/features/calls-view/calls-hosted-content';
+import { driveHostedContent } from '@app/features/drive-view/drive-hosted-content';
+import { projectHostedContent } from '@app/features/projects/open-project';
+import { reviewsHostedContent } from '@app/features/reviews-view/reviews-hosted-content';
+import { requestRuntimeShare } from '@app/features/settings/runtimeSettingsState';
+import { withListNavigationSource } from '@app/features/soup/collection/list-navigation-source';
+import {
+  type EntityWithRawNotifications,
+  getEntityNotifications,
+  scopeChannelNotificationsForEntity,
+} from '@app/features/soup/entity-notifications';
+import { replacePaneSearchParams } from '@app/lib/split-router';
+import { beginInteraction } from '@app/observability/flow';
+import { globalSplitManager } from '@app/signal/splitLayout';
+import { CALENDAR_BLOCK_ID } from '@block-calendar/types';
+import {
+  goToChannelLatest,
+  goToChannelMessage,
+} from '@block-channel/utils/link';
+import type {
+  ReferredFrom,
+  SplitContent,
+  SplitHandle,
+} from '@components/app/split-layout/layoutManager';
+import { toast } from '@core/component/Toast/Toast';
+import {
+  fileTypeToBlockName,
+  resolveBlockAlias,
+} from '@core/constant/allBlocks';
+import {
+  enableCalendarUi,
+  enableGraphqlSoup,
+  isFeatureEnabled,
+  USE_MACRO_PR_SUMMARY_BLOCK,
+} from '@core/constant/featureFlags';
+import {
+  ENTITY_ID_DATA_ATTRIBUTE,
+  entityIdSelector,
+} from '@core/dom-selectors';
+import { isTouchDevice } from '@core/mobile/isTouchDevice';
+import type { BlockOrchestrator } from '@core/orchestrator';
+import type { DateValue } from '@core/util/date';
+import { fireAndForget } from '@core/util/fireAndForget';
+import { throwOnErr } from '@core/util/result';
+import { waitForFrames } from '@core/util/sleep';
+import { openExternalUrl } from '@core/util/url';
+import {
+  type CalendarEventEntity,
+  type ChannelClickTarget,
+  type ChannelEntity,
+  type ChannelMessageEntity,
+  type ChannelThreadEntity,
+  type DocumentCommentTarget,
+  type DocumentEntity,
+  type EntityData,
+  emailQueryKeyExcludesDone,
+  getSnippetHit,
+  isEmailEntity,
+  isGithubPrEntity,
+  isHitSnippetEntity,
+  isNonMemberChannelEntity,
+  isSearchEntity,
+  isWithNotification,
+  queryKeys,
+  type SearchLocation,
+  toNotificationEntity,
+  type WithNotification,
+  type WithSearch,
+} from '@entity';
+import { Telemetry } from '@macro-inc/observability';
+import {
+  compositeEntity,
+  documentCommentLocation,
+  getChannelNotificationParams,
+  getDocumentCommentLocation,
+  getDocumentCommentNotification,
+  type NotificationSource,
+  notificationIsRead,
+  setDoneOverride,
+  type UnifiedNotification,
+} from '@notifications';
+import { openRuntimesSettings } from '@notifications/notification-navigation';
+import { isTopLevelChannelNotification } from '@notifications/top-level-channel-notification';
+import { hydrateChannelNotificationSelection } from '@queries/channel/notification-selection';
+import { queryClient } from '@queries/client';
+import { updateEmailThreadState } from '@queries/email/cache-cleanup';
+import {
+  archiveEmailThreads,
+  type EmailArchiveDisposition,
+} from '@queries/email/integration';
+import { emailKeys } from '@queries/email/keys';
+import {
+  type NotificationEntityRef,
+  updateNotificationsForEntities,
+} from '@queries/notification/entity-mutations';
+import { notificationKeys } from '@queries/notification/keys';
+import {
+  bulkMarkNotificationsAsDone,
+  bulkMarkNotificationsAsUndone,
+  restoreUserNotifications,
+  snapshotUserNotifications,
+} from '@queries/notification/user-notifications';
+import {
+  getSoupEntityById,
+  invalidateSoupEntity,
+  optimisticUpdateSoupEntity,
+  removeSoupEntities,
+  removeSoupEntitiesFromDoneFilteredQueries,
+} from '@queries/soup/cache';
+import { refreshActiveGraphqlSoupQueries } from '@queries/soup/graphql/active-queries';
+import { isAfter } from 'date-fns';
+import { match } from 'ts-pattern';
+import { applyGraphqlDoneOptimistic } from './actions/graphql-done-optimism';
+import {
+  searchLocationTarget,
+  searchLocationUpdates,
+} from './search-navigation';
+
+export { scopeChannelNotificationsForEntity };
+
+const mergeSearchEntities = <T extends EntityData>(
+  first: WithSearch<T>,
+  second: WithSearch<T>
+): WithSearch<T> => {
+  const serviceEntity = first.search.source === 'service' ? first : second;
+  const localEntity = first.search.source === 'local' ? first : second;
+  const hasLocal =
+    first.search.source === 'local' || second.search.source === 'local';
+
+  // NOTE: we that the longer name highlight is more relevant since it will contain a macro highlight tag
+  let nameHighlight;
+  if (serviceEntity.search.nameHighlight && localEntity.search.nameHighlight) {
+    nameHighlight =
+      serviceEntity.search.nameHighlight.length >=
+      localEntity.search.nameHighlight.length
+        ? serviceEntity.search.nameHighlight
+        : localEntity.search.nameHighlight;
+  } else {
+    nameHighlight =
+      serviceEntity.search.nameHighlight || localEntity.search.nameHighlight;
+  }
+
+  return {
+    ...localEntity,
+    ...serviceEntity,
+    search: {
+      ...serviceEntity.search,
+      source: hasLocal ? 'local' : 'service',
+      nameHighlight,
+      contentHitData: serviceEntity.search.contentHitData?.length
+        ? serviceEntity.search.contentHitData
+        : localEntity.search.contentHitData,
+    },
+  };
+};
+
+/**
+ * Deduplicates entities by id, preferring entities with search data from 'service' source
+ * over 'local' source, and using latest timestamp as a tiebreaker.
+ * When preferring service results, merges local nameHighlight if service doesn't have one.
+ */
+export const deduplicateEntities = <T extends EntityData>(
+  entities: T[]
+): T[] => {
+  const entityMap = new Map<string, T>();
+
+  for (const entity of entities) {
+    const existing = entityMap.get(entity.id);
+
+    if (!existing) {
+      entityMap.set(entity.id, entity);
+      continue;
+    }
+
+    const existingHasSearch = isSearchEntity(existing);
+    const newHasSearch = isSearchEntity(entity);
+
+    // Prefer entities with search data
+    if (newHasSearch && !existingHasSearch) {
+      entityMap.set(entity.id, entity);
+      continue;
+    }
+
+    // If both have search data, prefer 'service' over 'local'
+    if (existingHasSearch && newHasSearch) {
+      const existingSource = existing.search.source;
+      const newSource = entity.search.source;
+
+      if (
+        (newSource === 'service' && existingSource === 'local') ||
+        (existingSource === 'service' && newSource === 'local')
+      ) {
+        // Merge service and local search data
+        entityMap.set(entity.id, mergeSearchEntities(entity, existing));
+        continue;
+      }
+
+      // If both are the same source, keep the one with latest timestamp
+      if (isNewerEntity(entity, existing)) {
+        entityMap.set(entity.id, entity);
+      }
+      continue;
+    }
+
+    // If neither has search, keep the one with latest timestamp
+    if (!existingHasSearch && !newHasSearch) {
+      if (isNewerEntity(entity, existing)) {
+        entityMap.set(entity.id, entity);
+      }
+    }
+    // Otherwise keep existing (it has search and new doesn't)
+  }
+
+  return Array.from(entityMap.values());
+};
+
+/**
+ * Gets the timestamp of an entity (updatedAt or createdAt)
+ */
+const getEntityTimestamp = (entity: EntityData): DateValue => {
+  return entity.updatedAt ?? entity.createdAt ?? new Date(0);
+};
+
+/**
+ * Returns true if the new entity should replace the existing one based on timestamp. If the timestamp is the same, prefer to use the newer entity to handle optimistic updates
+ */
+const isNewerEntity = (
+  newEntity: EntityData,
+  existing: EntityData
+): boolean => {
+  return isAfter(getEntityTimestamp(newEntity), getEntityTimestamp(existing));
+};
+
+/**
+ * Opens an entity via {@link openExternalUrl}. On web this is a new browser
+ * tab; inside the native Tauri shell a same-origin Macro `/app` link is routed
+ * in-app (in place) instead — `window.open` there would kick the user out to
+ * the system browser. So despite the name, this does not guarantee a separate
+ * tab/pane under Tauri.
+ */
+export const openEntityInNewTab = ({
+  entity,
+  location,
+}: {
+  entity: EntityData;
+  location?: SearchLocation;
+}) => {
+  location ??= getRowClickFallbackLocation(entity);
+  // Build URL for the entity
+  let entityPath: string;
+  if (entity.type === 'calendar_event') {
+    entityPath = `/app${calendarPath(getPreferredCalendarPeriodView())}`;
+  } else if (entity.type === 'document') {
+    const { fileType, subType } = entity;
+    const blockName = fileTypeToBlockName(subType?.type ?? fileType);
+    entityPath = `/app/${blockName}/${entity.id}`;
+  } else if (
+    entity.type === 'channel_message' ||
+    entity.type === 'channel_thread'
+  ) {
+    entityPath = `/app/channel/${entity.channelId}`;
+  } else {
+    entityPath = `/app/${entity.type === 'agent_session' ? 'agent' : entity.type}/${entity.id}`;
+  }
+
+  // Add location params if present
+  let entityUrl = new URL(entityPath, window.location.origin);
+
+  if (entity.type === 'calendar_event') {
+    entityUrl.searchParams.set(
+      calendarFocusedEventSearchKey(),
+      calendarViewTargetForEntity(entity).eventId ?? entity.id
+    );
+  } else {
+    const channelTarget = getChannelEntityTarget(entity);
+    const target =
+      location ??
+      (channelTarget?.kind === 'message'
+        ? {
+            type: 'channel' as const,
+            messageId: channelTarget.messageId,
+            threadId: channelTarget.threadId,
+          }
+        : undefined);
+    if (target) {
+      const { namespace, params } = searchLocationTarget(
+        getEntitySplitContent(entity).id,
+        target
+      );
+      replacePaneSearchParams(entityUrl.searchParams, [
+        { [namespace]: params },
+      ]);
+    }
+  }
+
+  openExternalUrl(entityUrl.toString());
+};
+
+/**
+ * Restores DOM focus to an entity row in the soup view after a modal action completes.
+ * This is necessary because the hotkey system is focus-based, and modals steal
+ * focus away from the soup view. Without restoring DOM focus, scoped hotkeys
+ * like 'escape' won't work.
+ *
+ * @param entityId - Optional entity ID to focus on. If not provided, focuses the first entity in the list.
+ */
+export const restoreSoupFocus = async (entityId?: string): Promise<void> => {
+  // Get the active split's soup view DOM reference
+  const activeSplitId = globalSplitManager()?.activeSplitId();
+  if (!activeSplitId) return;
+
+  const domRef = document.querySelector(
+    `[data-soup-view-id="${activeSplitId}"]`
+  );
+
+  if (!(domRef instanceof HTMLElement)) return;
+
+  // Wait for DOM to update after modal closes
+  await waitForFrames(2);
+
+  // Entity rows are plain divs without a `tabindex` attribute so `.focus()`
+  // on them is a no-op. Targeting them is still useful because the browser
+  // may scroll them into view as part of the focus attempt. Always follow
+  // up by focusing the soup container (which has `tabindex={-1}`) — that's
+  // what actually reactivates the hotkey scope.
+  if (entityId) {
+    const entityEl = domRef.querySelector(entityIdSelector(entityId));
+    if (entityEl instanceof HTMLElement) entityEl.focus();
+  }
+
+  if (document.activeElement && domRef.contains(document.activeElement)) return;
+
+  const firstEntityEl = domRef.querySelector(`[${ENTITY_ID_DATA_ATTRIBUTE}]`);
+  if (firstEntityEl instanceof HTMLElement) firstEntityEl.focus();
+
+  if (document.activeElement && domRef.contains(document.activeElement)) return;
+
+  domRef.focus();
+};
+
+interface OpenEntityOptions {
+  openInNewSplit?: boolean;
+  location?: SearchLocation;
+  splitHandle?: SplitHandle;
+  mergeHistory?: boolean;
+  allowDuplicate?: boolean;
+  referredFrom?: ReferredFrom;
+  /**
+   * Notification source used to keep REST-backed unread state optimistic when
+   * opening a channel row. Callers that can open channels must provide it.
+   */
+  notificationSource?: NotificationSource;
+  /** Default: notification. Explicit message targets always take precedence. */
+  channelNavigation?: 'latest' | 'notification';
+  /** Default: inbox-row. Top-level includes mentions and reactions outside threads. */
+  channelReadScope?: 'top-level' | 'inbox-row';
+}
+
+/**
+ * Resolve which channel message to activate when a channel row is opened.
+ *
+ * A row with an explicit `target` (stamped at construction, e.g. a search hit
+ * standing for one matched message) always activates it. Notifications must
+ * never override a stamped target: the unified list attaches a channel-wide
+ * notifications() accessor to every row (search results included), so their
+ * presence says nothing about why a row exists.
+ *
+ * Rows without a target are containers — a `channel` row is the whole channel
+ * and a `channel_thread` row is keyed by its root, so neither carries the id
+ * of the message/reply that put it in the inbox. That id lives only on the
+ * driving notification (the same data the card renders), so read the target
+ * from there, exactly like the old inbox did via getChannelNotificationParams.
+ * Notifications are scoped to the row first (top-level sends for a channel,
+ * this thread's replies for a thread) and the most recent one wins.
+ *
+ * Read state only changes a whole-`channel` row: its notifications are skipped
+ * when read, because a channel aggregates many messages and the newest unread
+ * one (never your own send) can sit far above the latest — jumping there feels
+ * wrong once the row looks read. A `channel_thread`/`channel_message` row is
+ * scoped to one message, so it targets its driving notification read or not —
+ * that is the reply the row stands for and the message to highlight.
+ *
+ * With no aiming notification, fall back to the row's own semantics: a
+ * `channel_thread`/`channel_message` row opens at its own root/message, and a
+ * whole `channel` row opens at `latest` — landing on the newest message the
+ * row's preview shows (which may be your own send) rather than an older
+ * notification or nothing.
+ */
+export type ChannelPreviewSelection = WithNotification<
+  | Pick<ChannelEntity, 'id' | 'type' | 'target'>
+  | Pick<
+      ChannelMessageEntity,
+      'id' | 'type' | 'channelId' | 'messageId' | 'threadId' | 'target'
+    >
+  | Pick<
+      ChannelThreadEntity,
+      'id' | 'type' | 'channelId' | 'messageId' | 'threadId' | 'target'
+    >
+>;
+
+/**
+ * Build the route selection a channels-rail click navigates with.
+ *
+ * Takes a plain `id` (capture it before any `await` — store proxies held across
+ * hydration can lose fields) and a resolved `ChannelClickTarget`. Stamps only
+ * `ChannelEntityTarget` fields onto `target` — never `kind`, which belongs on
+ * the click intent, not the route selection.
+ */
+export function channelPreviewSelection(
+  channelId: string,
+  options: {
+    target?: ChannelClickTarget;
+    notifications?: WithNotification<ChannelEntity>['notifications'];
+  } = {}
+): ChannelPreviewSelection {
+  if (!channelId) {
+    throw new Error('Missing channel id for channel preview selection');
+  }
+  const target =
+    options.target?.kind === 'message'
+      ? {
+          messageId: options.target.messageId,
+          ...(options.target.threadId != null
+            ? { threadId: options.target.threadId }
+            : {}),
+        }
+      : undefined;
+  return {
+    type: 'channel',
+    id: channelId,
+    ...(target ? { target } : {}),
+    ...(options.notifications ? { notifications: options.notifications } : {}),
+  };
+}
+
+/** Resolve the path param for a channel preview route, or throw. */
+export function channelIdForPreviewNavigation(
+  channel: ChannelPreviewSelection
+): string {
+  const channelId = channel.type === 'channel' ? channel.id : channel.channelId;
+  if (typeof channelId !== 'string' || channelId.length === 0) {
+    throw new Error('Missing channel id for channel preview navigation');
+  }
+  return channelId;
+}
+
+export function getChannelEntityTarget(
+  entity: EntityData | ChannelPreviewSelection,
+  {
+    channelNavigation = 'notification',
+  }: { channelNavigation?: 'latest' | 'notification' } = {}
+): ChannelClickTarget | undefined {
+  if (
+    entity.type !== 'channel' &&
+    entity.type !== 'channel_message' &&
+    entity.type !== 'channel_thread'
+  ) {
+    return undefined;
+  }
+
+  if (entity.target) {
+    return {
+      kind: 'message',
+      messageId: entity.target.messageId,
+      threadId: entity.target.threadId,
+    };
+  }
+
+  const fallback: ChannelClickTarget =
+    entity.type === 'channel'
+      ? { kind: 'latest' }
+      : {
+          kind: 'message',
+          messageId: entity.messageId,
+          threadId: entity.threadId,
+        };
+
+  if (channelNavigation === 'latest' || !isWithNotification(entity))
+    return fallback;
+
+  const notifications = entity.notifications?.() ?? [];
+  const scoped = scopeChannelNotificationsForEntity(entity, notifications);
+  for (const notification of scoped) {
+    // For a whole-`channel` row, ignore notifications you have already read:
+    // the row stands for the entire channel, so once read it should open at
+    // the latest message, not scroll up to an already-seen one. (Read ones
+    // are skipped here; if all are read the loop falls through to the
+    // `latest` fallback.) A read notification is also usually well above the
+    // latest message — you are never notified of your own sends, so the newest
+    // notification is someone else's and predates any message you sent after.
+    //
+    // A thread/message row stands for one specific message, so it always jumps
+    // to its notification's message, read or not — that is the message the row
+    // is about and the one to highlight.
+    if (entity.type === 'channel' && notificationIsRead(notification)) continue;
+    const { messageId, threadId } = getChannelNotificationParams(notification);
+    if (messageId) return { kind: 'message', messageId, threadId };
+  }
+
+  return fallback;
+}
+
+/**
+ * Resolve the comment a document row opens at. A stamped `commentTarget` (the
+ * Inbox preview route carries one, since it keeps no notifications) wins;
+ * otherwise it is the comment notification the row stands for (see
+ * `getDocumentCommentNotification`), read or not, so opening it lands on that
+ * comment exactly like a copied comment link.
+ */
+export function getDocumentCommentTarget(entity: {
+  type: string;
+  fileType?: string;
+  subType?: DocumentEntity['subType'];
+  commentTarget?: DocumentCommentTarget;
+}) {
+  if (entity.type !== 'document') return undefined;
+  const document = { fileType: entity.fileType, subType: entity.subType };
+  if (entity.commentTarget) {
+    return documentCommentLocation(entity.commentTarget.commentId, document);
+  }
+  if (!isWithNotification(entity)) return undefined;
+
+  const notification = getDocumentCommentNotification(entity);
+  return notification && getDocumentCommentLocation(notification, document);
+}
+
+/**
+ * Activate a channel row's target message in its (already-open) channel block.
+ *
+ * Callable imperatively per click: re-selecting the same row leaves the preview
+ * entity unchanged, so a reactive derivation would never re-run — but a click
+ * should always re-activate the target (e.g. after the user cleared the
+ * highlight by clicking a message), matching the old inbox's per-click
+ * behaviour.
+ */
+export async function navigateChannelEntityToTarget(
+  entity: ChannelPreviewSelection,
+  blockOrchestrator: BlockOrchestrator
+): Promise<void> {
+  const target = getChannelEntityTarget(entity);
+  if (!target) return;
+
+  const channelId = entity.type === 'channel' ? entity.id : entity.channelId;
+
+  if (target.kind === 'latest') {
+    await goToChannelLatest(blockOrchestrator, channelId);
+    return;
+  }
+
+  await goToChannelMessage(
+    blockOrchestrator,
+    channelId,
+    target.messageId,
+    target.threadId
+  );
+}
+
+/** Scrolls an already-open document block to the row's comment target. */
+export async function navigateDocumentEntityToComment(
+  entity: Pick<DocumentEntity, 'id' | 'type' | 'fileType' | 'subType'>,
+  blockOrchestrator: BlockOrchestrator
+): Promise<void> {
+  const target = getDocumentCommentTarget(entity);
+  if (!target?.params) return;
+
+  const handle = await blockOrchestrator.getBlockHandle(
+    entity.id,
+    resolveBlockAlias(target.blockName)
+  );
+  await handle?.goToLocationFromParams(target.params);
+}
+
+export type CalendarPreviewSelection = WithNotification<
+  Pick<CalendarEventEntity, 'id' | 'type' | 'time' | 'occurrenceKey'>
+>;
+
+/** Retargets a legacy calendar preview block to a calendar event row. */
+export async function navigateCalendarPreviewToTarget(
+  entity: CalendarPreviewSelection,
+  blockOrchestrator: BlockOrchestrator
+): Promise<void> {
+  const calendarHandle = await blockOrchestrator.getBlockHandle(
+    CALENDAR_BLOCK_ID,
+    'calendar'
+  );
+  await calendarHandle?.goToLocationFromParams(
+    calendarViewTargetForEntity(entity)
+  );
+}
+
+/**
+ * Location a plain row click falls back to when no explicit location is given.
+ * Email rows open like plain soup rows — at the latest message, expanded —
+ * so only non-email snippet entities (calls) fall back to their row hit.
+ * Clicking a specific content hit still passes an explicit location.
+ */
+export const getRowClickFallbackLocation = (
+  entity: EntityData
+): SearchLocation | undefined =>
+  entity.type === 'agent_session' && isSearchEntity(entity)
+    ? entity.search.contentHitData?.[0]?.location
+    : isHitSnippetEntity(entity) && !isEmailEntity(entity)
+      ? getSnippetHit(entity)?.location
+      : undefined;
+
+/**
+ * Opens an entity in a split, handling navigation to specific locations within the entity.
+ * Supports both regular entities (channel, email, etc.) and document entities.
+ *
+ * @param entity - The entity to open
+ * @param options - Configuration options including whether to open in new split, location, and split handle
+ */
+export const openEntityInSplitFromUnifiedList = async (
+  entity: EntityData,
+  options: OpenEntityOptions
+): Promise<void> => {
+  // From the row action to the opened view's paint: the navigation it commits
+  // and the view it mounts join this interaction.
+  const interaction = beginInteraction('list.open', {
+    attributes: { 'entity.type': entity.type },
+  });
+  try {
+    await openEntity(entity, options);
+  } finally {
+    interaction.end();
+  }
+};
+
+const openEntity = async (
+  entity: EntityData,
+  options: OpenEntityOptions
+): Promise<void> => {
+  const { allowDuplicate, openInNewSplit, splitHandle, mergeHistory } = options;
+  let { location } = options;
+
+  if (!location) {
+    location = getRowClickFallbackLocation(entity);
+  }
+
+  // Get dependencies internally
+  const splitManager = globalSplitManager();
+  if (!splitManager) {
+    console.error('No split manager found');
+    return;
+  }
+
+  // Non-members use the row's inline Join button before opening a channel.
+  if (isNonMemberChannelEntity(entity)) {
+    return;
+  }
+
+  if (isGithubPrEntity(entity)) {
+    if (USE_MACRO_PR_SUMMARY_BLOCK) {
+      const content = { type: 'pr' as const, id: entity.id };
+      const result = splitManager.openWithSplit(
+        reviewsHostedContent(content) ?? content,
+        {
+          referredFrom: options.referredFrom,
+          activate: true,
+          preferNewSplit: openInNewSplit,
+          handle: splitHandle,
+          mergeHistory,
+          allowDuplicate: true,
+        }
+      );
+      if (result.status === 'reused' && result.owner !== result.sourceOwner) {
+        toast.alert('Content already open');
+      }
+    } else {
+      openExternalUrl(entity.metadata.url);
+    }
+    return;
+  }
+  if (entity.type === 'foreign') return;
+
+  if (entity.type === 'calendar_event') {
+    if (!isFeatureEnabled(enableCalendarUi)) return;
+    openCalendarView(calendarViewTargetForEntity(entity), {
+      manager: splitManager,
+      handle: splitHandle,
+      openInNewSplit,
+      mergeHistory,
+      referredFrom: options.referredFrom,
+    });
+    return;
+  }
+
+  const blockOrchestrator = splitManager.getOrchestrator();
+
+  // Latest opens do not need notifications to choose their destination. Snapshot
+  // the list row before navigation can dispose its Solid store, and hydrate only
+  // after the open is accepted. Inbox notification-targeted opens still wait.
+  const deferredChannel =
+    entity.type === 'channel' &&
+    entity.unreadNotifications !== undefined &&
+    options.channelNavigation === 'latest'
+      ? { ...entity }
+      : undefined;
+  if (
+    entity.type === 'channel' &&
+    entity.unreadNotifications !== undefined &&
+    !deferredChannel
+  ) {
+    try {
+      entity = await hydrateChannelNotificationSelection(
+        entity,
+        options.notificationSource?.withLocalOverrides
+      );
+    } catch (error) {
+      console.error('Failed to load conversation notifications', error);
+      toast.failure('Unable to open conversation. Please try again.');
+      return;
+    }
+  }
+
+  // A runtime has no page of its own: Settings → Machines points it out.
+  if (entity.type === 'harness') {
+    requestRuntimeShare(entity.id, false);
+    openRuntimesSettings(splitManager, {
+      newSplit: openInNewSplit,
+      sourceHandle: splitHandle,
+    });
+    return;
+  }
+
+  const content = getEntitySplitContent(entity);
+
+  const channelTarget = getChannelEntityTarget(entity, {
+    channelNavigation: options.channelNavigation,
+  });
+  const channelMessageTarget =
+    channelTarget?.kind === 'message' ? channelTarget : undefined;
+  const openChannelAtLatest = channelTarget?.kind === 'latest';
+
+  const target =
+    location ??
+    (channelMessageTarget
+      ? {
+          type: 'channel' as const,
+          messageId: channelMessageTarget.messageId,
+          threadId: channelMessageTarget.threadId,
+        }
+      : undefined);
+  // A row keeps pointing at its comment notification until that notification is
+  // done, so on touch — where the thread is a drawer over the whole page, not a
+  // margin card beside the text — the row would cover the document with the
+  // same comment on every open. A tap on a document row asks for the document;
+  // the notification list still opens the comment itself.
+  const commentParams =
+    !target && entity.type === 'document' && !isTouchDevice()
+      ? getDocumentCommentTarget(entity)?.params
+      : undefined;
+
+  const sourceContent =
+    splitHandle?.content() ?? splitManager.activeSplit()?.content();
+
+  const sourceListView =
+    sourceContent?.type === 'component' && isListViewID(sourceContent.id)
+      ? sourceContent.id
+      : undefined;
+  const referredFrom = options.referredFrom ?? sourceListView;
+
+  // Construct hosted content before opening the split so details do not mount
+  // legacy blocks. Comment targets keep their document block.
+  const hostedContent =
+    reviewsHostedContent(content) ??
+    callsHostedContent(content) ??
+    driveHostedContent(content, {
+      allowDocuments: !isTouchDevice() && !commentParams,
+    });
+  let splitContent: SplitContent = hostedContent ?? {
+    ...content,
+    params: commentParams,
+  };
+  if (splitHandle && referredFrom && isListViewID(referredFrom)) {
+    splitContent = withListNavigationSource(splitContent, splitHandle);
+  }
+
+  const hydrateNotificationsAndMarkSeen = (
+    channel: ChannelEntity,
+    notificationSource: NotificationSource
+  ) =>
+    Telemetry.span('channel.open.notifications', async (span) => {
+      span.setAttr('channel.id', channel.id);
+      try {
+        const hydrated = await hydrateChannelNotificationSelection(
+          channel,
+          notificationSource.withLocalOverrides
+        );
+        const view = splitManager.findOpenView(content);
+        // A late response must not mark a closed conversation or a mobile pane
+        // that the user has already left. Hydration never reopens or retargets it.
+        if (!view || (isTouchDevice() && !view.topLevelSplit?.isActive())) {
+          span.setAttr('channel.open.outcome', 'left');
+          return;
+        }
+        markChannelNotificationsSeenOnOpen(hydrated, notificationSource, {
+          channelReadScope: options.channelReadScope,
+        });
+        span.setAttr('channel.open.outcome', 'loaded');
+      } catch (error) {
+        span.setAttr('channel.open.outcome', 'failed');
+        console.error(
+          'Failed to load conversation notifications after opening',
+          { channelId: channel.id, error }
+        );
+      }
+    });
+
+  let markedNotifications = false;
+  const markNotificationsSeen = () => {
+    if (markedNotifications) return;
+    markedNotifications = true;
+    if (!options.notificationSource) return;
+    if (deferredChannel) {
+      fireAndForget(
+        hydrateNotificationsAndMarkSeen(
+          deferredChannel,
+          options.notificationSource
+        ),
+        'open-entity-in-split'
+      );
+      return;
+    }
+    markChannelNotificationsSeenOnOpen(entity, options.notificationSource, {
+      channelReadScope: options.channelReadScope,
+    });
+  };
+  const result = splitManager.openWithSplit(splitContent, {
+    search: target ? searchLocationUpdates(content.id, target) : undefined,
+    onApplied: markNotificationsSeen,
+    referredFrom,
+    activate: true,
+    preferNewSplit: openInNewSplit,
+    handle: splitHandle,
+    mergeHistory,
+    // Hosted details have distinct routes even when they share a component identity.
+    allowDuplicate: allowDuplicate || hostedContent !== undefined,
+    reopen:
+      entity.type === 'channel' && !location && openChannelAtLatest
+        ? 'latest'
+        : undefined,
+  });
+  if (result.status === 'reused' && result.owner !== result.sourceOwner) {
+    toast.alert('Content already open');
+  }
+
+  if (result.status === 'opened' || result.status === 'reused') {
+    markNotificationsSeen();
+  }
+
+  // The split is already open; a failed in-block navigation leaves it at its
+  // default position, so report it rather than rejecting every caller.
+  try {
+    if (commentParams && entity.type === 'document') {
+      // An already-open document ignores new split params.
+      await navigateDocumentEntityToComment(entity, blockOrchestrator);
+    } else if (!target && openChannelAtLatest) {
+      // Force the scroll-to-bottom even when the channel is already open in a
+      // (preview) split, where reopen: 'latest' only reactivates the parked
+      // split without re-pinning it to the newest message.
+      await goToChannelLatest(blockOrchestrator, content.id);
+    }
+  } catch (error) {
+    Telemetry.error(error, { surface: 'open-entity-in-split' });
+  }
+};
+
+/**
+ * Mark every unread notification represented by an opened channel Soup row.
+ *
+ * The row's attached Soup edge is authoritative, whether it is a raw GraphQL
+ * array (mobile Channels) or a list accessor. Only rows without an edge fall
+ * back to the separately paginated global source. Passing these notifications
+ * through the source keeps its REST cache and durable seen overrides in sync
+ * while the configured mutation updates GraphQL edges. Chat opens the whole
+ * conversation's top-level messages; Inbox opens only the row's stack.
+ */
+export function markChannelNotificationsSeenOnOpen(
+  entity: EntityWithRawNotifications<EntityData>,
+  notificationSource: NotificationSource,
+  {
+    channelReadScope = 'inbox-row',
+  }: { channelReadScope?: 'top-level' | 'inbox-row' } = {}
+) {
+  if (
+    entity.type !== 'channel' &&
+    entity.type !== 'channel_message' &&
+    entity.type !== 'channel_thread'
+  ) {
+    return;
+  }
+
+  const notifications = getEntityNotifications(entity, notificationSource, {
+    scopeChannelThreads: channelReadScope === 'inbox-row',
+  }).filter(
+    (notification) =>
+      !notificationIsRead(notification) &&
+      (channelReadScope === 'inbox-row' ||
+        isTopLevelChannelNotification(notification))
+  );
+  if (notifications.length === 0) return;
+
+  void notificationSource.bulkMarkAsRead(notifications).catch((error) => {
+    console.error('Failed to mark channel notifications as read', error);
+  });
+}
+
+/**
+ * The event and instance a calendar row points at, resolved exactly as the
+ * open path resolves it so a copied link lands where a click would.
+ */
+export function calendarEventLinkTarget(entity: CalendarPreviewSelection): {
+  eventId: string;
+  occurrenceKey?: string;
+} {
+  const { eventId, occurrenceKey } = calendarViewTargetForEntity(entity);
+  return { eventId: eventId ?? entity.id, occurrenceKey };
+}
+
+function calendarReminderContent(entity: CalendarPreviewSelection) {
+  const notifications = isWithNotification(entity)
+    ? (entity.notifications?.() ?? [])
+    : [];
+  const metadata = notifications
+    .map((notification) => notification.notification_metadata)
+    .find((candidate) => candidate?.tag === 'calendar_event_reminder');
+  return metadata?.tag === 'calendar_event_reminder'
+    ? metadata.content
+    : undefined;
+}
+
+/**
+ * The time of the instance an event row points at. A reminder names the
+ * instance that is starting, while a recurring row's own time is the series'
+ * first instance.
+ */
+export function calendarEventTimeForEntity(
+  entity: CalendarPreviewSelection
+): CalendarEventTime | undefined {
+  const content = calendarReminderContent(entity);
+  return content?.startsAt
+    ? {
+        kind: 'timed' as const,
+        startsAt: content.startsAt,
+        endsAt: content.endsAt ?? undefined,
+      }
+    : content?.startDate
+      ? { kind: 'allDay' as const, startDate: content.startDate }
+      : entity.time;
+}
+
+/** Build a Calendar view focus target for an event row's occurrence. */
+export function calendarViewTargetForEntity(
+  entity: CalendarPreviewSelection
+): CalendarViewTarget {
+  const content = calendarReminderContent(entity);
+  const time = calendarEventTimeForEntity(entity);
+
+  return {
+    eventId: content?.eventId ?? entity.id,
+    // A reminder names a precise instance, so it wins; otherwise fall back to
+    // whatever resolved the row (search supplies one, soup does not).
+    occurrenceKey: content?.occurrenceKey ?? entity.occurrenceKey,
+    range: time ? createCalendarRange(time) : undefined,
+  };
+}
+
+// TODO(dev-rb/github): Map GitHub PRs to { type: 'pr', id }.
+function getEntitySplitContent(entity: EntityData) {
+  return (
+    match(entity)
+      // The Tasks-hosted route carries the project's own identity, so an open
+      // project split is reused; the legacy component would mount a redirect
+      // shim beside it.
+      .with({ type: 'initiative' }, (entity) =>
+        projectHostedContent(entity.id, 'overview')
+      )
+      .with({ type: 'document' }, (entity) => {
+        const { id, fileType, subType } = entity;
+        const blockName = fileTypeToBlockName(subType?.type ?? fileType);
+
+        return { type: blockName, id };
+      })
+      .with({ type: 'channel_message' }, (entity) => {
+        return { type: 'channel' as const, id: entity.channelId };
+      })
+      .with({ type: 'channel_thread' }, (entity) => {
+        return { type: 'channel' as const, id: entity.channelId };
+      })
+      .with({ type: 'foreign' }, (entity) => {
+        return { type: 'unknown' as const, id: entity.id };
+      })
+      .with({ type: 'agent_session' }, (entity) => ({
+        type: 'agent' as const,
+        id: entity.id,
+      }))
+      .with({ type: 'crm_company' }, (entity) => {
+        return { type: 'company' as const, id: entity.id };
+      })
+      .with({ type: 'crm_contact' }, (entity) => {
+        return { type: 'contact' as const, id: entity.id };
+      })
+      // Calendar events open the singleton Calendar application view; the open
+      // path branches before reaching here, so this only serves duplicate checks.
+      .with({ type: 'calendar_event' }, () => {
+        return { type: 'component' as const, id: CALENDAR_VIEW_ID };
+      })
+      // Runtimes open in Settings → Machines; the open path branches before
+      // reaching here, so this only serves duplicate checks.
+      .with({ type: 'harness' }, () => {
+        return { type: 'component' as const, id: 'settings' };
+      })
+      .otherwise((entity) => {
+        return { type: entity.type, id: entity.id };
+      })
+  );
+}
+
+type TrashEmailsHandle = {
+  /** Fire-and-forget promise for the API calls. Rejects on failure (rolls back optimistic update). */
+  done: Promise<void>;
+  /** Optimistically restores all entities and asks the API to restore them from trash. */
+  undo: () => Promise<void>;
+};
+
+export type TrashEmailTarget = { id: string; linkId?: string };
+
+/**
+ * Trash one or more email threads.
+ *
+ * Optimistically removes them from the soup and from all email queries,
+ * then sends the desired trash state to the API. If anything fails, rolls
+ * back the optimistic update.
+ *
+ * Returns synchronously so the caller can show the undo toast immediately.
+ */
+export function trashEmails(targets: TrashEmailTarget[]): TrashEmailsHandle {
+  const ids = targets.map((t) => t.id);
+  queryClient.cancelQueries({ queryKey: queryKeys.all.email });
+
+  const previousEmail = queryClient.getQueriesData<{
+    pages: { items: EntityData[] }[];
+  }>({
+    queryKey: queryKeys.all.email,
+  });
+
+  const idSet = new Set(ids);
+  const soupTxn = removeSoupEntities(idSet);
+
+  // Optimistically remove from email queries
+  for (const [key, data] of previousEmail) {
+    if (!data) continue;
+    queryClient.setQueryData(key, {
+      ...data,
+      pages: data.pages.map((page) => ({
+        ...page,
+        items: page.items.filter((item) => !idSet.has(item.id)),
+      })),
+    });
+  }
+
+  const rollback = () => {
+    soupTxn.rollback();
+    for (const [key, data] of previousEmail) {
+      queryClient.setQueryData(key, data);
+    }
+  };
+
+  const done = (async () => {
+    try {
+      // Settle every request so a partial failure can be compensated.
+      const outcomes = await Promise.allSettled(
+        ids.map((id) =>
+          throwOnErr(() =>
+            updateEmailThreadState({
+              thread_id: id,
+              field: 'trashed',
+              value: true,
+            })
+          )
+        )
+      );
+
+      const failure = outcomes.find((o) => o.status === 'rejected');
+      if (failure) {
+        // Revert the threads that did trash so the server matches the rollback
+        // below; best effort, so a failed revert can't mask the original error.
+        await Promise.allSettled(
+          ids.flatMap((id, i) =>
+            outcomes[i]?.status === 'fulfilled'
+              ? [
+                  throwOnErr(() =>
+                    updateEmailThreadState({
+                      thread_id: id,
+                      field: 'trashed',
+                      value: false,
+                    })
+                  ),
+                ]
+              : []
+          )
+        );
+        throw (failure as PromiseRejectedResult).reason;
+      }
+    } catch (err) {
+      rollback();
+      throw err;
+    } finally {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.all.email }),
+        ...ids.map((id) => invalidateSoupEntity(id)),
+        ...(isFeatureEnabled(enableGraphqlSoup)
+          ? [refreshActiveGraphqlSoupQueries()]
+          : []),
+      ]);
+    }
+  })();
+
+  return {
+    done,
+    undo: async () => {
+      // Wait for the trash calls to finish before restoring the threads. On any
+      // failure `done` has already rolled back and reverted the server, so
+      // there is nothing left to undo.
+      try {
+        await done;
+      } catch {
+        return;
+      }
+
+      rollback();
+
+      try {
+        await Promise.all(
+          ids.map((id) => {
+            return throwOnErr(() =>
+              updateEmailThreadState({
+                thread_id: id,
+                field: 'trashed',
+                value: false,
+              })
+            );
+          })
+        );
+      } finally {
+        // The rollback restores REST lists, but GraphQL membership must be
+        // reconciled with the server after undo (including partial failures).
+        await queryClient.invalidateQueries({
+          queryKey: queryKeys.all.email,
+          refetchType: 'none',
+        });
+        if (isFeatureEnabled(enableGraphqlSoup)) {
+          await refreshActiveGraphqlSoupQueries();
+        }
+      }
+    },
+  };
+}
+
+export type MarkEntitiesDoneContext = {
+  /** Clears optimistic state — use for mark-done failure (cache is pre-mutation). */
+  rollback: () => void;
+  /** Re-applies the optimistic done state. Use for redo / undo failure. */
+  reapply: () => void;
+  /** Reverts email/soup caches and forces `done=false` override. Use for undo. */
+  applyUndone: () => void;
+  /** Release GraphQL intent only after mounted cache readers acknowledge it. */
+  settle: (notificationIds?: readonly string[]) => void;
+  /** After a partial inverse failure, let authoritative GraphQL state reconcile. */
+  releaseGraphql: () => void;
+};
+
+function notificationsForMarkDone(
+  entity: EntityData,
+  notifications: UnifiedNotification[],
+  scopeChannelNotificationsToEntity: boolean
+): UnifiedNotification[] {
+  if (
+    !scopeChannelNotificationsToEntity ||
+    (entity.type !== 'channel' &&
+      entity.type !== 'channel_message' &&
+      entity.type !== 'channel_thread')
+  ) {
+    return notifications;
+  }
+
+  return scopeChannelNotificationsForEntity(entity, notifications);
+}
+
+/**
+ * Extract the email ids and notification ids targeted by a mark-done on these
+ * entities. The ids are snapshotted here so mutationFn/undoFn/redoFn operate
+ * on the set that existed at mutation time.
+ */
+export function resolveMarkEntitiesDoneVariables(args: {
+  entities: EntityData[];
+  notificationSource: NotificationSource;
+  /**
+   * Channel and channel_thread entities share the same notification bucket.
+   * When true, channel mark-done skips thread-stack notifications, and
+   * channel_thread mark-done only targets that thread's stack.
+   */
+  scopeChannelNotificationsToEntity?: boolean;
+}): { emailIds: string[]; notificationIds: string[] } {
+  const {
+    entities,
+    notificationSource,
+    scopeChannelNotificationsToEntity = false,
+  } = args;
+  const emailIds = entities.filter((e) => e.type === 'email').map((e) => e.id);
+  const notificationIds = entities.flatMap((entity) => {
+    // GraphQL Soup rows carry their own notification edge. Prefer that edge
+    // over the global notification query, which may not have paged far enough
+    // to include this entity yet.
+    const attachedNotifications = isWithNotification(entity)
+      ? entity.notifications?.()
+      : undefined;
+    const notificationsForEntity =
+      attachedNotifications ??
+      notificationSource.notificationsByEntity()[
+        compositeEntity(toNotificationEntity(entity))
+      ] ??
+      [];
+
+    return notificationsForMarkDone(
+      entity,
+      notificationsForEntity,
+      scopeChannelNotificationsToEntity
+    ).map((n) => n.id);
+  });
+
+  return {
+    emailIds: [...new Set(emailIds)],
+    notificationIds: [...new Set(notificationIds)],
+  };
+}
+
+/**
+ * Applies the optimistic UI state for marking entities as done — removes the
+ * entities from done-filtered soup/email caches, flips surviving email rows
+ * to the done state, and sets the notification `done` override. Returns a
+ * context the mutation uses for rollback / reapply.
+ */
+export function applyEntitiesDoneOptimistic(args: {
+  entityIds: string[];
+  emailIds: string[];
+  notificationIds: string[];
+  scopeChannelThreads?: boolean;
+}): MarkEntitiesDoneContext {
+  const { entityIds, emailIds, notificationIds } = args;
+  if (isFeatureEnabled(enableGraphqlSoup)) {
+    return applyGraphqlDoneOptimistic({
+      entityIds,
+      notificationIds,
+      scopeChannelThreads: args.scopeChannelThreads,
+    });
+  }
+  const emailIdSet = new Set(emailIds);
+  const entityIdSet = new Set(entityIds);
+
+  // Snapshot the affected notifications before marking done. A done
+  // notification gets dropped from the cache (status-update event or a stale
+  // refetch), so undo re-adds it here so the soup `notDoneFilter` predicate
+  // lets the restored entity through again.
+  const notificationSnapshots = snapshotUserNotifications(notificationIds);
+
+  type EmailQueryKey = readonly unknown[];
+  type EmailCacheData = { pages: { items: EntityData[] }[] };
+  const removedEmails = new Map<EmailQueryKey, Map<string, EntityData>>();
+
+  const filterEmailCache = () => {
+    if (emailIdSet.size === 0) return;
+    for (const [key, data] of queryClient.getQueriesData<EmailCacheData>({
+      queryKey: queryKeys.all.email,
+    })) {
+      if (!data) continue;
+      // Views that show done threads keep their rows.
+      if (!emailQueryKeyExcludesDone(key)) continue;
+      const bucket = removedEmails.get(key) ?? new Map<string, EntityData>();
+      let mutated = false;
+      const pages = data.pages.map((page) => {
+        const items: EntityData[] = [];
+        for (const item of page.items) {
+          if (emailIdSet.has(item.id)) {
+            bucket.set(item.id, item);
+            mutated = true;
+          } else {
+            items.push(item);
+          }
+        }
+        return mutated && items.length !== page.items.length
+          ? { ...page, items }
+          : page;
+      });
+      if (mutated) {
+        removedEmails.set(key, bucket);
+        queryClient.setQueryData(key, { ...data, pages });
+      }
+    }
+  };
+
+  const restoreEmailCache = () => {
+    for (const [key, bucket] of removedEmails) {
+      if (bucket.size === 0) continue;
+      const toRestore = [...bucket.values()];
+      bucket.clear();
+      queryClient.setQueryData<EmailCacheData>(key, (current) => {
+        if (!current) return current;
+        const restoredIds = new Set(toRestore.map((e) => e.id));
+        return {
+          ...current,
+          pages: current.pages.map((page, idx) => {
+            const filtered = page.items.filter((i) => !restoredIds.has(i.id));
+            if (idx === 0) {
+              return { ...page, items: [...toRestore, ...filtered] };
+            }
+            if (filtered.length === page.items.length) {
+              return page;
+            }
+            return { ...page, items: filtered };
+          }),
+        };
+      });
+    }
+  };
+
+  let soupTxn: ReturnType<typeof removeSoupEntities> | null = null;
+  let emailRowTxns: { rollback: () => void }[] = [];
+
+  const reapply = () => {
+    // Remove the marked entities from done-filtered soup queries (inbox,
+    // mail Important/Noise); views that show done content (e.g. mail All)
+    // keep their rows. Undo restores them via this transaction's rollback.
+    soupTxn =
+      entityIds.length > 0
+        ? removeSoupEntitiesFromDoneFilteredQueries(entityIdSet)
+        : null;
+    // Rows that remain visible flip to the done state.
+    emailRowTxns = emailIds.map((id) =>
+      optimisticUpdateSoupEntity({
+        tag: 'emailThread',
+        data: { id, inboxVisible: false },
+        frecency_score: getSoupEntityById(id)?.frecency_score ?? 0,
+      })
+    );
+    filterEmailCache();
+    setDoneOverride(notificationIds, true);
+  };
+
+  const rollbackSoup = () => {
+    for (const txn of [...emailRowTxns].reverse()) {
+      txn.rollback();
+    }
+    emailRowTxns = [];
+    soupTxn?.rollback();
+    soupTxn = null;
+  };
+
+  const rollback = () => {
+    rollbackSoup();
+    restoreEmailCache();
+    setDoneOverride(notificationIds, undefined);
+  };
+
+  const applyUndone = () => {
+    rollbackSoup();
+    restoreEmailCache();
+    restoreUserNotifications(notificationSnapshots);
+    // Force `done=false` — cache may have reconciled to `done=true` from the
+    // server, so clearing the override would leave the UI hidden after undo.
+    setDoneOverride(notificationIds, false);
+  };
+
+  reapply();
+
+  return {
+    rollback,
+    reapply,
+    applyUndone,
+    settle: () => {},
+    releaseGraphql: () => {},
+  };
+}
+
+/**
+ * Optimistic UI for marking entities as not done — flips email rows back to
+ * inbox-visible and forces the notification `done` override off. Rows are
+ * patched in place; done-filtered views regain the entities when the caller
+ * invalidates after the server confirms.
+ */
+export function applyEntitiesNotDoneOptimistic(args: {
+  emailIds: string[];
+  notificationIds: string[];
+}): { rollback: () => void; settle: () => void } {
+  const { emailIds, notificationIds } = args;
+  if (isFeatureEnabled(enableGraphqlSoup)) {
+    return applyGraphqlDoneOptimistic({
+      entityIds: emailIds,
+      notificationIds,
+      done: false,
+    });
+  }
+  const emailRowTxns = emailIds.map((id) =>
+    optimisticUpdateSoupEntity({
+      tag: 'emailThread',
+      data: { id, inboxVisible: true },
+      frecency_score: getSoupEntityById(id)?.frecency_score ?? 0,
+    })
+  );
+  setDoneOverride(notificationIds, false);
+
+  return {
+    settle: () => {},
+    rollback: () => {
+      for (const txn of [...emailRowTxns].reverse()) {
+        txn.rollback();
+      }
+      setDoneOverride(notificationIds, undefined);
+    },
+  };
+}
+
+/**
+ * A write receipt is delivered even when another write in the action fails.
+ * ID-scoped notification receipts keep the explicit requested scope (including
+ * durably queued writes); the backend atomically updates its owned, non-deleted
+ * matches in one statement. Entity-scoped receipts instead carry returned rows
+ * so Undo can discover exact IDs without including later notifications.
+ *
+ * A rejected response is not proof of no persistence: post-commit push-cleanup
+ * lookups can fail, and transport responses can be lost. Retire unacknowledged
+ * display intent; do not guess additional inverse IDs from those failures.
+ */
+export type MarkDoneWriteOutcome =
+  | {
+      kind: 'email';
+      id: string;
+      result: PromiseSettledResult<EmailArchiveDisposition>;
+    }
+  | { kind: 'notifications'; result: PromiseSettledResult<string[]> }
+  | {
+      kind: 'entity-notifications';
+      result: PromiseSettledResult<UnifiedNotification[]>;
+    };
+
+/**
+ * Fires archive, selective ID-scoped notification, and entity-scoped notification
+ * writes. Returns the authoritative notification IDs
+ * produced by the entity write. Throws on any failure; the caller owns rollback
+ * through the context returned by `applyEntitiesDoneOptimistic`.
+ */
+export async function executeMarkEntitiesDone(args: {
+  emailIds: string[];
+  notificationIds: string[];
+  notificationEntities?: NotificationEntityRef[];
+  onWriteSettled?: (outcome: MarkDoneWriteOutcome) => void;
+}): Promise<string[]> {
+  const { emailIds, notificationIds, notificationEntities = [] } = args;
+  const graphql = isFeatureEnabled(enableGraphqlSoup);
+  if (!graphql) {
+    await Promise.all([
+      queryClient.cancelQueries({ queryKey: queryKeys.all.email }),
+      queryClient.cancelQueries({ queryKey: notificationKeys.user._def }),
+    ]);
+  }
+
+  const writeNotificationIds = async () => {
+    if (notificationIds.length > 0)
+      await bulkMarkNotificationsAsDone(notificationIds);
+    return notificationIds;
+  };
+  const writeNotificationEntities = async () => {
+    if (notificationEntities.length === 0) return [];
+    return await updateNotificationsForEntities({
+      entities: notificationEntities,
+      operation: 'MARK_DONE',
+    });
+  };
+  const [emailResults, [notificationResult], [entityResult]] =
+    await Promise.all([
+      archiveEmailThreads(emailIds, true),
+      Promise.allSettled([writeNotificationIds()]),
+      Promise.allSettled([writeNotificationEntities()]),
+    ]);
+  const report = args.onWriteSettled ?? (() => {});
+  for (const [index, result] of emailResults.entries())
+    report({ kind: 'email', id: emailIds[index], result });
+  if (notificationIds.length > 0)
+    report({ kind: 'notifications', result: notificationResult });
+  if (notificationEntities.length > 0)
+    report({ kind: 'entity-notifications', result: entityResult });
+
+  const authoritativeNotificationIds =
+    entityResult.status === 'fulfilled'
+      ? entityResult.value.map(({ id }) => id)
+      : [];
+  const results = [...emailResults, notificationResult, entityResult];
+  const hasQueuedEmail = emailResults.some(
+    (result) => result.status === 'fulfilled' && result.value === 'queued'
+  );
+  const rejected = results.find(
+    (r): r is PromiseRejectedResult => r.status === 'rejected'
+  );
+
+  if (graphql) {
+    // Email/notification writers own normalized rollback and revalidation.
+    if (rejected) throw rejected.reason ?? new Error('Failed to mark as done');
+    return authoritativeNotificationIds;
+  }
+
+  if (rejected) {
+    // Real refetch to reconcile server state with the UI after the caller
+    // rolls back its optimistic cache writes. Some email or notification
+    // writes may have succeeded before another operation failed.
+    await Promise.all([
+      ...(!hasQueuedEmail
+        ? [
+            queryClient.invalidateQueries({ queryKey: queryKeys.all.email }),
+            ...emailIds.map((id) => invalidateSoupEntity(id)),
+          ]
+        : []),
+      queryClient.invalidateQueries({ queryKey: notificationKeys.user._def }),
+    ]);
+    throw rejected.reason ?? new Error('Failed to mark as done');
+  }
+
+  await Promise.all([
+    // A shared REST list can contain both committed and queued threads. Do
+    // not fetch its pre-write server state over any queued optimistic row.
+    ...(!hasQueuedEmail
+      ? [
+          queryClient.invalidateQueries({
+            queryKey: queryKeys.all.email,
+            refetchType: 'none',
+          }),
+          ...emailIds.map((id) => invalidateSoupEntity(id)),
+        ]
+      : []),
+    queryClient.invalidateQueries({
+      queryKey: notificationKeys.user._def,
+      refetchType: 'none',
+    }),
+  ]);
+
+  return authoritativeNotificationIds;
+}
+
+/**
+ * Fires the unarchive + bulk-undone APIs for the given ids. Throws on any
+ * failure; caller is responsible for re-applying optimistic state.
+ */
+export async function executeMarkEntitiesUndone(args: {
+  emailIds: string[];
+  notificationIds: string[];
+  /** Report each write before reconciliation, so bulk actions can settle or
+   * roll back just that thread even when a sibling write fails. */
+  onEmailSettled?: (
+    id: string,
+    result: PromiseSettledResult<EmailArchiveDisposition>
+  ) => void;
+  onWriteSettled?: (outcome: MarkDoneWriteOutcome) => void;
+}): Promise<EmailArchiveDisposition> {
+  const { emailIds, notificationIds } = args;
+  const graphql = isFeatureEnabled(enableGraphqlSoup);
+  if (!graphql) {
+    await Promise.all([
+      queryClient.cancelQueries({ queryKey: queryKeys.all.email }),
+      queryClient.cancelQueries({ queryKey: notificationKeys.user._def }),
+    ]);
+  }
+
+  const writeNotificationIds = async () => {
+    if (notificationIds.length > 0)
+      await bulkMarkNotificationsAsUndone(notificationIds);
+    return notificationIds;
+  };
+  const [emailResults, [notificationResult]] = await Promise.all([
+    archiveEmailThreads(emailIds, false),
+    Promise.allSettled([writeNotificationIds()]),
+  ]);
+  for (const [index, result] of emailResults.entries()) {
+    args.onEmailSettled?.(emailIds[index], result);
+    args.onWriteSettled?.({ kind: 'email', id: emailIds[index], result });
+  }
+  if (notificationIds.length > 0)
+    args.onWriteSettled?.({
+      kind: 'notifications',
+      result: notificationResult,
+    });
+  const results = [...emailResults, notificationResult];
+  const hasQueuedEmail = emailResults.some(
+    (result) => result.status === 'fulfilled' && result.value === 'queued'
+  );
+  const rejected = results.find(
+    (r): r is PromiseRejectedResult => r.status === 'rejected'
+  );
+
+  if (graphql) {
+    if (rejected) throw rejected.reason ?? new Error('Failed to undo');
+    return hasQueuedEmail ? 'queued' : 'committed';
+  }
+
+  if (rejected) {
+    // REST retains its legacy batch rollback/reconciliation.
+    await Promise.all([
+      ...(!hasQueuedEmail
+        ? [
+            queryClient.invalidateQueries({ queryKey: queryKeys.all.email }),
+            ...emailIds.map((id) => invalidateSoupEntity(id)),
+          ]
+        : []),
+      queryClient.invalidateQueries({ queryKey: notificationKeys.user._def }),
+    ]);
+    throw rejected.reason ?? new Error('Failed to undo');
+  }
+
+  await Promise.all([
+    ...(!hasQueuedEmail
+      ? [
+          queryClient.invalidateQueries({
+            queryKey: queryKeys.all.email,
+            refetchType: 'none',
+          }),
+          // Refetch open thread views only after the unarchive has committed.
+          ...emailIds.map((id) =>
+            queryClient.invalidateQueries({
+              queryKey: emailKeys.threadMessages(id).queryKey,
+            })
+          ),
+        ]
+      : []),
+    queryClient.invalidateQueries({
+      queryKey: notificationKeys.user._def,
+      refetchType: 'none',
+    }),
+  ]);
+  return hasQueuedEmail ? 'queued' : 'committed';
+}

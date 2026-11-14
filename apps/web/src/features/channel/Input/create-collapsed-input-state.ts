@@ -1,0 +1,66 @@
+import { isMobile } from '@core/mobile/isMobile';
+import { pickPhotoLibraryMediaOrFiles } from '@core/mobile/nativePhotoLibrary';
+import { fireAndForget } from '@core/util/fireAndForget';
+import {
+  type Accessor,
+  createEffect,
+  createMemo,
+  createSignal,
+  on,
+} from 'solid-js';
+
+/**
+ * State and handlers for the `CollapsedInput` that stands in for a full
+ * input until the user expands it.
+ */
+export function createCollapsedInputState(options: {
+  /** Id of the input this state serves; collapses again when it changes. */
+  inputId: Accessor<string | undefined>;
+  attachFiles: (files: File[]) => Promise<void>;
+}) {
+  const [isExpanded, setIsExpanded] = createSignal(false);
+  let filePickerRef: HTMLInputElement | undefined;
+
+  // Collapse again when the surrounding view switches to another input.
+  // The memo equality-gates the id: callers' `input` prop getters can track
+  // more than the id (e.g. the unified reply/edit input feeds the live draft
+  // value back into `input`), and `on()` re-fires on any tracked change, not
+  // value change — without the memo every keystroke would collapse the input.
+  const inputId = createMemo(options.inputId);
+  createEffect(on(inputId, () => setIsExpanded(false), { defer: true }));
+
+  const attachFiles = async (files: File[]) => {
+    if (files.length === 0) return;
+    await options.attachFiles(files);
+  };
+
+  const attachPicked = async () => {
+    await attachFiles(
+      await pickPhotoLibraryMediaOrFiles(() => filePickerRef?.click())
+    );
+  };
+
+  const attach = () => {
+    fireAndForget(attachPicked(), 'channel-input');
+  };
+
+  const onFilePickerChange = (
+    event: Event & { currentTarget: HTMLInputElement }
+  ) => {
+    const files = Array.from(event.currentTarget.files ?? []);
+    event.currentTarget.value = '';
+    fireAndForget(attachFiles(files), 'channel-input');
+  };
+
+  return {
+    /** Whether the collapsed stand-in renders instead of the real input. */
+    isCollapsed: () => isMobile() && !isExpanded(),
+    expand: () => setIsExpanded(true),
+    collapse: () => setIsExpanded(false),
+    attach,
+    onFilePickerChange,
+    setFilePickerRef: (element: HTMLInputElement) => {
+      filePickerRef = element;
+    },
+  };
+}

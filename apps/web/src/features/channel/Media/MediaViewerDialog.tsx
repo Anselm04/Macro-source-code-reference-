@@ -1,0 +1,216 @@
+import { FileDownloadButton } from '@core/component/FileDownload';
+import { Lightbox, LightboxToolbar } from '@core/component/Lightbox';
+import { isMobile } from '@core/mobile/isMobile';
+import {
+  createFileDownload,
+  type FileDownloadController,
+} from '@core/util/createFileDownload';
+import ChevronLeftIcon from '@icon/system/regular/caret-left.svg';
+import ChevronRightIcon from '@icon/system/regular/caret-right.svg';
+import XIcon from '@icon/system/regular/x.svg';
+import { Dialog } from '@kobalte/core/dialog';
+import { Button, cn } from '@ui';
+import { type Accessor, createMemo, Show } from 'solid-js';
+import { mediaDownloadSource } from '../queries/static-media-download';
+import type { MediaItem } from './media-items';
+
+type MediaViewerDialogProps = {
+  items: Accessor<MediaItem[]>;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  currentIndex: Accessor<number>;
+  onCurrentIndexChange: (index: number) => void;
+};
+
+function VideoViewerContent(props: {
+  item: Accessor<MediaItem>;
+  download: FileDownloadController;
+  onPrevious?: () => void;
+  onNext?: () => void;
+  indexLabel?: Accessor<string>;
+  navigationHidden?: boolean;
+}) {
+  let opener: HTMLElement | undefined;
+  const navButtonClass =
+    'absolute top-1/2 -translate-y-1/2 bg-surface backdrop-blur-sm rounded-lg border border-edge p-2 shadow-md hover:bg-surface transition-colors disabled:cursor-not-allowed disabled:opacity-50';
+
+  let swipeTouchStartX = 0;
+  let swipeTouchEndX = 0;
+  let isSwiping = false;
+
+  const handleTouchStart = (e: TouchEvent) => {
+    const hasNav = props.onPrevious != null || props.onNext != null;
+    if (!hasNav || e.touches.length !== 1) return;
+    swipeTouchStartX = e.touches[0].clientX;
+    swipeTouchEndX = e.touches[0].clientX;
+    isSwiping = false;
+  };
+
+  const handleTouchMove = (e: TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    swipeTouchEndX = e.touches[0].clientX;
+    if (Math.abs(swipeTouchStartX - swipeTouchEndX) > 30) isSwiping = true;
+  };
+
+  const handleTouchEnd = () => {
+    if (isSwiping) {
+      const diff = swipeTouchStartX - swipeTouchEndX;
+      if (Math.abs(diff) > 50) {
+        if (diff > 0) props.onNext?.();
+        else props.onPrevious?.();
+      }
+    }
+    isSwiping = false;
+    swipeTouchStartX = 0;
+    swipeTouchEndX = 0;
+  };
+
+  return (
+    <div
+      class="fixed inset-0 z-modal flex items-center justify-center"
+      style={{
+        'margin-top': 'max(var(--safe-top), 0.5rem)',
+        'margin-bottom': 'max(var(--safe-bottom), 1.5rem)',
+        'margin-left': 'max(var(--safe-left), 0.5rem)',
+        'margin-right': 'max(var(--safe-right), 0.5rem)',
+      }}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
+    >
+      <Dialog.Content
+        class="flex items-center justify-center bg-surface"
+        onOpenAutoFocus={() => {
+          if (document.activeElement instanceof HTMLElement)
+            opener = document.activeElement;
+        }}
+        onCloseAutoFocus={(event) => {
+          if (opener?.isConnected) {
+            event.preventDefault();
+            opener.focus();
+          }
+        }}
+      >
+        <div class="flex size-full items-center justify-center">
+          <video
+            class="max-h-[80vh] max-w-[90vw] rounded-2xl bg-[black]"
+            tabIndex={0}
+            controls
+            autoplay
+            playsinline
+            src={props.item().fullSrc}
+          />
+        </div>
+
+        <LightboxToolbar isVisible={true}>
+          <FileDownloadButton download={props.download} iconOnly />
+          <Dialog.CloseButton
+            aria-label="Close"
+            tooltip="Close"
+            as={Button}
+            variant="ghost"
+            size="icon-md"
+          >
+            <XIcon class="size-4 touch:size-6 shrink-0 pointer-events-none" />
+          </Dialog.CloseButton>
+        </LightboxToolbar>
+
+        <Show when={props.indexLabel}>
+          <div
+            class="absolute top-4 left-4 rounded-lg border border-edge bg-surface px-3 py-1.5 shadow-md"
+            style={{ 'z-index': 'calc(var(--z-index-modal) + 1)' }}
+          >
+            <span class="text-sm font-medium text-ink">
+              {props.indexLabel?.()}
+            </span>
+          </div>
+        </Show>
+
+        <Show when={!isMobile() && !props.navigationHidden}>
+          <button
+            class={cn(navButtonClass, 'left-4')}
+            style={{ 'z-index': 'calc(var(--z-index-modal) + 1)' }}
+            onClick={props.onPrevious}
+            disabled={!props.onPrevious}
+            aria-label="Previous media"
+          >
+            <ChevronLeftIcon class="size-5 text-ink" />
+          </button>
+
+          <button
+            class={cn(navButtonClass, 'right-4')}
+            style={{ 'z-index': 'calc(var(--z-index-modal) + 1)' }}
+            onClick={props.onNext}
+            disabled={!props.onNext}
+            aria-label="Next media"
+          >
+            <ChevronRightIcon class="size-5 text-ink" />
+          </button>
+        </Show>
+      </Dialog.Content>
+    </div>
+  );
+}
+
+export function MediaViewerDialog(props: MediaViewerDialogProps) {
+  const currentItem = createMemo(() => props.items()[props.currentIndex()]);
+  const download = createFileDownload(() => {
+    const item = currentItem();
+    return item?.kind === 'video' ? mediaDownloadSource(item) : undefined;
+  });
+  const hasPrevious = () => props.currentIndex() > 0;
+  const hasNext = () => props.currentIndex() < props.items().length - 1;
+  const hasMultipleItems = () => props.items().length > 1;
+  const indexLabel = () =>
+    `${props.currentIndex() + 1}/${props.items().length}`;
+
+  const navigatePrevious = () => {
+    if (!hasPrevious()) return;
+    props.onCurrentIndexChange(props.currentIndex() - 1);
+  };
+
+  const navigateNext = () => {
+    if (!hasNext()) return;
+    props.onCurrentIndexChange(props.currentIndex() + 1);
+  };
+
+  return (
+    <Dialog
+      open={props.open}
+      onOpenChange={(open) => {
+        if (!open) download.cancel();
+        props.onOpenChange(open);
+      }}
+    >
+      <Dialog.Portal>
+        <Dialog.Overlay class="fixed inset-0 z-modal scrim-glass" />
+        <Show when={currentItem()}>
+          {(item) => (
+            <Show
+              when={item().kind === 'image'}
+              fallback={
+                <VideoViewerContent
+                  item={item}
+                  download={download}
+                  onPrevious={hasPrevious() ? navigatePrevious : undefined}
+                  onNext={hasNext() ? navigateNext : undefined}
+                  indexLabel={hasMultipleItems() ? indexLabel : undefined}
+                  navigationHidden={!hasMultipleItems()}
+                />
+              }
+            >
+              <Lightbox
+                src={() => item().fullSrc}
+                imageId={() => item().id}
+                onPrevious={hasPrevious() ? navigatePrevious : undefined}
+                onNext={hasNext() ? navigateNext : undefined}
+                navigationHidden={!hasMultipleItems()}
+                indexLabel={hasMultipleItems() ? indexLabel : undefined}
+              />
+            </Show>
+          )}
+        </Show>
+      </Dialog.Portal>
+    </Dialog>
+  );
+}

@@ -1,0 +1,734 @@
+import { type ListActivation, useListInteractions } from '@app/components/list';
+import { ListViewport } from '@app/components/list/ListViewport';
+import {
+  resolveEntityActionViewContext,
+  toEntityActionListState,
+  useEntityActionHotkeys,
+} from '@app/features/next-soup/actions';
+import { openEntityInSplitFromUnifiedList } from '@app/features/next-soup/utils';
+import {
+  MaybeSoupEntityActionDrawerManager,
+  SoupEntityContextMenu,
+} from '@app/features/soup';
+import { DEBUG_SETTING_KEYS, useDebugSetting } from '@app/lib/debugSettings';
+import { makePersistedState } from '@app/lib/persistence';
+import {
+  addUnique,
+  removeValue,
+  toggleValue,
+} from '@app/lib/signals/store-array-updaters';
+import { useGlobalNotificationSource } from '@components/app/GlobalAppState';
+import { SwipableRowProvider } from '@components/app/mobile/SwipableRow';
+import { useSplitPanelOrThrow } from '@components/app/split-layout/layoutUtils';
+import { HotkeyTags } from '@core/hotkey/constants';
+import { registerHotkey } from '@core/hotkey/hotkeys';
+import { isMobile } from '@core/mobile/isMobile';
+import { isTouchDevice } from '@core/mobile/isTouchDevice';
+import { createScrollTopFade } from '@core/util/createScrollTopFade';
+import {
+  type EntityData,
+  EntitySelectionToolbar,
+  getTaskStatusOptionId,
+  ListLayoutProvider,
+  type TaskEntityWithProperties,
+} from '@entity';
+import { soupPropertyToProperty } from '@entity/extractors-property';
+import CheckIcon from '@icon/system/regular/check.svg';
+import SpinnerIcon from '@icon/system/regular/spinner.svg';
+import { markRowNotificationsSeenOnOpen } from '@notifications/mark-row-seen';
+import { PROPERTY_OPTION_IDS, SYSTEM_PROPERTY_IDS } from '@property';
+import { useBulkSaveEntityPropertiesMutation } from '@queries/properties/entity';
+import { EntityType } from '@service-properties/generated/schemas/entityType';
+import { Button } from '@ui';
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  type JSX,
+  Match,
+  on,
+  type Setter,
+  Show,
+  Switch,
+} from 'solid-js';
+import type { VirtualizerHandle } from 'virtua/solid';
+import {
+  createTasksListEntryStorage,
+  DEFAULT_TASKS_LIST_STATE,
+  type TasksListStateSnapshot,
+} from '../../persistence';
+import type { TasksDataSourceItem } from '../../queries/use-tasks-query';
+import {
+  type TasksListActivationMetadata,
+  useTasksView,
+} from '../../tasks-view-context';
+import { TaskGroupHeader } from './TaskGroupHeader';
+import { TaskListContinuationRow } from './TaskListContinuationRow';
+import { TaskListEntity } from './TaskListEntity';
+import { TaskListHeader } from './TaskListHeader';
+import { TASK_LIST_COLUMNS } from './task-grid-template';
+import './task-list.css';
+import { ProjectAssignmentDialog } from '@app/features/projects/projects';
+import { fireAndForget } from '@core/util/fireAndForget';
+
+const getStatusProperty = (task: TaskEntityWithProperties) => {
+  const status = task.properties?.find(
+    (property) => property.definition.id === SYSTEM_PROPERTY_IDS.STATUS
+  );
+  if (!status) return undefined;
+  try {
+    return soupPropertyToProperty(status);
+  } catch {
+    return undefined;
+  }
+};
+
+export type TaskListProps = {
+  /** The focusable list root, for callers that hand keyboard focus back. */
+  ref?: (element: HTMLDivElement) => void;
+  /** Optional list-state content; defaults remain unchanged for other callers. */
+  emptyContent?: JSX.Element;
+  loadingContent?: JSX.Element;
+  errorContent?: JSX.Element;
+  referencePropertyIds?: readonly string[];
+  /** Pinned above the rows, such as the main Tasks list's tutorial row. */
+  listStart?: JSX.Element;
+};
+
+export function TaskList(props: TaskListProps) {
+  const panel = useSplitPanelOrThrow();
+  const notificationSource = useGlobalNotificationSource();
+  const {
+    state,
+    calendar,
+    projectsEnabled,
+    showTaskProject,
+    setState,
+    source,
+    list,
+    registerListActivationHandler,
+    openTask,
+    scopeKey,
+    filterByTag,
+  } = useTasksView();
+  const forceEmptyState = useDebugSetting(
+    DEBUG_SETTING_KEYS.FORCE_EMPTY_STATES
+  );
+  const isGroupExpanded = (groupId: string) =>
+    !state.collapsedGroupIds.includes(groupId);
+  const setGroupExpanded = (groupId: string, expanded: boolean) =>
+    setState(
+      'collapsedGroupIds',
+      expanded ? removeValue(groupId) : addUnique(groupId)
+    );
+  const toggleGroup = (groupId: string) =>
+    setState('collapsedGroupIds', toggleValue(groupId));
+
+  function openEntity(
+    entity: EntityData,
+    options: {
+      openInNewSplit?: boolean;
+      mergeHistory?: boolean;
+    } = {}
+  ) {
+    markRowNotificationsSeenOnOpen(entity, notificationSource);
+    fireAndForget(
+      openEntityInSplitFromUnifiedList(entity, {
+        splitHandle: panel.handle,
+        referredFrom: 'tasks',
+        ...options,
+      }),
+      'open-entity-in-split'
+    );
+  }
+
+  function onActivate({
+    item,
+    metadata,
+  }: ListActivation<TasksDataSourceItem, TasksListActivationMetadata>) {
+    if (item.kind === 'group-header') {
+      toggleGroup(item.groupId);
+
+      return;
+    }
+
+    if (item.kind !== 'entity') return;
+
+    const sourceRow = source
+      .items()
+      .find((row) => row.kind === 'entity' && row.id === item.id);
+
+    if (sourceRow?.kind !== 'entity') return;
+
+    const newSplit =
+      metadata?.newSplit === true || metadata?.event?.shiftKey === true;
+
+    if (
+      !newSplit &&
+      openTask(
+        { id: sourceRow.entity.id, fallbackName: sourceRow.entity.name },
+        { event: metadata?.event }
+      )
+    )
+      return;
+
+    openEntity(sourceRow.entity, { openInNewSplit: newSplit });
+  }
+
+  registerListActivationHandler(onActivate);
+
+  const entityActionViewContext = () =>
+    resolveEntityActionViewContext({
+      activeListView: panel.handle.content().id,
+      activeTab: state.tab,
+    });
+  const [viewport, setViewport] = createSignal<HTMLDivElement>();
+  createScrollTopFade(() =>
+    state.groupBy === 'none' ? viewport() : undefined
+  );
+  const [grid, setGrid] = createSignal<HTMLDivElement>();
+  const [timestampHeaderWidth, setTimestampHeaderWidth] =
+    createSignal<number>();
+  const [virtualizer, setVirtualizer] = createSignal<VirtualizerHandle>();
+
+  let scrollOffset = DEFAULT_TASKS_LIST_STATE.scrollOffset;
+  const readListState = (): TasksListStateSnapshot => ({
+    focusKey: list.focus.requestedKey(),
+    scrollOffset: virtualizer()?.scrollOffset ?? scrollOffset,
+  });
+
+  const applyListState: Setter<TasksListStateSnapshot> = (next) => {
+    const current = readListState();
+    const value = typeof next === 'function' ? next(current) : next;
+
+    // The view-owned controller survives inline detail navigation. Restore
+    // persisted focus only on a cold mount that has no live focus to preserve.
+    if (current.focusKey === undefined && value.focusKey !== undefined) {
+      list.focus.restore(value.focusKey, { reason: 'restore' });
+    }
+
+    scrollOffset = value.scrollOffset;
+    if (value.scrollOffset !== current.scrollOffset) {
+      virtualizer()?.scrollTo(value.scrollOffset);
+    }
+
+    return value;
+  };
+  const [, setPersistedListState] = makePersistedState(
+    [readListState, applyListState],
+    { storages: createTasksListEntryStorage(panel.handle, scopeKey) }
+  );
+
+  const visibleRows = source.items;
+  const columns = () =>
+    TASK_LIST_COLUMNS.filter(
+      (column) => column !== 'initiative' || showTaskProject()
+    );
+  const columnCount = () => columns().length;
+  const [assigningProjectTasks, setAssigningProjectTasks] =
+    createSignal<string[]>();
+  const tasksById = createMemo(() => {
+    const tasks = new Map<string, TaskEntityWithProperties>();
+    for (const row of visibleRows()) {
+      if (row.kind === 'entity') tasks.set(row.entity.id, row.entity);
+    }
+    return tasks;
+  });
+  const saveProperties = useBulkSaveEntityPropertiesMutation();
+  const canCompleteTask = (taskId: string) => {
+    const task = tasksById().get(taskId);
+    if (!task || saveProperties.isPending) return false;
+    return (
+      getTaskStatusOptionId(task) !== PROPERTY_OPTION_IDS.STATUS.COMPLETED &&
+      getStatusProperty(task) !== undefined
+    );
+  };
+  const completeTask = (taskId: string) => {
+    const task = tasksById().get(taskId);
+    if (!task) return;
+    const property = getStatusProperty(task);
+    if (!property) return;
+    saveProperties.mutate({
+      properties: [
+        {
+          entityId: task.id,
+          entityType: EntityType.TASK,
+          property,
+          apiValues: {
+            valueType: 'SELECT_STRING',
+            values: [PROPERTY_OPTION_IDS.STATUS.COMPLETED],
+          },
+        },
+      ],
+    });
+  };
+
+  const selectedTasks = createMemo(() =>
+    list.selection
+      .items()
+      .flatMap((row) => (row.kind === 'entity' ? [row.entity] : []))
+  );
+
+  const focusedTask = () => {
+    const row = list.focus.result()?.item;
+    return row?.kind === 'entity' ? row.entity : undefined;
+  };
+
+  const actionState = toEntityActionListState({
+    controller: list,
+    getEntity: (row) => (row.kind === 'entity' ? row.entity : undefined),
+    onFocus: (target) => {
+      if (target) {
+        virtualizer()?.scrollToIndex(target.index, { align: 'nearest' });
+      }
+
+      grid()?.focus();
+    },
+  });
+
+  const listInteractions = useListInteractions({
+    controller: list,
+    scopeId: panel.splitHotkeyScope,
+    scrollHandle: virtualizer,
+    enabled: panel.isPanelActive,
+    navigation: {
+      // Hold focus at a group's last loaded task until its next page arrives;
+      // a failed page lets focus continue into the next group.
+      onBeforeMove: ({ direction, current }) => {
+        if (direction !== 1 || !current) return true;
+        const next = list.items.at(current.index + 1);
+        return (
+          next?.kind !== 'load-more' ||
+          next.groupId === undefined ||
+          Boolean(source.groupError?.(next.groupId))
+        );
+      },
+      onNavigate: (event) => {
+        if (event.kind !== 'move' || event.direction !== 1) return;
+        if (source.isLoadingMore() || !source.hasMore()) {
+          return;
+        }
+
+        const distanceFromEnd = event.result
+          ? list.items.count() - event.result.index - 1
+          : 0;
+        if (distanceFromEnd > 3) return;
+
+        fireAndForget(source.loadMore(), 'tasks-view');
+      },
+    },
+    activation: {
+      createMetadata: (intent) => ({ newSplit: intent === 'alternate' }),
+      alternateDescription: 'Open in new split',
+    },
+    disclosure: {
+      isHeader: (row) => row.kind === 'group-header',
+      getKey: (row) =>
+        row.kind === 'section-header' ? undefined : row.groupId,
+      isExpanded: isGroupExpanded,
+      setExpanded: setGroupExpanded,
+      getFocusKey: (groupId) =>
+        visibleRows().find(
+          (row) => row.kind === 'group-header' && row.groupId === groupId
+        )?.id,
+    },
+  });
+
+  useEntityActionHotkeys({
+    scopeId: panel.splitHotkeyScope,
+    list: actionState,
+    selectedEntities: selectedTasks,
+    focusedEntity: focusedTask,
+    restoreFocus: () => grid()?.focus(),
+    viewContext: entityActionViewContext,
+    splitHandle: panel.handle,
+    condition: panel.isPanelActive,
+  });
+
+  registerHotkey({
+    scopeId: panel.splitHotkeyScope,
+    description: 'Add to project…',
+    tags: [HotkeyTags.SelectionModification],
+    condition: () =>
+      panel.isPanelActive() && projectsEnabled() && selectedTasks().length > 0,
+    keyDownHandler: () => {
+      const ids = selectedTasks().map((task) => task.id);
+      if (!projectsEnabled() || !ids.length) return false;
+      setAssigningProjectTasks(ids);
+      return true;
+    },
+  });
+
+  let restoredScroll = false;
+  function registerVirtualizer(handle?: VirtualizerHandle) {
+    setVirtualizer(handle);
+    if (!handle || restoredScroll) return;
+
+    handle.scrollTo(scrollOffset);
+    restoredScroll = true;
+  }
+
+  let activeTab = state.tab;
+  createEffect(() => {
+    const nextTab = state.tab;
+    if (nextTab === activeTab) return;
+
+    activeTab = nextTab;
+    listInteractions.selection.clear();
+    list.focus.clear({ reason: 'programmatic' });
+    setPersistedListState((current) => ({ ...current, scrollOffset: 0 }));
+  });
+
+  createEffect(() => {
+    visibleRows();
+    if (source.isLoading()) return;
+    if (list.focus.result()) return;
+
+    const restored = list.focus.restore(list.focus.requestedKey(), {
+      retainUnavailable: false,
+    });
+    if (restored) return;
+    if (isTouchDevice()) return;
+
+    list.focus.first({
+      isNavigable: (row) => row.kind === 'entity',
+      reason: 'restore',
+    });
+  });
+
+  // A group's next page can arrive after the reader scrolled past that group,
+  // inserting rows above the viewport. Keep the first visible row in place.
+  let scrollAnchor: { id: string; offset: number } | undefined;
+  function recordScrollAnchor() {
+    const handle = virtualizer();
+    if (!handle || handle.scrollOffset <= 0) {
+      scrollAnchor = undefined;
+      return;
+    }
+    const index = handle.findItemIndex(handle.scrollOffset);
+    const row = visibleRows()[index];
+    scrollAnchor = row && {
+      id: row.id,
+      offset: handle.scrollOffset - handle.getItemOffset(index),
+    };
+  }
+  createEffect(
+    on(
+      visibleRows,
+      (rows) => {
+        const handle = virtualizer();
+        const anchor = scrollAnchor;
+        if (!handle || !anchor) return;
+        const index = rows.findIndex((row) => row.id === anchor.id);
+        if (index < 0) return;
+        const offset = handle.getItemOffset(index) + anchor.offset;
+        if (Math.abs(offset - handle.scrollOffset) >= 1)
+          handle.scrollTo(offset);
+      },
+      { defer: true }
+    )
+  );
+
+  function checkNearEnd() {
+    const handle = virtualizer();
+    if (!handle) return;
+
+    if (!source.hasMore()) return;
+
+    const distance =
+      handle.scrollSize - handle.scrollOffset - handle.viewportSize;
+    if (distance >= 300 || source.isLoadingMore()) return;
+
+    fireAndForget(source.loadMore(), 'tasks-view');
+  }
+
+  const emptyMessage = () => {
+    if (state.search.trim()) return 'No tasks match this search.';
+
+    return 'No tasks in this view.';
+  };
+
+  return (
+    <MaybeSoupEntityActionDrawerManager>
+      <div
+        ref={(element: HTMLDivElement) => {
+          setGrid(element);
+          props.ref?.(element);
+        }}
+        role="grid"
+        aria-label="Tasks"
+        aria-multiselectable="true"
+        aria-activedescendant={list.focus.key()}
+        tabIndex={0}
+        class="soup-list @container/u-list relative flex size-full min-h-0 min-w-0 flex-col overflow-hidden pb-2 pt-1 outline-none"
+        style={{
+          '--task-updated-header-width':
+            timestampHeaderWidth() === undefined
+              ? undefined
+              : `${timestampHeaderWidth()}px`,
+        }}
+      >
+        <div class="flex size-full min-h-0 min-w-0 flex-col px-2 @min-[640px]/u-list:px-3 mobile:px-1">
+          <ListLayoutProvider ref={grid}>
+            <Show when={!isMobile()}>
+              <TaskListHeader
+                columns={columns()}
+                onTimestampWidthChange={setTimestampHeaderWidth}
+              />
+            </Show>
+            <SwipableRowProvider
+              container={viewport}
+              canSwipeLeft={canCompleteTask}
+              canSwipeRight={() => false}
+              onSwipeLeft={completeTask}
+              triggerBehavior="spring-back"
+            >
+              <Switch>
+                <Match when={!forceEmptyState() && source.isLoading()}>
+                  <Show
+                    when={props.loadingContent !== undefined}
+                    fallback={
+                      <div class="grid min-h-0 flex-1 place-items-center text-ink-muted">
+                        <SpinnerIcon class="size-5 animate-spin" />
+                      </div>
+                    }
+                  >
+                    {props.loadingContent}
+                  </Show>
+                </Match>
+
+                <Match when={!forceEmptyState() && source.error()}>
+                  <Show
+                    when={props.errorContent !== undefined}
+                    fallback={
+                      <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 text-sm text-ink-muted">
+                        <span>Tasks couldn’t be loaded.</span>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={() =>
+                            fireAndForget(source.refresh(), 'tasks-view')
+                          }
+                        >
+                          Try again
+                        </Button>
+                      </div>
+                    }
+                  >
+                    {props.errorContent}
+                  </Show>
+                </Match>
+
+                <Match when={forceEmptyState() || visibleRows().length === 0}>
+                  <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 text-sm text-ink-muted">
+                    <Show
+                      when={props.emptyContent !== undefined}
+                      fallback={<span>{emptyMessage()}</span>}
+                    >
+                      {props.emptyContent}
+                    </Show>
+                    <Show when={!forceEmptyState() && source.hasMore()}>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={source.isLoadingMore()}
+                        onClick={() =>
+                          fireAndForget(source.loadMore(), 'tasks-view')
+                        }
+                      >
+                        <Show
+                          when={source.isLoadingMore()}
+                          fallback="Search more results"
+                        >
+                          <SpinnerIcon class="size-3 animate-spin" />
+                          Searching
+                        </Show>
+                      </Button>
+                    </Show>
+                  </div>
+                </Match>
+
+                <Match when={true}>
+                  <ListViewport
+                    ref={registerVirtualizer}
+                    viewportRef={setViewport}
+                    items={visibleRows()}
+                    isSticky={(row) => row.kind === 'group-header'}
+                    focusedIndex={list.focus.index()}
+                    start={props.listStart}
+                    onScroll={() => {
+                      recordScrollAnchor();
+                      checkNearEnd();
+                    }}
+                  >
+                    {(row) => (
+                      <Switch>
+                        <Match
+                          when={row.kind === 'group-header' ? row : undefined}
+                        >
+                          {(group) => (
+                            <TaskGroupHeader
+                              row={group()}
+                              columnCount={columnCount()}
+                              groupBy={state.groupBy}
+                              expanded={isGroupExpanded(group().groupId)}
+                              focused={list.focus.isFocused(group().id)}
+                              onFocus={() =>
+                                list.focus.set(group().id, {
+                                  reason: 'hover',
+                                })
+                              }
+                              onToggle={() =>
+                                list.activate.key(group().id, {
+                                  reason: 'pointer',
+                                })
+                              }
+                            />
+                          )}
+                        </Match>
+                        <Match when={row.kind === 'entity' && row}>
+                          {(entityRow) => (
+                            <SoupEntityContextMenu
+                              entity={entityRow().entity}
+                              list={actionState}
+                              selectedEntities={selectedTasks}
+                              viewContext={entityActionViewContext()}
+                              onOpenChange={(open) => {
+                                if (!open) return;
+                                list.focus.set(entityRow().id, {
+                                  reason: 'pointer',
+                                  force: true,
+                                });
+                                list.selection.setAnchor(entityRow().id);
+                              }}
+                            >
+                              <TaskListEntity
+                                referencePropertyIds={
+                                  props.referencePropertyIds
+                                }
+                                showProject={showTaskProject()}
+                                calendar={calendar}
+                                rowId={entityRow().id}
+                                entity={entityRow().entity}
+                                highlighted={list.focus.isFocused(
+                                  entityRow().id
+                                )}
+                                checked={list.selection.isSelected(
+                                  entityRow().id
+                                )}
+                                onFilterByTag={filterByTag}
+                                onMouseMove={() =>
+                                  list.focus.set(entityRow().id, {
+                                    reason: 'hover',
+                                  })
+                                }
+                                onClick={(event) => {
+                                  if (
+                                    event.metaKey ||
+                                    event.ctrlKey ||
+                                    (isTouchDevice() &&
+                                      list.selection.count() > 0)
+                                  ) {
+                                    listInteractions.selection.toggle(
+                                      entityRow().id
+                                    );
+
+                                    return;
+                                  }
+
+                                  list.activate.key(entityRow().id, {
+                                    reason: 'pointer',
+                                    metadata: { event },
+                                  });
+                                }}
+                                onProjectClick={(project, event) => {
+                                  const openInNewSplit = event.shiftKey;
+
+                                  openEntity(project, {
+                                    openInNewSplit,
+                                  });
+                                }}
+                                onChecked={(selected, shiftKey) =>
+                                  listInteractions.selection.set(
+                                    entityRow().id,
+                                    selected,
+                                    { range: shiftKey }
+                                  )
+                                }
+                                entityRowConfig={{
+                                  swipeLeftColor: 'bg-success',
+                                  swipeLeftRevealedComponent: (
+                                    <CheckIcon class="size-8 text-surface" />
+                                  ),
+                                }}
+                              />
+                            </SoupEntityContextMenu>
+                          )}
+                        </Match>
+                        <Match
+                          when={row.kind === 'section-header' ? row : undefined}
+                        >
+                          {(section) => (
+                            <div id={section().id} role="row">
+                              <div
+                                role="gridcell"
+                                aria-colspan={columnCount()}
+                                class="flex h-8 items-end px-3 pb-1 text-xs font-semibold text-ink-extra-muted"
+                              >
+                                {section().label}
+                              </div>
+                            </div>
+                          )}
+                        </Match>
+                        <Match
+                          when={
+                            row.kind === 'load-more' &&
+                            row.groupId !== undefined
+                              ? { ...row, groupId: row.groupId }
+                              : undefined
+                          }
+                        >
+                          {(continuation) => (
+                            <TaskListContinuationRow
+                              id={continuation().id}
+                              columnCount={columnCount()}
+                              isLoading={continuation().isLoading ?? false}
+                              failed={Boolean(
+                                source.groupError?.(continuation().groupId)
+                              )}
+                              onLoad={() =>
+                                fireAndForget(
+                                  source.loadMoreGroup(continuation().groupId),
+                                  'tasks-view'
+                                )
+                              }
+                            />
+                          )}
+                        </Match>
+                      </Switch>
+                    )}
+                  </ListViewport>
+                </Match>
+              </Switch>
+            </SwipableRowProvider>
+            <Show when={selectedTasks().length > 0}>
+              <EntitySelectionToolbar
+                selected={selectedTasks()}
+                onClear={listInteractions.selection.clear}
+                analyticsSource="tasks_view_selection_toolbar"
+              />
+            </Show>
+            <Show when={projectsEnabled() && assigningProjectTasks()}>
+              {(assigning) => (
+                <ProjectAssignmentDialog
+                  taskIds={assigning()}
+                  onClose={() => setAssigningProjectTasks(undefined)}
+                />
+              )}
+            </Show>
+          </ListLayoutProvider>
+        </div>
+      </div>
+    </MaybeSoupEntityActionDrawerManager>
+  );
+}

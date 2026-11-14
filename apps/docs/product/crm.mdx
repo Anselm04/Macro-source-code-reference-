@@ -1,0 +1,57 @@
+---
+title: "Customers"
+icon: "buildings"
+description: "Contact and company records built automatically from your team's email."
+---
+
+<GuideGraphic kind="crm" label="A customer record stays connected to the team conversation." />
+
+Customers stays off until a team admin turns on **Team CRM** in **Settings → CRM**. **Backfill existing emails** builds records from mail the team already has. **Start from now** uses only mail that arrives after you turn it on. If you are not an admin, Customers says a team owner or admin has to enable it. Turning **Team CRM** off permanently deletes the team's companies, contacts, and their history.
+
+Watch a 1:26 walkthrough of Macro CRM.
+
+<video src="https://macro.com/video/tutorials/crm.mp4" poster="https://macro.com/video/tutorials/crm-poster.jpg" controls playsInline preload="metadata" className="w-full aspect-video rounded-xl" />
+
+## How email fills the CRM
+
+CRM reads the account marked **Primary** in **Settings → Email**. A second account you connect does not. Mail you send from the primary account to someone outside that account's domain creates a contact, and everyone at that domain shares one company. Mail you only receive does not create a company. Once the company exists, later mail moves **Last Interaction**, including replies and other people at that domain. Generic tool and vendor domains are left out.
+
+On a team, every member's **Primary** account feeds the same Customers. Two people emailing someone at one company produce one company and one contact. The name saved first stays. **Sync Emails** controls whether teammates can open those threads. The company remains either way.
+
+## Companies and people
+
+**Companies** lists every visible company, grouped by stage. **Owner**, **Revenue**, and **Last Interaction** are the columns. **Display options** can also show **Stage**. A new company stays at **No stage** until someone places it. The stages start as **Lead**, **Demo**, **Customer**, and **Churned**.
+
+An admin changes them in **Settings → CRM**. **Customize** renames a stage, drags it into a new order, or **Add** one. Delete a stage and companies in it move to **No stage**. **Reset to defaults** restores the four above. New pipelines start from these stages. A pipeline you already created keeps its own.
+
+Open a company to set **Stage**, **Owner**, and **Revenue**. **Add property** adds a field of your own. **Views** saves the current filters and grouping. Choose **Personal** or **Team**, then **Save**. Admins can **Show hidden companies** from **Display options**.
+
+**People** lists contacts, with the person, their company, and when you last contacted them.
+
+**New** creates a **Company**, a **Contact**, or a **Pipeline**. **Import** and **Export** move companies in and out of the team. On a pipeline, those actions are **Import CSV** and **Export CSV**.
+
+## Pipelines
+
+A pipeline is a [database](/product/databases) that lives in Customers. It tracks companies or contacts through stages you name, and **Board** is a view of that table: one column per stage, and a card you drag to move. Pipelines do not appear in Drive.
+
+A sales pipeline moves companies from a first conversation to a demo to a customer. A hiring pipeline moves contacts through interview stages. A renewal pipeline tracks customers coming up for another term. A partnerships pipeline tracks organizations you are evaluating. The same company or contact can sit in more than one pipeline.
+
+**Pipelines** in the sidebar lists the ones you can open. **New pipeline** sets the name, whether it tracks **Companies** or **Contacts**, and **Share with my team**. **Create pipeline** adds it. **Add deal** adds a company. **Add contact** adds a person. **Table** is the other layout. Cells, columns, and views work the same way as in a database.
+
+## Team sharing
+
+A company is on the team's lists when **Visible in CRM** is checked. An admin unchecks it to hide the company, and its contacts, from lists and search. Admins can show hidden companies again.
+
+**Sync Emails** starts on. Everyone on the team can then read the team's email with that company. Turn it off and those threads stay with the people on them. Only an admin can change **Visible in CRM** or **Sync Emails**. Hiding a company also turns **Sync Emails** off.
+
+@mentioning a company or contact does not share it. See [Mentions](/concepts/mentions#what-happens-when-you-mention).
+
+A pipeline starts private. Check **Share with my team** to share it when you create it. Later, the owner uses **Share** and sets **Team access** to **Can edit**, or to **No team access** to keep it private.
+
+## Discussions
+
+Every company and contact has a discussion for notes that should stay on the record. @mention a teammate and they get a notification.
+
+<Note>
+  You can also work with the CRM through Macro's MCP server. Connect it in **Settings → MCP server**.
+</Note>

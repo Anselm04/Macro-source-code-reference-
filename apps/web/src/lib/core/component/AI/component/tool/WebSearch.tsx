@@ -1,0 +1,63 @@
+import { UnfurlLink } from '@core/component/Link';
+import Globe from '@icon/system/regular/globe.svg';
+import { createSignal, For } from 'solid-js';
+import { BaseTool } from './BaseTool';
+import { Tool } from './Tool';
+import { createToolRenderer } from './ToolRenderer';
+
+const handler = createToolRenderer({
+  name: 'WebSearch',
+  render: (ctx) => {
+    const [isExpanded, setIsExpanded] = createSignal(false);
+    const results = () => ctx.response?.data.results ?? [];
+    const hitCount = () => results().length;
+    const hasResults = () => hitCount() > 0;
+    const statusText = () => {
+      if (!ctx.response) return undefined;
+      if (hitCount() === 0) return 'No Results';
+      if (hitCount() === 1) return '1 result';
+      return `${hitCount()} results`;
+    };
+
+    return (
+      <BaseTool
+        icon={Globe}
+        renderContext={ctx.renderContext}
+        type="call"
+        response={
+          hasResults() && isExpanded() ? (
+            <div class="flex flex-col">
+              <For each={results()}>
+                {(result) => (
+                  <UnfurlLink
+                    unfurled={{
+                      title: result.title,
+                      url: result.url,
+                    }}
+                  />
+                )}
+              </For>
+            </div>
+          ) : undefined
+        }
+      >
+        <div class="flex min-w-0 flex-1 items-center justify-between gap-3 overflow-hidden">
+          <div class="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
+            <span class="min-w-0 truncate">
+              {ctx.response ? 'Searched for' : 'Search for'}{' '}
+              <span class="text-ink">{ctx.tool.data.query}</span>
+            </span>
+          </div>
+          <Tool.ResultToggle
+            expanded={isExpanded()}
+            onToggle={() => setIsExpanded((expanded) => !expanded)}
+            showToggle={hasResults()}
+            status={statusText()}
+          />
+        </div>
+      </BaseTool>
+    );
+  },
+});
+
+export const webSearchHandler = handler;

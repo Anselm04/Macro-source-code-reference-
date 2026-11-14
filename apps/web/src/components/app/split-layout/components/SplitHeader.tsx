@@ -1,0 +1,564 @@
+import type { ListDetailNavigationTarget } from '@app/components/list';
+import { ViewBreadcrumbs } from '@app/components/view-shell';
+import { isListViewID, LIST_VIEW_ID } from '@app/constants/list-views';
+import { CALENDAR_VIEW_ID } from '@app/features/calendar-view/types';
+import { driveLocationLabel } from '@app/features/drive-view/core/location-label';
+import type { DriveState } from '@app/features/drive-view/core/types';
+import { useSoup } from '@app/features/next-soup/soup-context';
+import { openEntityInSplitFromUnifiedList } from '@app/features/next-soup/utils';
+import { projectRouteId } from '@app/features/projects/core/route';
+import { t } from '@app/lib/i18n';
+import { useGlobalNotificationSource } from '@components/app/GlobalAppState';
+import { HeaderActionGroup } from '@components/app/HeaderActionGroup';
+import { type BlockName, NonDocumentBlockTypes } from '@core/block';
+import { fileTypeToBlockName } from '@core/constant/allBlocks';
+import { TOKENS } from '@core/hotkey/tokens';
+import { isMobile } from '@core/mobile/isMobile';
+import { isNativeMobilePlatform } from '@core/mobile/isNativeMobilePlatform';
+import { isTouchDevice } from '@core/mobile/isTouchDevice';
+import { fireAndForget } from '@core/util/fireAndForget';
+import { type EntityDragEvent, isEntityDragEvent } from '@entity';
+import CollapseIcon from '@icon/system/regular/arrows-in.svg';
+import ExpandIcon from '@icon/system/regular/arrows-out.svg';
+import CaretDown from '@icon/system/regular/caret-down.svg';
+import CaretLeft from '@icon/system/regular/caret-left.svg';
+import CaretUp from '@icon/system/regular/caret-up.svg';
+import { mergeRefs } from '@solid-primitives/refs';
+import { createDroppable, useDragDropContext } from '@thisbeyond/solid-dnd';
+import { Button, ButtonGroup, cn } from '@ui';
+import {
+  createMemo,
+  onCleanup,
+  type ParentProps,
+  type Setter,
+  Show,
+  untrack,
+  useContext,
+} from 'solid-js';
+import { Portal } from 'solid-js/web';
+import { match, P } from 'ts-pattern';
+import {
+  type PriorityCollapseController,
+  PriorityCollapseOverflowSensor,
+} from '../../../priority-collapse/PriorityCollapseOverflowSensor';
+import { runSplitBack } from '../back-interceptor';
+import { SplitLayoutContext, SplitPanelContext } from '../context';
+import type { SplitContent } from '../layoutManager';
+import { canSpotlight } from '../utils/canSpotlight';
+import { HeaderIsland } from './HeaderIsland';
+import { SplitHeaderContextMenu } from './SplitHeaderContextMenu';
+
+function getEntitySplitContent(data: EntityDragEvent['draggable']['data']):
+  | {
+      type: SplitContent['type'];
+      id: string;
+    }
+  | undefined {
+  return (
+    match(data)
+      .returnType<{ type: SplitContent['type']; id: string } | undefined>()
+      .with({ type: 'initiative' }, (entity) => ({
+        type: 'component' as const,
+        id: projectRouteId({ id: entity.id, section: 'overview' }),
+      }))
+      .with({ type: 'document' }, (entity) => ({
+        type: fileTypeToBlockName(entity.subType?.type ?? entity.fileType) as
+          | BlockName
+          | 'unknown',
+        id: entity.id,
+      }))
+      .with(
+        { type: P.union('channel_message', 'channel_thread') },
+        (entity) => ({
+          type: 'channel',
+          id: entity.channelId,
+        })
+      )
+      .with({ type: 'agent_session' }, (entity) => ({
+        type: 'agent',
+        id: entity.id,
+      }))
+      // Reminders open their referenced entity rather than a block of their own.
+      .with({ type: 'foreign' }, () => undefined)
+      // A runtime opens in Settings → Machines, not a block of its own.
+      .with({ type: 'harness' }, () => undefined)
+      // The full calendar opening path supplies the event range to focus.
+      .with({ type: 'calendar_event' }, () => ({
+        type: 'component',
+        id: CALENDAR_VIEW_ID,
+      }))
+      .with({ type: 'crm_company' }, (entity) => ({
+        type: 'company',
+        id: entity.id,
+      }))
+      .with({ type: 'crm_contact' }, (entity) => ({
+        type: 'contact',
+        id: entity.id,
+      }))
+      .with(
+        {
+          type: P.union(
+            'channel',
+            'chat',
+            'email',
+            'project',
+            'call',
+            'routine',
+            'database',
+            'form'
+          ),
+        },
+        (entity) => ({ type: entity.type, id: entity.id })
+      )
+      .exhaustive()
+  );
+}
+
+function hasAgentsBackFallback(content: SplitContent) {
+  return (
+    content.type === 'agent' || (isTouchDevice() && content.type === 'chat')
+  );
+}
+
+function SplitBackButton() {
+  const context = useContext(SplitPanelContext);
+  if (!context) return null;
+  return (
+    <Button
+      variant="ghost"
+      aria-label={t('splitMenu.goBack')}
+      tooltip={{ content: t('splitMenu.goBack'), hotkey: TOKENS.split.go.back }}
+      size="icon-sm"
+      class="p-1 touch:active:bg-transparent"
+      disabled={
+        !context.handle.canGoBack() &&
+        !hasAgentsBackFallback(context.handle.content())
+      }
+      onClick={() =>
+        runSplitBack({
+          canGoBack: () =>
+            context.handle.canGoBack() ||
+            hasAgentsBackFallback(context.handle.content()),
+          goBack: () => {
+            if (!context.handle.canGoBack()) {
+              context.handle.replace({
+                next: { type: 'component', id: 'agents' },
+                mergeHistory: true,
+              });
+            } else context.handle.goBack();
+          },
+        })
+      }
+    >
+      <CaretLeft class="size-3.5 touch:size-6 shrink-0 pointer-events-none" />
+    </Button>
+  );
+}
+
+function _SplitSpotlightButton() {
+  const context = useContext(SplitPanelContext);
+  const layout = useContext(SplitLayoutContext);
+  if (!context || !layout) return '';
+  return (
+    <Show when={canSpotlight(layout.manager)}>
+      <Button
+        variant="ghost"
+        aria-label={
+          context.handle.isSpotLight()
+            ? t('splitMenu.minimizeSplit')
+            : t('splitMenu.spotlightSplit')
+        }
+        tooltip={{
+          content: context.handle.isSpotLight()
+            ? t('splitMenu.minimizeSplit')
+            : t('splitMenu.spotlightSplit'),
+          hotkey: TOKENS.window.spotlight.toggle,
+        }}
+        class="p-1 hidden"
+        onClick={() => context.handle.toggleSpotlight()}
+      >
+        {context.handle.isSpotLight() ? (
+          <CollapseIcon class="h-4" />
+        ) : (
+          <ExpandIcon class="h-4" />
+        )}
+      </Button>
+    </Show>
+  );
+}
+
+function SplitDriveReturnButton() {
+  const panel = useContext(SplitPanelContext);
+  const layout = useContext(SplitLayoutContext);
+  if (!panel || !layout) return null;
+
+  const sourceList = createMemo(() =>
+    panel.handle
+      .history()
+      .slice(0, -1)
+      .reverse()
+      .find(
+        (content) => content.type === 'component' && isListViewID(content.id)
+      )
+  );
+  const isDrive = (content: SplitContent) =>
+    content.type === 'component' && content.id === LIST_VIEW_ID.documents;
+  const currentIsDriveItem = () => {
+    const content = panel.handle.content();
+    return (
+      content.type !== 'component' &&
+      (content.type === 'project' ||
+        !NonDocumentBlockTypes.includes(content.type))
+    );
+  };
+  const sourceLabel = () => {
+    const state = sourceList()?.state;
+    const label = state?.['drive.returnLabel'];
+
+    if (typeof label === 'string') return label;
+
+    const driveState = state?.['drive.view.v2'] as DriveState | undefined;
+    return driveState ? driveLocationLabel(driveState.location) : 'My Files';
+  };
+  const returnToDrive = () => {
+    if (panel.handle.goBackTo(isDrive)) return;
+    const driveSplit = layout.manager
+      .splits()
+      .find((split) => isDrive(split.content));
+    if (driveSplit) layout.manager.getSplit(driveSplit.id)?.activate();
+  };
+
+  return (
+    <Show
+      when={sourceList()?.id === LIST_VIEW_ID.documents && currentIsDriveItem()}
+    >
+      <ViewBreadcrumbs.ReturnButton
+        onClick={returnToDrive}
+        tooltip={sourceLabel()}
+      >
+        {sourceLabel()}
+      </ViewBreadcrumbs.ReturnButton>
+      <ViewBreadcrumbs.Separator class="ml-1" />
+    </Show>
+  );
+}
+
+function SoupNavigationButtons() {
+  const context = useContext(SplitPanelContext);
+  const soup = useSoup();
+  const notificationSource = useGlobalNotificationSource();
+  if (!context) return null;
+
+  const rows = createMemo(() => soup.rows());
+  const currentIndex = () => soup.focus.index();
+
+  const navigationReferredFrom = createMemo(() => {
+    const referredFrom = context.handle.referredFrom();
+    if (referredFrom !== 'home' && referredFrom !== 'mail') {
+      return;
+    }
+
+    return referredFrom;
+  });
+
+  const shouldShow = createMemo(() => {
+    // The mobile swipe layout doesn't handle mergeHistory navigations, so
+    // these controls would silently no-op there.
+    if (isTouchDevice()) return false;
+
+    const referredFrom = navigationReferredFrom();
+    const isNavigableListView =
+      referredFrom === 'home' || referredFrom === 'mail';
+
+    return isNavigableListView && rows().length > 0;
+  });
+
+  const canNavigateUp = createMemo(() => {
+    return rows().length > 0 && currentIndex() !== 0;
+  });
+
+  const canNavigateDown = createMemo(() => {
+    return rows().length > 0 && currentIndex() !== rows().length - 1;
+  });
+
+  const navigate = (offset: number) => {
+    const next = soup.navigate.by(offset, { skipGroupHeaders: true });
+    if (!next) return;
+
+    fireAndForget(
+      openEntityInSplitFromUnifiedList(next.row.original, {
+        splitHandle: context.handle,
+        mergeHistory: true,
+        referredFrom: navigationReferredFrom(),
+        notificationSource,
+      }),
+      'open-entity-in-split'
+    );
+  };
+
+  return (
+    <Show when={shouldShow()}>
+      <ListNavigationButtons
+        size={context.headerMdControls?.[0]() ? 'md' : 'sm'}
+        navigation={{
+          canPrevious: canNavigateUp,
+          canNext: canNavigateDown,
+          previous: () => navigate(-1),
+          next: () => navigate(1),
+        }}
+      />
+    </Show>
+  );
+}
+
+/** Shared header controls; each host supplies its current list navigation. */
+export function ListNavigationButtons(props: {
+  navigation: ListDetailNavigationTarget;
+  class?: string;
+  size?: 'sm' | 'md';
+}) {
+  const iconSize = () =>
+    isTouchDevice() || props.size === 'md' ? 'icon-md' : 'icon-sm';
+  return (
+    <HeaderActionGroup label={t('splitMenu.itemNavigation')} size={props.size}>
+      <div class={cn('flex items-center touch:gap-0.5', props.class)}>
+        <ButtonGroup.Button
+          aria-label={t('splitMenu.previousItem')}
+          tooltip={{
+            content: t('splitMenu.previousItem'),
+            hotkey: TOKENS.entity.step.start,
+          }}
+          variant="ghost"
+          size={iconSize()}
+          disabled={!props.navigation.canPrevious()}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={props.navigation.previous}
+        >
+          <CaretUp class="size-4" />
+        </ButtonGroup.Button>
+        <ButtonGroup.Button
+          aria-label={t('splitMenu.nextItem')}
+          tooltip={{
+            content: t('splitMenu.nextItem'),
+            hotkey: TOKENS.entity.step.end,
+          }}
+          variant="ghost"
+          size={iconSize()}
+          disabled={!props.navigation.canNext()}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={props.navigation.next}
+        >
+          <CaretDown class="size-4" />
+        </ButtonGroup.Button>
+      </div>
+    </HeaderActionGroup>
+  );
+}
+
+export function SplitHeader(props: {
+  ref: Setter<HTMLDivElement | null>;
+  collapseController: PriorityCollapseController;
+}) {
+  const panel = useContext(SplitPanelContext);
+  const notificationSource = useGlobalNotificationSource();
+  if (!panel) {
+    throw new Error('<SplitHeader> must be used within a <SplitLayout>');
+  }
+
+  const hideMobileBack = () => {
+    const content = panel.handle.content();
+    return (
+      isListViewID(content.id) ||
+      (content.type === 'component' &&
+        (content.id === 'booking-links' ||
+          content.id === 'external' ||
+          content.id === 'passwords'))
+    );
+  };
+
+  const droppableId = `split-header-${panel.handle.id}`;
+  const droppable = createDroppable(droppableId, {
+    type: 'split-header',
+  });
+  const [dragDropState, { onDragEnd }] = useDragDropContext() ?? [
+    undefined,
+    { onDragEnd: () => {} },
+  ];
+
+  const isEntityDraggingOver = createMemo(() => {
+    const data = dragDropState?.active.draggable?.data;
+    return (
+      data?.dragType === 'entity' &&
+      dragDropState?.active.droppable?.id === droppableId
+    );
+  });
+
+  onDragEnd((event) => {
+    if (!isEntityDragEvent(event) || event.droppable?.id !== droppableId) {
+      return;
+    }
+
+    const data = event.draggable.data;
+
+    const current = panel.handle.content();
+    const next = getEntitySplitContent(data);
+    if (!next) return;
+    if (current.type === next.type && current.id === next.id) return;
+
+    fireAndForget(
+      openEntityInSplitFromUnifiedList(data, {
+        splitHandle: panel.handle,
+        allowDuplicate: true,
+        notificationSource,
+      }),
+      'open-entity-in-split'
+    );
+  });
+
+  return (
+    <SplitHeaderContextMenu>
+      <div
+        class={cn(
+          '@container/split-header isolate relative w-full h-full overflow-clip text-ink',
+          // On mobile the header overlays the panel body as a transparent strip
+          // of floating islands; the island utility's px min-size keeps them
+          // tappable regardless of the OS text-size setting (inert on desktop).
+          'touch:absolute touch:inset-x-0 touch:top-(--safe-top) touch:z-mobile-nav-bar touch:h-11.25 touch:overflow-visible touch:pointer-events-none',
+          isMobile() &&
+            !isNativeMobilePlatform() &&
+            'touch:top-[calc(var(--safe-top)+6px)]',
+          isEntityDraggingOver() && 'bg-active'
+        )}
+        data-split-header
+        ref={mergeRefs(droppable, props.ref)}
+      >
+        <Show when={panel.panelRef()}>
+          {(panelRef) => (
+            <Portal mount={panelRef()}>
+              <Show when={isEntityDraggingOver()}>
+                <div
+                  class="pointer-events-none absolute inset-0 z-modal-overlay bg-modal-overlay flex items-center justify-center"
+                  data-split-header-drop-overlay
+                >
+                  <div class="max-w-[min(28rem,calc(100%-3rem))] min-w-0 bg-surface border border-edge rounded-full shadow-lg shadow-drop-shadow px-4 py-2 flex items-center gap-2 font-sans text-xs text-ink">
+                    <span class="shrink-0 text-ink-muted">
+                      {t('splitMenu.openInThisSplit')}
+                    </span>
+                  </div>
+                </div>
+              </Show>
+            </Portal>
+          )}
+        </Show>
+        <div
+          class="absolute inset-0 flex justify-start items-center not-touch:pl-1 touch:px-(--mobile-chrome-gutter) touch:gap-2"
+          ref={props.collapseController.setRow}
+        >
+          <Show
+            when={isTouchDevice()}
+            fallback={
+              <div class="relative flex items-center pl-2 h-full">
+                <SplitDriveReturnButton />
+              </div>
+            }
+          >
+            {/* List views and Scheduling use navigation islands instead of Back. */}
+            <HeaderIsland
+              class={cn(
+                'relative gap-0 px-1',
+                ((!panel.handle.canGoBack() &&
+                  !hasAgentsBackFallback(panel.handle.content())) ||
+                  hideMobileBack()) &&
+                  'hidden'
+              )}
+            >
+              <Show when={!hideMobileBack()}>
+                <SplitBackButton />
+              </Show>
+            </HeaderIsland>
+          </Show>
+
+          {/* On mobile nothing clips this region (islands float over the
+              panel), so the max-content element is capped at the sensor's
+              width to let shrinkable islands truncate long titles instead of
+              painting off-screen. */}
+          <PriorityCollapseOverflowSensor
+            controller={props.collapseController}
+            truncateAsLastResort
+            class="relative min-w-0 h-full shrink overflow-hidden touch:overflow-visible"
+            contentClass="h-full flex items-center gap-0.5 pl-2 touch:pl-0 touch:gap-2 touch:max-w-full"
+            contentRef={(element) => {
+              panel.layoutRefs.headerLeft = element;
+              onCleanup(() => {
+                if (panel.layoutRefs.headerLeft === element) {
+                  panel.layoutRefs.headerLeft = undefined;
+                }
+              });
+            }}
+          />
+
+          <div class="header-actions h-full grow shrink flex items-center justify-end gap-2 px-2 touch:px-0">
+            <div
+              class="contents"
+              ref={(ref) => {
+                panel.layoutRefs.headerRight = ref;
+                onCleanup(() => {
+                  if (panel.layoutRefs.headerRight === ref) {
+                    panel.layoutRefs.headerRight = undefined;
+                  }
+                });
+              }}
+            />
+            <SoupNavigationButtons />
+          </div>
+        </div>
+      </div>
+    </SplitHeaderContextMenu>
+  );
+}
+
+export function SplitHeaderLeft(props: ParentProps) {
+  const ctx = useContext(SplitPanelContext);
+  if (!ctx)
+    throw new Error('<SplitHeaderLeft> must be used within a <SplitLayout>');
+
+  return (
+    <Show when={!ctx.mobileHeaderOwner[0]() && ctx.layoutRefs.headerLeft}>
+      <Portal
+        mount={ctx.layoutRefs.headerLeft}
+        ref={(div) => (div.style.display = 'contents')}
+      >
+        {props.children}
+      </Portal>
+    </Show>
+  );
+}
+
+/**
+ * `size="md"` declares that this contribution's controls are 32px (a list
+ * header with New, or Mail), so the header's own controls match them.
+ */
+export function SplitHeaderRight(props: ParentProps<{ size?: 'sm' | 'md' }>) {
+  const ctx = useContext(SplitPanelContext);
+  if (!ctx)
+    throw new Error('<SplitHeaderRight> must be used within a <SplitLayout>');
+
+  // A contribution's size is fixed for its lifetime, so it is read once.
+  const declaresMd = untrack(() => props.size === 'md');
+  if (declaresMd && ctx.headerMdControls) {
+    const [, setCount] = ctx.headerMdControls;
+    setCount((count) => count + 1);
+    onCleanup(() => setCount((count) => count - 1));
+  }
+
+  return (
+    <Show when={!ctx.mobileHeaderOwner[0]() && ctx.layoutRefs.headerRight}>
+      <Portal
+        mount={ctx.layoutRefs.headerRight}
+        ref={(div) => (div.style.display = 'contents')}
+      >
+        {props.children}
+      </Portal>
+    </Show>
+  );
+}

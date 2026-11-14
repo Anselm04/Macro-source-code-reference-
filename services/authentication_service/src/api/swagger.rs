@@ -1,0 +1,591 @@
+use github::domain::models::{
+    EnrichGithubPullRequestsProxyRequest, EnrichGithubPullRequestsResponse,
+    EnrichedGithubPullRequest, GithubMergeMethod, GithubPullRequestCheckRun,
+    GithubPullRequestComment, GithubPullRequestMergeability, GithubPullRequestMergeabilityEntry,
+    GithubPullRequestMergeabilityRequest, GithubPullRequestMergeabilityResponse,
+    GithubPullRequestNumber, GithubPullRequestRef, GithubPullRequestState, GithubPullRequestStatus,
+    MergeGithubPullRequestRequest, MergeGithubPullRequestResponse,
+    SetGithubPullRequestDraftRequest, SetGithubPullRequestDraftResponse,
+    SetGithubPullRequestStateRequest, SetGithubPullRequestStateResponse,
+};
+use gtm_invite::inbound::axum_router::dto::{
+    CreateGtmInviteLinkRequest, GtmInviteLink, GtmInviteLinkList, GtmInviteLinkStatus,
+    GtmInviteOffer, GtmInviteOfferStatus, PublicGtmInviteLink, RedeemGtmInviteLinkRequest,
+};
+use model::authentication::login::request::{AppleLoginRequest, PasswordRequest};
+use system_status::domain::models::{CurrentSystemStatus, StatusUpdate, SystemStatus};
+use system_status::inbound::axum_router::SystemStatusHistory;
+use teams::domain::model::{
+    PatchTeamCrmSettingsRequest, PatchTeamCrmSettingsResponse, PatchTeamMemberPlanRequest,
+    PatchTeamRequest, PatchTeamUserRole, Team, TeamInviteDetails, TeamInviteLinkTeam,
+    TeamInviteLinkToken, TeamMember, TeamPlan, TeamRole, TeamWithMembers,
+};
+use teams::inbound::axum_router::domain_notice::SendDomainNoticeResponse;
+use teams::inbound::axum_router::get_team_invites::TeamInvitesResponse as TeamTeamInvitesResponse;
+use teams::inbound::axum_router::get_user_invites::TeamInvitesResponse as UserTeamInvitesResponse;
+use teams::inbound::axum_router::invite_link::{
+    CreatedTeamInviteLinkResponse, JoinTeamByInviteLinkResponse, TeamInviteLinkResponse,
+};
+use teams::inbound::axum_router::toggle_auto_join_domain::ToggleAutoJoinDomainResponse;
+use teams::inbound::axum_router::toggle_non_admin_invites::ToggleNonAdminInvitesResponse;
+use teams::inbound::axum_router::{
+    create_team::CreateTeamRequest, invite_to_team::InviteToTeamRequest,
+};
+use user_quota::UserQuota;
+use utoipa::OpenApi;
+
+use crate::api::agent_api_keys::{
+    AgentApiKey, AgentApiKeyProvider, PutAgentApiKeyRequest, SavedAgentApiKey,
+};
+use crate::api::cursor_api_key::{CursorApiKeyStatus, put_cursor_api_key::PutCursorApiKeyRequest};
+use crate::api::email::generate_email_link::GenerateEmailLinkRequest;
+use crate::api::email::resend_fusionauth_verify_user_email::ResendFusionauthVerifyUserEmailRequest;
+use crate::api::jwt::macro_api_token::MacroApiTokenResponse;
+use crate::api::link::create_in_progress_link::CreateInProgressLinkResponse;
+use crate::api::link::github::{GithubLinkStatusResponse, InitGithubLinkResponse};
+use crate::api::link::gmail::{GmailLinkStatusResponse, InitGmailLinkResponse};
+use crate::api::link::outlook::InitOutlookLinkResponse;
+use crate::api::merge::create_merge_request::CreateAccountMergeRequest;
+use crate::api::user::get_legacy_user_permissions::GetLegacyUserPermissionsResponse;
+use crate::api::user::get_user_link_exists::UserLinkResponse;
+use crate::api::user::get_user_organization::UserOrganizationResponse;
+use crate::api::user::patch_tutorial::PatchUserTutorialRequest;
+use crate::api::user::patch_user_group::PatchUserGroupRequest;
+use crate::api::user::patch_user_onboarding::PatchUserOnboardingRequest;
+use crate::api::user::post_get_names::PostGetNamesRequestBody;
+use crate::api::user::post_get_names_with_email::GetNamesWithEmailRequestBody;
+use crate::api::user::stripe::change_plan::{ChangePlanRequest, ChangePlanResponse};
+use crate::api::user::stripe::create_checkout_session_v2::{
+    CheckoutSessionV2Response, CreateCheckoutSessionV2Request,
+};
+use crate::api::user::stripe::create_portal_session::CreatePortalSessionRequest;
+use crate::api::user::stripe::{PaidPlan, StripeSessionResponse};
+use crate::api::{
+    email, github_pull_requests, health, jwt, link, login, logout, merge, mobile_welcome_email,
+    oauth, oauth2, permissions, session, user,
+};
+use model::authentication::login::response::SsoRequiredResponse;
+use model::authentication::{
+    login::request::PasswordlessRequest, permission::Permission, user::GetUserInfo,
+};
+use model::response::{EmptyResponse, ErrorResponse, UserTokensResponse};
+use model::user::{
+    Language, ProfilePictureQueryParams, ProfilePictures, PutUserNameQueryParams, UserLanguage,
+    UserName, UserNames, UserProfilePicture,
+};
+
+#[derive(OpenApi)]
+#[openapi(
+        info(
+                terms_of_service = "https://macro.com/terms",
+        ),
+        paths(
+                /// /health
+                health::health_handler,
+
+                /// /permissions
+                permissions::get_permissions::handler,
+                permissions::get_user_permissions::handler,
+
+                /// /login
+                login::passwordless::handler,
+                login::sso::handler,
+                login::password::handler,
+                login::apple::handler,
+
+                /// /logout
+                logout::handler,
+
+                /// /link
+                link::create_in_progress_link::handler,
+                link::github::init_github_link_handler,
+                link::github::delete_github_link_handler,
+                link::github::check_github_link_status_handler,
+                link::gmail::init_gmail_link_handler,
+                link::gmail::check_gmail_link_status_handler,
+                link::outlook::init_outlook_link_handler,
+                link::outlook::email_connection_providers,
+
+                // Cursor API key (settings -> Connections). Fully qualified:
+                // the `cursor_api_key` crate shadows the module of the same
+                // name in this path position.
+                crate::api::codex::status,
+                crate::api::codex::start_login,
+                crate::api::codex::poll_login,
+                crate::api::codex::cancel_login,
+                crate::api::codex::disconnect,
+                crate::api::codex::environments,
+                crate::api::codex::configure,
+                crate::api::cursor_api_key::get_cursor_api_key::handler,
+                crate::api::cursor_api_key::put_cursor_api_key::handler,
+                crate::api::agent_api_keys::get_handler,
+                crate::api::agent_api_keys::put_handler,
+                crate::api::agent_api_keys::delete_handler,
+                crate::api::cursor_api_key::delete_cursor_api_key::handler,
+                crate::api::cursor_api_key::list_cursor_models::handler,
+                crate::api::cursor_api_key::put_cursor_default_model::handler,
+
+                /// /github_pull_requests
+                github_pull_requests::handler,
+                github_pull_requests::merge_handler,
+                github_pull_requests::draft_handler,
+                github_pull_requests::state_handler,
+                github_pull_requests::mergeability_handler,
+
+                /// /oauth
+                oauth::oauth_redirect::handler,
+                oauth::passwordless_callback::handler,
+
+                oauth2::handler,
+
+                /// /jwt
+                jwt::refresh::handler,
+                jwt::macro_api_token::handler,
+
+                /// /user
+                user::get_user_info::handler,
+                user::delete_user::handler,
+                user::post_profile_pictures::handler,
+                user::put_profile_picture::handler,
+                user::put_profile_picture_file::create_upload_handler,
+                user::put_profile_picture_file::handler,
+                user::agent_setup::handler,
+                user::put_name::handler,
+                user::get_name::handler,
+                user::patch_user_group::handler,
+                user::patch_user_onboarding::handler,
+                user::post_get_names::handler_external,
+                user::post_get_names_with_email::handler,
+                user::get_user_link_exists::handler,
+                user::get_user_organization::handler,
+                user::get_user_quota::handler,
+                user::get_legacy_user_permissions::handler,
+                user::patch_tutorial::handler,
+                user::stripe::create_checkout_session_v2::create_checkout_session,
+                user::stripe::create_portal_session::create_portal_session,
+                user::stripe::change_plan::change_plan,
+                user::stripe::subscription_status::subscription_status,
+                user::stripe::trial_eligibility::trial_eligibility,
+
+                /// /ai-billing
+                ai_billing::inbound::axum_router::get_summary_handler::<crate::api::context::AiBillingServiceType, crate::api::context::AuthorizationService>,
+                ai_billing::inbound::axum_router::get_plans_handler,
+                ai_billing::inbound::axum_router::update_overage_handler::<crate::api::context::AiBillingServiceType, crate::api::context::AuthorizationService>,
+                ai_billing::inbound::axum_router::update_auto_reload_handler::<crate::api::context::AiBillingServiceType, crate::api::context::AuthorizationService>,
+                ai_billing::inbound::axum_router::create_credit_checkout_handler::<crate::api::context::AiBillingServiceType, crate::api::context::AuthorizationService>,
+                ai_billing::inbound::axum_router::purchase_credits_handler::<crate::api::context::AiBillingServiceType, crate::api::context::AuthorizationService>,
+
+                /// /session
+                session::session_login::handler,
+                session::session_creation::handler,
+
+                /// /email
+                email::verify_fusionauth_user_email::handler,
+                email::resend_fusionauth_verify_user_email::handler,
+                email::generate_email_link::handler,
+                email::verify_email_link::handler,
+
+                /// /team
+                teams::inbound::axum_router::create_team::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::delete_team::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::join_team::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::get_team::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::invite_to_team::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::get_team_invites::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::patch_team::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::patch_team_crm_settings::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::toggle_auto_join_domain::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                hosted_runtimes::inbound::axum_router::list::<hosted_runtimes::outbound::pg::PgComputerRepo, crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>, hosted_runtimes::domain::service::SystemClock, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                hosted_runtimes::inbound::axum_router::offers::<hosted_runtimes::outbound::pg::PgComputerRepo, crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>, hosted_runtimes::domain::service::SystemClock, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                hosted_runtimes::inbound::axum_router::purchase::<hosted_runtimes::outbound::pg::PgComputerRepo, crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>, hosted_runtimes::domain::service::SystemClock, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                hosted_runtimes::inbound::axum_router::power::<hosted_runtimes::outbound::pg::PgComputerRepo, crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>, hosted_runtimes::domain::service::SystemClock, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                hosted_runtimes::inbound::axum_router::retry::<hosted_runtimes::outbound::pg::PgComputerRepo, crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>, hosted_runtimes::domain::service::SystemClock, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                hosted_runtimes::inbound::axum_router::cancel::<hosted_runtimes::outbound::pg::PgComputerRepo, crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>, hosted_runtimes::domain::service::SystemClock, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                hosted_runtimes::inbound::axum_router::undo_cancel::<hosted_runtimes::outbound::pg::PgComputerRepo, crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>, hosted_runtimes::domain::service::SystemClock, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                hosted_runtimes::inbound::axum_router::restore::<hosted_runtimes::outbound::pg::PgComputerRepo, crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>, hosted_runtimes::domain::service::SystemClock, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                hosted_runtimes::inbound::axum_router::release::<hosted_runtimes::outbound::pg::PgComputerRepo, crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>, hosted_runtimes::domain::service::SystemClock, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                hosted_runtimes::inbound::axum_router::complete_setup::<hosted_runtimes::outbound::pg::PgComputerRepo, crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>, hosted_runtimes::domain::service::SystemClock, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                team_agents::inbound::axum_router::create_team_agent_handler::<crate::api::context::TeamAgentsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                team_agents::inbound::axum_router::list_team_agents_handler::<crate::api::context::TeamAgentsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                team_agents::inbound::axum_router::delete_team_agent_handler::<crate::api::context::TeamAgentsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                team_agents::inbound::axum_router::get_team_agent_voice_handler::<crate::api::context::TeamAgentsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                team_agents::inbound::axum_router::set_team_agent_voice_handler::<crate::api::context::TeamAgentsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::domain_notice::handler::<crate::api::context::DomainNoticeServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::toggle_non_admin_invites::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::reject_invitation::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::get_user_invites::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::get_user_teams::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::remove_user_from_team::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::patch_team_member_plan::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::delete_team_invite::handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::invite_link::get_handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::invite_link::create_handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::invite_link::delete_handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::invite_link::get_team_handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+                teams::inbound::axum_router::invite_link::join_handler::<crate::api::context::TeamsServiceType, crate::api::context::EntityAccessServiceType, crate::api::context::AuthorizationService>,
+
+                /// /user/language
+                user_language::inbound::axum_router::get_user_language_handler::<crate::api::context::UserLanguageServiceType, crate::api::context::AuthorizationService>,
+                user_language::inbound::axum_router::put_user_language_handler::<crate::api::context::UserLanguageServiceType, crate::api::context::AuthorizationService>,
+                /// /referral
+                referral::inbound::axum_router::get_referral_code_handler::<crate::api::context::ReferralServiceType, crate::api::context::RateLimiter, crate::api::context::AuthorizationService>,
+                referral::inbound::axum_router::post_referral_invite_handler::<crate::api::context::ReferralServiceType, crate::api::context::RateLimiter, crate::api::context::AuthorizationService>,
+
+                /// /gtm-invite
+                gtm_invite::inbound::axum_router::create_link::handler::<crate::api::context::GtmInviteServiceType, crate::api::context::RateLimiter, crate::api::context::AuthorizationService>,
+                gtm_invite::inbound::axum_router::list_links::handler::<crate::api::context::GtmInviteServiceType, crate::api::context::RateLimiter, crate::api::context::AuthorizationService>,
+                gtm_invite::inbound::axum_router::revoke_link::handler::<crate::api::context::GtmInviteServiceType, crate::api::context::RateLimiter, crate::api::context::AuthorizationService>,
+                gtm_invite::inbound::axum_router::resolve_link::handler::<crate::api::context::GtmInviteServiceType, crate::api::context::RateLimiter, crate::api::context::AuthorizationService>,
+                gtm_invite::inbound::axum_router::redeem_link::handler::<crate::api::context::GtmInviteServiceType, crate::api::context::RateLimiter, crate::api::context::AuthorizationService>,
+                gtm_invite::inbound::axum_router::get_offer::handler::<crate::api::context::GtmInviteServiceType, crate::api::context::RateLimiter, crate::api::context::AuthorizationService>,
+
+                /// /system-status
+                system_status::inbound::axum_router::get_current::handler::<crate::api::context::SystemStatusServiceType, crate::api::context::AuthorizationService>,
+                system_status::inbound::axum_router::set_status::handler::<crate::api::context::SystemStatusServiceType, crate::api::context::AuthorizationService>,
+                system_status::inbound::axum_router::list_history::handler::<crate::api::context::SystemStatusServiceType, crate::api::context::AuthorizationService>,
+
+                /// /mobile-welcome-email
+                mobile_welcome_email::handler,
+
+                /// /merge
+                merge::create_merge_request::handler,
+                merge::verify_merge_request::handler,
+        ),
+        components(
+            schemas(
+                        Permission,
+                        PasswordlessRequest,
+                        PasswordRequest,
+                        SsoRequiredResponse,
+                        EmptyResponse,
+                        ErrorResponse,
+                        GetUserInfo,
+                        ProfilePictures,
+                        UserProfilePicture,
+                        AppleLoginRequest,
+                        ProfilePictureQueryParams,
+                        crate::api::user::put_profile_picture_file::PutProfilePictureFileRequest,
+                        crate::api::user::put_profile_picture_file::CreateProfilePictureUploadRequest,
+                        crate::api::user::put_profile_picture_file::ProfilePictureUpload,
+                        crate::api::user::agent_setup::AgentSetupResponse,
+                        PutUserNameQueryParams,
+                        UserName,
+                        UserLanguage,
+                        Language,
+                        UserNames,
+                        GetNamesWithEmailRequestBody,
+                        PostGetNamesRequestBody,
+                        UserTokensResponse,
+                        UserLinkResponse,
+                        MacroApiTokenResponse,
+                        ResendFusionauthVerifyUserEmailRequest,
+                        GenerateEmailLinkRequest,
+                        CreateInProgressLinkResponse,
+                        InitGithubLinkResponse,
+                        GithubLinkStatusResponse,
+                        InitGmailLinkResponse,
+                        GmailLinkStatusResponse,
+                        InitOutlookLinkResponse,
+                        CursorApiKeyStatus,
+                        PutCursorApiKeyRequest,
+                        AgentApiKey,
+                        SavedAgentApiKey,
+                        AgentApiKeyProvider,
+                        PutAgentApiKeyRequest,
+
+                        // GTM invite links
+                        GtmInviteLink,
+                        GtmInviteLinkStatus,
+                        GtmInviteLinkList,
+                        CreateGtmInviteLinkRequest,
+                        PublicGtmInviteLink,
+                        RedeemGtmInviteLinkRequest,
+                        GtmInviteOffer,
+                        GtmInviteOfferStatus,
+
+                        // System status
+                        SystemStatus,
+                        CurrentSystemStatus,
+                        StatusUpdate,
+                        SystemStatusHistory,
+
+                        // Plans and AI billing
+                        PaidPlan,
+                        ChangePlanRequest,
+                        ChangePlanResponse,
+                        ai_billing::UsageSnapshot,
+                        ai_billing::PlanTier,
+                        ai_billing::DenyReason,
+                        ai_billing::inbound::axum_router::AiBillingErrorBody,
+                        ai_billing::inbound::axum_router::PlanCatalogEntry,
+                        ai_billing::inbound::axum_router::PlanCatalogResponse,
+                        ai_billing::inbound::axum_router::UpdateOverageRequest,
+                        ai_billing::inbound::axum_router::UpdateAutoReloadRequest,
+                        ai_billing::inbound::axum_router::AutoReloadDefaults,
+                        ai_billing::AutoReloadSnapshot,
+                        ai_billing::inbound::axum_router::CreditCheckoutRequestBody,
+                        ai_billing::inbound::axum_router::CreditCheckoutResponse,
+                        ai_billing::inbound::axum_router::CreditPurchaseRequestBody,
+                        ai_billing::inbound::axum_router::CreditPurchaseResponse,
+                        ai_billing::CreditPurchaseStatus,
+                        ai_billing::CreditPurchaseSnapshot,
+
+                        // GitHub pull requests
+                        EnrichGithubPullRequestsProxyRequest,
+                        EnrichGithubPullRequestsResponse,
+                        EnrichedGithubPullRequest,
+                        GithubPullRequestCheckRun,
+                        GithubPullRequestComment,
+                        GithubPullRequestRef,
+                        GithubPullRequestStatus,
+                        GithubMergeMethod,
+                        MergeGithubPullRequestRequest,
+                        MergeGithubPullRequestResponse,
+                        SetGithubPullRequestDraftRequest,
+                        SetGithubPullRequestDraftResponse,
+                        GithubPullRequestState,
+                        SetGithubPullRequestStateRequest,
+                        SetGithubPullRequestStateResponse,
+                        GithubPullRequestNumber,
+                        GithubPullRequestMergeability,
+                        GithubPullRequestMergeabilityEntry,
+                        GithubPullRequestMergeabilityRequest,
+                        GithubPullRequestMergeabilityResponse,
+
+                        UserQuota,
+                        UserOrganizationResponse,
+                        GetLegacyUserPermissionsResponse,
+                        PatchUserTutorialRequest,
+
+                        // Stripe
+                        CreateCheckoutSessionV2Request,
+                        CheckoutSessionV2Response,
+                        CreatePortalSessionRequest,
+                        StripeSessionResponse,
+
+                        // User onboarding
+                        PatchUserGroupRequest,
+                        PatchUserOnboardingRequest,
+
+                        // Teams
+                        models_permissions::share_permission::LinkShare,
+                        TeamRole,
+                        TeamMember,
+                        Team,
+                        TeamPlan,
+                        TeamWithMembers,
+                        TeamInviteDetails,
+                        CreateTeamRequest,
+                        InviteToTeamRequest,
+                        PatchTeamRequest,
+                        PatchTeamMemberPlanRequest,
+                        PatchTeamUserRole,
+                        PatchTeamCrmSettingsRequest,
+                        PatchTeamCrmSettingsResponse,
+                        ToggleAutoJoinDomainResponse,
+                        hosted_runtimes::domain::models::ComputerStatus,
+                        team_agents::domain::models::TeamAgent,
+                        team_agents::domain::models::TeamAgents,
+                        team_agents::domain::models::TeamAgentStatus,
+                        team_agents::domain::models::CreateTeamAgent,
+                        team_agents::domain::voice::AgentVoice,
+                        hosted_runtimes::domain::models::ComputerStatusKind,
+                        hosted_runtimes::domain::models::BillingStatus,
+                        hosted_runtimes::domain::models::SetupProgress,
+                        hosted_runtimes::domain::models::SetupStep,
+                        hosted_runtimes::domain::models::SizeOffer,
+                        hosted_runtimes::domain::models::Quote,
+                        hosted_runtimes::domain::models::BillingInterval,
+                        hosted_runtimes::domain::models::SubscriptionItem,
+                        hosted_runtimes::domain::size::ComputerSize,
+                        hosted_runtimes::inbound::axum_router::PurchaseBody,
+                        hosted_runtimes::inbound::axum_router::Purchased,
+                        hosted_runtimes::inbound::axum_router::PurchaseState,
+                        hosted_runtimes::inbound::axum_router::PowerBody,
+                        hosted_runtimes::inbound::axum_router::ReleaseBody,
+                        SendDomainNoticeResponse,
+                        ToggleNonAdminInvitesResponse,
+                        TeamInviteLinkResponse,
+                        CreatedTeamInviteLinkResponse,
+                        JoinTeamByInviteLinkResponse,
+                        TeamInviteLinkTeam,
+                        TeamInviteLinkToken,
+                        TeamTeamInvitesResponse,
+                        UserTeamInvitesResponse,
+
+                        // Mobile welcome email
+                        mobile_welcome_email::SendMobileWelcomeEmailRequest,
+                        mobile_welcome_email::SendMobileWelcomeEmailResponse,
+
+                        // Merge
+                        CreateAccountMergeRequest,
+                ),
+        ),
+        tags(
+            (name = "auth service", description = "Macro Authentication Service")
+        )
+    )]
+pub struct ApiDoc;
+
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_pull_requests_openapi_includes_enrich_path() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let operation = &openapi["paths"]["/github_pull_requests/enrich"]["post"];
+
+        assert_eq!(operation["operationId"], "enrich_github_pull_requests");
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/EnrichGithubPullRequestsProxyRequest")
+        );
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/EnrichGithubPullRequestsResponse")
+        );
+        assert!(operation["responses"].get("428").is_some());
+    }
+
+    #[test]
+    fn github_pull_requests_openapi_includes_merge_path() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let operation = &openapi["paths"]["/github_pull_requests/merge"]["post"];
+
+        assert_eq!(operation["operationId"], "merge_github_pull_request");
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/MergeGithubPullRequestRequest")
+        );
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/MergeGithubPullRequestResponse")
+        );
+        for status in ["403", "404", "409", "422", "428"] {
+            assert!(
+                operation["responses"].get(status).is_some(),
+                "missing {status} response"
+            );
+        }
+
+        let schemas = &openapi["components"]["schemas"];
+        let request_properties = &schemas["MergeGithubPullRequestRequest"]["properties"];
+        for property in ["owner", "repo", "number", "mergeMethod"] {
+            assert!(
+                request_properties.get(property).is_some(),
+                "missing request property {property}"
+            );
+        }
+        assert_eq!(
+            schemas["GithubMergeMethod"]["enum"],
+            serde_json::json!(["merge", "squash", "rebase"])
+        );
+        let response_properties = &schemas["MergeGithubPullRequestResponse"]["properties"];
+        assert!(response_properties.get("sha").is_some());
+        assert!(response_properties.get("pullRequest").is_some());
+    }
+
+    #[test]
+    fn github_pull_requests_openapi_includes_draft_and_mergeability_paths() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let draft = &openapi["paths"]["/github_pull_requests/draft"]["post"];
+        assert_eq!(draft["operationId"], "set_github_pull_request_draft");
+        assert_eq!(
+            draft["requestBody"]["content"]["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/SetGithubPullRequestDraftRequest")
+        );
+        let mergeability = &openapi["paths"]["/github_pull_requests/mergeability"]["post"];
+        assert_eq!(
+            mergeability["operationId"],
+            "get_github_pull_request_mergeability"
+        );
+        assert_eq!(
+            mergeability["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+                .as_str(),
+            Some("#/components/schemas/GithubPullRequestMergeabilityResponse")
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["GithubPullRequestMergeability"]["enum"],
+            serde_json::json!(["mergeable", "conflicting", "unknown"])
+        );
+    }
+
+    #[test]
+    fn github_pull_requests_openapi_includes_state_path() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let operation = &openapi["paths"]["/github_pull_requests/state"]["post"];
+
+        assert_eq!(operation["operationId"], "set_github_pull_request_state");
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/SetGithubPullRequestStateRequest")
+        );
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/SetGithubPullRequestStateResponse")
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["GithubPullRequestState"]["enum"],
+            serde_json::json!(["open", "closed"])
+        );
+    }
+
+    #[test]
+    fn github_link_status_openapi_includes_path_and_schema() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let operation = &openapi["paths"]["/link/github/status"]["get"];
+
+        assert_eq!(operation["operationId"], "check_github_link_status");
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/GithubLinkStatusResponse")
+        );
+        assert!(operation["responses"].get("428").is_some());
+        assert!(
+            openapi["components"]["schemas"]
+                .get("GithubLinkStatusResponse")
+                .is_some()
+        );
+        let fields = &openapi["components"]["schemas"]["GithubLinkStatusResponse"]["properties"];
+        assert!(fields.get("github_username").is_some());
+        assert!(fields.get("github_user_id").is_some());
+    }
+
+    #[test]
+    fn github_pull_requests_openapi_includes_components() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = &openapi["components"]["schemas"];
+
+        for schema_name in [
+            "EnrichGithubPullRequestsProxyRequest",
+            "EnrichGithubPullRequestsResponse",
+            "EnrichedGithubPullRequest",
+            "GithubPullRequestCheckRun",
+            "GithubPullRequestComment",
+            "GithubPullRequestRef",
+            "GithubPullRequestStatus",
+        ] {
+            assert!(
+                schemas.get(schema_name).is_some(),
+                "missing schema component {schema_name}"
+            );
+        }
+
+        let request_properties = &schemas["EnrichGithubPullRequestsProxyRequest"]["properties"];
+        assert!(request_properties.get("pullRequests").is_some());
+        assert!(request_properties.get("macroUserId").is_none());
+
+        let response_properties = &schemas["EnrichedGithubPullRequest"]["properties"];
+        assert!(response_properties.get("comments").is_some());
+        assert!(response_properties.get("checks").is_some());
+        assert!(
+            response_properties
+                .get("participantGithubUserIds")
+                .is_some()
+        );
+    }
+}

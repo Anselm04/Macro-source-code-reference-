@@ -1,0 +1,10 @@
+{
+  "name": "notification-service-stack",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "main": "index.ts",
+  "devDependencies": {
+    "yaml": "^2.8.1"
+  }
+}

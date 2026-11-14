@@ -1,0 +1,16 @@
+//! Behavior tests for the agent loop, grouped by guarantee.
+//!
+//! Shared setup lives in [`util`]; each `test_*` module asserts one family of
+//! guarantees against the public session surface.
+
+mod util;
+
+mod test_cooperative_cancellation;
+mod test_eager_tools;
+mod test_prompt_cache;
+mod test_streamed_tool_calls;
+mod test_telemetry;
+mod test_thinking;
+mod test_tool;
+mod test_tool_search;
+mod test_user_tools;

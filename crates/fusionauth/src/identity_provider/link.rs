@@ -1,0 +1,181 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use crate::{AuthedClient, Result, error::FusionAuthClientError};
+
+/// Structured shape of FusionAuth validation error responses.
+/// See https://fusionauth.io/docs/v1/tech/apis/errors
+#[derive(serde::Deserialize, Debug, Default)]
+struct FusionAuthErrorBody {
+    #[serde(default, rename = "fieldErrors")]
+    field_errors: HashMap<String, Vec<FusionAuthFieldError>>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct FusionAuthFieldError {
+    code: String,
+}
+
+impl FusionAuthErrorBody {
+    /// Returns true if any field error carries the FusionAuth `[alreadyLinked]` code,
+    /// regardless of which field triggered it.
+    fn is_already_linked(&self) -> bool {
+        self.field_errors
+            .values()
+            .flatten()
+            .any(|e| e.code.starts_with("[alreadyLinked]"))
+    }
+}
+
+/// Link lookups and deletes report a deleted user as a validation error.
+pub(super) fn is_missing_user(body: &str) -> bool {
+    serde_json::from_str::<FusionAuthErrorBody>(body)
+        .ok()
+        .is_some_and(|body| {
+            body.field_errors
+                .get("userId")
+                .is_some_and(|errors| errors.iter().any(|error| error.code == "[invalid]userId"))
+        })
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+/// Response containing identity provider links.
+pub struct RetrieveLinkResponse {
+    /// The link returned from the lookup - should only be one in the vec
+    #[serde(rename = "identityProviderLinks")]
+    idp_links: Vec<Link>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+/// An identity provider link.
+pub struct Link {
+    /// The display name for this link.
+    pub display_name: String,
+    /// The identity provider ID.
+    pub identity_provider_id: String,
+    /// The name of the identity provider.
+    pub identity_provider_name: String,
+    /// The type of the identity provider.
+    pub identity_provider_type: String,
+    /// The user ID on the identity provider side.
+    pub identity_provider_user_id: String,
+    /// The instant when the link was created.
+    pub insert_instant: u64,
+    /// The instant of the last login using this link.
+    pub last_login_instant: u64,
+    /// The tenant ID.
+    pub tenant_id: String,
+    /// The token associated with this link.
+    pub token: String,
+    /// The FusionAuth user ID.
+    pub user_id: String,
+}
+
+/// Retrieves all links for a given user
+/// If idp_id is provided, only links for that identity provider are returned
+/// https://fusionauth.io/docs/apis/identity-providers/links#retrieve-a-link
+/// Valid respones: 200, 400, 401, 404, 500
+pub(crate) async fn get_links(
+    client: &AuthedClient,
+    base_url: &str,
+    user_id: &str,
+    idp_id: Option<String>,
+) -> Result<Vec<Link>> {
+    let mut url = format!("{base_url}/api/identity-provider/link?userId={user_id}");
+
+    if let Some(id) = idp_id {
+        url.push_str(&format!("&identityProviderId={id}"));
+    }
+
+    let res = client
+        .client()
+        .get(url)
+        .timeout(super::LINK_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(FusionAuthClientError::transport)?;
+
+    let status = res.status();
+    match status {
+        reqwest::StatusCode::OK => {
+            let response: RetrieveLinkResponse =
+                res.json().await.map_err(FusionAuthClientError::transport)?;
+
+            tracing::trace!(link_count = response.idp_links.len(), "links found");
+
+            Ok(response.idp_links)
+        }
+        reqwest::StatusCode::NOT_FOUND => Err(FusionAuthClientError::NoIdentityProviderFound),
+        _ => {
+            let headers = res.headers().clone();
+            let body = res.text().await.map_err(FusionAuthClientError::transport)?;
+            if status == reqwest::StatusCode::BAD_REQUEST && is_missing_user(&body) {
+                return Err(FusionAuthClientError::UserDoesNotExist);
+            }
+            Err(FusionAuthClientError::unexpected(status, &headers, body))
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+/// An identity provider link for creating a link.
+pub struct IdentityProviderLink<'a> {
+    /// The display name
+    pub display_name: Cow<'a, str>,
+    /// The identity provider id
+    pub identity_provider_id: Cow<'a, str>,
+    /// The identity provider user id
+    pub identity_provider_user_id: Cow<'a, str>,
+    /// The user id
+    pub user_id: Cow<'a, str>,
+    /// The token
+    pub token: Cow<'a, str>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+/// Request to link a user to an identity provider.
+pub struct LinkUserRequest<'a> {
+    /// The identity provider link
+    pub identity_provider_link: IdentityProviderLink<'a>,
+}
+
+/// This API is used to create a link between a FusionAuth User and a user in a 3rd party identity provider. This API may be useful when you already know the unique Id of a user in a 3rd party identity provider and the corresponding FusionAuth User.
+/// https://fusionauth.io/docs/apis/identity-providers/links#link-a-user
+/// Valid respones: 200, 400, 401, 500, 504
+pub(crate) async fn link_user(
+    client: &AuthedClient,
+    base_url: &str,
+    request: LinkUserRequest<'_>,
+) -> Result<()> {
+    let res = client
+        .client()
+        .post(format!("{base_url}/api/identity-provider/link",))
+        .timeout(super::LINK_REQUEST_TIMEOUT)
+        .json(&request)
+        .send()
+        .await
+        .map_err(FusionAuthClientError::transport)?;
+
+    let status = res.status();
+    if status == reqwest::StatusCode::OK {
+        return Ok(());
+    }
+
+    let headers = res.headers().clone();
+    let body = res.text().await.map_err(FusionAuthClientError::transport)?;
+
+    if serde_json::from_str::<FusionAuthErrorBody>(&body)
+        .ok()
+        .as_ref()
+        .is_some_and(FusionAuthErrorBody::is_already_linked)
+    {
+        tracing::info!(body=%body, "fusionauth idp link already exists");
+        return Err(FusionAuthClientError::IdentityProviderLinkAlreadyExists);
+    }
+
+    Err(FusionAuthClientError::unexpected(status, &headers, body))
+}

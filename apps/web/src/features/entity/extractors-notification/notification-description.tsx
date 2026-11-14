@@ -1,0 +1,183 @@
+import type { NotificationType } from '@core/types';
+import { getDisplayNameParts, tryMacroId } from '@core/user';
+import type { NotificationStack } from '@notifications';
+import {
+  entityDiscussionVerb,
+  isEntityDiscussionEvent,
+} from '@notifications/entity-discussion';
+import { getNotificationAction } from '@notifications/notification-metadata';
+import {
+  getNotificationAgentSender,
+  getUniqueAgentSenders,
+} from '@notifications/notification-sender';
+import { createMemo } from 'solid-js';
+import type { Notification } from '../types/notification';
+import {
+  getActionVerb,
+  getGithubSenderLogin,
+  getTypeNoun,
+  getTypePreposition,
+  getUniqueGithubLogins,
+  getUniqueSenderIds,
+  isGithubNotificationType,
+} from './notification-description-helpers';
+
+// Re-export helpers for backward compatibility and testing
+
+interface NotificationDescriptionProps {
+  notification?: Notification;
+  stack?: NotificationStack;
+}
+
+/** The verb for one notification. A Claude sign-in names its stage, with the
+ *  same words its push and toast use. */
+function actionFor(
+  notification: Notification | undefined,
+  type: NotificationType
+): string {
+  const metadata = notification?.notification_metadata;
+  if (isEntityDiscussionEvent(metadata)) return entityDiscussionVerb(metadata);
+  if (
+    notification &&
+    (metadata?.tag === 'agent_sign_in_expiry' ||
+      metadata?.tag === 'computer_setup')
+  )
+    return getNotificationAction(notification);
+  return getActionVerb(type);
+}
+
+/**
+ * Displays a complete description of the notification including sender(s) and action
+ *
+ * Formats:
+ * - Single notification: "Peter mentioned you"
+ * - Stack with one sender: "Peter: 13 messages"
+ * - Stack with multiple senders: "13 messages from Peter +5"
+ */
+export function NotificationDescription(props: NotificationDescriptionProps) {
+  const isSingleNotification = () => {
+    return Boolean(
+      props.notification ||
+        (props.stack && props.stack.notifications.length === 1)
+    );
+  };
+
+  const notificationType = (): NotificationType | undefined => {
+    if (props.notification) return props.notification.notification_metadata.tag;
+    if (props.stack) return props.stack.type;
+    return undefined;
+  };
+
+  const count = () => {
+    if (props.stack) return props.stack.notifications.length;
+    return 1;
+  };
+
+  const macroFirstName = (id: string) => {
+    const parts = getDisplayNameParts(tryMacroId(id), {
+      emailFallback: 'local-part',
+    });
+    return parts.firstName || parts.fullName;
+  };
+
+  // Sender display labels for the notification/stack. GitHub PR senders are
+  // always named by the GitHub login carried in the notification metadata —
+  // never by a linked Macro user's name, even when the notification has a
+  // `sender_id`. Macro senders resolve to their display name; agents, which
+  // have no `sender_id`, are named from the metadata.
+  // Memoized so the per-sender name resolution (which has side effects: it
+  // queues a fetch and registers a reactive effect) runs once per dependency
+  // change rather than on every call from the description() formatters.
+  const senderLabels = createMemo((): string[] => {
+    if (props.notification) {
+      const metadata = props.notification.notification_metadata;
+      if (
+        isEntityDiscussionEvent(metadata) &&
+        metadata.content.senderDisplayName
+      )
+        return [metadata.content.senderDisplayName];
+      const tag = metadata.tag;
+      if (isGithubNotificationType(tag)) {
+        const login = getGithubSenderLogin(props.notification);
+        return login ? [login] : [];
+      }
+      if (props.notification.sender_id) {
+        return [macroFirstName(props.notification.sender_id)];
+      }
+      const agent = getNotificationAgentSender(props.notification);
+      return agent ? [agent.name] : [];
+    }
+    if (props.stack) {
+      if (
+        props.stack.type === 'initiative_discussion' ||
+        props.stack.type === 'crm_discussion'
+      ) {
+        return [
+          ...new Set(
+            props.stack.notifications.flatMap((notification) => {
+              const meta = notification.notification_metadata;
+              if (
+                isEntityDiscussionEvent(meta) &&
+                meta.content.senderDisplayName
+              )
+                return [meta.content.senderDisplayName];
+              return notification.sender_id
+                ? [macroFirstName(notification.sender_id)]
+                : [];
+            })
+          ),
+        ];
+      }
+      if (isGithubNotificationType(props.stack.type)) {
+        return getUniqueGithubLogins(props.stack.notifications);
+      }
+      const macroIds = getUniqueSenderIds(props.stack.notifications);
+      const agents = getUniqueAgentSenders(props.stack.notifications);
+      return [
+        ...macroIds.map(macroFirstName),
+        ...agents.map((agent) => agent.name),
+      ];
+    }
+    return [];
+  });
+
+  const primarySenderLabel = () => senderLabels()[0];
+  const secondarySenderLabel = () => senderLabels()[1];
+  const additionalSenderCount = () => Math.max(0, senderLabels().length - 1);
+  const hasMultipleSenders = () => additionalSenderCount() > 0;
+
+  const description = () => {
+    const type = notificationType();
+    const sender = primarySenderLabel();
+
+    if (!type) return '';
+
+    // Single notification: "Peter mentioned you"
+    if (isSingleNotification()) {
+      const single = props.notification ?? props.stack?.notifications[0];
+      const action = actionFor(single, type);
+      if (sender && type !== 'ai_response') {
+        return `${sender} ${action}`;
+      }
+      return action;
+    }
+
+    // Stack with multiple senders
+    if (hasMultipleSenders()) {
+      const senderCount = senderLabels().length;
+      if (senderCount === 2) {
+        return `${count()} ${getTypeNoun(type, count())} ${getTypePreposition(type)} ${sender} and ${secondarySenderLabel()}`;
+      }
+      // Three or more senders: "13 messages from Peter and 5 others"
+      return `${count()} ${getTypeNoun(type, count())} ${getTypePreposition(type)} ${sender} and ${additionalSenderCount()} ${additionalSenderCount() === 1 ? 'other' : 'others'}`;
+    }
+
+    // Stack with single sender: "Peter: 13 messages"
+    if (sender) {
+      return `${sender}: ${count()} ${getTypeNoun(type, count())}`;
+    }
+    return `${count()} ${getTypeNoun(type, count())}`;
+  };
+
+  return <>{description()}</>;
+}

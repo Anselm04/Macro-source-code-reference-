@@ -1,0 +1,324 @@
+import { SERVER_HOSTS } from '@core/constant/servers';
+import {
+  type FetchWithTokenErrorCode,
+  fetchWithToken,
+} from '@core/util/fetchWithToken';
+import type { ObjectLike, ResultError } from '@core/util/result';
+import type { SafeFetchInit } from '@core/util/safeFetch';
+import { err, ok, type Result } from 'neverthrow';
+import { z } from 'zod';
+import type {
+  BulkGetByEventItemIdsRequest,
+  BulkItem,
+  BulkRemoveItemsRequest,
+  BulkSetItemsRequest,
+  GetAllUserNotificationsResponse,
+  NotificationState,
+} from './generated/schemas';
+import type { ApiUserNotification } from './generated/schemas/apiUserNotification';
+import type { DeviceRequest } from './generated/schemas/deviceRequest';
+import { EntityType } from './generated/schemas/entityType';
+import type { GetNotificationTypePreferencesResponse } from './generated/schemas/getNotificationTypePreferencesResponse';
+import type { NotificationBulkRequest } from './generated/schemas/notificationBulkRequest';
+import type { UserUnsubscribe } from './generated/schemas/userUnsubscribe';
+
+const notificationHost: string = SERVER_HOSTS['notification-service'];
+// const notificationHost: string = 'http://localhost:8086';
+
+const _NOTIFICATION_WEBSOCKET_EVENT = 'notification';
+
+type WithEventItemId = { event_item_id: string };
+type WithItem = { item_id: string; item_type: string };
+
+const notificationEntityType = z.enum(EntityType);
+
+function notificationPreferenceItems(
+  items: readonly UserUnsubscribe[]
+): Result<BulkItem[], ResultError<'INVALID_ITEM_TYPE'>[]> {
+  const validatedItems: BulkItem[] = [];
+  for (const item of items) {
+    let itemType = item.item_type;
+    if (itemType === 'email' || itemType === 'thread') {
+      itemType = 'email_thread';
+    } else if (itemType === 'foreign') {
+      itemType = 'foreign_entity';
+    }
+
+    const parsedType = notificationEntityType.safeParse(itemType);
+    if (!parsedType.success) {
+      return err([
+        {
+          code: 'INVALID_ITEM_TYPE',
+          message: 'Unsupported notification item type.',
+          arg: 'item_type',
+        },
+      ]);
+    }
+
+    validatedItems.push({
+      item_id: item.item_id,
+      item_type: parsedType.data,
+    });
+  }
+
+  return ok(validatedItems);
+}
+
+function notificationFetch(
+  url: string,
+  init?: SafeFetchInit
+): Promise<Result<void, ResultError<FetchWithTokenErrorCode>[]>>;
+function notificationFetch<T extends ObjectLike>(
+  url: string,
+  init?: SafeFetchInit
+): Promise<Result<T, ResultError<FetchWithTokenErrorCode>[]>>;
+function notificationFetch<T extends ObjectLike = never>(
+  url: string,
+  init?: SafeFetchInit
+):
+  | Promise<Result<T, ResultError<FetchWithTokenErrorCode>[]>>
+  | Promise<Result<void, ResultError<FetchWithTokenErrorCode>[]>> {
+  return fetchWithToken<T>(`${notificationHost}${url}`, init);
+}
+
+// message id is set by the notification service
+
+const _channelMentionMetadata = z.object({
+  message_id: z.string(),
+});
+
+// this metadata is provided by the front end
+export type DocumentMentionMetadata = z.infer<typeof documentMentionMetadata>;
+export type DocumentMentionLocation = NonNullable<
+  DocumentMentionMetadata['location']
+>;
+const commentRef = z.union([z.number(), z.string()]);
+
+export const documentMentionMetadata = z.object({
+  mention_id: z.string(),
+  location: z
+    .discriminatedUnion('type', [
+      z.object({
+        type: z.literal('create-comment'),
+        commentId: commentRef,
+        threadId: commentRef,
+        text: z.string(),
+      }),
+      z.object({
+        type: z.literal('edit-comment'),
+        commentId: commentRef,
+        threadId: commentRef,
+        text: z.string(),
+      }),
+    ])
+    .optional(),
+});
+
+type NotificationParams = { cursor?: string; limit?: number };
+
+/** Omitted states selects active notifications; an empty array selects all states. */
+type UserNotificationParams = NotificationParams & {
+  states?: NotificationState[];
+};
+
+function userNotificationQuery({
+  limit,
+  cursor,
+  states,
+}: UserNotificationParams): string {
+  const query = new URLSearchParams();
+  if (limit !== undefined) query.set('limit', String(limit));
+  if (cursor !== undefined) query.set('cursor', cursor);
+  if (states !== undefined) query.set('states', states.join(','));
+  return query.toString();
+}
+
+export const notificationServiceClient = {
+  async userNotifications(args: UserNotificationParams) {
+    return (
+      await notificationFetch<GetAllUserNotificationsResponse>(
+        `/user_notifications?${userNotificationQuery(args)}`,
+        {
+          method: 'GET',
+        }
+      )
+    ).map((result) => {
+      return result;
+    });
+  },
+  async getUserNotificationById(notificationId: string) {
+    return (
+      await notificationFetch<ApiUserNotification>(
+        `/user_notifications/${notificationId}`,
+        { method: 'GET' }
+      )
+    ).map((result) => result);
+  },
+  async bulkGetUserNotificationsByEventItemId(
+    args: UserNotificationParams & BulkGetByEventItemIdsRequest
+  ) {
+    return (
+      await notificationFetch<GetAllUserNotificationsResponse>(
+        `/user_notifications/item/bulk?${userNotificationQuery(args)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ eventItemIds: args.eventItemIds }),
+        }
+      )
+    ).map((result) => {
+      return result;
+    });
+  },
+  async markNotificationAsSeen(args: NotificationBulkRequest) {
+    const { notificationIds } = args;
+    return (
+      await notificationFetch<any>(`/user_notifications/bulk/seen`, {
+        method: 'PATCH',
+        body: JSON.stringify({ notificationIds }),
+      })
+    ).map((result) => result);
+  },
+  async markNotificationAsDone(args: NotificationBulkRequest) {
+    const { notificationIds } = args;
+    return (
+      await notificationFetch<any>(`/user_notifications/bulk/done`, {
+        method: 'PATCH',
+        body: JSON.stringify({ notificationIds }),
+      })
+    ).map((result) => result);
+  },
+  async bulkMarkNotificationAsSeen(args: NotificationBulkRequest) {
+    const { notificationIds } = args;
+    return (
+      await notificationFetch<any>(`/user_notifications/bulk/seen`, {
+        method: 'PATCH',
+        body: JSON.stringify({ notificationIds }),
+      })
+    ).map((result) => result);
+  },
+  async bulkMarkNotificationAsDone(args: NotificationBulkRequest) {
+    const { notificationIds } = args;
+    return (
+      await notificationFetch<any>(`/user_notifications/bulk/done`, {
+        method: 'PATCH',
+        body: JSON.stringify({ notificationIds }),
+      })
+    ).map((result) => result);
+  },
+  async bulkMarkNotificationAsUndone(args: NotificationBulkRequest) {
+    const { notificationIds } = args;
+    return (
+      await notificationFetch<any>(`/user_notifications/bulk/undone`, {
+        method: 'PATCH',
+        body: JSON.stringify({ notificationIds }),
+      })
+    ).map((result) => result);
+  },
+  async markNotificationEntityAsSeen(args: WithEventItemId) {
+    const { event_item_id } = args;
+    return (
+      await notificationFetch<{}>(
+        `/user_notifications/item/${event_item_id}/seen`,
+        {
+          method: 'PATCH',
+        }
+      )
+    ).map((result) => result);
+  },
+  async markNotificationEntityAsDone(args: WithEventItemId) {
+    const { event_item_id } = args;
+    return (
+      await notificationFetch<{}>(
+        `/user_notifications/item/${event_item_id}/done`,
+        {
+          method: 'PATCH',
+        }
+      )
+    ).map((result) => result);
+  },
+  async registerDevice(args: DeviceRequest) {
+    return notificationFetch<{}>('/device/register', {
+      method: 'POST',
+      body: JSON.stringify(args),
+    });
+  },
+  async unregisterDevice(args: DeviceRequest) {
+    return notificationFetch<{}>('/device/unregister', {
+      method: 'DELETE',
+      body: JSON.stringify(args),
+    });
+  },
+  async getNotificationTypePreferences() {
+    return notificationFetch<GetNotificationTypePreferencesResponse>(
+      '/user_notifications/preferences',
+      { method: 'GET' }
+    );
+  },
+  async disableNotificationType(notificationEventType: string) {
+    return notificationFetch<{}>(
+      `/user_notifications/preferences/${encodeURIComponent(notificationEventType)}/disable`,
+      { method: 'PUT' }
+    );
+  },
+  async enableNotificationType(notificationEventType: string) {
+    return notificationFetch<{}>(
+      `/user_notifications/preferences/${encodeURIComponent(notificationEventType)}/enable`,
+      { method: 'PUT' }
+    );
+  },
+  async getUnsubscribes() {
+    return (
+      await notificationFetch<UserUnsubscribe[]>('/unsubscribe', {
+        method: 'GET',
+      })
+    ).map((result) => ({ data: result }));
+  },
+  async unsubscribeItems(
+    items: readonly UserUnsubscribe[],
+    snoozedUntil?: string
+  ) {
+    const validatedItems = notificationPreferenceItems(items);
+    if (validatedItems.isErr()) return err(validatedItems.error);
+
+    const body: BulkSetItemsRequest = {
+      items: validatedItems.value,
+      snoozed_until: snoozedUntil,
+    };
+    return notificationFetch<{}>('/unsubscribe/items', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+  async removeUnsubscribeItems(items: readonly UserUnsubscribe[]) {
+    const validatedItems = notificationPreferenceItems(items);
+    if (validatedItems.isErr()) return err(validatedItems.error);
+
+    const body: BulkRemoveItemsRequest = {
+      items: validatedItems.value,
+    };
+    return notificationFetch<{}>('/unsubscribe/items', {
+      method: 'DELETE',
+      body: JSON.stringify(body),
+    });
+  },
+  async unsubscribeItem(args: WithItem & { snoozed_until?: string | null }) {
+    const query = args.snoozed_until
+      ? `?snoozed_until=${encodeURIComponent(args.snoozed_until)}`
+      : '';
+    return notificationFetch<{}>(
+      `/unsubscribe/item/${encodeURIComponent(args.item_type)}/${encodeURIComponent(args.item_id)}${query}`,
+      {
+        method: 'POST',
+      }
+    );
+  },
+  async removeUnsubscribeItem(args: WithItem) {
+    return notificationFetch<{}>(
+      `/unsubscribe/item/${encodeURIComponent(args.item_type)}/${encodeURIComponent(args.item_id)}`,
+      {
+        method: 'DELETE',
+      }
+    );
+  },
+};

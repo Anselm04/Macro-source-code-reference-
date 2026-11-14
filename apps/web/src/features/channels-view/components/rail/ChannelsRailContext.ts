@@ -1,0 +1,247 @@
+import type { ListController, ListScrollHandle } from '@app/components/list';
+import type { ChannelPreviewSelection } from '@app/features/next-soup/utils';
+import { createAssertedContextProvider } from '@core/context/createContext';
+import type { ChannelEntity } from '@entity';
+import type { ChannelLabel } from '@service-storage/generated/schemas/channelLabel';
+import type { ChannelLabelRule } from '@service-storage/generated/schemas/channelLabelRule';
+import type { ChannelLabelScopeSelection } from '@service-storage/generated/schemas/channelLabelScopeSelection';
+import type { Favorite } from '@service-storage/generated/schemas/favorite';
+import type { ContextProviderProps } from '@solid-primitives/context';
+import type { Accessor } from 'solid-js';
+import type { ChannelsSourceScope, ChannelsSources } from '../../queries';
+import type {
+  ChannelListSort,
+  ChannelSectionKey,
+  ChannelSectionPreferences,
+  ChannelsGroup,
+  ChannelsRailSection,
+  ChannelsSortGroup,
+  ChannelsTab,
+} from '../../types';
+import type { useChannelRailActivity } from './hooks/useChannelRailActivity';
+
+type ChannelRailActivity = ReturnType<typeof useChannelRailActivity>;
+
+export const ALL_THREADS_ROW_ID = 'all-threads';
+
+export type ChannelRailRow =
+  | {
+      /** The Threads tab's unfiltered entry above the conversation list. */
+      kind: 'all-threads';
+      id: typeof ALL_THREADS_ROW_ID;
+      group?: undefined;
+    }
+  | {
+      kind: 'section';
+      id: `section:${ChannelsRailSection}`;
+      group: ChannelsRailSection;
+    }
+  | {
+      kind: 'status';
+      id: `status:${ChannelsGroup}`;
+      group: ChannelsGroup;
+    }
+  | {
+      /** Loading or retry feedback after an open section's available channels. */
+      kind: 'reference-status';
+      id: `reference-status:${ChannelSectionKey}`;
+      group: 'favorites' | 'team_channels';
+      state: 'loading' | 'error';
+    }
+  | {
+      kind: 'favorite';
+      id: `favorite:${string}`;
+      group: 'favorites';
+      favorite: Favorite;
+    }
+  | {
+      /** A team channel label heading inside the Team channels section. */
+      kind: 'label';
+      id: `label:${string}`;
+      group: 'team_channels';
+      /** Index in the Team channels section's rendered rows (labels and channels). */
+      localIndex: number;
+      label: ChannelLabel;
+    }
+  | {
+      kind: 'conversation';
+      id: `channel:${string}`;
+      group?: ChannelsGroup;
+      scope: ChannelsSourceScope;
+      /**
+       * Index in the scope's rendered list. For `team_channels` that list mixes
+       * label headings and channels, so it is not an index into the source.
+       */
+      localIndex: number;
+      channel: ChannelEntity;
+      /** The label this row is nested under, when any. */
+      labelId?: string;
+    };
+
+/**
+ * One rendered row of the Team channels section: a label heading or a channel,
+ * nested (`labelId` set) or in the plain list below the labels.
+ */
+export type ChannelSectionRow =
+  | { kind: 'label'; label: ChannelLabel }
+  | { kind: 'conversation'; channel: ChannelEntity; labelId?: string };
+
+/** Payload of a channel row being dragged to or out of a label (solid-dnd). */
+export type ChannelLabelDragData = {
+  dragType: 'channel-label';
+  dndScope: string;
+  channelId: string;
+  /** The label the channel is currently in, when any. */
+  labelId?: string;
+  /** Shown by the global drag overlay. */
+  name: string;
+  iconType: 'channel';
+};
+
+/** Where a dragged channel may land. */
+export type ChannelLabelDropTarget =
+  | { kind: 'label'; labelId: string }
+  | { kind: 'smart-tag'; labelId: string }
+  | { kind: 'channel'; channelId: string }
+  | { kind: 'unlabelled' };
+
+/** Payload of a drop target in the Channels section (solid-dnd). */
+export type ChannelLabelDropData = {
+  dragType: 'channel-label-target';
+  dndScope: string;
+  target: ChannelLabelDropTarget;
+  /** Read by the `pointerWithin` collision detector. */
+  isDropTargetDisabled: () => boolean;
+};
+
+export const rowKeyForChannel = (channelId: string, labelId?: string) =>
+  `channel:${channelId}${labelId ? `:label:${labelId}` : ''}` as const;
+
+export const rowKeyForFavorite = (favorite: Favorite) =>
+  `favorite:${favorite.entityType}:${favorite.entityId}` as const;
+
+export const rowKeyForSection = (group: ChannelsRailSection) =>
+  `section:${group}` as const;
+
+export const rowKeyForLabel = (labelId: string) => `label:${labelId}` as const;
+
+export const domIdForRow = (railId: string, rowId: string) =>
+  `${railId}-${rowId}`;
+
+export type ChannelRailActivationMetadata = {
+  event?: MouseEvent;
+  newSplit?: boolean;
+};
+
+export type ChannelsRailContext = {
+  railId: string;
+  list: ListController<ChannelRailRow, ChannelRailActivationMetadata>;
+  sectionsEnabled: Accessor<boolean>;
+  tab: Accessor<ChannelsTab>;
+  selectTab: (tab: ChannelsTab) => void;
+  sources: ChannelsSources;
+  favorites: Accessor<readonly Favorite[]>;
+  /** A channel available from loaded pages, normalized cache, or a by-ID lookup. */
+  channelById: (channelId: string) => ChannelEntity | undefined;
+  selectedChannel: Accessor<ChannelPreviewSelection | undefined>;
+  /** Whether the Threads tab is available to this user. */
+  threadsEnabled: Accessor<boolean>;
+  /** Threads tab filter: the conversation whose threads are shown, or all. */
+  threadsChannelId: Accessor<string | undefined>;
+  isGroupOpen: (group: ChannelsRailSection) => boolean;
+  toggleGroup: (group: ChannelsRailSection) => void;
+  /** Whether channel labels and smart tags are enabled for this user. */
+  channelTagsEnabled: Accessor<boolean>;
+  /** Every label in the authorized scope, including empty labels. */
+  labels: Accessor<readonly ChannelLabel[]>;
+  /** Whether labels can be used after loading successfully. */
+  labelsAvailable: Accessor<boolean>;
+  /** Why labels are unavailable, for the create menu and refused drops. */
+  labelsUnavailableReason: Accessor<string>;
+  labelsFailed: Accessor<boolean>;
+  retryLabels: () => Promise<void>;
+  /** Retry unresolved channels referenced by section membership or favorites. */
+  retryReferencedChannels: () => Promise<void>;
+  isLabelOpen: (labelId: string) => boolean;
+  toggleLabel: (labelId: string) => void;
+  /** The Channels section's rendered rows: label headings and channels. */
+  channelSectionRows: Accessor<readonly ChannelSectionRow[]>;
+  /** Number of channels in the label with unread activity. */
+  labelUnreadCount: (label: ChannelLabel) => number;
+  /** Create a manual or smart section with optional initial channel members. */
+  createLabel: (
+    channelIds: string[],
+    scope?: 'personal' | 'team'
+  ) => Promise<void>;
+  updateSection: (
+    label: ChannelLabel,
+    name: string,
+    rule?: ChannelLabelRule,
+    targetScope?: ChannelLabelScopeSelection
+  ) => Promise<void>;
+  /** Legacy menu actions retained while the section rollout is off. */
+  createSmartTag: () => Promise<void>;
+  editSmartTag: (label: ChannelLabel) => Promise<void>;
+  canShareSections: Accessor<boolean>;
+  canEditSection: (label: ChannelLabel) => boolean;
+  canChangeSectionScope: (label: ChannelLabel) => boolean;
+  /** Pick eligible channels to add to a manual section. */
+  addChannelsToLabel: (label: ChannelLabel) => Promise<void>;
+  /** Assign additions without opening the channel picker; return IDs that failed. */
+  addLabelChannels: (
+    label: ChannelLabel,
+    channelIds: string[]
+  ) => Promise<string[]>;
+  renameLabel: (label: ChannelLabel) => Promise<void>;
+  /** Delete after the user confirms; applies to the whole team. */
+  deleteLabel: (label: ChannelLabel) => Promise<void>;
+  /** Move a channel into a label, or out of any label (`undefined`). */
+  setChannelLabel: (
+    channelId: string,
+    labelId: string | undefined,
+    fromLabelId?: string
+  ) => void;
+  /** Where a dragged channel would land right now, for highlighting the whole target. */
+  activeDropTarget: Accessor<ChannelLabelDropTarget | undefined>;
+  /** Mark every unread notification in the label's visible channels read. */
+  markLabelRead: (label: ChannelLabel) => void;
+  markSectionRead: (section: ChannelSectionKey) => Promise<void>;
+  /** Update the viewer's notifications for the section's current full membership. */
+  muteSection: (section: ChannelSectionKey, muted: boolean) => Promise<void>;
+  snoozeSection: (section: ChannelSectionKey, until?: Date) => Promise<void>;
+  sectionNotificationsDisabled: (section: ChannelSectionKey) => boolean;
+  sortBy: (group: ChannelsSortGroup) => ChannelListSort;
+  setSortBy: (group: ChannelsSortGroup, sort: ChannelListSort) => void;
+  sectionPreferences: (section: ChannelSectionKey) => ChannelSectionPreferences;
+  setSectionPreferences: (
+    section: ChannelSectionKey,
+    preferences: ChannelSectionPreferences
+  ) => void;
+  sectionOrder: Accessor<readonly ChannelSectionKey[]>;
+  setSectionOrder: (sections: ChannelSectionKey[]) => void;
+  registerRootRef: (element: HTMLDivElement) => void;
+  activateRow: (rowId: ChannelRailRow['id'], event?: MouseEvent) => void;
+  /** Warm a channel row's messages on the press that may open it. */
+  prefetchRow: (rowId: ChannelRailRow['id'], event: PointerEvent) => void;
+  registerScrollRef: (
+    group: ChannelsRailSection | 'threads',
+    element: HTMLDivElement
+  ) => void;
+  /** The sectioned renderer owns its nested scroll regions and local indexes. */
+  registerBrowseScrollHandle: (handle: ListScrollHandle) => () => void;
+  registerVirtualizer: (
+    scope: ChannelsSourceScope,
+    handle: ListScrollHandle
+  ) => () => void;
+  channelActivity: ChannelRailActivity;
+};
+
+type ChannelsRailProviderProps = ContextProviderProps & {
+  value: ChannelsRailContext;
+};
+
+export const [ChannelsRailProvider, useChannelsRail] =
+  createAssertedContextProvider<ChannelsRailContext, ChannelsRailProviderProps>(
+    'ChannelsRail',
+    (props) => props.value
+  );

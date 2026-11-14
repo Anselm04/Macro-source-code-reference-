@@ -1,0 +1,215 @@
+import type { ChannelEntity } from '@entity';
+import type { ChannelLabel } from '@service-storage/generated/schemas/channelLabel';
+import { describe, expect, it } from 'vitest';
+import {
+  channelMatchesSmartTag,
+  resolveChannelLabelMemberships,
+} from './smart-tags';
+
+const channel = (
+  id: string,
+  name: string,
+  channelType: ChannelEntity['channelType'] = 'team'
+): ChannelEntity => ({
+  id,
+  name,
+  channelType,
+  type: 'channel',
+  ownerId: 'alice',
+});
+const rule = { attribute: 'name' as const, contains: 'support' };
+const label = (id: string, channelIds: string[]): ChannelLabel => ({
+  id,
+  name: id,
+  channelIds,
+  channelCount: channelIds.length,
+  sortOrder: 0,
+  createdAt: '',
+  updatedAt: '',
+  rule,
+});
+
+it('uses only name matches in rule sections while retaining authorized unjoined members', () => {
+  const result = resolveChannelLabelMemberships(
+    [
+      {
+        ...label('shared', ['picked', 'renamed', 'unloaded']),
+        teamId: 'team',
+        explicitChannelIds: ['picked'],
+      },
+    ],
+    [
+      { ...channel('picked', 'General'), teamId: 'team', isParticipant: false },
+      { ...channel('renamed', 'Sales'), teamId: 'team', isParticipant: true },
+      {
+        ...channel('new-match', 'Support'),
+        teamId: 'team',
+        isParticipant: false,
+      },
+      {
+        ...channel('foreign', 'Support'),
+        teamId: 'other-team',
+        isParticipant: true,
+      },
+      { ...channel('unknown', 'Support'), isParticipant: true },
+    ]
+  );
+  expect(result[0].channelIds).toEqual(['unloaded', 'new-match']);
+  expect(result[0].explicitChannelIds).toEqual([]);
+  expect(result[0].channelCount).toBe(2);
+});
+
+it('keeps personal section membership participant-only even for explicit picks', () => {
+  const result = resolveChannelLabelMemberships(
+    [
+      {
+        ...label('personal', ['picked', 'not-joined']),
+        rule: null,
+        explicitChannelIds: ['picked', 'not-joined'],
+      },
+    ],
+    [
+      { ...channel('picked', 'General', 'private'), isParticipant: true },
+      {
+        ...channel('not-joined', 'Support'),
+        teamId: 'team',
+        isParticipant: false,
+      },
+    ]
+  );
+  expect(result[0].channelIds).toEqual(['picked']);
+  expect(result[0].explicitChannelIds).toEqual(['picked']);
+});
+
+describe('smart tag matching', () => {
+  it('matches literal substrings ignoring case for team channels, excluding empty patterns', () => {
+    expect(channelMatchesSmartTag(channel('a', 'Acme SUPPORT'), rule)).toBe(
+      true
+    );
+    expect(
+      channelMatchesSmartTag(channel('a', 'support', 'direct_message'), rule)
+    ).toBe(false);
+    expect(
+      channelMatchesSmartTag(channel('a', '100%_support'), {
+        attribute: 'name',
+        contains: '%_',
+      })
+    ).toBe(true);
+    expect(
+      channelMatchesSmartTag(channel('a', 'any'), {
+        attribute: 'name',
+        contains: '%',
+      })
+    ).toBe(false);
+    expect(
+      channelMatchesSmartTag(channel('a', 'any'), {
+        attribute: 'name',
+        contains: '',
+      })
+    ).toBe(false);
+  });
+
+  it('updates loaded memberships on channel rename while retaining matches beyond loaded pages', () => {
+    const manual = { ...label('manual', ['renamed']), rule: null };
+    const result = resolveChannelLabelMemberships(
+      [label('smart', ['unloaded', 'renamed']), manual],
+      [channel('renamed', 'Sales'), channel('new', 'New Support')]
+    );
+    expect(result[0].channelIds).toEqual(['unloaded', 'new']);
+    expect(result[0].channelCount).toBe(2);
+    expect(result[1]).toBe(manual);
+  });
+
+  it.each(['public', 'private', 'direct_message'] as const)(
+    'excludes %s channels from smart matching and cached manual or smart memberships',
+    (channelType) => {
+      const nonTeam = channel('non-team', 'Support', channelType);
+      expect(channelMatchesSmartTag(nonTeam, rule, { teamId: 'team' })).toBe(
+        false
+      );
+      const result = resolveChannelLabelMemberships(
+        [
+          {
+            ...label('manual', ['unloaded', 'non-team', 'team']),
+            teamId: 'team',
+            rule: null,
+          },
+          {
+            ...label('smart', ['unloaded', 'non-team', 'team']),
+            teamId: 'team',
+          },
+        ],
+        [nonTeam, channel('team', 'Support')]
+      );
+      for (const resolved of result) {
+        expect(resolved.channelIds).toEqual(['unloaded', 'team']);
+        expect(resolved.channelCount).toBe(2);
+      }
+    }
+  );
+
+  it('preserves the manual count of assignments outside the loaded viewer-relative IDs', () => {
+    const result = resolveChannelLabelMemberships(
+      [
+        {
+          ...label('manual', ['public', 'team']),
+          teamId: 'team',
+          rule: null,
+          channelCount: 8,
+        },
+      ],
+      [channel('public', 'Public', 'public'), channel('team', 'Support')]
+    );
+    expect(result[0].channelIds).toEqual(['team']);
+    expect(result[0].channelCount).toBe(7);
+  });
+
+  it('keeps new shared smart-label matches server-authoritative when channel team IDs are unavailable', () => {
+    const result = resolveChannelLabelMemberships(
+      [
+        {
+          ...label('shared', ['unloaded', 'renamed', 'member']),
+          teamId: 'team',
+        },
+      ],
+      [
+        channel('renamed', 'Sales'),
+        channel('member', 'Support'),
+        channel('another-team', 'Support'),
+        channel('new', 'Support'),
+      ]
+    );
+    expect(result[0].channelIds).toEqual(['unloaded', 'member']);
+    expect(result[0].channelCount).toBe(2);
+  });
+
+  it('matches current-team channels before the shared membership snapshot refreshes', () => {
+    const result = resolveChannelLabelMemberships(
+      [{ ...label('shared', ['unknown-team']), teamId: 'team' }],
+      [
+        { ...channel('new', 'SUPPORT queue'), teamId: 'team' },
+        { ...channel('renamed', 'Support'), teamId: 'team' },
+        { ...channel('other-team', 'Support'), teamId: 'other-team' },
+        {
+          ...channel('unjoined', 'Support'),
+          teamId: 'team',
+          isParticipant: false,
+        },
+        channel('unknown-team', 'Support'),
+        channel('unconfirmed', 'Support'),
+      ]
+    );
+
+    expect(result[0].channelIds).toEqual(['new', 'renamed', 'unknown-team']);
+    expect(result[0].channelCount).toBe(3);
+  });
+
+  it('matches private channels in personal sections without adding them to shared sections', () => {
+    const result = resolveChannelLabelMemberships(
+      [label('personal', []), { ...label('shared', []), teamId: 'team' }],
+      [channel('private', 'Support', 'private')]
+    );
+    expect(result[0].channelIds).toEqual(['private']);
+    expect(result[1].channelIds).toEqual([]);
+  });
+});

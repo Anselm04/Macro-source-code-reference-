@@ -1,0 +1,86 @@
+import type { VisibleCalendar } from '../../../generated/calendar/types.gen';
+import { MacroNotFoundError, unwrap } from '../../utils';
+import type { MacroClient } from '../../utils/client';
+import { Link } from '../email/link';
+import { MacroEntity } from '../entity';
+
+/**
+ * A calendar visible to the requester across their connected inboxes: a
+ * free-to-construct handle whose detail resolves from the caller's calendar
+ * list. There is no fetch-by-id endpoint, so a bare {@link Calendar.byId}
+ * handle loads its detail by listing the caller's calendars and matching on id.
+ */
+export class Calendar extends MacroEntity<VisibleCalendar> {
+  /**
+   * Set whether this calendar contributes to the caller's availability.
+   *
+   * @write
+   * @openworld
+   * @idempotent
+   */
+  async setContributesToAvailability(
+    contributesToAvailability: boolean,
+  ): Promise<void> {
+    await this.mutate((c) =>
+      c.calendar.setAvailabilityCalendar({
+        path: { calendar_id: this.id },
+        body: { contributesToAvailability },
+      }),
+    );
+  }
+
+  protected async fetch(): Promise<VisibleCalendar> {
+    const { calendars } = unwrap(await this.client.calendar.listCalendars());
+    const found = calendars.find((calendar) => calendar.id === this.id);
+    if (!found) throw new MacroNotFoundError(`calendar ${this.id} not found`);
+    return found;
+  }
+
+  /** A handle to a calendar by id. Detail loads on first access. */
+  static byId(client: MacroClient, id: string): Calendar {
+    return new Calendar(client, id);
+  }
+
+  /** The caller's visible calendars, primaries and writable first. */
+  static async list(client: MacroClient): Promise<Calendar[]> {
+    const { calendars } = unwrap(await client.calendar.listCalendars());
+    return calendars.map(
+      (calendar) => new Calendar(client, calendar.id, calendar),
+    );
+  }
+
+  /** Provider display name. Often says whose calendar it is: Google names a
+   * person's primary calendar after them or their address. */
+  readonly name = this.field('name');
+
+  /** Connected inbox address that syncs this calendar. It stays the user's
+   * own address on a calendar someone else shared with them. */
+  readonly emailAddress = this.field('emailAddress');
+
+  /** Whether this is its account's primary calendar. The user's other
+   * calendars are not primary either, so false does not mean it isn't theirs. */
+  readonly isPrimary = this.field('isPrimary');
+
+  /** Whether the grant can create and modify events on this calendar. People
+   * can hold that on someone else's calendar, so it does not mean it is theirs. */
+  readonly isWritable = this.field('isWritable');
+
+  /** Whether this calendar counts toward the caller's busy time: their Busy
+   * switch in Settings → Calendar, on for every calendar until they turn it
+   * off. Booking links, team availability and agents all read it. */
+  readonly contributesToAvailability = this.field('contributesToAvailability');
+
+  /** Whether this is a subscribed system calendar (holidays, birthdays). */
+  readonly isSubscription = this.field('isSubscription');
+
+  /** Provider color, when set. */
+  readonly color = this.field('color');
+
+  /** A persistent per-calendar sync failure, surfaced for settings badges. */
+  readonly syncError = this.field('syncError');
+
+  /** The connected inbox (email link) that syncs this calendar. */
+  readonly emailLink = this.mappedField('emailLinkId', (id) =>
+    Link.byId(this.client, id),
+  );
+}

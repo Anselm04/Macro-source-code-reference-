@@ -1,0 +1,48 @@
+// Re-export user context hooks for backwards compatibility
+export {
+  useIsAuthenticated,
+  useUserId,
+  useUserInfo,
+} from '@core/context/user';
+export {
+  invalidateAiBillingSummary,
+  invalidateSubscriptionStatus,
+  useAiBillingPlansQuery,
+  useAiBillingSummaryQuery,
+  useChangePlanMutation,
+  useCreateAiCreditCheckoutMutation,
+  useIncludedAiCentsByTier,
+  usePurchaseAiCreditsMutation,
+  useSubscriptionStatusQuery,
+  useUpdateAiAutoReloadMutation,
+  useUpdateAiOverageMutation,
+} from './ai-billing';
+export {
+  type GithubLink,
+  type GithubLinkStatus,
+  githubLinkAuthorizationUrl,
+  invalidateGithubLinkStatus,
+  useDeleteGithubLinkMutation,
+  useGithubLinkStatusQuery,
+  useInitGithubLinkMutation,
+  useReauthenticateGithubMutation,
+} from './github-link';
+export { useInitGmailLink } from './gmail-link';
+export { authKeys } from './keys';
+export { useSendMobileWelcomeEmail } from './mobile-welcome-email';
+export {
+  type CreateCheckoutSessionArgs,
+  useCreateBillingPortalMutation,
+  useCreateCheckoutSessionMutation,
+  useTrialEligibilityQuery,
+} from './stripe-checkout';
+export type { UserInfoData } from './user-info';
+export {
+  useSetUserLanguageMutation,
+  useUserLanguageQuery,
+} from './user-language';
+export {
+  normalizeUserNameQueryId,
+  useUserNames,
+} from './user-names';
+export { invalidateUserQuota } from './user-quota';

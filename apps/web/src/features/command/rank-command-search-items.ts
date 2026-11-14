@@ -1,0 +1,210 @@
+import { deepEqual } from '@core/util/compareUtils';
+import { createFreshSearch, NAME_MATCH_RANKING } from '@core/util/freshSort';
+import { normalizeNameText } from '@core/util/name-match-score';
+import { preservePersonOrder } from '@core/util/ordered-window';
+import uFuzzy from '@leeoniya/ufuzzy';
+import { match } from 'ts-pattern';
+import type { CommandMenuItem } from './useCommandItems';
+
+// Command keyword eligibility is not a database-person lookup. Keep its existing
+// matcher for commands and ordinary entities; personal windows retain core order.
+const COMMAND_MATCHER = new uFuzzy({});
+
+/** The label a row shows; its search text can add emails, aliases, or command keywords. */
+function displayName(item: CommandMenuItem): string {
+  return match(item)
+    .with({ kind: 'entity' }, { kind: 'user' }, (row) => row.data.name)
+    .with({ kind: 'command' }, ({ data }) =>
+      typeof data.description === 'function'
+        ? data.description()
+        : data.description
+    )
+    .with(
+      { kind: 'search' },
+      { kind: 'ask-ai' },
+      { kind: 'new-project' },
+      (row) => row.searchText
+    )
+    .exhaustive();
+}
+
+/**
+ * A command's label is a verb and what it acts on ("Go to Settings", "Change
+ * theme"), and people type the latter. A label ending in the query from a
+ * later word names the command after it: it ranks under exact names and above
+ * names that only start with the query. A later word starting with the query
+ * ranks with names starting with it.
+ */
+function commandNameRank(label: string, term: string): number {
+  if (!term) return 0;
+  const name = normalizeNameText(label);
+  if (name.endsWith(` ${term}`)) return 2;
+  return name.includes(` ${term}`) ? 1 : 0;
+}
+
+function compareRecency(left: CommandMenuItem, right: CommandMenuItem) {
+  return (
+    right.sortTimestamp - left.sortTimestamp || left.id.localeCompare(right.id)
+  );
+}
+
+function isPeopleItem(item: CommandMenuItem) {
+  return (
+    item.bucket === 'dm' ||
+    item.bucket === 'person' ||
+    item.bucket === 'crm_contact'
+  );
+}
+
+/** Keep the existing order within each group and the positions of other results. */
+function prioritizeInternalPeople<T extends CommandMenuItem>(items: T[]): T[] {
+  const people = items
+    .filter(isPeopleItem)
+    .sort(
+      (left, right) =>
+        Number(left.bucket === 'crm_contact') -
+        Number(right.bucket === 'crm_contact')
+    );
+  let nextPerson = 0;
+  return items.map((item) =>
+    isPeopleItem(item) ? people[nextPerson++] : item
+  );
+}
+
+function isMacroPerson(item: CommandMenuItem) {
+  return item.bucket === 'dm' || item.bucket === 'person';
+}
+
+/**
+ * Sources republish their lists on cache refreshes and page reads, often with
+ * new objects that hold the same data. Rows that are the same object or hold
+ * equal data rank the same, so such a list needs no new ranking. Commands
+ * carry handlers and are compared by identity only.
+ */
+export function sameRankInput(
+  previous: readonly CommandMenuItem[],
+  next: readonly CommandMenuItem[]
+): boolean {
+  if (previous.length !== next.length) return false;
+
+  return previous.every((item, index) => {
+    const other = next[index];
+    if (item === other) return true;
+    if (item.kind === 'command' || other.kind === 'command') return false;
+    return deepEqual(item, other);
+  });
+}
+
+/** Rank cached and local candidates together using the command menu's rules. */
+export function rankCommandSearchItems<T extends CommandMenuItem>(
+  items: T[],
+  query: string,
+  options: {
+    preserveAdditionalEntityMatches: boolean;
+    /** Rows a server search already matched, kept even when the menu's
+     * fuzzy matcher would not match them. */
+    preservedIds?: ReadonlySet<string>;
+    /** Members of the viewer's team. Their people rows and one-to-one
+     * conversations lead other rows that match equally well. */
+    teammateIds?: ReadonlySet<string>;
+    viewerId?: string;
+  }
+): T[] {
+  const term = normalizeNameText(query);
+  const search = createFreshSearch<T>({
+    config: {
+      ...NAME_MATCH_RANKING,
+      useViewedAt: true,
+      channelBoost: 3,
+      dmBoost: 1.8,
+      fuzzyWeight: 0.7,
+      timeWeight: 0.7,
+      minFuzzyThreshold: 0.1,
+      commaSeparatedChannelMatch: true,
+    },
+    getName: (item) => item.searchText,
+    getDisplayName: displayName,
+    isChannelItem: (item) => item.bucket === 'channel' || item.bucket === 'dm',
+    isDmItem: (item) => item.bucket === 'dm',
+    isPersonItem: (item) => item.bucket === 'dm' || item.bucket === 'person',
+    getTimestamp: (item) => item.timestamps,
+  });
+
+  const commands = items.filter((item) => item.kind === 'command');
+  const commandMatches = new Set(
+    (
+      COMMAND_MATCHER.filter(
+        commands.map((item) => item.searchText),
+        query
+      ) ?? []
+    ).map((index) => commands[index].id)
+  );
+  const eligible = items.filter(
+    (item) => item.kind !== 'command' || commandMatches.has(item.id)
+  );
+  const withTeammate = (item: CommandMenuItem) => {
+    const team = options.teammateIds;
+    if (!team?.size) return false;
+    if (item.kind === 'user') return team.has(item.id);
+    if (item.kind !== 'entity' || item.data.type !== 'channel') return false;
+    if (item.data.channelType !== 'direct_message') return false;
+    const others = (item.data.participantIds ?? []).filter(
+      (id) => id !== options.viewerId
+    );
+    return others.length === 1 && team.has(others[0]);
+  };
+  // Match quality decides first. Among equally good matches, teammates and
+  // conversations with them lead, then other Macro users and DMs, then
+  // documents and channels.
+  const scored = search(eligible, query)
+    .map((result) =>
+      result.item.kind === 'command'
+        ? {
+            ...result,
+            nameMatchRank: Math.max(
+              result.nameMatchRank,
+              commandNameRank(displayName(result.item), term)
+            ),
+          }
+        : result
+    )
+    .sort(
+      (left, right) =>
+        right.nameMatchRank - left.nameMatchRank ||
+        Number(withTeammate(right.item)) - Number(withTeammate(left.item)) ||
+        Number(isMacroPerson(right.item)) - Number(isMacroPerson(left.item)) ||
+        right.combinedScore - left.combinedScore ||
+        compareRecency(left.item, right.item)
+    );
+  const ranked = scored.map(({ item }) => item);
+  // People keep their window order only among equally good name matches, so
+  // a recent weak match cannot take the slot an exact name earned.
+  const nameRanks = new Map(
+    scored.map(({ item, nameMatchRank }) => [item.id, nameMatchRank])
+  );
+  // Window order holds among people who match equally well and are equally
+  // close to the viewer, so a teammate keeps the lead the sort gave them.
+  const nameRank = (item: T) =>
+    (nameRanks.get(item.id) ?? -Infinity) * 2 + Number(withTeammate(item));
+  const preserved = (item: CommandMenuItem) =>
+    options.preservedIds?.has(item.id) ||
+    (options.preserveAdditionalEntityMatches && item.kind === 'entity');
+  if (!options.preserveAdditionalEntityMatches && !options.preservedIds?.size)
+    return preservePersonOrder(
+      prioritizeInternalPeople(ranked),
+      items,
+      nameRank
+    );
+
+  // Cache search accepts broader subsequences than the menu's fuzzy matcher.
+  // Keep these additional matches reachable after the regular ranked results.
+  const matchedIds = new Set(ranked.map((item) => item.id));
+  const additional = items
+    .filter((item) => preserved(item) && !matchedIds.has(item.id))
+    .sort(compareRecency);
+  return preservePersonOrder(
+    prioritizeInternalPeople([...ranked, ...additional]),
+    items,
+    nameRank
+  );
+}

@@ -1,0 +1,242 @@
+import type { DateValue } from '@core/util/date';
+import type { StreamEvent } from '@service-connection/generated/schemas';
+import { createElementSize } from '@solid-primitives/resize-observer';
+import {
+  type Accessor,
+  createContext,
+  createEffect,
+  createMemo,
+  createSignal,
+  type JSX,
+  onCleanup,
+  type Ref,
+  Show,
+  useContext,
+} from 'solid-js';
+import { MultiSelectCheckbox } from '../../components/MultiSelectCheckbox';
+import { UnreadIndicator } from '../../components/UnreadIndicator';
+import type { EntityRowConfig } from '../../extractors-notification';
+import type {
+  EntityData,
+  EntityWithProperties,
+  ProjectEntity,
+} from '../../types/entity';
+import type { WithNotification } from '../../types/notification';
+import type { ContentHitData, SearchLocation } from '../../types/search';
+import { isSearchEntity } from '../../types/search';
+
+export interface BaseListEntityProps<E extends EntityData = EntityData>
+  extends Pick<
+    JSX.HTMLAttributes<HTMLDivElement>,
+    'role' | 'tabIndex' | 'onKeyDown'
+  > {
+  entity: WithNotification<E>;
+  onClick?: (event: MouseEvent) => void;
+  timestamp?: DateValue | null;
+  ref?: Ref<HTMLDivElement>;
+  checked?: boolean;
+  highlighted?: boolean;
+  /** The row open beside the list, marked while the cursor moves elsewhere. */
+  current?: boolean;
+  hovered?: boolean;
+  /** Caller-owned quick actions, revealed on pointer hover or keyboard focus. */
+  actions?: JSX.Element;
+  /** Persistent controls for touch devices, before the timestamp. */
+  touchActions?: JSX.Element;
+  /** Persistent status/action immediately before the timestamp. */
+  leadingAction?: JSX.Element;
+  /** Caller-owned marker between the icon and the title, e.g. a priority. */
+  titleLeading?: JSX.Element;
+  /** Caller-owned leading visual inside the standard Soup icon slot. */
+  icon?: JSX.Element;
+  /** Supporting text after the title in the standard content slot. */
+  titleTrailing?: JSX.Element;
+  /** Caller-owned metadata ahead of the entity's own, in wide rows only. */
+  meta?: JSX.Element;
+  /** Caller-owned metadata after the entity's own, in wide rows only. */
+  metaEnd?: JSX.Element;
+  /** Caller-owned marker ahead of the preview, in stacked email rows only. */
+  previewLeading?: JSX.Element;
+  hideContentHits?: boolean;
+  /** Resolved app display name for a linked GitHub PR author, when available. */
+  authorDisplayName?: string;
+  /** Opt-in by the data-owning view; keep nonessential setup off initial render. */
+  deferInteractions?: boolean;
+  /** Hide the multi-select checkbox (e.g. read-only embeds outside soup). */
+  hideCheckbox?: boolean;
+  onChecked?: (checked: boolean, shiftKey: boolean) => void;
+  onMouseMove?: () => void;
+  showCalendarAttendance?: boolean;
+  /** Lets standalone collections own their tag-filter navigation. */
+  onFilterByTag?: (optionId: string) => void;
+  onProjectClick?: (
+    entity: ProjectEntity,
+    e: PointerEvent | MouseEvent
+  ) => void;
+  onContentHitClick?: (
+    e: PointerEvent | MouseEvent,
+    location?: SearchLocation
+  ) => void;
+  entityRowConfig?: EntityRowConfig;
+  /** The row visually closes its group (or the list) — the next row is a
+   * group header or absent. Layouts use it to drop a trailing divider. */
+  isLastInGroup?: boolean;
+}
+
+const WIDE_BREAKPOINT = 512; // @lg container query = 32rem
+
+export interface LayoutProps {
+  entity: WithNotification<EntityWithProperties<EntityData>>;
+  /** Persistent schedule metadata, including on touch and notification rows. */
+  scheduleStatus?: JSX.Element;
+  actions?: JSX.Element;
+  leadingAction?: JSX.Element;
+  titleLeading?: JSX.Element;
+  /** Caller-owned leading visual inside the standard Soup icon slot. */
+  icon?: JSX.Element;
+  /** Supporting text after the title in the standard content slot. */
+  titleTrailing?: JSX.Element;
+  meta?: JSX.Element;
+  metaEnd?: JSX.Element;
+  previewLeading?: JSX.Element;
+  /** Stored reference values alongside the existing property pills. */
+  referenceProperties?: JSX.Element;
+  checked?: boolean;
+  authorDisplayName?: string;
+  hideCheckbox?: boolean;
+  onChecked?: (checked: boolean, shiftKey: boolean) => void;
+  unread: boolean;
+  isShared: boolean;
+  hasNotifications: boolean;
+  showHitSnippet: boolean;
+  streamState?: StreamEvent;
+  setSnippetContainerRef: (el: HTMLElement) => void;
+  chars: number;
+  showCalendarAttendance?: boolean;
+  onFilterByTag?: (optionId: string) => void;
+  onProjectClick?: (
+    entity: ProjectEntity,
+    e: PointerEvent | MouseEvent
+  ) => void;
+  /** Show a task's Project with its other properties (Projects enabled). */
+  showProject?: boolean;
+}
+
+/**
+ * How rows render once the list is too narrow for columns. `inbox` gives
+ * email rows the compact stacked layout (sender, subject, snippet) on desktop,
+ * for lists that sit beside a reading pane; touch devices keep their own email
+ * rows, with the sender's picture.
+ */
+export type NarrowLayoutVariant =
+  | 'standard'
+  | 'condensed'
+  | 'single-line'
+  | 'inbox';
+
+interface ListLayoutContextValue {
+  isWide: Accessor<boolean>;
+  narrowLayout: Accessor<NarrowLayoutVariant>;
+}
+
+const ListLayoutContext = createContext<ListLayoutContextValue>();
+
+export function ListLayoutProvider(props: {
+  ref: Accessor<HTMLElement | undefined>;
+  narrowLayout?: NarrowLayoutVariant;
+  /** The list width, in px, from which rows use columns. */
+  wideBreakpoint?: number;
+  /** Responsive rows have a nonzero width and their layout can be restored. */
+  onMeasured?: () => void;
+  children: JSX.Element;
+}) {
+  const [listWidth, setListWidth] = createSignal(Number.POSITIVE_INFINITY);
+  const isWide = createMemo(
+    () => listWidth() >= (props.wideBreakpoint ?? WIDE_BREAKPOINT)
+  );
+
+  createEffect(() => {
+    const el = props.ref();
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? 0;
+      setListWidth(width);
+      if (width > 0) props.onMeasured?.();
+    });
+    observer.observe(el);
+    onCleanup(() => observer.disconnect());
+  });
+
+  return (
+    <ListLayoutContext.Provider
+      value={{ isWide, narrowLayout: () => props.narrowLayout ?? 'standard' }}
+    >
+      {props.children}
+    </ListLayoutContext.Provider>
+  );
+}
+
+export const useListLayout = () => useContext(ListLayoutContext);
+
+export const hasSearchContentHits = (entity: EntityData) =>
+  isSearchEntity(entity) && !!entity.search.contentHitData?.length;
+
+export function firstContentHit(
+  entity: EntityData
+): ContentHitData | undefined {
+  return isSearchEntity(entity) ? entity.search.contentHitData?.[0] : undefined;
+}
+
+/**
+ * Tracks the half-width character budget of an element via ResizeObserver.
+ * Used as the chars argument to windowSearchMatch so the snippet windowing
+ * tracks the actual rendered width.
+ */
+export function useCharacterCount(ref: Accessor<HTMLElement | undefined>) {
+  const size = createElementSize(ref);
+  const [chars, setChars] = createSignal(200);
+  const CHAR_WIDTH_PX = 6; // approximation for text-sm
+
+  createEffect(() => {
+    if (!size.width) return;
+    setChars(Math.round(size.width / CHAR_WIDTH_PX / 2));
+  });
+
+  return chars;
+}
+
+/**
+ * The single-line rows' indicator cell: the multi-select checkbox while the
+ * row is checked, otherwise the unread dot in an always-reserved slot so
+ * toggling selection doesn't shift the row.
+ */
+export function RowIndicator(props: {
+  checked?: boolean;
+  hideCheckbox?: boolean;
+  onChecked?: (checked: boolean, shiftKey: boolean) => void;
+  unread: boolean;
+}) {
+  return (
+    <Show
+      when={!props.hideCheckbox && props.checked}
+      fallback={
+        <div class="size-4 p-0.5 flex items-center justify-center">
+          <UnreadIndicator active={props.unread} />
+        </div>
+      }
+    >
+      <div class="w-4 overflow-hidden">
+        <MultiSelectCheckbox
+          checked={props.checked}
+          onChecked={props.onChecked}
+        />
+      </div>
+    </Show>
+  );
+}
+
+export function InboxDivider() {
+  return (
+    <div class="col-span-3 ml-(--soup-inbox-left-of-content) min-w-full min-h-px max-h-px bg-edge-divider" />
+  );
+}

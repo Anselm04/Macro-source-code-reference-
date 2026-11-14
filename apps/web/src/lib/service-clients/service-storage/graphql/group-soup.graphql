@@ -1,0 +1,17 @@
+query GroupSoup($input: GroupedSoupInput!) {
+	user {
+		id
+		groupSoup(input: $input) {
+			bins {
+				key
+				displayOrder
+				label
+				totalCount
+				nextCursor
+				items {
+					...SoupItemFields
+				}
+			}
+		}
+	}
+}

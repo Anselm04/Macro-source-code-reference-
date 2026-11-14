@@ -1,0 +1,393 @@
+import { SERVER_HOSTS, SYNC_SERVICE_HOSTS } from '@core/constant/servers';
+import { Telemetry, type TraceContext } from '@macro-inc/observability';
+import { err, ok, type Result } from 'neverthrow';
+import { match } from 'ts-pattern';
+import { platformFetch } from './platformFetch';
+import type { ObjectLike, ResultError } from './result';
+import { sleep } from './sleep';
+import { redactLinkTokens } from './telemetryUrl';
+
+const tracedOrigins: ReadonlySet<string> = (() => {
+  const origins = new Set<string>();
+  for (const host of [
+    ...Object.values(SERVER_HOSTS),
+    SYNC_SERVICE_HOSTS.worker,
+  ]) {
+    try {
+      origins.add(new URL(host).origin);
+    } catch {}
+  }
+  if (typeof window !== 'undefined') origins.add(window.location.origin);
+  return origins;
+})();
+
+function isTracedOrigin(url: URL): boolean {
+  return tracedOrigins.has(url.origin);
+}
+
+function requestUrl(input: RequestInfo): URL | undefined {
+  const raw = typeof input === 'string' ? input : input.url;
+  try {
+    return new URL(
+      raw,
+      typeof window === 'undefined' ? undefined : window.location.origin
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function tracedFetch(
+  input: RequestInfo,
+  init: RequestInit & { headers: Record<string, string> },
+  traceOptions?: SafeFetchTraceOptions
+): Promise<Response> {
+  const url = requestUrl(input);
+  if (!url) return platformFetch(input, init);
+  const method = (init.method ?? 'GET').toUpperCase();
+  const path = redactLinkTokens(url.pathname);
+  const span = traceOptions?.parentSpan
+    ? traceOptions.parentSpan.run(() =>
+        Telemetry.span(`http ${method} ${path}`, { kind: 'client' })
+      )
+    : Telemetry.span(`http ${method} ${path}`, { kind: 'client' });
+  const started = performance.now();
+  span.setAttr('http.method', method);
+  // Path only: query strings can carry tokens.
+  span.setAttr('http.url', `${url.origin}${path}`);
+  return span.run(async () => {
+    try {
+      if (isTracedOrigin(url)) {
+        span.injectTraceHeaders(init.headers);
+      }
+      const response = await platformFetch(input, init);
+      span.setAttr('http.response_headers_ms', performance.now() - started);
+      span.setAttr('http.timing_scope', 'until_response_headers');
+      span.setAttr('http.status_code', response.status);
+      if (!response.ok) {
+        const expected = traceOptions?.expectedStatusCodes?.includes(
+          response.status
+        );
+        if (expected) {
+          span.setAttr('http.expected_status', true);
+          return response;
+        }
+        const message = `HTTP ${response.status} for ${method} ${path}`;
+        span.error({
+          name: 'HttpError',
+          message,
+          stack: new Error(message).stack,
+        });
+      }
+      return response;
+    } catch (error) {
+      span.error(
+        error instanceof Error
+          ? {
+              name: error.name,
+              message: redactLinkTokens(error.message),
+              stack: error.stack ? redactLinkTokens(error.stack) : undefined,
+            }
+          : redactLinkTokens(String(error))
+      );
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
+}
+
+/**
+ * Base error codes for fetch operations.
+ */
+export type BaseFetchErrorCode =
+  | 'NETWORK_ERROR'
+  | 'HTTP_ERROR'
+  | 'NOT_FOUND'
+  | 'UNAUTHORIZED'
+  | 'FORBIDDEN'
+  | 'CONFLICT'
+  | 'SERVER_ERROR'
+  | 'INVALID_JSON'
+  | 'UNKNOWN_ERROR'
+  | 'GONE';
+
+/** The error safeFetch reports for a failed status when no custom handler words it. */
+export function statusError(status: number): ResultError<BaseFetchErrorCode> {
+  return match(status)
+    .returnType<ResultError<BaseFetchErrorCode>>()
+    .with(404, () => ({ code: 'NOT_FOUND', message: 'Resource not found' }))
+    .with(401, () => ({ code: 'UNAUTHORIZED', message: 'Unauthorized access' }))
+    .with(403, () => ({ code: 'FORBIDDEN', message: 'Forbidden' }))
+    .with(409, () => ({ code: 'CONFLICT', message: 'Resource conflict' }))
+    .with(410, () => ({ code: 'GONE', message: 'Resource deleted' }))
+    .with(500, () => ({
+      code: 'SERVER_ERROR',
+      message: 'Internal server error',
+    }))
+    .otherwise(() => ({
+      code: 'HTTP_ERROR',
+      message: `HTTP error! status: ${status}`,
+    }));
+}
+
+/**
+ * A function type for custom error response handling.
+ *
+ * @template CustomErrorCode - Additional custom error codes.
+ *
+ * @example
+ * // Define custom error codes
+ * type MyApiErrorCode = 'RATE_LIMITED' | 'INVALID_INPUT';
+ *
+ * // Create a custom error handler
+ * const myErrorHandler: ErrorResponseHandler<MyApiErrorCode> = async (response) => {
+ *   const data = await response.json();
+ *   if (response.status === 429) {
+ *     return {
+ *       code: 'RATE_LIMITED',
+ *       message: 'Too many requests, please try again later',
+ *     };
+ *   } else if (response.status === 400) {
+ *     return {
+ *       code: 'INVALID_INPUT',
+ *       message: data.error || 'Invalid input provided',
+ *     };
+ *   }
+ *   // Fall back to default error handling
+ *   return {
+ *     code: 'HTTP_ERROR',
+ *     message: `HTTP error! status: ${response.status}`,
+ *   };
+ * };
+ */
+export type ErrorResponseHandler<CustomErrorCode extends string> = (
+  response: Response
+) => Promise<ResultError<BaseFetchErrorCode | CustomErrorCode>>;
+
+/**
+ * Configuration for retry behavior.
+ */
+export interface RetryConfig {
+  maxTries?: number;
+  /** number in seconds or expnential backoff */
+  delay?: 'exponential' | number;
+}
+
+/** Trace context and response classification, never forwarded to fetch. */
+export interface SafeFetchTraceOptions {
+  /** Restore the action's parent after async auth or mutation scheduling. */
+  parentSpan?: TraceContext;
+  /** Non-OK responses that should not mark the HTTP span as failed. */
+  expectedStatusCodes?: readonly number[];
+}
+
+/**
+ * Extended RequestInit interface that includes retry configuration.
+ */
+export interface SafeFetchInit extends RequestInit {
+  retry?: RetryConfig;
+  trace?: SafeFetchTraceOptions;
+}
+
+export type TextResponse = { contentType: 'text/plain'; body: string };
+
+/**
+ * Performs a safe fetch operation with structured error handling and retry capability.
+ *
+ * @template T - The expected return type of the fetch operation.
+ * @template CustomErrorCode - Additional custom error codes (optional).
+ * @param {RequestInfo} input - The resource to fetch.
+ * @param {SafeFetchInit} [init] - Custom settings to apply to the request, including retry configuration.
+ * @param {ErrorResponseHandler<CustomErrorCode>} [errorResponseHandler] - Custom error response handler.
+ * @returns {Promise<Result<T, ResultError<BaseFetchErrorCode | CustomErrorCode>[]>>} A promise that resolves to a Result.
+ *
+ * @example
+ * // Basic usage
+ * async function fetchUser(userId: string) {
+ *   const result = await safeFetch<{ id: string, name: string }>(
+ *     `https://localhost/users/${userId}`
+ *   );
+ *
+ *   if ((result).isErr()) {
+ *     console.error('Error fetching user:', result.error);
+ *     return;
+ *   }
+ *
+ *   const user = result.value;
+ *   console.log('User data:', user);
+ * }
+ *
+ * @example
+ * // Usage with custom error handling
+ * type MyApiErrorCode = 'RATE_LIMITED' | 'INVALID_INPUT';
+ *
+ * const myErrorHandler: ErrorResponseHandler<MyApiErrorCode> = async (response) => {
+ *   // ... (implementation as shown in {@link ErrorResponseHandler} example)
+ * };
+ *
+ * async function fetchUserWithCustomErrors(userId: string) {
+ *   const result = await safeFetch<{ id: string, name: string }, MyApiErrorCode>(
+ *     `https://localhost/users/${userId}`,
+ *     undefined,
+ *     myErrorHandler
+ *   );
+ *
+ *   if ((result).isErr()) {
+ *     const errors = result.error;
+ *     switch (errors[0].code) {
+ *       case 'RATE_LIMITED':
+ *         console.error('Rate limit reached:', errors[0].message);
+ *         // Implement retry logic or inform user
+ *         break;
+ *       case 'INVALID_INPUT':
+ *         console.error('Invalid input:', errors[0].message);
+ *         // Prompt user to correct input
+ *         break;
+ *       default:
+ *         console.error('Error fetching user:', errors);
+ *     }
+ *     return;
+ *   }
+ *
+ *   const user = result.value;
+ *   console.log('User data:', user);
+ * }
+ *
+ * @example
+ * // Basic usage with retry
+ * async function fetchUser(userId: string) {
+ *   const result = await safeFetch<{ id: string, name: string }>(
+ *     `https://localhost/users/${userId}`,
+ *     {
+ *       method: 'GET',
+ *       retry: { maxTries: 3, delay: 'exponential' }
+ *     }
+ *   );
+ *
+ *   if ((result).isErr()) {
+ *     console.error('Error fetching user:', result.error);
+ *     return;
+ *   }
+ *
+ *   const user = result.value;
+ *   console.log('User data:', user);
+ * }
+ */
+export async function safeFetch<
+  T extends (ObjectLike & (TextResponse | {})) | Uint8Array,
+  CustomErrorCode extends string = never,
+>(
+  input: RequestInfo,
+  init?: SafeFetchInit,
+  errorResponseHandler?: ErrorResponseHandler<CustomErrorCode>
+): Promise<Result<T, ResultError<BaseFetchErrorCode | CustomErrorCode>[]>> {
+  const { retry, trace: suppliedTrace, ...fetchInit } = init || {};
+  const trace = {
+    ...suppliedTrace,
+    parentSpan: suppliedTrace?.parentSpan ?? Telemetry.captureContext(),
+  };
+  const maxTries = retry?.maxTries ?? 1;
+  const delay = retry?.delay ?? 0;
+  type ErrorCode = BaseFetchErrorCode | CustomErrorCode;
+  const fetchErr = (errors: ResultError<ErrorCode>[]) =>
+    err<T, ResultError<ErrorCode>[]>(errors);
+  let lastError: Result<T, ResultError<ErrorCode>[]> | undefined;
+
+  for (let attempt = 1; attempt <= maxTries; attempt++) {
+    try {
+      const response = await tracedFetch(
+        input,
+        {
+          ...fetchInit,
+          headers: {
+            ...(fetchInit?.method !== 'GET' &&
+              fetchInit?.method !== 'HEAD' &&
+              !(fetchInit?.body instanceof FormData) && {
+                'Content-Type':
+                  (fetchInit?.headers as Record<string, string> | undefined)?.[
+                    'Content-Type'
+                  ] ?? 'application/json',
+              }),
+            ...fetchInit?.headers,
+          } as Record<string, string>,
+        },
+        trace
+      );
+
+      if (!response.ok) {
+        if (errorResponseHandler) {
+          const customError = await errorResponseHandler(response);
+          return fetchErr(customError ? [customError] : []);
+        }
+
+        const failure = statusError(response.status);
+        if (failure.code !== 'SERVER_ERROR') return fetchErr([failure]);
+        lastError = fetchErr([failure]);
+      } else {
+        if (fetchInit.method === 'HEAD') return ok({} as T);
+
+        const contentType = response.headers.get('Content-Type');
+        if (!contentType) return ok({} as T);
+
+        if (contentType.includes('text/plain')) {
+          const text = await response.text();
+          return ok({ contentType, body: text } as T);
+        }
+
+        if (
+          contentType.includes('application/octet-stream') ||
+          contentType.startsWith('audio/') ||
+          contentType.startsWith('image/') ||
+          contentType.includes('text/calendar') ||
+          contentType.includes('message/rfc822')
+        ) {
+          return ok(new Uint8Array(await response.arrayBuffer()) as T);
+        }
+
+        const data = await response.json();
+        return ok(data as T);
+      }
+    } catch (error) {
+      if (error instanceof TypeError && error.message === 'Failed to fetch') {
+        lastError = fetchErr([
+          { code: 'NETWORK_ERROR', message: 'Network error occurred' },
+        ]);
+      } else if (error instanceof SyntaxError) {
+        return fetchErr([
+          { code: 'INVALID_JSON', message: 'Invalid JSON in response' },
+        ]);
+      } else {
+        return fetchErr([
+          {
+            code: 'UNKNOWN_ERROR',
+            message: redactLinkTokens(`An unknown error occurred: ${error}`),
+          },
+        ]);
+      }
+    }
+
+    if (attempt < maxTries) {
+      await sleep(calculateDelay(delay, attempt));
+    }
+  }
+
+  return (
+    lastError ??
+    fetchErr([
+      {
+        code: 'UNKNOWN_ERROR',
+        message: 'Retry failed for an unknown reason',
+      },
+    ])
+  );
+}
+function calculateDelay(
+  delay: 'exponential' | number,
+  attempt: number
+): number {
+  if (typeof delay === 'number') {
+    return delay;
+  }
+  return Math.pow(2, attempt - 1) * 500; // Exponential backoff in milliseconds
+}

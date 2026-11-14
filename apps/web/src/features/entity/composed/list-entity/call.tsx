@@ -1,0 +1,232 @@
+import { formatCallDuration } from '@block-call/utils';
+import { UserIcon } from '@core/component/UserIcon';
+import { isMacroId } from '@core/user/macroId';
+import { matches } from '@core/util/match';
+import UserCircleIcon from '@icon/system/regular/user-circle.svg';
+import { UserGroup } from '@property/component/propertyValue/UserGroup';
+import { usePropertyEntityDisplay } from '@property/hooks';
+import type { EntityReference } from '@property/types';
+import { EntityType } from '@service-properties/generated/schemas/entityType';
+import { HoverCard } from '@ui';
+import { For, Show } from 'solid-js';
+import { CallChannelNameBadge, CallStatusBadge } from '../../components/Badges';
+import { CallRecordName } from '../../components/CallRecordName';
+import { Entity } from '../../entity';
+import { HitSnippet } from '../../extractors-search/HitSnippet';
+import { SearchSender } from '../../extractors-search/search-sender';
+import type { CallEntity, CallGuest } from '../../types/entity';
+import { isCallRecordHit } from '../../types/search';
+import { firstContentHit } from './shared';
+
+function ParticipantItem(props: { userId: string }) {
+  const { name } = usePropertyEntityDisplay(
+    () => props.userId,
+    () => EntityType.USER,
+    { fallbackIcon: null }
+  );
+  return (
+    <div class="inline-flex items-center gap-1.5 px-2 py-1 text-xs leading-none text-ink-muted border border-edge-muted size-fit">
+      <div class="size-4 rounded-full overflow-hidden shrink-0">
+        <UserIcon id={props.userId} isDeleted={false} size="fill" />
+      </div>
+      <span class="truncate max-w-37.5">{name()}</span>
+    </div>
+  );
+}
+
+function ParticipantsTooltip(props: {
+  participantIds: string[];
+  guests: CallGuest[];
+}) {
+  return (
+    <div class="min-w-48 max-w-72">
+      <div class="flex items-center gap-2 text-ink-muted border-b border-edge-muted/50 pb-1.5 mb-1.5">
+        <UserCircleIcon class="size-3.5 text-ink-muted" />
+        <span class="text-xs">Participants</span>
+      </div>
+      <div class="flex flex-col gap-1.5 max-h-64 overflow-y-auto">
+        <For each={props.participantIds}>
+          {(userId) => <ParticipantItem userId={userId} />}
+        </For>
+        <For each={props.guests}>
+          {(guest) => (
+            <div class="inline-flex items-center gap-1.5 px-2 py-1 text-xs text-ink-muted">
+              <UserCircleIcon class="size-4" />
+              <span>{guest.displayName.trim() || 'Guest'}</span>
+              <span class="text-ink-extra-muted">Guest</span>
+            </div>
+          )}
+        </For>
+      </div>
+    </div>
+  );
+}
+
+export function CallParticipants(props: {
+  participantIds: string[];
+  guests?: CallGuest[];
+}) {
+  const guests = () => props.guests ?? [];
+  const entities = (): EntityReference[] =>
+    props.participantIds.map((id) => ({
+      entity_id: id,
+      entity_type: EntityType.USER,
+    }));
+  return (
+    <Show when={props.participantIds.length + guests().length > 0}>
+      <HoverCard
+        content={
+          <ParticipantsTooltip
+            participantIds={props.participantIds}
+            guests={guests()}
+          />
+        }
+      >
+        <div class="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
+          <Show when={entities().length > 0}>
+            <UserGroup entities={entities()} maxUsers={2} />
+          </Show>
+          <Show when={guests().length}>
+            {(count) => (
+              <span class="text-xs text-ink-muted">
+                {count()} {count() === 1 ? 'guest' : 'guests'}
+              </span>
+            )}
+          </Show>
+        </div>
+      </HoverCard>
+    </Show>
+  );
+}
+
+export function CallNarrowBody(props: {
+  entity: CallEntity;
+  showAttendanceBadge: boolean;
+  setContainerRef: (el: HTMLElement) => void;
+  chars: number;
+}) {
+  const hit = () => firstContentHit(props.entity);
+  return (
+    <Entity.Slot placement="body" class="flex flex-col pb-2 min-h-[2lh] pr-4">
+      <Show
+        when={hit()}
+        fallback={
+          <span class="text-ink-muted text-xs truncate">
+            <CallRecordName entity={props.entity} />
+          </span>
+        }
+      >
+        {(h) => (
+          <span class="flex items-center gap-1 min-w-0 truncate">
+            <Show when={matches(h(), isCallRecordHit)}>
+              {(callHit) => (
+                <Show when={callHit().senderId}>
+                  {(id) => (
+                    <Show
+                      when={isMacroId(id())}
+                      fallback={
+                        <UserCircleIcon class="size-4 text-ink-muted" />
+                      }
+                    >
+                      <UserIcon id={id()} size="sm" />
+                    </Show>
+                  )}
+                </Show>
+              )}
+            </Show>
+            <span class="shrink-0 text-ink-extra-muted text-xs whitespace-nowrap">
+              <SearchSender hit={h()} />
+            </span>
+            <span
+              ref={props.setContainerRef}
+              class="text-ink/50 font-normal truncate min-w-0 text-xs"
+            >
+              <HitSnippet content={h().content} chars={props.chars} />
+            </span>
+          </span>
+        )}
+      </Show>
+      <span class="text-ink-extra-muted text-xs flex items-center gap-2">
+        <Show
+          when={props.entity.durationMs}
+          fallback={props.entity.isActive ? 'In progress' : 'No duration'}
+        >
+          {(ms) => formatCallDuration(ms())}
+        </Show>
+        <Show when={props.showAttendanceBadge}>
+          <CallStatusBadge status={props.entity.status} />
+        </Show>
+      </span>
+      <Show when={!hit() && props.entity.summary}>
+        {(summary) => (
+          <span class="text-ink/50 font-normal truncate text-xs">
+            {summary()}
+          </span>
+        )}
+      </Show>
+    </Entity.Slot>
+  );
+}
+
+export function CallWideContent(props: {
+  entity: CallEntity;
+  setContainerRef: (el: HTMLElement) => void;
+  chars: number;
+}) {
+  const hit = () => firstContentHit(props.entity);
+  const channelName = () => props.entity.channelName?.trim() || undefined;
+  return (
+    <>
+      <span class="truncate">
+        <CallRecordName entity={props.entity} />
+      </span>
+      <Show when={channelName()}>
+        {(name) => <CallChannelNameBadge channelName={name()} />}
+      </Show>
+      <Show
+        when={hit()}
+        fallback={
+          <Show when={props.entity.summary}>
+            {(summary) => (
+              <span class="text-ink/50 font-medium truncate flex-1 min-w-0">
+                {summary()}
+              </span>
+            )}
+          </Show>
+        }
+      >
+        {(h) => (
+          <>
+            <span class="shrink-0 flex gap-1.5 items-center">
+              <Show when={matches(h(), isCallRecordHit)}>
+                {(callHit) => (
+                  <Show when={callHit().senderId}>
+                    {(id) => (
+                      <Show
+                        when={isMacroId(id())}
+                        fallback={
+                          <UserCircleIcon class="size-4 text-ink-muted" />
+                        }
+                      >
+                        <UserIcon id={id()} size="sm" />
+                      </Show>
+                    )}
+                  </Show>
+                )}
+              </Show>
+              <span class="text-ink-extra-muted text-xs whitespace-nowrap">
+                <SearchSender hit={h()} />
+              </span>
+            </span>
+            <div
+              ref={props.setContainerRef}
+              class="text-ink/50 font-medium flex-1 min-w-0 truncate"
+            >
+              <HitSnippet content={h().content} chars={props.chars} />
+            </div>
+          </>
+        )}
+      </Show>
+    </>
+  );
+}

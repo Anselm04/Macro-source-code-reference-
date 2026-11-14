@@ -1,0 +1,111 @@
+import type { FormCollaboration } from '@service-storage/generated/schemas/formCollaboration';
+import { describe, expect, it } from 'vitest';
+import { publicationMessage } from './form-publication';
+
+const detail: FormCollaboration['detail'] = {
+  form: {
+    id: 'form',
+    name: 'Registration',
+    description: '',
+    ownerId: 'owner',
+    databaseId: 'database',
+    tableId: 'table',
+    submittedColumnId: null,
+    respondentColumnId: null,
+    audience: 'members',
+    tallyVisible: false,
+    responsesVisible: false,
+    anonymous: false,
+    status: 'open',
+    closesAt: null,
+    confirmationMessage: 'Thank you',
+    branding: { logoFileId: null, coverFileId: null, accentColor: null },
+    createdAt: '2026-10-05T09:00:00Z',
+    updatedAt: '2026-10-05T09:00:00Z',
+    projectId: null,
+    isHiddenInDrive: false,
+  },
+  access: 'edit',
+  tableGone: false,
+  sections: [
+    {
+      kind: 'questions',
+      id: 'section',
+      title: 'About you',
+      description: '',
+      questions: [
+        {
+          id: 'question',
+          column: 'column',
+          title: 'Name',
+          helpText: '',
+          kind: { type: 'text' },
+          required: false,
+          widget: null,
+          options: [],
+        },
+      ],
+    },
+  ],
+};
+
+describe('publicationMessage', () => {
+  it('names the affected question and uses gate wording', () => {
+    expect(
+      publicationMessage({
+        detail,
+        publicationError: {
+          kind: 'layout',
+          problem: { kind: 'gateNamesLaterColumn', column: 'column' },
+        },
+      })
+    ).toBe('“Name” must come before the gate that checks it.');
+    expect(
+      publicationMessage({
+        detail,
+        publicationError: {
+          kind: 'layout',
+          problem: { kind: 'conditionNamesLaterColumn', column: 'column' },
+        },
+      })
+    ).toBe('“Name” must come before the section shown depending on it.');
+    expect(
+      publicationMessage({
+        detail,
+        publicationError: {
+          kind: 'layout',
+          problem: { kind: 'unknownColumn', column: 'deleted-column' },
+        },
+      })
+    ).toBe('That question was deleted. Remove it from this form.');
+  });
+
+  it('distinguishes a saved draft waiting to publish from unreadable content', () => {
+    expect(
+      publicationMessage({ detail, publicationError: { kind: 'pending' } })
+    ).toBe('Your draft is saved. Publishing hasn’t finished; try again.');
+    expect(
+      publicationMessage({ detail, publicationError: { kind: 'invalidDraft' } })
+    ).toBe(
+      'This draft couldn’t be read. Your published form is still available.'
+    );
+    expect(publicationMessage({ detail })).toBeUndefined();
+  });
+
+  it('gives generic copy for problems from a newer server instead of throwing', () => {
+    expect(
+      publicationMessage({
+        detail,
+        publicationError: JSON.parse('{"kind":"quotaExceeded"}'),
+      })
+    ).toBe('Your draft is saved, but it couldn’t be published yet.');
+    expect(
+      publicationMessage({
+        detail,
+        publicationError: JSON.parse(
+          '{"kind":"layout","problem":{"kind":"tooManySections"}}'
+        ),
+      })
+    ).toBe('Your draft is saved, but it couldn’t be published yet.');
+  });
+});

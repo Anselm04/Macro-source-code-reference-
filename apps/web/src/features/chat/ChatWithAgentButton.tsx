@@ -1,0 +1,236 @@
+import { agentsRouteId } from '@app/features/agents-view/core/route';
+import { openAgentComposer } from '@app/features/agents-view/primitives/open-composer';
+import { startPendingSession } from '@app/features/block-agent/context/pending-session';
+import { globalSplitManager } from '@app/signal/splitLayout';
+import { HeaderActionButton } from '@components/app/HeaderActionButton';
+import type { SplitHandle } from '@components/app/split-layout/layoutManager';
+import {
+  type ChatAttachmentMention,
+  chatAttachmentMentionToMarkdown,
+} from '@core/component/AI/util/chatAttachmentMention';
+import { toast } from '@core/component/Toast/Toast';
+import { fileTypeToBlockName } from '@core/constant/allBlocks';
+import {
+  enableChatV3Agents,
+  isFeatureEnabled,
+} from '@core/constant/featureFlags';
+import { fireAndForget } from '@core/util/fireAndForget';
+import AgentIcon from '@icon/system/regular/sparkle.svg';
+import { buildMentionMarkdownString } from '@macro-inc/lexical-core/utils/mentions';
+import type { ChannelType } from '@service-cognition/generated/schemas/channelType';
+import type { ButtonSize } from '@ui';
+import { createSignal } from 'solid-js';
+
+export { AgentIcon as ChatWithAgentIcon };
+
+type ChatWithAgentEntity =
+  | { type: 'email'; id: string; name: string }
+  | {
+      type: 'document';
+      id: string;
+      name: string;
+      fileType: string | null | undefined;
+      blockParams?: Record<string, string>;
+    }
+  | { type: 'project'; id: string; name: string }
+  | { type: 'chat'; id: string; name: string }
+  | { type: 'channel'; id: string; name: string; channelType: ChannelType }
+  | { type: 'pr'; id: string; url: string };
+
+type ChatWithAgentAttachment = Exclude<ChatWithAgentEntity, { type: 'pr' }>;
+
+function buildMention(entity: ChatWithAgentAttachment): ChatAttachmentMention {
+  const blockName =
+    entity.type === 'document'
+      ? fileTypeToBlockName(entity.fileType, true)
+      : entity.type === 'email'
+        ? 'email'
+        : entity.type;
+
+  return {
+    documentId: entity.id,
+    documentName: entity.name,
+    blockName,
+    ...(entity.type === 'channel' ? { channelType: entity.channelType } : {}),
+    ...(entity.type === 'document' && entity.blockParams
+      ? { blockParams: entity.blockParams }
+      : {}),
+  };
+}
+
+async function createAndOpenAgent(seed: {
+  input?: string;
+  /** Sent immediately once the agent session is ready. */
+  message?: string;
+  /** The model the session runs on; the caller checks the plan allows it. */
+  model?: string;
+  /** Context for the agent alone, kept out of the composer and the transcript. */
+  instructions?: string;
+  /** Replaces this split's content instead of opening a new split. */
+  replaceSplit?: SplitHandle;
+}) {
+  const manager = globalSplitManager();
+  if (!seed.replaceSplit && !manager) {
+    toast.failure('Unable to open chat');
+    return false;
+  }
+  // Unsent text with no session settings is a draft for the new-conversation
+  // composer, where the user picks Auto, Chat, or Code and the agent first.
+  if (
+    manager &&
+    seed.input !== undefined &&
+    !seed.message &&
+    !seed.model &&
+    !seed.instructions &&
+    isFeatureEnabled(enableChatV3Agents)
+  ) {
+    openAgentComposer(manager, !seed.replaceSplit, {
+      draft: seed.input,
+      handle: seed.replaceSplit,
+    });
+    return true;
+  }
+
+  const id = startPendingSession({
+    prompt: seed.message,
+    initialInput: seed.message ? undefined : seed.input,
+    ...(seed.model ? { modelOverride: seed.model } : {}),
+    ...(seed.instructions ? { instructions: seed.instructions } : {}),
+  });
+  if (seed.replaceSplit) {
+    // In-place handoffs (search "Ask AI") land in the full Agents workspace.
+    seed.replaceSplit.replace({
+      next: {
+        type: 'component',
+        id: agentsRouteId({
+          mode: 'chat',
+          conversation: { type: 'agent_session', id },
+        }),
+      },
+    });
+  } else {
+    // A new split beside the source opens the bare session, without the
+    // Agents workspace's conversation sidebar.
+    manager?.openWithSplit(
+      { type: 'agent', id },
+      { activate: true, preferNewSplit: true }
+    );
+  }
+  return true;
+}
+
+function entityMentionMarkdown(entity: ChatWithAgentEntity): string {
+  if (entity.type === 'pr') {
+    // The Macro id lets the agent read the diff through the SDK.
+    return buildMentionMarkdownString({
+      type: 'pr',
+      id: entity.id,
+      url: entity.url,
+      label: '',
+    });
+  }
+
+  return chatAttachmentMentionToMarkdown(buildMention(entity));
+}
+
+/** Prefixes a read-only chat's mention so the agent knows to read that chat and carry on. */
+const CONTINUE_CHAT_PREFIX = 'Continue this chat: ';
+
+export async function openChatWithAgent(entity: ChatWithAgentEntity) {
+  const mention = `${entityMentionMarkdown(entity)} `;
+  const input =
+    entity.type === 'chat' ? `${CONTINUE_CHAT_PREFIX}${mention}` : mention;
+  return createAndOpenAgent({ input });
+}
+
+/** Open a new agent session with `initialInput` unsent, on `model`, told `instructions` privately. */
+export async function openChatWithInput(
+  initialInput: string,
+  options?: { model?: string; instructions?: string }
+) {
+  await createAndOpenAgent({
+    input: initialInput,
+    model: options?.model,
+    instructions: options?.instructions,
+  });
+}
+
+/**
+ * Replace `splitHandle`'s content with a new agent session seeded with `initialInput`
+ * (not sent). Used by the search view's "Ask AI" button to hand off in place.
+ */
+export async function openChatWithInputReplacingSplit(
+  initialInput: string,
+  splitHandle: SplitHandle
+) {
+  await createAndOpenAgent({ input: initialInput, replaceSplit: splitHandle });
+}
+
+/** Open a new agent session and send `message` once it is ready. */
+export async function openChatWithMessage(message: string) {
+  await createAndOpenAgent({ message });
+}
+
+/**
+ * Replace `splitHandle`'s content with a new agent session and immediately send
+ * `message`. Used by the search view's "Ask AI" button to hand off in place.
+ */
+export async function openChatWithMessageReplacingSplit(
+  message: string,
+  splitHandle: SplitHandle
+) {
+  await createAndOpenAgent({ message, replaceSplit: splitHandle });
+}
+
+export function ChatWithAgentButton(props: {
+  entity: ChatWithAgentEntity;
+  /** Button text; defaults to "Chat". */
+  label?: string;
+  disabled?: boolean;
+  grouped?: boolean;
+  size?: ButtonSize;
+}) {
+  const [opening, setOpening] = createSignal(false);
+  async function open() {
+    if (opening() || props.disabled) return;
+    setOpening(true);
+    try {
+      await openChatWithAgent(props.entity);
+    } finally {
+      setOpening(false);
+    }
+  }
+  return (
+    <HeaderActionButton
+      grouped={props.grouped}
+      size={props.size}
+      tooltip={props.label ?? 'Chat with Agent'}
+      label={props.label ?? 'Chat'}
+      icon={
+        <AgentIcon class="size-3.5 touch:size-6 shrink-0 pointer-events-none" />
+      }
+      onClick={() => fireAndForget(open(), 'chat-with-agent')}
+      disabled={props.disabled || opening()}
+      busy={opening()}
+    />
+  );
+}
+
+export function AskMacroButton(props: {
+  entity: ChatWithAgentEntity;
+  grouped?: boolean;
+  size?: ButtonSize;
+}) {
+  return (
+    <HeaderActionButton
+      grouped={props.grouped}
+      size={props.size}
+      onClick={() => openChatWithAgent(props.entity)}
+      tooltip="Ask Macro"
+      label="Ask Macro"
+      icon={
+        <AgentIcon class="size-3.5 touch:size-6 shrink-0 pointer-events-none" />
+      }
+    />
+  );
+}

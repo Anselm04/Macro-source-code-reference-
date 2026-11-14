@@ -1,0 +1,524 @@
+import { ROUTER_BASE } from '@app/constants/routerBase';
+import { AgentsViewSkeleton } from '@app/features/agents-view/agents-view-skeleton';
+import { AgentSignup, MobileWebSignup } from '@app/features/auth/auth';
+import { CalendarViewSkeleton } from '@app/features/calendar-view/calendar-view-skeleton';
+import { ChannelInviteAcceptance } from '@app/features/channel-invitations/ChannelInviteAcceptance';
+import { ChannelsViewSkeleton } from '@app/features/channels-view/channels-view-skeleton';
+import { DriveViewSkeleton } from '@app/features/drive-view/drive-view-skeleton';
+import { EmailViewSkeleton } from '@app/features/email-view/email-view-skeleton';
+import { ExternalViewSkeleton } from '@app/features/external-view/external-view-skeleton';
+import { InviteLinksPortal } from '@app/features/gtm-invite/InviteLinksPortal';
+import { InviteWelcome } from '@app/features/gtm-invite/InviteWelcome';
+import {
+  HomeCalendarRouteView,
+  HomeDetailRouteView,
+} from '@app/features/home/home-view';
+import { HomeRouteView } from '@app/features/home/route-views';
+import { ReviewsViewSkeleton } from '@app/features/reviews-view/reviews-view-skeleton';
+import { TasksViewSkeleton } from '@app/features/tasks-view/tasks-view-skeleton';
+import { TeamInviteAcceptance } from '@app/features/team-invitations/TeamInviteAcceptance';
+import {
+  createMemoryPaneStore,
+  SplitRouter,
+  useSolidRouterHistory,
+} from '@app/lib/split-router';
+import { globalSplitManager } from '@app/signal/splitLayout';
+import { ChannelLoading } from '@channel/Channel/ChannelLoading';
+import { createAppSplitRouterMiddleware } from '@components/app/split-layout/split-router/app-middleware';
+import { createAppPanePolicy } from '@components/app/split-layout/split-router/app-pane-policy';
+import {
+  splitContentFromLocation,
+  upgradeLegacyPath,
+} from '@components/app/split-layout/split-router/legacy-route';
+import { isNativeMobilePlatform } from '@core/mobile/isNativeMobilePlatform';
+import { isTouchDevice } from '@core/mobile/isTouchDevice';
+import { lazyNamed } from '@core/util/lazyNamed';
+import { isTauri } from '@core/util/platform';
+import { transformShortIdInUrlPathname } from '@core/util/url';
+import { type JSX, lazy } from 'solid-js';
+import { paneRoute } from './app-route';
+import { BasePathComponent } from './BasePath';
+import {
+  ActivityRouteView,
+  AgentsRouteView,
+  BookingLinksRouteView,
+  CalendarRouteView,
+  CallDetailRouteView,
+  CallsCallDetail,
+  CallsRouteView,
+  ChannelDetailRouteView,
+  ChannelsRouteView,
+  CompaniesRouteView,
+  DriveCallRouteView,
+  DriveDetailView,
+  DriveRouteView,
+  EmailComposeRouteView,
+  EmailDetailRouteView,
+  ExternalChatRouteView,
+  ExternalRouteView,
+  FoldersRouteView,
+  FormRespondRoutePage,
+  HomeEntityDetailRouteView,
+  MailRouteView,
+  MeetingRouter,
+  NotFound,
+  NotificationsCalendarRouteView,
+  NotificationsRouteView,
+  PasswordsRouteView,
+  PrDetailRouteView,
+  ProjectDetailRouteView,
+  ProjectTaskRouteView,
+  RecentRouteView,
+  ReviewsPrDetailRouteView,
+  ReviewsRouteView,
+  SearchRouteView,
+  SettingsRouteView,
+  TasksDetailRouteView,
+  TasksRouteView,
+} from './lazy-route-views';
+import {
+  BookingReceiptRoutePage,
+  EmailCallback,
+  EmailLinkCallback,
+  LoginPage,
+  LoginPopupSuccess,
+  OnboardingPage,
+  PublicBookingRoutePage,
+  SignupPage,
+  TaskSlugPage,
+  WelcomePage,
+} from './pages';
+import {
+  accountManagerRoute,
+  activityRoute,
+  agentChatsRoute,
+  agentSetupDoneRoute,
+  agentSetupRoute,
+  agentSignupRoute,
+  agentsRoute,
+  agentsViewRoute,
+  appRoute,
+  authRoute,
+  baseRoute,
+  bookingLinksRoute,
+  bookingReceiptRoute,
+  calendarSplitRoute,
+  callDetailRoute,
+  callsCallRoute,
+  callsRoute,
+  channelDetailRoute,
+  channelInviteRoute,
+  channelsSplitRoute,
+  codersRoute,
+  companiesRoute,
+  crmItemRoute,
+  crmPipelineItemRoute,
+  crmPipelineRecordFileItemRoute,
+  crmPipelineRecordItemRoute,
+  crmPipelineRecordRoute,
+  crmPipelineRetiredDatabaseRoute,
+  crmPipelineRetiredRecordDatabasesRoute,
+  crmPipelineRoute,
+  crmRecordFileItemRoute,
+  crmRecordItemRoute,
+  crmRecordRoute,
+  crmRetiredDatabaseRoute,
+  crmRetiredRecordDatabasesRoute,
+  debugRoutes,
+  driveCallRoute,
+  driveFolderDocumentRoute,
+  driveFolderRoute,
+  driveRootDocumentRoute,
+  driveSplitRoute,
+  driveTabDocumentRoute,
+  driveTabRoute,
+  emailComposeRoute,
+  emailSignupCallbackRoute,
+  emailSplitRoute,
+  emailThreadRoute,
+  externalChatRoute,
+  externalRoute,
+  foldersRoute,
+  formRespondRoute,
+  homeCalendarRoute,
+  homeChannelRoute,
+  homeDocumentRoute,
+  homePreviewRoute,
+  homeSplitRoute,
+  inboxLinkCallbackRoute,
+  internalInviteLinksRoute,
+  internalSystemStatusRoute,
+  inviteRoute,
+  legacyContentRoute,
+  loginPopupSuccessRoute,
+  loginRoute,
+  meetRoute,
+  mobileEmailSignupRoute,
+  notFoundRoute,
+  notificationsCalendarRoute,
+  notificationsRoute,
+  onboardingRoute,
+  passwordsRoute,
+  prDetailRoute,
+  projectDetailRoute,
+  projectTaskRoute,
+  publicBookingRoute,
+  publicRoute,
+  recentRoute,
+  reviewsPrRoute,
+  reviewsSplitRoute,
+  routineCreateRoute,
+  routineDetailRoute,
+  routinesRoute,
+  searchRoute,
+  settingsRoute,
+  signupRoute,
+  taskDetailRoute,
+  taskSlugRoute,
+  tasksProjectsRoute,
+  tasksSplitRoute,
+  teamInviteRoute,
+  welcomeRoute,
+} from './routes';
+import {
+  AppShell,
+  AuthShell,
+  FocusedShell,
+  withFormRespondShell,
+  withMeetingShell,
+} from './shells';
+
+const AccountManagerPage = lazyNamed(
+  () => import('@app/features/account-manager/account-manager-page'),
+  'AccountManagerPage'
+);
+const AgentSetupPage = lazyNamed(
+  () => import('@app/features/agent-setup/agent-setup-page'),
+  'AgentSetupPage'
+);
+const AgentSetupDonePage = lazyNamed(
+  () => import('@app/features/agent-setup/agent-setup-page'),
+  'AgentSetupDonePage'
+);
+const { Router, Route } = SplitRouter;
+
+// Views under appRoute load lazily (lazy-route-views.ts); auth and booking
+// pages render outside it and load with the app.
+const SystemStatusDashboard = lazyNamed(
+  () => import('@app/features/system-status/views/SystemStatusDashboard'),
+  'SystemStatusDashboard'
+);
+
+/** Debug views stay behind the registry's lazy import. */
+function debugView(componentId: string) {
+  return lazy(async () => {
+    const { resolveComponent } = await import(
+      '@components/app/split-layout/componentRegistry'
+    );
+    return { default: () => resolveComponent(componentId).element() };
+  });
+}
+
+/**
+ * The app's routes, as `<SplitRouter.Route>` elements; read once by the
+ * router, and by tests that need the real route table.
+ */
+export function appRouteElements(): JSX.Element {
+  const debugRouteElements = debugRoutes.map(({ componentId, route }) => (
+    <Route definition={route} component={debugView(componentId)} />
+  ));
+
+  return (
+    <>
+      <Route definition={baseRoute} component={BasePathComponent} />
+      <Route definition={publicRoute} component={FocusedShell}>
+        <Route
+          definition={publicBookingRoute}
+          component={PublicBookingRoutePage}
+        />
+        <Route
+          definition={bookingReceiptRoute}
+          component={BookingReceiptRoutePage}
+        />
+      </Route>
+      <Route
+        definition={formRespondRoute}
+        component={withFormRespondShell(FormRespondRoutePage)}
+      />
+      <Route
+        definition={meetRoute}
+        component={withMeetingShell(MeetingRouter)}
+      />
+      <Route definition={authRoute} component={AuthShell}>
+        <Route definition={taskSlugRoute} component={TaskSlugPage} />
+        <Route definition={signupRoute} component={SignupPage} />
+        <Route definition={agentSignupRoute} component={AgentSignup} />
+        <Route
+          definition={accountManagerRoute}
+          component={AccountManagerPage}
+        />
+        <Route definition={agentSetupRoute} component={AgentSetupPage} />
+        <Route
+          definition={agentSetupDoneRoute}
+          component={AgentSetupDonePage}
+        />
+        <Route
+          definition={emailSignupCallbackRoute}
+          component={EmailCallback}
+        />
+        <Route
+          definition={inboxLinkCallbackRoute}
+          component={EmailLinkCallback}
+        />
+        <Route
+          definition={loginPopupSuccessRoute}
+          component={LoginPopupSuccess}
+        />
+        <Route definition={loginRoute} component={LoginPage} />
+        <Route definition={welcomeRoute} component={WelcomePage} />
+        <Route
+          definition={mobileEmailSignupRoute}
+          component={MobileWebSignup}
+        />
+        <Route definition={onboardingRoute} component={OnboardingPage} />
+        <Route definition={inviteRoute} component={InviteWelcome} />
+        <Route
+          definition={internalInviteLinksRoute}
+          component={InviteLinksPortal}
+        />
+        <Route
+          definition={internalSystemStatusRoute}
+          component={SystemStatusDashboard}
+        />
+        <Route definition={teamInviteRoute} component={TeamInviteAcceptance} />
+        <Route
+          definition={channelInviteRoute}
+          component={ChannelInviteAcceptance}
+        />
+      </Route>
+
+      <Route definition={appRoute} component={AppShell}>
+        <Route
+          definition={driveSplitRoute}
+          component={DriveRouteView}
+          loading={DriveViewSkeleton}
+        >
+          <Route definition={driveFolderRoute}>
+            <Route
+              definition={driveFolderDocumentRoute}
+              component={DriveDetailView}
+            />
+          </Route>
+          <Route definition={driveTabRoute}>
+            <Route
+              definition={driveTabDocumentRoute}
+              component={DriveDetailView}
+            />
+          </Route>
+          <Route definition={driveCallRoute} component={DriveCallRouteView} />
+          <Route
+            definition={driveRootDocumentRoute}
+            component={DriveDetailView}
+          />
+        </Route>
+        <Route definition={settingsRoute} component={SettingsRouteView} />
+        <Route
+          definition={routineCreateRoute}
+          component={AgentsRouteView}
+          loading={AgentsViewSkeleton}
+        />
+        <Route
+          definition={routineDetailRoute}
+          component={AgentsRouteView}
+          loading={AgentsViewSkeleton}
+        />
+        <Route
+          definition={routinesRoute}
+          component={AgentsRouteView}
+          loading={AgentsViewSkeleton}
+        />
+        <Route
+          definition={agentsRoute}
+          component={AgentsRouteView}
+          loading={AgentsViewSkeleton}
+        />
+        <Route
+          definition={codersRoute}
+          component={AgentsRouteView}
+          loading={AgentsViewSkeleton}
+        />
+        <Route
+          definition={agentChatsRoute}
+          component={AgentsRouteView}
+          loading={AgentsViewSkeleton}
+        />
+        <Route definition={homeSplitRoute} component={HomeRouteView}>
+          {/* The period path is matched before the block pattern can claim `calendar`. */}
+          <Route
+            definition={homeCalendarRoute}
+            component={HomeCalendarRouteView}
+          />
+          <Route
+            definition={homeChannelRoute}
+            component={HomeEntityDetailRouteView}
+          />
+          <Route
+            definition={homeDocumentRoute}
+            component={HomeEntityDetailRouteView}
+          />
+          <Route
+            definition={homePreviewRoute}
+            component={HomeDetailRouteView}
+          />
+        </Route>
+        <Route definition={recentRoute} component={RecentRouteView} />
+        <Route definition={activityRoute} component={ActivityRouteView} />
+        <Route definition={passwordsRoute} component={PasswordsRouteView} />
+        <Route
+          definition={notificationsRoute}
+          component={NotificationsRouteView}
+        >
+          <Route
+            definition={notificationsCalendarRoute}
+            component={NotificationsCalendarRouteView}
+          />
+        </Route>
+        <Route
+          definition={agentsViewRoute}
+          component={AgentsRouteView}
+          loading={AgentsViewSkeleton}
+        />
+        <Route
+          definition={emailSplitRoute}
+          component={MailRouteView}
+          loading={EmailViewSkeleton}
+        >
+          <Route
+            definition={emailComposeRoute}
+            component={EmailComposeRouteView}
+          />
+          <Route
+            definition={emailThreadRoute}
+            component={EmailDetailRouteView}
+          />
+        </Route>
+        <Route
+          definition={tasksSplitRoute}
+          component={TasksRouteView}
+          loading={TasksViewSkeleton}
+        >
+          <Route
+            definition={projectDetailRoute}
+            component={ProjectDetailRouteView}
+          >
+            <Route
+              definition={projectTaskRoute}
+              component={ProjectTaskRouteView}
+            />
+          </Route>
+          <Route definition={tasksProjectsRoute} />
+          <Route
+            definition={taskDetailRoute}
+            component={TasksDetailRouteView}
+          />
+        </Route>
+        <Route
+          definition={reviewsSplitRoute}
+          component={ReviewsRouteView}
+          loading={ReviewsViewSkeleton}
+        >
+          <Route
+            definition={reviewsPrRoute}
+            component={ReviewsPrDetailRouteView}
+          />
+        </Route>
+        <Route
+          definition={bookingLinksRoute}
+          component={BookingLinksRouteView}
+        />
+        <Route
+          definition={externalRoute}
+          component={ExternalRouteView}
+          loading={ExternalViewSkeleton}
+        >
+          <Route
+            definition={externalChatRoute}
+            component={ExternalChatRouteView}
+          />
+        </Route>
+        <Route
+          definition={calendarSplitRoute}
+          component={CalendarRouteView}
+          loading={CalendarViewSkeleton}
+        />
+        <Route
+          definition={channelsSplitRoute}
+          component={ChannelsRouteView}
+          loading={ChannelsViewSkeleton}
+        >
+          <Route
+            definition={channelDetailRoute}
+            component={ChannelDetailRouteView}
+            loading={ChannelLoading}
+          />
+        </Route>
+        <Route definition={callsRoute} component={CallsRouteView}>
+          <Route definition={callsCallRoute} component={CallsCallDetail} />
+        </Route>
+        <Route definition={callDetailRoute} component={CallDetailRouteView} />
+        <Route definition={companiesRoute} component={CompaniesRouteView}>
+          <Route definition={crmPipelineRoute}>
+            <Route definition={crmPipelineItemRoute} />
+            <Route definition={crmPipelineRecordRoute} />
+            <Route definition={crmPipelineRecordItemRoute} />
+            <Route definition={crmPipelineRecordFileItemRoute} />
+            <Route definition={crmPipelineRetiredDatabaseRoute} />
+            <Route definition={crmPipelineRetiredRecordDatabasesRoute} />
+          </Route>
+          <Route definition={crmItemRoute} />
+          <Route definition={crmRecordRoute} />
+          <Route definition={crmRecordItemRoute} />
+          <Route definition={crmRecordFileItemRoute} />
+          <Route definition={crmRetiredDatabaseRoute} />
+          <Route definition={crmRetiredRecordDatabasesRoute} />
+        </Route>
+        <Route definition={foldersRoute} component={FoldersRouteView} />
+        <Route definition={searchRoute} component={SearchRouteView} />
+        <Route definition={prDetailRoute} component={PrDetailRouteView} />
+        {debugRouteElements}
+        {/* Renders the split's legacy mount, so it has no component. */}
+        <Route definition={legacyContentRoute} />
+        <Route definition={notFoundRoute} component={NotFound} />
+      </Route>
+    </>
+  );
+}
+
+export function AppRouterView() {
+  return (
+    <Router
+      history={(routes) =>
+        useSolidRouterHistory({
+          base: ROUTER_BASE,
+          mode: isTauri() ? 'hash' : 'path',
+          transformPath: (path) =>
+            upgradeLegacyPath(routes, transformShortIdInUrlPathname(path)),
+        })
+      }
+      paneStore={createMemoryPaneStore()}
+      policy={createAppPanePolicy({
+        manager: globalSplitManager,
+        toContent: splitContentFromLocation,
+        defaultLocation: () => ({
+          route: paneRoute({ id: 'view-home', params: {} }),
+        }),
+        stacked: isNativeMobilePlatform,
+      })}
+      middleware={createAppSplitRouterMiddleware({ isTouchDevice })}
+      globalSearch={['referral_code']}
+      defaultRoute={() => ({ matches: [{ id: baseRoute.id, params: {} }] })}
+    >
+      {appRouteElements()}
+    </Router>
+  );
+}

@@ -1,0 +1,69 @@
+use super::*;
+
+/// Tells someone whose address matches a team's auto-join domain that a team now exists for their
+/// organization and that signing up with their work email joins it. It is an informational,
+/// one-time notice that names who set the team up rather than announcing a sign-up.
+#[derive(Debug, Clone, Serialize, Deserialize, Template)]
+#[template(path = "colleague_joined_macro.html")]
+pub struct ColleagueJoinedMacro {
+    /// The team the recipient joins automatically when they sign up.
+    pub team_name: String,
+    /// The colleague who joined Macro.
+    pub joined_by: MacroUserIdStr<'static>,
+    /// The colleague's display name from an untrusted source. It is shown on one line, capped,
+    /// and escaped.
+    pub joined_name: Option<String>,
+    /// The address the recipient signs up with to join the team.
+    pub recipient_email: EmailStr<'static>,
+}
+
+impl ColleagueJoinedMacro {
+    fn display_name(&self) -> Option<String> {
+        single_line_name(self.joined_name.as_deref())
+    }
+
+    fn joined_email(&self) -> &str {
+        self.joined_by.email_str()
+    }
+
+    fn recipient(&self) -> &str {
+        self.recipient_email.0.as_ref()
+    }
+
+    fn signup_url(&self) -> Url {
+        signup_url(Environment::new_or_prod())
+    }
+
+    /// The notification service signs this into a link that stops these notices.
+    fn unsubscribe_href(&self) -> String {
+        notification::domain::models::signing::unsubscribe_placeholder(Self::TYPE_NAME)
+    }
+}
+
+impl Notification for ColleagueJoinedMacro {
+    const TYPE_NAME: &'static str = "colleague_joined_macro";
+}
+
+impl NotificationExtEmail for ColleagueJoinedMacro {
+    fn format_email(&self) -> EmailContent {
+        EmailContent::new(
+            "A team has been created for your organization".to_string(),
+            self.render()
+                .expect("ColleagueJoinedMacro template render failed in format_email"),
+        )
+    }
+
+    fn rate_limit_config() -> RateLimitConfig {
+        RateLimitConfig {
+            max_count: 1,
+            window: Duration::from_hours(24 * 365),
+        }
+    }
+
+    fn rate_limit_key(&self) -> RateLimitKey {
+        RateLimitKey::builder(&Self::TYPE_NAME)
+            .append(&self.joined_by)
+            .append(&self.recipient())
+            .finish()
+    }
+}

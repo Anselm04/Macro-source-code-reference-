@@ -1,0 +1,200 @@
+import { lazyNamed } from '@core/util/lazyNamed';
+import { lazy } from 'solid-js';
+
+/**
+ * Every view except Home (the default landing) loads as its own chunk. The
+ * split router warms a route's chunks while it navigates, and `AppShell`
+ * fetches the likely-next ones once the first screen settles.
+ */
+export const ActivityRouteView = lazyNamed(
+  () => import('@app/features/activity/route-views'),
+  'ActivityRouteView'
+);
+export const BookingLinksRouteView = lazyNamed(
+  () => import('@app/features/scheduling/route-views'),
+  'BookingLinksRouteView'
+);
+export const ExternalRouteView = lazyNamed(
+  () => import('@app/features/external-view/route-views'),
+  'ExternalRouteView'
+);
+export const ExternalChatRouteView = lazyNamed(
+  () => import('@app/features/external-view/route-views'),
+  'ExternalChatRouteView'
+);
+export const AgentsRouteView = lazyNamed(
+  () => import('@app/features/agents-view/route-views'),
+  'AgentsRouteView'
+);
+export const CallDetailRouteView = lazyNamed(
+  () => import('@app/features/block-call/route-views'),
+  'CallDetailRouteView'
+);
+
+export const CallsCallDetail = lazyNamed(
+  () => import('@app/features/calls-view/views/call-detail'),
+  'CallsCallDetail'
+);
+export const NotificationsCalendarRouteView = lazyNamed(
+  () => import('@app/features/notifications-inbox/route-views'),
+  'NotificationsCalendarRouteView'
+);
+export const NotificationsRouteView = lazyNamed(
+  () => import('@app/features/notifications-inbox/route-views'),
+  'NotificationsRouteView'
+);
+export const PrDetailRouteView = lazyNamed(
+  () => import('@app/features/block-pr/route-views'),
+  'PrDetailRouteView'
+);
+export const CalendarRouteView = lazyNamed(
+  () => import('@app/features/calendar-view/route-views'),
+  'CalendarRouteView'
+);
+export const ChannelDetailRouteView = lazyNamed(
+  () => import('@app/features/channels-view/channels-view'),
+  'ChannelDetailRouteView'
+);
+export const ChannelsRouteView = lazyNamed(
+  () => import('@app/features/channels-view/route-views'),
+  'ChannelsRouteView'
+);
+export const CompaniesRouteView = lazyNamed(
+  () => import('@app/features/crm/route-views'),
+  'CompaniesRouteView'
+);
+export const DriveDetailView = lazyNamed(
+  () => import('@app/features/drive-view/components/DriveDetailView'),
+  'DriveDetailView'
+);
+export const DriveCallRouteView = lazyNamed(
+  () => import('@app/features/drive-view/route-views'),
+  'DriveCallRouteView'
+);
+export const DriveRouteView = lazyNamed(
+  () => import('@app/features/drive-view/route-views'),
+  'DriveRouteView'
+);
+export const EmailComposeRouteView = lazyNamed(
+  () => import('@app/features/email-view/components/EmailComposeRouteView'),
+  'EmailComposeRouteView'
+);
+export const EmailDetailRouteView = lazyNamed(
+  () => import('@app/features/email-view/components/EmailDetailView'),
+  'EmailDetailRouteView'
+);
+export const MailRouteView = lazyNamed(
+  () => import('@app/features/email-view/route-views'),
+  'MailRouteView'
+);
+export const HomeEntityDetailRouteView = lazyNamed(
+  () => import('@app/features/home/components/HomeEntityDetailRouteView'),
+  'HomeEntityDetailRouteView'
+);
+export const MeetingRouter = lazyNamed(
+  () => import('@app/features/meetings/meeting-router'),
+  'MeetingRouter'
+);
+export const CallsRouteView = lazyNamed(
+  () => import('@app/features/next-soup/route-views'),
+  'CallsRouteView'
+);
+export const FoldersRouteView = lazyNamed(
+  () => import('@app/features/next-soup/route-views'),
+  'FoldersRouteView'
+);
+export const RecentRouteView = lazyNamed(
+  () => import('@app/features/next-soup/route-views'),
+  'RecentRouteView'
+);
+export const SearchRouteView = lazyNamed(
+  () => import('@app/features/next-soup/route-views'),
+  'SearchRouteView'
+);
+export const ReviewsPrDetailRouteView = lazyNamed(
+  () => import('@app/features/reviews-view/components/ReviewsPrDetail'),
+  'ReviewsPrDetailRouteView'
+);
+export const ReviewsRouteView = lazyNamed(
+  () => import('@app/features/reviews-view/route-views'),
+  'ReviewsRouteView'
+);
+export const SettingsRouteView = lazyNamed(
+  () => import('@app/features/settings/route-views'),
+  'SettingsRouteView'
+);
+export const TasksDetailRouteView = lazyNamed(
+  () => import('@app/features/tasks-view/components/TasksDetailView'),
+  'TasksDetailRouteView'
+);
+export const ProjectDetailRouteView = lazyNamed(
+  () => import('@app/features/tasks-view/route-views'),
+  'ProjectDetailRouteView'
+);
+export const ProjectTaskRouteView = lazyNamed(
+  () => import('@app/features/tasks-view/route-views'),
+  'ProjectTaskRouteView'
+);
+export const TasksRouteView = lazyNamed(
+  () => import('@app/features/tasks-view/route-views'),
+  'TasksRouteView'
+);
+export const FormRespondRoutePage = lazyNamed(
+  () => import('./pages'),
+  'FormRespondRoutePage'
+);
+export const PasswordsRouteView = lazyNamed(
+  () => import('@app/features/passwords/route-views'),
+  'PasswordsRouteView'
+);
+export const NotFound = lazy(
+  () => import('@core/component/AccessErrorViews/NotFound')
+);
+
+/**
+ * Views a session is likely to open next. Fetching them while the browser is
+ * idle keeps the first navigation as fast as it was with one big bundle.
+ */
+export const LIKELY_NEXT_VIEWS = [
+  HomeEntityDetailRouteView,
+  ChannelsRouteView,
+  ChannelDetailRouteView,
+  MailRouteView,
+  EmailDetailRouteView,
+  DriveRouteView,
+  DriveDetailView,
+  TasksRouteView,
+  AgentsRouteView,
+  CalendarRouteView,
+];
+
+/**
+ * The app's other views. The native apps read chunks from their own bundle, so
+ * they warm these too, after the likely ones: nothing downloads, and a view
+ * nobody warmed shows its skeleton while its code loads.
+ */
+export const OTHER_APP_VIEWS = [
+  SearchRouteView,
+  NotificationsRouteView,
+  NotificationsCalendarRouteView,
+  RecentRouteView,
+  FoldersRouteView,
+  CallsRouteView,
+  CallsCallDetail,
+  CallDetailRouteView,
+  TasksDetailRouteView,
+  ProjectDetailRouteView,
+  ProjectTaskRouteView,
+  EmailComposeRouteView,
+  DriveCallRouteView,
+  ReviewsRouteView,
+  ReviewsPrDetailRouteView,
+  PrDetailRouteView,
+  ActivityRouteView,
+  CompaniesRouteView,
+  SettingsRouteView,
+  BookingLinksRouteView,
+  ExternalRouteView,
+  ExternalChatRouteView,
+  PasswordsRouteView,
+];

@@ -1,0 +1,71 @@
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::domain::models::{ContactInfo, CreateDraftInput, EmailErr};
+
+use super::{ApiDraftInput, ApiDraftOutput};
+
+/// Request body for sending a message (backward-compatible with `{ message: MessageToSend }`).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SendMessageRequest {
+    /// The message content.
+    pub message: ApiDraftInput,
+}
+
+/// Response body for sending a message.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SendMessageResponse {
+    /// The created message.
+    pub message: ApiDraftOutput,
+}
+
+impl SendMessageRequest {
+    /// Convert the API request into a domain `CreateDraftInput`.
+    ///
+    /// `send_time` is not set here — the service layer computes it from config.
+    pub fn into_domain(self) -> Result<CreateDraftInput, EmailErr> {
+        let msg = self.message;
+        let sender_email = msg.sender_email()?;
+
+        Ok(CreateDraftInput {
+            frozen_signature_html: None,
+            draft_generation: msg.draft_generation,
+            sender_email,
+            db_id: msg.db_id,
+            provider_id: msg.provider_id,
+            replying_to_id: msg.replying_to_id,
+            provider_thread_id: msg.provider_thread_id,
+            thread_db_id: msg.thread_db_id,
+            subject: msg.subject,
+            to: msg
+                .to
+                .unwrap_or_default()
+                .into_iter()
+                .map(ContactInfo::from)
+                .collect(),
+            cc: msg
+                .cc
+                .unwrap_or_default()
+                .into_iter()
+                .map(ContactInfo::from)
+                .collect(),
+            bcc: msg
+                .bcc
+                .unwrap_or_default()
+                .into_iter()
+                .map(ContactInfo::from)
+                .collect(),
+            body_text: msg.body_text,
+            body_html: msg.body_html,
+            body_macro: msg.body_macro,
+            headers_json: msg.headers_json,
+            send_time: None,
+            include_signature: msg.include_signature,
+            // The actor comes from the transport's auth context, never the
+            // request body; the handler fills it in.
+            actor: None,
+            draft_client_binding: None,
+            thread_client_binding: None,
+        })
+    }
+}

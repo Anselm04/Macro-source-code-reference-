@@ -1,0 +1,45 @@
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  on,
+  onCleanup,
+} from 'solid-js';
+
+const [isTabFocused_, setIsTabFocused] = createSignal(document.hasFocus());
+const maybeSetFocus = () => setIsTabFocused(document.hasFocus());
+createEffect(() => {
+  window.addEventListener('focus', maybeSetFocus);
+  window.addEventListener('blur', maybeSetFocus);
+  window.addEventListener('visibilitychange', maybeSetFocus);
+
+  onCleanup(() => {
+    window.removeEventListener('focus', maybeSetFocus);
+    window.removeEventListener('blur', maybeSetFocus);
+    window.removeEventListener('visibilitychange', maybeSetFocus);
+  });
+});
+
+const [isTabVisible_, setIsTabVisible] = createSignal(
+  document.visibilityState === 'visible'
+);
+document.addEventListener('visibilitychange', () =>
+  setIsTabVisible(document.visibilityState === 'visible')
+);
+
+/** Whether the tab is on screen, focused or not (e.g. beside a focused window) */
+export const isTabVisible = isTabVisible_;
+
+/** Whether the tab is currently focused */
+export const isTabFocused = createMemo(() => isTabFocused_(), {
+  equalFn: (a: boolean | undefined, b: boolean | undefined) => a! === b!,
+});
+
+function _createTabFocusEffect(callback: (isTabFocused: boolean) => void) {
+  createEffect(
+    on(isTabFocused, (curr, prev) => {
+      if (curr === prev) return;
+      callback(isTabFocused());
+    })
+  );
+}

@@ -1,0 +1,223 @@
+import { createCollapsedSidebarSectionsStorage } from '@app/components/view-shell';
+import { normalizeFacetSelection } from '@app/features/soup';
+import type {
+  MakePersistedStateOptions,
+  PersistenceStorage,
+} from '@app/lib/persistence';
+import {
+  createEntryPersistenceStorage,
+  type EntryPersistenceHandle,
+} from '@components/app/split-layout/entry-persistence';
+import type { Accessor } from 'solid-js';
+import { z } from 'zod';
+import { TASK_TAB_IDS } from './core/task-navigation';
+import { DEFAULT_TASK_FACET_SELECTION } from './filters/task-facets';
+import type { TasksViewState } from './types';
+
+export const TASKS_ENTRY_STATE_KEY = 'tasks.view';
+export const TASKS_LIST_ENTRY_STATE_KEY = 'tasks.listState';
+
+const taskTabSchema = z.enum(TASK_TAB_IDS).catch('my-tasks');
+
+const taskGroupBySchema = z.enum([
+  'none',
+  'status',
+  'priority',
+  'assignee',
+  'project',
+  'date',
+  'due_date',
+]);
+
+const taskSortSchema = z.array(
+  z.object({
+    id: z.enum([
+      'updated_at',
+      'created_at',
+      'viewed_at',
+      'status',
+      'priority',
+      'due_date_earliest',
+      'due_date_latest',
+    ]),
+    reversed: z.boolean().optional(),
+  })
+);
+
+const taskFacetsSchema = z.record(z.string(), z.array(z.string()));
+
+const taskDueDateFilterSchema = z.union([
+  z.object({
+    type: z.enum([
+      'overdue',
+      'today',
+      'tomorrow',
+      'next_7_days',
+      'later',
+      'has_due_date',
+      'no_due_date',
+    ]),
+  }),
+  z
+    .object({
+      type: z.literal('range'),
+      start: z.iso.date().optional(),
+      end: z.iso.date().optional(),
+    })
+    .refine(
+      (range) =>
+        Boolean(range.start || range.end) &&
+        (!range.start || !range.end || range.start <= range.end)
+    ),
+]);
+
+const tasksEntryStateSchemaWithDefaults = z.object({
+  version: z.literal(1).default(1),
+  layout: z.enum(['list', 'board', 'gantt']).catch('list').default('list'),
+  tab: taskTabSchema.default('my-tasks'),
+  search: z.string().default(''),
+  groupBy: taskGroupBySchema.default('priority'),
+  sort: taskSortSchema.default([{ id: 'updated_at' }]),
+  facets: taskFacetsSchema.default(
+    normalizeFacetSelection(DEFAULT_TASK_FACET_SELECTION)
+  ),
+  dueDate: taskDueDateFilterSchema.optional().catch(undefined),
+  collapsedGroupIds: z.array(z.string()).default([]),
+});
+
+type TasksEntryState = z.infer<typeof tasksEntryStateSchemaWithDefaults>;
+
+const DEFAULT_TASKS_ENTRY_STATE = {
+  version: 1,
+  layout: 'list',
+  tab: 'my-tasks',
+  search: '',
+  groupBy: 'priority',
+  sort: [{ id: 'updated_at' }],
+  facets: normalizeFacetSelection(DEFAULT_TASK_FACET_SELECTION),
+  collapsedGroupIds: [],
+  dueDate: undefined,
+} satisfies TasksEntryState;
+
+const tasksListStateSchemaWithDefaults = z.object({
+  version: z.literal(1).default(1),
+  focusKey: z.string().optional(),
+  scrollOffset: z.number().finite().default(0),
+});
+
+type TasksListEntryState = z.infer<typeof tasksListStateSchemaWithDefaults>;
+
+export type TasksListStateSnapshot = {
+  focusKey: TasksListEntryState['focusKey'];
+  scrollOffset: TasksListEntryState['scrollOffset'];
+};
+
+export const DEFAULT_TASKS_LIST_STATE: TasksListStateSnapshot = {
+  focusKey: undefined,
+  scrollOffset: 0,
+};
+
+function selectEntryState(state: TasksViewState): TasksEntryState {
+  return {
+    version: 1,
+    layout: state.layout,
+    tab: state.savedViewActive ? 'my-tasks' : state.tab,
+    search: state.savedViewActive ? '' : state.search,
+    groupBy: state.groupBy,
+    sort: state.sort.map((item) => ({ ...item })),
+    facets: normalizeFacetSelection(
+      state.savedViewActive ? DEFAULT_TASK_FACET_SELECTION : state.facets
+    ),
+    collapsedGroupIds: [...state.collapsedGroupIds],
+    dueDate:
+      !state.savedViewActive && state.dueDate
+        ? { ...state.dueDate }
+        : undefined,
+  };
+}
+
+function createTasksEntryStorage(options: {
+  handle: EntryPersistenceHandle;
+  restore: boolean;
+  scopeKey?: string;
+}): PersistenceStorage<TasksViewState> {
+  return createEntryPersistenceStorage({
+    handle: options.handle,
+    key: options.scopeKey
+      ? `${TASKS_ENTRY_STATE_KEY}:${options.scopeKey}`
+      : TASKS_ENTRY_STATE_KEY,
+    restore: (current, stored) => {
+      if (!options.restore) return undefined;
+
+      const result = tasksEntryStateSchemaWithDefaults.safeParse(stored);
+      const restored = result.success ? result.data : DEFAULT_TASKS_ENTRY_STATE;
+      return {
+        ...current,
+        layout: restored.layout,
+        tab: restored.tab,
+        search: restored.search,
+        groupBy: restored.groupBy,
+        sort: restored.sort.map((item) => ({ ...item })),
+        facets: normalizeFacetSelection(restored.facets),
+        dueDate: restored.dueDate,
+        collapsedGroupIds: [...restored.collapsedGroupIds],
+      };
+    },
+    select: selectEntryState,
+  });
+}
+
+export function createTasksListEntryStorage(
+  handle: EntryPersistenceHandle,
+  scopeKey?: string
+): PersistenceStorage<TasksListStateSnapshot> {
+  return createEntryPersistenceStorage({
+    handle,
+    key: scopeKey
+      ? `${TASKS_LIST_ENTRY_STATE_KEY}:${scopeKey}`
+      : TASKS_LIST_ENTRY_STATE_KEY,
+    restore: (current, stored) => {
+      const result = tasksListStateSchemaWithDefaults.safeParse(stored);
+      const restored = result.success ? result.data : DEFAULT_TASKS_LIST_STATE;
+
+      return {
+        ...current,
+        focusKey: restored.focusKey,
+        scrollOffset: restored.scrollOffset,
+      };
+    },
+    select: (state): TasksListEntryState => ({
+      version: 1,
+      ...(state.focusKey === undefined ? {} : { focusKey: state.focusKey }),
+      scrollOffset: state.scrollOffset,
+    }),
+  });
+}
+
+export type CreateTasksViewPersistenceOptions = {
+  handle: EntryPersistenceHandle;
+  userId: Accessor<string | undefined>;
+  restoreEntryState?: boolean;
+  restorePreferences?: boolean;
+  scopeKey?: string;
+};
+
+/** Persists Tasks navigation and user-level sidebar preferences. */
+export function createTasksViewPersistence(
+  options: CreateTasksViewPersistenceOptions
+): MakePersistedStateOptions<TasksViewState> {
+  return {
+    storages: [
+      createCollapsedSidebarSectionsStorage({
+        key: 'macro:tasks:preferences:v1',
+        userId: options.userId,
+        restore: options.restorePreferences ?? true,
+      }),
+      createTasksEntryStorage({
+        handle: options.handle,
+        restore: options.restoreEntryState ?? true,
+        scopeKey: options.scopeKey,
+      }),
+    ],
+  };
+}

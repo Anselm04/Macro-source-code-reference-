@@ -1,0 +1,153 @@
+import { DocumentTitleHoverCard } from '@app/components/entity-detail/DocumentTitleHoverCard';
+import { ViewBreadcrumbs } from '@app/components/view-shell';
+import type { EntityAppearance } from '@app/features/entity-appearance/core/appearance';
+import { EntityAppearanceTrigger } from '@app/features/entity-appearance/entity-appearance';
+import { useDocumentAppearance } from '@app/features/entity-appearance/queries/document-appearance';
+import { useBlockEntityCommands } from '@app/features/next-soup/actions';
+import { SplitFileMenu } from '@components/app/split-layout/components/SplitFileMenu';
+import {
+  useSplitDisplayName,
+  useSplitPanelOrThrow,
+} from '@components/app/split-layout/layoutUtils';
+import type { BlockAlias, BlockName } from '@core/block';
+import { EntityIcon } from '@core/component/EntityIcon';
+import { Permissions } from '@core/component/SharePermissions';
+import { blockNameToDefaultFile } from '@core/constant/allBlocks';
+import { useUserId } from '@core/context/user';
+import { buildEntityData } from '@entity';
+import { Show } from 'solid-js';
+import { useMarkdownDocument } from '../context/markdown-document-context';
+import type { MarkdownDocumentKind } from '../types';
+import { useMarkdownName } from './MarkdownNameProvider';
+import { useMarkdownDocumentTools } from './useMarkdownDocumentTools';
+
+export function markdownDocumentBlockName(
+  kind: MarkdownDocumentKind
+): BlockName | BlockAlias {
+  return kind === 'document' ? 'md' : kind;
+}
+
+export function MarkdownDetailBreadcrumbItem(props: {
+  value: string;
+  metadata: unknown;
+  order: number;
+  documentId: string;
+  kind: MarkdownDocumentKind;
+  fallbackName?: string;
+  ownerId: string;
+  projectId?: string;
+  appearance?: EntityAppearance | null;
+  onClose: () => void;
+  onDuplicate: (id: string, name: string) => void;
+}) {
+  const panel = useSplitPanelOrThrow();
+  const { displayName } = useMarkdownName();
+  const { permissions, state } = useMarkdownDocument();
+  const { fileOperations, menuTools } = useMarkdownDocumentTools();
+  const blockName = () => markdownDocumentBlockName(props.kind);
+  const userId = useUserId();
+  const appearance = useDocumentAppearance(
+    () =>
+      props.kind === 'document' || props.kind === 'snippet'
+        ? { id: props.documentId, appearance: props.appearance }
+        : undefined,
+    () => Boolean(userId())
+  );
+  const documentName = () =>
+    displayName() || props.fallbackName || blockNameToDefaultFile(blockName());
+  const headerEntity = () =>
+    props.kind === 'document' || props.kind === 'snippet'
+      ? buildEntityData({
+          id: props.documentId,
+          name: documentName(),
+          blockName: blockName(),
+          ownerId: props.ownerId,
+          projectId: props.projectId,
+          appearance: appearance(),
+        })
+      : undefined;
+  useSplitDisplayName(documentName);
+  const focusDocument = () => state.editor.md.editor?.focus();
+
+  const menuPermissions = () => {
+    if (permissions.isOwner()) return Permissions.OWNER;
+    if (permissions.canEdit()) return Permissions.CAN_EDIT;
+    if (permissions.canComment()) return Permissions.CAN_COMMENT;
+    return Permissions.CAN_VIEW;
+  };
+
+  useBlockEntityCommands({
+    id: props.documentId,
+    scopeId: panel.splitHotkeyScope,
+    onDeleted: props.onClose,
+    resolveEntity: () =>
+      buildEntityData({
+        id: props.documentId,
+        name: documentName(),
+        blockName: blockName(),
+        ownerId: props.ownerId,
+        projectId: props.projectId,
+      }),
+  });
+
+  return (
+    <ViewBreadcrumbs.Item
+      value={props.value}
+      metadata={props.metadata}
+      order={props.order}
+    >
+      {(item) => (
+        <div class="flex min-w-0 items-center motion-safe:animate-[dialog-overlay-open_150ms_ease-out]">
+          <Show when={permissions.canEdit() ? headerEntity() : undefined}>
+            {(entity) => (
+              <span class="shrink-0">
+                <EntityAppearanceTrigger
+                  entity={entity()}
+                  editable={permissions.canEdit()}
+                />
+              </span>
+            )}
+          </Show>
+          <DocumentTitleHoverCard
+            documentId={props.documentId}
+            name={documentName()}
+            ownerId={props.ownerId}
+          >
+            <ViewBreadcrumbs.Button
+              class="gap-1.5"
+              isActive={item.isActive()}
+              onClick={() => {
+                item.onSelect();
+                focusDocument();
+              }}
+            >
+              <Show when={!permissions.canEdit() || !headerEntity()}>
+                <EntityIcon
+                  targetType={blockName()}
+                  appearance={appearance()}
+                  size="xs"
+                  class="shrink-0"
+                />
+              </Show>
+              <span class="truncate">{documentName()}</span>
+            </ViewBreadcrumbs.Button>
+          </DocumentTitleHoverCard>
+          <div class="shrink-0">
+            <SplitFileMenu
+              id={props.documentId}
+              itemType="document"
+              name={documentName()}
+              ops={fileOperations}
+              tools={menuTools}
+              entityKind={blockName()}
+              entity={headerEntity()}
+              permissions={menuPermissions()}
+              onDuplicate={(id) => props.onDuplicate(id, documentName())}
+              onDelete={props.onClose}
+            />
+          </div>
+        </div>
+      )}
+    </ViewBreadcrumbs.Item>
+  );
+}

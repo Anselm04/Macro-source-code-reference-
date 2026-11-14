@@ -1,0 +1,232 @@
+import type { NotificationType } from '@core/types';
+import { GITHUB_EVENT_TYPES } from '@notifications/github-event-types';
+import { match } from 'ts-pattern';
+import type { Notification } from '../types/notification';
+
+/**
+ * Whether the notification type is one of the GitHub PR event types, whose
+ * sender is always presented as the GitHub identity.
+ * @internal
+ */
+export function isGithubNotificationType(type: NotificationType): boolean {
+  return (GITHUB_EVENT_TYPES as readonly string[]).includes(type);
+}
+
+/**
+ * Gets unique sender IDs from a notification stack
+ * @internal
+ */
+export function getUniqueSenderIds(notifications: Notification[]): string[] {
+  const senderIds = new Set<string>();
+  for (const notification of notifications) {
+    if (notification.sender_id) {
+      senderIds.add(notification.sender_id);
+    }
+  }
+  return Array.from(senderIds);
+}
+
+/**
+ * The GitHub login of the user who triggered a GitHub PR notification, carried
+ * in the notification metadata. GitHub notifications always name the sender by
+ * this login — never by the linked Macro user's name — even when the actor is
+ * a Macro user and the notification has a `sender_id`.
+ * @internal
+ */
+export function getGithubSenderLogin(
+  notification: Notification
+): string | undefined {
+  const metadata = notification.notification_metadata;
+  const content = (metadata as { content?: unknown }).content;
+  if (
+    content &&
+    typeof content === 'object' &&
+    'senderGithubLogin' in content
+  ) {
+    const login = (content as { senderGithubLogin?: string | null })
+      .senderGithubLogin;
+    return login ?? undefined;
+  }
+  return undefined;
+}
+
+/**
+ * The GitHub avatar for the sender of a GitHub PR notification. Prefers the
+ * avatar URL captured from the webhook, falling back to the login-derived
+ * GitHub avatar endpoint.
+ * @internal
+ */
+export function getGithubSenderAvatarUrl(
+  notification: Notification
+): string | undefined {
+  const metadata = notification.notification_metadata;
+  const content = (metadata as { content?: unknown }).content;
+  if (
+    content &&
+    typeof content === 'object' &&
+    'senderGithubAvatarUrl' in content
+  ) {
+    const url = (content as { senderGithubAvatarUrl?: string | null })
+      .senderGithubAvatarUrl;
+    if (url) return url;
+  }
+
+  const login = getGithubSenderLogin(notification);
+  return login
+    ? `https://github.com/${encodeURIComponent(login)}.png?size=80`
+    : undefined;
+}
+
+/**
+ * Gets unique GitHub sender logins from a notification stack, preserving order.
+ * @internal
+ */
+export function getUniqueGithubLogins(notifications: Notification[]): string[] {
+  const logins = new Set<string>();
+  for (const notification of notifications) {
+    const login = getGithubSenderLogin(notification);
+    if (login) {
+      logins.add(login);
+    }
+  }
+  return Array.from(logins);
+}
+
+/**
+ * Gets the action verb for a notification type
+ * @internal
+ */
+export function getActionVerb(type: NotificationType): string {
+  return (
+    match(type)
+      .with('channel_mention', () => 'mentioned you')
+      .with('document_mention', () => 'shared with you')
+      .with('mentioned_in_document_comment', () => 'mentioned you in a comment')
+      .with('replied_to_document_comment_thread', () => 'replied to a comment')
+      .with('initiative_discussion', () => 'commented')
+      .with('entity_access_requested', () => 'requested access')
+      .with('entity_access_granted', () => 'granted access')
+      .with('runtime_access_removed', () => 'removed access')
+      .with('commented_on_document', 'crm_discussion', () => 'commented')
+      .with('channel_message_reply', () => 'replied')
+      .with(
+        'channel_message_send',
+        'external_chat_message',
+        () => 'sent a message'
+      )
+      .with('channel_message_reaction', () => 'reacted to your message')
+      .with('ai_response', () => 'AI responded')
+      .with('new_email', () => 'sent an email')
+      .with('channel_invite', () => 'invited you')
+      .with('channel_access_requested', () => 'asked to join')
+      .with('invite_to_team', () => 'invited you')
+      .with('task_assigned', () => 'assigned you')
+      .with('github_pr_status_changed', () => 'updated a pull request')
+      .with('github_pr_check_run', () => 'completed a check')
+      .with('github_review_requested', () => 'requested your review')
+      .with('github_pr_comment', () => 'commented on a pull request')
+      .with('github_pr_mention', () => 'mentioned you on a pull request')
+      .with('github_pr_review', () => 'reviewed your pull request')
+      .with('call_started', () => 'started a call')
+      // Reads as a standalone phrase, not an actor's action — nobody sent it.
+      .with('reminder', () => 'reminder')
+      .with('calendar_event_reminder', () => 'upcoming event')
+      .with('calendar_event_join_request', () => 'asked to join')
+      .with('inbox_reauth_required', () => 'needs reconnection')
+      .with('agent_session_settled', () => 'finished')
+      .with('agent_session_waiting_for_input', () => 'needs your answer')
+      .with('agent_session_mentioned', () => 'mentioned you')
+      .with('routine_run_finished', () => 'ran')
+      .with('agent_sign_in_expiry', () => 'needs a new sign-in')
+      .with('computer_setup', () => 'finished setup')
+      .exhaustive(() => 'updated')
+  );
+}
+
+/**
+ * Gets a noun for the notification type (for multi-notification descriptions)
+ * @internal
+ */
+export function getTypeNoun(type: NotificationType, count: number): string {
+  return match(type)
+    .with('channel_message_reply', () => (count === 1 ? 'reply' : 'replies'))
+    .with('channel_message_send', 'external_chat_message', () =>
+      count === 1 ? 'message' : 'messages'
+    )
+    .with('channel_message_reaction', () =>
+      count === 1 ? 'reaction' : 'reactions'
+    )
+    .with('ai_response', () => (count === 1 ? 'response' : 'responses'))
+    .with('channel_mention', () => (count === 1 ? 'mention' : 'mentions'))
+    .with('document_mention', () =>
+      count === 1 ? 'document shared' : 'documents shared'
+    )
+    .with('mentioned_in_document_comment', () =>
+      count === 1 ? 'mention' : 'mentions'
+    )
+    .with('replied_to_document_comment_thread', () =>
+      count === 1 ? 'reply' : 'replies'
+    )
+    .with('initiative_discussion', () => (count === 1 ? 'comment' : 'comments'))
+    .with('entity_access_requested', () =>
+      count === 1 ? 'access request' : 'access requests'
+    )
+    .with('entity_access_granted', () =>
+      count === 1 ? 'access grant' : 'access grants'
+    )
+    .with('runtime_access_removed', () =>
+      count === 1 ? 'access removal' : 'access removals'
+    )
+    .with('commented_on_document', 'crm_discussion', () =>
+      count === 1 ? 'comment' : 'comments'
+    )
+    .with('new_email', () => (count === 1 ? 'email' : 'emails'))
+    .with('channel_invite', () => (count === 1 ? 'invite' : 'invites'))
+    .with('channel_access_requested', () =>
+      count === 1 ? 'request to join' : 'requests to join'
+    )
+    .with('invite_to_team', () => (count === 1 ? 'invite' : 'invites'))
+    .with('task_assigned', () => (count === 1 ? 'task' : 'tasks'))
+    .with('github_pr_status_changed', () =>
+      count === 1 ? 'pull request' : 'pull requests'
+    )
+    .with('github_pr_check_run', () => (count === 1 ? 'check' : 'checks'))
+    .with('github_review_requested', () =>
+      count === 1 ? 'review request' : 'review requests'
+    )
+    .with('github_pr_comment', () => (count === 1 ? 'comment' : 'comments'))
+    .with('github_pr_mention', () => (count === 1 ? 'mention' : 'mentions'))
+    .with('github_pr_review', () => (count === 1 ? 'review' : 'reviews'))
+    .with('call_started', () => (count === 1 ? 'call' : 'calls'))
+    .with('reminder', () => (count === 1 ? 'reminder' : 'reminders'))
+    .with('calendar_event_reminder', () => (count === 1 ? 'event' : 'events'))
+    .with('calendar_event_join_request', () =>
+      count === 1 ? 'request to join' : 'requests to join'
+    )
+    .with('inbox_reauth_required', () => (count === 1 ? 'inbox' : 'inboxes'))
+    .with('agent_session_settled', () =>
+      count === 1 ? 'agent run' : 'agent runs'
+    )
+    .with('agent_session_waiting_for_input', () =>
+      count === 1 ? 'question' : 'questions'
+    )
+    .with('agent_session_mentioned', () =>
+      count === 1 ? 'mention' : 'mentions'
+    )
+    .with('routine_run_finished', () =>
+      count === 1 ? 'routine run' : 'routine runs'
+    )
+    .with('agent_sign_in_expiry', () =>
+      count === 1 ? 'agent sign-in' : 'agent sign-ins'
+    )
+    .with('computer_setup', () =>
+      count === 1 ? 'computer setup' : 'computer setups'
+    )
+    .exhaustive(() => (count === 1 ? 'notification' : 'notifications'));
+}
+
+export function getTypePreposition(type: NotificationType): string {
+  return match(type)
+    .with('document_mention', () => 'by')
+    .otherwise(() => 'from');
+}

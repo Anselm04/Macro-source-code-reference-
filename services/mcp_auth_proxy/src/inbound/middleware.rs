@@ -1,0 +1,231 @@
+//! Existing user API keys and JWT bearer authentication for protected MCP.
+
+#[cfg(test)]
+mod test;
+
+use ai_toolset::ToolCaller;
+use axum::{
+    body::Body,
+    http::{
+        Request, Response, StatusCode, Uri,
+        header::{HeaderValue, WWW_AUTHENTICATE},
+    },
+};
+use bot_id::BotId;
+use macro_auth::middleware::decode_jwt::{JwtToken, JwtValidationArgs, handler};
+
+use crate::domain::access_token_clients::AccessTokenClients;
+use macro_user_id::user_id::MacroUserIdStr;
+
+/// Validated Macro JWT from the `Authorization: Bearer` header.
+#[derive(Clone)]
+pub struct JwtAccessToken(pub String);
+
+/// Managed session provenance from a verified Macro API JWT.
+#[derive(Clone, Copy)]
+pub struct ManagedAgentSession(pub uuid::Uuid);
+
+/// What the bearer middleware validates a request with.
+#[derive(Clone)]
+pub struct BearerAuth {
+    /// Signature, audience, and issuer checks for both token kinds.
+    pub jwt_args: JwtValidationArgs,
+    /// Which client each OAuth access token was issued to.
+    pub clients: AccessTokenClients,
+    /// Optional standard revocable user-key authorizer.
+    pub user_api_keys: Option<std::sync::Arc<dyn crate::domain::user_api_keys::McpUserApiKeys>>,
+}
+
+/// Which kind of credential authenticated an MCP request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAuthMethod {
+    /// A FusionAuth access token, as issued by the OAuth broker to clients
+    /// such as Claude.ai, ChatGPT, or Cursor.
+    OAuth,
+    /// A Macro API key the user created and pasted into the client.
+    ApiKey,
+}
+
+impl McpAuthMethod {
+    /// Stable lowercase label for logs and analytics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OAuth => "oauth",
+            Self::ApiKey => "api_key",
+        }
+    }
+}
+
+fn resource_metadata_path() -> String {
+    format!(
+        "{}/.well-known/oauth-protected-resource",
+        super::GATEWAY_PATH_PREFIX
+    )
+}
+
+fn absolute_resource_metadata_url(request: &Request<Body>) -> String {
+    let scheme = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http");
+    let authority = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        })
+        .unwrap_or("localhost");
+
+    let metadata_path = resource_metadata_path();
+    let mut uri = Uri::builder()
+        .scheme(scheme)
+        .authority(authority)
+        .path_and_query(metadata_path.as_str())
+        .build()
+        .expect("valid resource metadata uri")
+        .to_string();
+
+    if !uri.starts_with("http://") && !uri.starts_with("https://") {
+        uri = format!("{scheme}://{authority}{metadata_path}");
+    }
+
+    uri
+}
+
+fn unauthorized_response(request: &Request<Body>, error: Option<&str>) -> Response<Body> {
+    let resource_metadata = absolute_resource_metadata_url(request);
+    let challenge = match error {
+        Some(error) => {
+            format!(r#"Bearer error="{error}", resource_metadata="{resource_metadata}""#)
+        }
+        None => format!(r#"Bearer resource_metadata="{resource_metadata}""#),
+    };
+
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    response.headers_mut().insert(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_str(&challenge).expect("valid WWW-Authenticate header"),
+    );
+    response
+}
+
+/// Validates an existing user API key or `Authorization: Bearer <token>` and stores the authenticated
+/// [`MacroUserIdStr`], its [`McpAuthMethod`], and its [`ToolCaller`] in the
+/// request extensions. Every authenticated request carries a caller:
+/// - a Macro API token signed for an agent (only key holders such as the
+///   agent harness's egress sign the claim, so a client cannot name a bot) is
+///   [`ToolCaller::Agent`];
+/// - an OAuth access token is [`ToolCaller::McpClient`], named after the
+///   client the broker issued it to;
+/// - an existing user API key or any other Macro API token is [`ToolCaller::ApiKey`].
+#[tracing::instrument(skip_all, fields(caller = tracing::field::Empty))]
+pub async fn validate_bearer(
+    axum::extract::State(auth): axum::extract::State<BearerAuth>,
+    mut request: Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(keys) = &auth.user_api_keys
+        && let Some(key) = request
+            .headers()
+            .get("x-macro-user-api-key")
+            .and_then(|value| value.to_str().ok())
+        && let Some(user_id) = keys.user(key).await
+    {
+        tracing::Span::current().record("caller", tracing::field::debug(&ToolCaller::ApiKey));
+        request.extensions_mut().insert(user_id);
+        request.extensions_mut().insert(McpAuthMethod::ApiKey);
+        request.extensions_mut().insert(ToolCaller::ApiKey);
+        return next.run(request).await;
+    }
+    let token = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned);
+
+    let Some(token) = token else {
+        tracing::debug!("MCP request missing bearer token");
+        return unauthorized_response(&request, None);
+    };
+
+    let jwt_token = match handler(&auth.jwt_args, &token) {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::warn!(error=?error, "MCP bearer token validation failed");
+            return unauthorized_response(&request, Some("invalid_token"));
+        }
+    };
+
+    // A code-mode credential signed with its session's scope is checked per
+    // request path; MCP calls tools at one path and has no session to scope
+    // their own credentials to, so it accepts none of them.
+    if let JwtToken::MacroApiToken(api) = &jwt_token
+        && api.agent_scope.is_some()
+    {
+        tracing::warn!(
+            agent_correlation_id = ?api.agent_correlation_id,
+            agent_session_id = ?api.agent_session_id,
+            "refused a scoped code-mode credential at the MCP endpoint"
+        );
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return response;
+    }
+    if let JwtToken::MacroApiToken(api) = &jwt_token
+        && api.agent_id.is_some()
+        && let Some(session) = api.agent_session_id
+    {
+        request
+            .extensions_mut()
+            .insert(ManagedAgentSession(session));
+    }
+    let (user_id, auth_method, caller) = match jwt_token {
+        JwtToken::MacroAccessToken(access) => {
+            let name = match auth.clients.client_name(&token).await {
+                Ok(name) => name,
+                Err(error) => {
+                    tracing::error!(error=?error, "could not read the client an access token was issued to");
+                    let mut response = Response::new(Body::empty());
+                    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                    return response;
+                }
+            };
+            (
+                access.macro_user_id,
+                McpAuthMethod::OAuth,
+                ToolCaller::McpClient { name },
+            )
+        }
+        JwtToken::MacroApiToken(api) => (
+            api.macro_user_id,
+            McpAuthMethod::ApiKey,
+            match api.agent_id {
+                Some(agent) => ToolCaller::Agent(BotId::new_from_uuid(agent)),
+                None => ToolCaller::ApiKey,
+            },
+        ),
+    };
+    tracing::Span::current().record("caller", tracing::field::debug(&caller));
+
+    let user_id = match MacroUserIdStr::try_from(user_id) {
+        Ok(user_id) => user_id,
+        Err(error) => {
+            tracing::warn!(error=?error, "MCP bearer token contained invalid macro user id");
+            return unauthorized_response(&request, Some("invalid_token"));
+        }
+    };
+
+    request.extensions_mut().insert(user_id);
+    request.extensions_mut().insert(auth_method);
+    request.extensions_mut().insert(caller);
+    request.extensions_mut().insert(JwtAccessToken(token));
+
+    next.run(request).await
+}

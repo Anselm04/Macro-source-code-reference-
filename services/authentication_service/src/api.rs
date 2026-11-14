@@ -1,0 +1,246 @@
+use crate::api::context::ApiContext;
+use anyhow::Context;
+use axum::Router;
+use axum::http::HeaderName;
+use macro_auth::constant::MACRO_REFRESH_TOKEN_HEADER;
+use macro_tower_layers::MacroRequestIdAndTracingLayer;
+use native_app_service::inbound::RouterState;
+use std::net::SocketAddr;
+use std::time::Duration;
+use tower_http::compression::CompressionLayer;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+
+// Utilities
+pub(crate) mod context;
+
+// Routes
+mod agent_api_keys;
+mod codex;
+mod cursor_api_key;
+#[allow(unused_imports)]
+mod email;
+mod link;
+#[allow(unused_imports)]
+mod merge;
+mod mobile_welcome_email;
+
+mod github_pull_requests;
+mod health;
+mod internal;
+mod jwt;
+mod jwt_session;
+mod login;
+mod logout;
+mod oauth;
+mod oauth2;
+mod permissions;
+mod permissions_extractor;
+mod session;
+pub(crate) mod signup_policy;
+mod user;
+
+pub use user::stripe::StripePrices;
+mod webhooks;
+
+// Misc
+mod middleware;
+pub(crate) mod swagger;
+mod utils;
+
+#[cfg(test)]
+mod test;
+#[cfg(test)]
+pub(crate) mod trace_capture;
+
+/// Path prefix the shared gateway ALB forwards unmodified. Dual-mounted
+/// alongside `/` so the dedicated ALB keeps working during cutover.
+const GATEWAY_PATH_PREFIX: &str = "/auth";
+
+pub(crate) async fn setup_and_serve(state: ApiContext, port: usize) -> anyhow::Result<()> {
+    let cors = macro_cors::cors_layer_with_headers(vec![HeaderName::from_static(
+        MACRO_REFRESH_TOKEN_HEADER,
+    )]);
+
+    let env = state.environment;
+    let correlation =
+        agent_correlation::inbound::CorrelationState::new(state.db.clone(), state.jwt_args.clone());
+
+    let app = api_router(state.clone())
+        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            correlation,
+            agent_correlation::inbound::propagate,
+        ))
+        .layer(MacroRequestIdAndTracingLayer::new(Duration::from_millis(200)).into_inner())
+        // The health router is attached here so we don't attach the logging middleware to it
+        .merge(health::router())
+        .layer(cors)
+        .layer(CompressionLayer::new());
+    // Swagger sits outside the dual-mount. Nested under `/auth`, the absolute
+    // `/api-doc/openapi.json` URL in the UI would 404 on the gateway.
+    let app = mount_at_root_and_prefix(app).merge(swagger_ui());
+
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
+        .unwrap();
+    tracing::info!(
+        "authentication service is up and running with environment {:?} on port {}",
+        &env,
+        &port
+    );
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(macro_entrypoint::shutdown_signal())
+    .await
+    .context("error starting service")
+}
+
+fn mount_at_root_and_prefix(inner: Router) -> Router {
+    Router::new()
+        .merge(inner.clone())
+        .nest(GATEWAY_PATH_PREFIX, inner)
+}
+
+fn swagger_ui() -> Router {
+    Router::new()
+        .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", swagger::ApiDoc::openapi()))
+        .merge(
+            SwaggerUi::new("/auth/docs")
+                .url("/auth/api-doc/openapi.json", swagger::ApiDoc::openapi()),
+        )
+}
+
+fn computer_router_state(
+    state: &ApiContext,
+) -> hosted_runtimes::inbound::axum_router::ComputerRouterState<
+    hosted_runtimes::outbound::pg::PgComputerRepo,
+    crate::outbound::computer_billing::TeamComputerBilling<crate::api::context::TeamsServiceType>,
+    hosted_runtimes::domain::service::SystemClock,
+    crate::api::context::EntityAccessServiceType,
+    crate::api::context::AuthorizationService,
+    hosted_runtimes::outbound::pg::PgComputerRepo,
+> {
+    hosted_runtimes::inbound::axum_router::ComputerRouterState {
+        service: state.computer_service.clone(),
+        entity_access_service: state.entity_access_service.clone(),
+        authorization_state: state.authorization_state.clone(),
+    }
+}
+
+fn api_router(state: ApiContext) -> Router<ApiContext> {
+    Router::new()
+        .merge(native_app_service::inbound::native_app_router(
+            RouterState {
+                inner: state.native_app_service.clone(),
+            },
+        ))
+        .nest(
+            "/internal",
+            internal::router().merge(team_agents::inbound::axum_router::agent_enrollment_router(
+                team_agents::inbound::axum_router::AgentEnrollmentRouterState {
+                    service: state.team_agents_service.clone(),
+                    authorization_state: state.authorization_state.clone(),
+                },
+            )),
+        )
+        .nest("/permissions", permissions::router())
+        .nest("/login", login::router(state.clone()))
+        .nest("/logout", logout::router())
+        .nest("/oauth", oauth::router(state.clone()))
+        .nest("/oauth2", oauth2::router())
+        .nest(
+            "/user",
+            user::router().merge(user_language::inbound::axum_router::user_language_router(
+                user_language::inbound::axum_router::UserLanguageRouterState::new(
+                    state.user_language_service.clone(),
+                    state.authorization_state.clone(),
+                ),
+            )),
+        )
+        .nest("/link", link::router())
+        .nest("/cursor-api-key", cursor_api_key::router())
+        .nest("/agents", agent_api_keys::router())
+        .nest("/codex", codex::router())
+        .nest("/github_pull_requests", github_pull_requests::router())
+        .nest(
+            "/team",
+            teams::inbound::axum_router::teams_router(
+                teams::inbound::axum_router::TeamRouterState {
+                    service: state.teams_service.clone(),
+                    entity_access_service: state.entity_access_service.clone(),
+                    authorization_state: state.authorization_state.clone(),
+                },
+            ),
+        )
+        .merge(hosted_runtimes::inbound::axum_router::team_router(
+            computer_router_state(&state),
+        ))
+        .nest(
+            "/team_agents",
+            team_agents::inbound::axum_router::team_agents_router(
+                team_agents::inbound::axum_router::TeamAgentsRouterState {
+                    service: state.team_agents_service.clone(),
+                    entity_access_service: state.entity_access_service.clone(),
+                    authorization_state: state.authorization_state.clone(),
+                },
+            ),
+        )
+        .merge(
+            teams::inbound::axum_router::domain_notice::domain_notice_router(
+                teams::inbound::axum_router::domain_notice::DomainNoticeRouterState {
+                    service: state.domain_notice_service.clone(),
+                    entity_access_service: state.entity_access_service.clone(),
+                    authorization_state: state.authorization_state.clone(),
+                },
+            ),
+        )
+        .nest(
+            "/referral",
+            referral::inbound::axum_router::referral_router(
+                referral::inbound::axum_router::ReferralRouterState {
+                    service: state.referral_service.clone(),
+                    rate_limiter: state.rate_limit_service.clone(),
+                    authorization_state: state.authorization_state.clone(),
+                },
+            ),
+        )
+        .nest(
+            "/gtm-invite",
+            gtm_invite::inbound::axum_router::gtm_invite_router(
+                gtm_invite::inbound::axum_router::GtmInviteRouterState {
+                    service: state.gtm_invite_service.clone(),
+                    rate_limiter: state.rate_limit_service.clone(),
+                    authorization_state: state.authorization_state.clone(),
+                },
+            ),
+        )
+        .nest(
+            "/system-status",
+            system_status::inbound::axum_router::system_status_router(
+                system_status::inbound::axum_router::SystemStatusRouterState {
+                    service: state.system_status_service.clone(),
+                    authorization_state: state.authorization_state.clone(),
+                },
+            ),
+        )
+        .nest("/jwt", jwt::router())
+        .nest("/session", session::router())
+        .merge(ai_billing::inbound::ai_billing_router(
+            ai_billing::inbound::AiBillingRouterState {
+                service: state.ai_billing_service.clone(),
+                payments: state.ai_payment_gateway.clone(),
+                pricing: state.ai_billing_service.pricing(),
+                authorization_state: state.authorization_state.clone(),
+            },
+        ))
+        .merge(mobile_welcome_email::router(state.clone()))
+        .nest(
+            "/webhooks",
+            webhooks::router().layer(axum::middleware::from_fn(
+                macro_middleware::connection_drop_prevention_handler,
+            )),
+        )
+}

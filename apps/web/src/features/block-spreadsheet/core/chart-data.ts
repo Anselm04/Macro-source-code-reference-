@@ -1,0 +1,234 @@
+import { cellPlainText } from '@macro-inc/spreadsheet/cell-mentions';
+import {
+  type ChartPlot,
+  type ChartRange,
+  type ChartValue,
+  parseChartLiteral,
+  parseChartReference,
+  type SheetChart,
+} from '@macro-inc/spreadsheet/sheet-drawings';
+import type { WorkbookCalculation } from './calculation';
+import { paletteColor } from './drawingml-colors';
+import { formatCellAddress } from './spreadsheet-document';
+import type { SpreadsheetWorkbookSheet } from './workbook-document';
+
+export type { ChartValue } from '@macro-inc/spreadsheet/sheet-drawings';
+/**
+ * Reads a reference that names a sheet and cells, row by row, up to
+ * `MAX_CHART_POINTS` values.
+ */
+export type ChartReader = (range: ChartRange) => ChartValue[] | undefined;
+
+export type ChartSeriesData = {
+  name: string;
+  color: string;
+  values: (number | null)[];
+  /** The x values of a scatter or bubble series. */
+  x?: (number | null)[];
+  /** A bubble series' sizes. */
+  sizes?: (number | null)[];
+  noFill?: boolean;
+  noLine?: boolean;
+  /** How the first value displays, to format the axis like the cells. */
+  sample?: string;
+};
+
+export type ChartPlotData = Omit<ChartPlot, 'series'> & {
+  series: ChartSeriesData[];
+};
+
+export type ChartData = {
+  title?: string;
+  legend?: SheetChart['legend'];
+  categories: string[];
+  /**
+   * Each point's labels from the outermost level in, for treemaps and
+   * sunbursts whose labels span several columns.
+   */
+  paths?: string[][];
+  /** No cells label the points, so they are numbered 1, 2, 3. */
+  numbered?: true;
+  plots: ChartPlotData[];
+  /** Colors of pie and doughnut slices. */
+  palette: string[];
+};
+
+/** Office's default accents, for charts without the workbook's. */
+const DEFAULT_PALETTE = [
+  '#4472C4',
+  '#ED7D31',
+  '#A5A5A5',
+  '#FFC000',
+  '#5B9BD5',
+  '#70AD47',
+];
+/** Points a series draws, at most; readers stop there. */
+export const MAX_CHART_POINTS = 5_000;
+
+/**
+ * Reads cells as charts show them: calculated values, or the literal cells
+ * before the first calculation. References without a sheet read `home`.
+ */
+export function createChartReader(
+  sheets: () => SpreadsheetWorkbookSheet[],
+  values: () => WorkbookCalculation,
+  home?: string
+): ChartReader {
+  return (range) => {
+    const sheet = sheets().find((entry) =>
+      range.sheet === undefined
+        ? entry.id === home
+        : entry.name.toLowerCase() === range.sheet.toLowerCase()
+    );
+    if (!sheet) return;
+    const results = values()[sheet.id] ?? {};
+    const read: ChartValue[] = [];
+    for (let row = range.top; row <= range.bottom; row++)
+      for (let column = range.left; column <= range.right; column++) {
+        if (read.length >= MAX_CHART_POINTS) return read;
+        const address = formatCellAddress(row, column);
+        const result = results[address];
+        if (result) {
+          read.push({ text: result.display, number: result.number });
+          continue;
+        }
+        const text = sheet.cells[address]?.value ?? '';
+        const number = text.trim() === '' ? Number.NaN : Number(text);
+        read.push({
+          text: cellPlainText(text),
+          ...(Number.isFinite(number) && { number }),
+        });
+      }
+    return read;
+  };
+}
+
+/**
+ * A reference as charts write it: `[0]!` marks a name in the same
+ * workbook, and a name may stand for a range.
+ */
+function range(
+  reference: string,
+  names: { name: string; formula: string }[]
+): ReturnType<typeof parseChartReference> {
+  const text = reference.replace(/^\[0\]!/, '').trim();
+  const direct = parseChartReference(text);
+  if (direct) return direct;
+  const local = /^(?:'((?:[^']|'')+)'|([^'!]+))!(.+)$/.exec(text);
+  const bare = local?.[3] ?? text;
+  const name = names.find(
+    (entry) => entry.name.toLowerCase() === bare.toLowerCase()
+  );
+  return name ? parseChartReference(name.formula.replace(/^=/, '')) : undefined;
+}
+
+/** The data a chart draws, read through its references. */
+export function chartData(
+  chart: SheetChart,
+  read: ChartReader,
+  names: { name: string; formula: string }[] = []
+): ChartData {
+  const values = (index: number | undefined) => {
+    if (index === undefined) return;
+    const reference = chart.references[index] ?? '';
+    const literal = parseChartLiteral(reference);
+    if (literal) return literal.slice(0, MAX_CHART_POINTS);
+    const target = range(reference, names);
+    return target ? read(target)?.slice(0, MAX_CHART_POINTS) : undefined;
+  };
+  /**
+   * A block of labels as one list per point: its rows when it is at least as
+   * tall as it is wide, else its columns.
+   */
+  const levels = (index: number): string[][] => {
+    const cells = values(index) ?? [];
+    const reference = chart.references[index] ?? '';
+    const target = !parseChartLiteral(reference) && range(reference, names);
+    if (!target) return cells.map((value) => [value.text]);
+    const width = target.right - target.left + 1;
+    const height = target.bottom - target.top + 1;
+    const across = height >= width;
+    return Array.from({ length: across ? height : width }, (_, point) =>
+      Array.from(
+        { length: across ? width : height },
+        (_, level) =>
+          cells[across ? point * width + level : level * width + point]?.text ??
+          ''
+      )
+    );
+  };
+  const palette = chart.colors?.length ? chart.colors : DEFAULT_PALETTE;
+  let categories: string[] | undefined;
+  let paths: string[][] | undefined;
+  let count = 0;
+  const plots = chart.plots.map(({ series: plotSeries, ...plot }) => ({
+    ...plot,
+    series: plotSeries.map((series) => {
+      const index = count++;
+      const points = values(series.values) ?? [];
+      const labels = values(series.categories);
+      // Scatter and bubble charts plot numbers on both axes.
+      const xy = plot.kind === 'scatter' || plot.kind === 'bubble';
+      const nested = plot.kind === 'treemap' || plot.kind === 'sunburst';
+      if (nested && series.categories !== undefined && !paths) {
+        paths = levels(series.categories);
+        // A point is named by its innermost label.
+        categories = paths.map(
+          (path) => path.findLast((label) => label.trim()) ?? ''
+        );
+      } else if (!xy && labels && !categories)
+        categories = labels.map((value) => value.text);
+      // A pivot chart's series are named as its pivot table names them.
+      const name =
+        (chart.pivot && series.name) ||
+        values(series.nameRef)
+          ?.map((value) => value.text.trim())
+          .filter(Boolean)
+          .join(' ') ||
+        series.name ||
+        `Series ${index + 1}`;
+      return {
+        name,
+        color: series.color ?? paletteColor(palette, index),
+        values: points.map((value) => value.number ?? null),
+        // Text among the x values numbers the points 1, 2, 3, as in Excel.
+        ...(xy && {
+          x:
+            labels &&
+            !labels.some(
+              (value) => value.number === undefined && value.text.trim()
+            )
+              ? labels.map((value) => value.number ?? null)
+              : points.map((_, point) => point + 1),
+        }),
+        ...(plot.kind === 'bubble' && {
+          sizes: (values(series.sizes) ?? points.map(() => undefined)).map(
+            (value) => value?.number ?? null
+          ),
+        }),
+        ...(series.noFill && { noFill: true }),
+        ...(series.noLine && { noLine: true }),
+        ...(points.find((value) => value.number !== undefined) && {
+          sample: points.find((value) => value.number !== undefined)?.text,
+        }),
+      };
+    }),
+  }));
+  const longest = Math.max(
+    0,
+    ...plots.flatMap((plot) =>
+      plot.series.map((series) => series.values.length)
+    )
+  );
+  return {
+    ...(chart.title && { title: chart.title }),
+    ...(chart.legend && { legend: chart.legend }),
+    categories:
+      categories ??
+      Array.from({ length: longest }, (_, index) => `${index + 1}`),
+    ...(!categories && { numbered: true as const }),
+    ...(paths && { paths }),
+    plots,
+    palette,
+  };
+}

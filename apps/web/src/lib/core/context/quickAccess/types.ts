@@ -1,0 +1,270 @@
+import type { IUser } from '@core/user/types';
+import type { DateValue } from '@core/util/date';
+import type {
+  AgentSessionEntity,
+  ChannelEntity,
+  ChatEntity,
+  CrmCompanyEntity,
+  CrmContactEntity,
+  DatabaseEntity,
+  DocumentEntity,
+  EmailEntity,
+  EntityData,
+  FormEntity,
+  InitiativeEntity,
+  ProjectEntity,
+  RoutineEntity,
+  SkillEntity,
+  SnippetEntity,
+  TaskEntity,
+} from '@entity';
+import type { PeopleSearch } from '@graphql-cache/people/generated';
+import type { Accessor } from 'solid-js';
+
+// Note (seamus) : Ideally history would return ownerId or we would get actual
+//     soup entities for quick access
+export type QuickAccessEntity<T extends EntityData = EntityData> = T;
+
+export type Bucket =
+  | 'channel'
+  | 'dm'
+  | 'person'
+  | 'document'
+  | 'task'
+  | 'snippet'
+  | 'skill'
+  | 'note'
+  | 'chat'
+  | 'project'
+  | 'email'
+  | 'crm_company'
+  // CRM contacts, kept apart from 'person' (Macro users and email contacts).
+  | 'crm_contact'
+  | 'agent_session'
+  | 'initiative'
+  | 'database'
+  | 'form'
+  | 'routine';
+
+export type EntityBucket = Exclude<Bucket, 'person'>;
+
+const ALL_BUCKETS: Bucket[] = [
+  'channel',
+  'dm',
+  'person',
+  'document',
+  'task',
+  'snippet',
+  'skill',
+  'note',
+  'chat',
+  'project',
+  'email',
+  'crm_company',
+  'crm_contact',
+  'agent_session',
+  'database',
+  'form',
+  'routine',
+  'initiative',
+];
+
+export type BucketCombination = 'all' | 'channels' | 'documents';
+
+export const BUCKET_COMBINATIONS: Record<BucketCombination, Bucket[]> = {
+  all: ALL_BUCKETS,
+  channels: ['dm', 'channel'],
+  documents: [
+    'document',
+    'note',
+    'task',
+    'snippet',
+    'skill',
+    'chat',
+    'project',
+    'database',
+    'form',
+    'initiative',
+  ],
+};
+
+type ItemTimestamps = {
+  viewedAt?: DateValue | null;
+  updatedAt?: DateValue | null;
+  createdAt?: DateValue | null;
+  lastInteraction?: DateValue | null;
+};
+
+type QuickAccessBase = {
+  id: string;
+  /** Stable UI identity while an explicit contact alias resolves asynchronously. */
+  searchKey?: string;
+  searchText: string;
+  sortTimestamp: number;
+  /** Position in the current matched personal window; never a history index. */
+  personOrder?: number;
+  timestamps: ItemTimestamps;
+};
+
+export type EntityItem<T extends QuickAccessEntity = QuickAccessEntity> =
+  QuickAccessBase & {
+    kind: 'entity';
+    bucket: EntityBucket;
+    data: T;
+  };
+
+export type UserItem = QuickAccessBase & {
+  kind: 'user';
+  bucket: 'person';
+  data: IUser;
+  /** A bounded ranked hit's existing DM, resolved from the channel source. */
+  commandTarget?: EntityItem<ChannelEntity>;
+};
+
+export type QuickAccessItem = EntityItem | UserItem;
+
+function _isEntityItem(item: QuickAccessItem): item is EntityItem {
+  return item.kind === 'entity';
+}
+
+function _isUserItem(item: QuickAccessItem): item is UserItem {
+  return item.kind === 'user';
+}
+
+function _isEntityOfType<T extends EntityData['type']>(
+  item: QuickAccessItem,
+  entityType: T
+): item is EntityItem<Extract<EntityData, { type: T }>> {
+  return item.kind === 'entity' && item.data.type === entityType;
+}
+
+function _isFromBucket<B extends Bucket>(
+  item: QuickAccessItem,
+  bucket: B
+): boolean {
+  return item.bucket === bucket;
+}
+
+/**
+ * Maps a bucket to its corresponding QuickAccessItem type
+ */
+export type BucketItemMap = {
+  channel: EntityItem<ChannelEntity>;
+  dm: EntityItem<ChannelEntity>;
+  document: EntityItem<DocumentEntity>;
+  task: EntityItem<TaskEntity>;
+  snippet: EntityItem<SnippetEntity>;
+  skill: EntityItem<SkillEntity>;
+  note: EntityItem<DocumentEntity>;
+  chat: EntityItem<ChatEntity>;
+  project: EntityItem<ProjectEntity>;
+  email: EntityItem<EmailEntity>;
+  crm_company: EntityItem<CrmCompanyEntity>;
+  crm_contact: EntityItem<CrmContactEntity>;
+  agent_session: EntityItem<AgentSessionEntity>;
+  database: EntityItem<DatabaseEntity>;
+  form: EntityItem<FormEntity>;
+  routine: EntityItem<RoutineEntity>;
+  initiative: EntityItem<InitiativeEntity>;
+  person: UserItem;
+};
+
+export type ItemForBucket<B extends Bucket> = BucketItemMap[B];
+
+export type ItemsForBuckets<Buckets extends Bucket[]> = Buckets extends [
+  infer First extends Bucket,
+  ...infer Rest extends Bucket[],
+]
+  ? ItemForBucket<First> | ItemsForBuckets<Rest>
+  : never;
+
+export type QuickAccessList<T extends QuickAccessItem = QuickAccessItem> = {
+  items: Accessor<T[]>;
+  /** Changes when a bounded result window is replaced, not on label refreshes. */
+  windowKey?: Accessor<string | undefined>;
+  /** Number of loaded matching items. Check hasMore for additional cached pages. */
+  totalCount: Accessor<number>;
+  hasMore: Accessor<boolean>;
+  isLoading: Accessor<boolean>;
+  /** The cache has not yet answered the current query; listed rows may be other sources'. */
+  isSearching?: Accessor<boolean>;
+  isLoadingMore: Accessor<boolean>;
+  error: Accessor<unknown>;
+  loadMore: () => Promise<void>;
+};
+
+export type QuickAccessListOptions<
+  B extends readonly Bucket[] = readonly Bucket[],
+> = {
+  buckets: B;
+  /** Search only this list; omitted values retain ordinary browse ordering. */
+  searchTerm?: Accessor<string>;
+  /** Disable this list without affecting other Quick Access consumers. */
+  enabled?: Accessor<boolean>;
+  /** Person scoring policy, applied before the native window limit. */
+  peopleMode?: PeopleSearch['mode'];
+  excludeSelf?: boolean;
+  /** Explicit scoped participants/guests excluded from personal suggestions. */
+  excludedPeople?: Accessor<ReadonlySet<string>>;
+};
+
+export type QuickAccessContextValue = {
+  /** Existing channel activity for an explicit peer, without loading contacts. */
+  interactionForUser: (id: string) => DateValue | undefined;
+  /**
+   * Get items from specific buckets, cached and reactive.
+   * Returns all items if no buckets specified. Passing options scopes search
+   * to that list without affecting other Quick Access consumers.
+   *
+   * @example
+   * const channels = quickAccess.useList('channel', 'dm').items;
+   * const people = quickAccess.useList('person').items;
+   * const results = quickAccess.useList({
+   *   buckets: ['document'],
+   *   searchTerm,
+   * }).items;
+   */
+  useList: {
+    (): QuickAccessList;
+    <B extends Bucket>(...buckets: [B]): QuickAccessList<ItemForBucket<B>>;
+    <B extends Bucket[]>(...buckets: B): QuickAccessList<ItemsForBuckets<B>>;
+    <const B extends readonly Bucket[]>(
+      options: QuickAccessListOptions<B>
+    ): QuickAccessList<ItemForBucket<B[number]>>;
+  };
+
+  /** Whether this source reads normalized records through cache fragments. */
+  usesRecordSelection: Accessor<boolean>;
+
+  /** Whether scoped lists are ranked by the cache materialized projection. */
+  usesSearchProjection: Accessor<boolean>;
+
+  /**
+   * Whether any data sources are still loading.
+   */
+  isLoading: Accessor<boolean>;
+
+  /**
+   * Force refresh of all data sources.
+   */
+  refresh: () => void;
+
+  /**
+   * Get a single item by ID from the cache.
+   * Returns undefined if the item is not found.
+   *
+   * Use this for lazy lookup of full item data when you only have an ID.
+   * This is more efficient than searching through lists.
+   *
+   * @example
+   * const item = quickAccess.getById(someId);
+   * if (item) {
+   *   console.log(item.data);
+   * }
+   */
+  getById: (id: string) => QuickAccessItem | undefined;
+};
+
+export function exclude(...buckets: Bucket[]) {
+  return ALL_BUCKETS.filter((bucket) => !buckets.includes(bucket));
+}

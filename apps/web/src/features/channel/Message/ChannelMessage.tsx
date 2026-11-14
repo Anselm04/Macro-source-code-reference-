@@ -1,0 +1,273 @@
+import { useMessageActionDrawer } from '@channel/Mobile/message-action-drawer-context';
+import { touchHandler } from '@core/directive/touchHandler';
+import type { MessageActions, MessageData } from '@core/messages/types';
+import { messageSendMotion } from '@core/util/message-send-motion';
+import TrashIcon from '@icon/system/regular/trash.svg';
+import type { MessageParent } from '@service-storage/messages';
+import { type JSX, Match, Show, Switch } from 'solid-js';
+import type { MessageEditor } from '../Channel/create-message-editor';
+import { MessageEditorContent } from '../Channel/InlineMessageEditor';
+import { useMessage } from './context';
+import type { ChannelMessageListMeta } from './list-meta';
+import { Message } from './Message';
+import { MaybeSwipeToReplyRow } from './SwipeToReplyRow';
+
+type ChannelMessageProps = {
+  renderContent?: (content: JSX.Element) => JSX.Element;
+  /**
+   * The stored conversation the message belongs to; inline editing needs
+   * it. Rows of messages stored elsewhere leave it out.
+   */
+  parent?: MessageParent;
+  /** Header time; defaults to the time alone in a channel. */
+  timestampFormat?: 'time' | 'dateAndTime';
+  inputMode?: 'inline' | 'unified';
+  message: MessageData;
+  actions?: MessageActions;
+  listMeta?: ChannelMessageListMeta;
+  messageEditor?: MessageEditor;
+  selected?: boolean;
+  /**
+   * The unified-input mode's floating reply/edit input, or message
+   * navigation, points at this message.
+   */
+  targeted?: boolean;
+  /**
+   * Leave out who triggered a bot's message. In a private conversation with
+   * an agent that is always the viewer, so it says nothing.
+   */
+  hideTriggeredBy?: boolean;
+  onClick?: JSX.EventHandlerUnion<HTMLDivElement, MouseEvent>;
+};
+
+function isEditingMessage(
+  messageEditor: MessageEditor | undefined,
+  messageId: string
+) {
+  return messageEditor?.state()?.messageId === messageId;
+}
+
+function MessageContentSlot(props: {
+  renderContent?: (content: JSX.Element) => JSX.Element;
+  parent?: MessageParent;
+  inputMode?: 'inline' | 'unified';
+  messageEditor?: MessageEditor;
+  class?: string;
+}) {
+  const message = useMessage();
+  const isEditing = () => isEditingMessage(props.messageEditor, message().id);
+  const inlineEditing = () => {
+    const parent = props.parent;
+    const messageEditor = props.messageEditor;
+    if (!isEditing() || props.inputMode === 'unified') return;
+    return parent && messageEditor ? { parent, messageEditor } : undefined;
+  };
+
+  const content = (
+    <Switch>
+      <Match when={inlineEditing()}>
+        {(editing) => (
+          <MessageEditorContent
+            parent={editing().parent}
+            message={message()}
+            messageEditor={editing().messageEditor}
+            class={props.class}
+          />
+        )}
+      </Match>
+      <Match when={message().content.trim() !== ''}>
+        <Message.Content class={props.class} />
+      </Match>
+    </Switch>
+  );
+  return props.renderContent ? props.renderContent(content) : content;
+}
+
+function MessageFooter(props: { messageEditor?: MessageEditor }) {
+  const message = useMessage();
+
+  return (
+    <Show when={!isEditingMessage(props.messageEditor, message().id)}>
+      <Message.Attachments />
+      <Message.Reactions />
+    </Show>
+  );
+}
+
+function MessageActionsSlot(props: {
+  messageEditor?: MessageEditor;
+  showTimestamp?: boolean;
+}) {
+  const message = useMessage();
+
+  return (
+    <Show when={!isEditingMessage(props.messageEditor, message().id)}>
+      <Message.ActionMenu showTimestamp={props.showTimestamp} />
+    </Show>
+  );
+}
+
+function DeletedMessageLayout() {
+  return (
+    <Message.Layout class="pt-(--regular-message-padding-t) pb-2">
+      <Message.Slot placement="icon">
+        <div class="shrink-0 size-(--user-icon-width) rounded-full bg-edge-muted text-ink-muted flex items-center justify-center">
+          <TrashIcon class="size-5" aria-hidden="true" />
+        </div>
+      </Message.Slot>
+      <Message.Slot
+        placement="content"
+        class="ph-no-capture flex min-h-(--user-icon-width) items-center"
+      >
+        <p class="text-sm text-ink-muted italic">This message was deleted.</p>
+      </Message.Slot>
+    </Message.Layout>
+  );
+}
+
+function RegularMessageLayout(props: {
+  renderContent?: (content: JSX.Element) => JSX.Element;
+  parent?: MessageParent;
+  timestampFormat?: 'time' | 'dateAndTime';
+  inputMode?: 'inline' | 'unified';
+  messageEditor?: MessageEditor;
+  hideTriggeredBy?: boolean;
+}) {
+  return (
+    <Message.Layout class="pt-(--regular-message-padding-t)">
+      <Message.Slot placement="icon">
+        <Message.SenderIcon />
+      </Message.Slot>
+      <Message.Slot placement="header" class="flex flex-col gap-0.5 min-w-0">
+        {/* In a narrow card (a document comment) the session link wraps to
+            its own line rather than running past the card's edge. */}
+        <div class="flex flex-wrap items-baseline gap-x-1 gap-y-0.5 min-w-0">
+          <div class="flex items-baseline gap-1 min-w-0">
+            <Message.SenderName />
+            <Message.AgentBadge />
+            <Message.Timestamp
+              class="shrink-0"
+              format={
+                props.timestampFormat ??
+                (props.parent?.type === 'channel' ? 'time' : 'dateAndTime')
+              }
+            />
+            <Message.EditedIndicator class="shrink-0" />
+          </div>
+          <Message.AgentSessionLink class="ml-auto" />
+        </div>
+        <Show when={!props.hideTriggeredBy}>
+          <Message.FromPill />
+        </Show>
+      </Message.Slot>
+      <Message.Slot placement="content" class="ph-no-capture">
+        <MessageContentSlot
+          renderContent={props.renderContent}
+          parent={props.parent}
+          inputMode={props.inputMode}
+          messageEditor={props.messageEditor}
+        />
+      </Message.Slot>
+      <Message.Slot
+        placement="footer"
+        class="ph-no-capture flex flex-col min-w-0"
+      >
+        <MessageFooter messageEditor={props.messageEditor} />
+      </Message.Slot>
+      <MessageActionsSlot messageEditor={props.messageEditor} />
+    </Message.Layout>
+  );
+}
+
+function GroupedMessageLayout(props: {
+  renderContent?: (content: JSX.Element) => JSX.Element;
+  parent?: MessageParent;
+  inputMode?: 'inline' | 'unified';
+  messageEditor?: MessageEditor;
+}) {
+  return (
+    <Message.Layout>
+      {/* No icon placeholder: the grid template already reserves the gutter
+          column, and an invisible 36px icon would stretch the row, leaving
+          more space below the text than above it. */}
+      <Message.Slot placement="content">
+        <div class="ph-no-capture flex gap-3 min-w-0 items-start">
+          <MessageContentSlot
+            renderContent={props.renderContent}
+            parent={props.parent}
+            inputMode={props.inputMode}
+            messageEditor={props.messageEditor}
+            class="min-w-0 flex-1"
+          />
+          {/* No sender line to sit on: the link takes the top right of the
+              content row instead. */}
+          <Message.AgentSessionLink class="mt-0.5" />
+        </div>
+      </Message.Slot>
+      <Message.Slot
+        placement="footer"
+        class="ph-no-capture flex flex-col min-w-0"
+      >
+        <MessageFooter messageEditor={props.messageEditor} />
+      </Message.Slot>
+      {/* Grouped rows have no header timestamp; the hover toolbar carries it. */}
+      <MessageActionsSlot messageEditor={props.messageEditor} showTimestamp />
+    </Message.Layout>
+  );
+}
+
+export function ChannelMessage(props: ChannelMessageProps) {
+  const drawerManager = useMessageActionDrawer();
+  const isGrouped = () => props.listMeta?.isGroupedWithPrevious === true;
+
+  return (
+    <MaybeSwipeToReplyRow message={props.message} actions={props.actions}>
+      <Message.Root
+        class="w-full"
+        message={props.message}
+        actions={props.actions}
+        selected={props.selected}
+        targeted={
+          props.targeted ||
+          // In unified-input mode the edit happens in the floating input; the
+          // accent bar marks the message it is bound to.
+          (props.inputMode === 'unified' &&
+            isEditingMessage(props.messageEditor, props.message.id))
+        }
+        onClick={props.onClick}
+        ref={(el) => {
+          messageSendMotion(el, () => `channel:${props.message.id}`);
+          touchHandler(el, () => ({
+            touchClassName: 'channel-message-long-press-highlight',
+            onLongPress: () =>
+              drawerManager?.open(props.message, props.actions),
+          }));
+        }}
+      >
+        <Switch>
+          <Match when={props.message.deleted_at != null}>
+            <DeletedMessageLayout />
+          </Match>
+          <Match when={isGrouped()}>
+            <GroupedMessageLayout
+              renderContent={props.renderContent}
+              parent={props.parent}
+              inputMode={props.inputMode}
+              messageEditor={props.messageEditor}
+            />
+          </Match>
+          <Match when={true}>
+            <RegularMessageLayout
+              renderContent={props.renderContent}
+              parent={props.parent}
+              timestampFormat={props.timestampFormat}
+              inputMode={props.inputMode}
+              messageEditor={props.messageEditor}
+              hideTriggeredBy={props.hideTriggeredBy}
+            />
+          </Match>
+        </Switch>
+      </Message.Root>
+    </MaybeSwipeToReplyRow>
+  );
+}

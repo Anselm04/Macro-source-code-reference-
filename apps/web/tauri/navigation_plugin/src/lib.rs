@@ -1,0 +1,352 @@
+use crate::scheme::MacroScheme;
+use logger::Logger;
+use serde::{Deserialize, Serialize};
+use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
+use tauri::{Emitter, Manager, Runtime, plugin::Plugin};
+use tauri_plugin_opener::OpenerExt;
+use url::Url;
+
+#[cfg(test)]
+mod tests;
+
+pub mod scheme;
+
+#[derive(Debug, Clone)]
+struct ExternalUrl<'a>(Cow<'a, Url>);
+
+/// Possible outcomes when trying to perform on_navigation
+#[derive(Debug, Clone)]
+enum NavigationOutput<'a> {
+    /// This is an external [Url] which will be opened in a browser
+    External(ExternalUrl<'a>),
+    /// A [Url] on one of the webview's own origins (`tauri://localhost`,
+    /// the dev server, ...) — the webview is allowed to load it directly.
+    /// This is what permits the SPA's own page loads.
+    Internal,
+    /// A third-party document the SPA embeds in an iframe. WebKit asks the
+    /// navigation handler about subframe loads too, so it must be allowed to
+    /// load in place; as a new window it is still external.
+    Embedded,
+    /// A link to content inside the Macro app whose literal [Url] points at
+    /// the remote website (e.g. `https://macro.com/app/...`). The webview
+    /// must not load it — that would replace the running SPA with the live
+    /// site — so the navigation is cancelled and re-emitted as a `navigate`
+    /// event for the SPA router to handle in-place.
+    AppLink(MacroScheme),
+    /// Browser-only URLs and local files outside the allowed cache directory
+    /// must not be handed to the operating system's URL handler.
+    Blocked,
+}
+
+/// Payload of the `navigate` event consumed by the frontend router bridge.
+#[derive(Clone, Serialize, Debug)]
+pub struct NavigatePayload<'a> {
+    pub path: &'a str,
+    pub query: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Platform {
+    Mobile,
+    Desktop,
+}
+
+#[derive(Clone)]
+pub struct MacroNavigationPlugin {
+    internal_domains: Arc<[Url]>,
+    app_link_hosts: &'static [&'static str],
+    embedded_documents: Arc<[Url]>,
+    allowed_file_prefix: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthCallbackQuery<'a> {
+    original_url: Option<Url>,
+    #[serde(flatten, borrow)]
+    remaining: HashMap<Cow<'a, str>, Cow<'a, str>>,
+}
+
+#[derive(Debug, Serialize)]
+struct MacroCallbackQuery<'a> {
+    original_url: MacroScheme,
+    #[serde(flatten, borrow)]
+    remaining: HashMap<Cow<'a, str>, Cow<'a, str>>,
+}
+
+impl MacroNavigationPlugin {
+    pub fn new(allow_list: &'static [&'static str]) -> Result<Self, url::ParseError> {
+        Ok(MacroNavigationPlugin {
+            internal_domains: allow_list
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<Arc<_>, _>>()?,
+            app_link_hosts: &[],
+            embedded_documents: Arc::new([]),
+            allowed_file_prefix: None,
+        })
+    }
+
+    /// hosts whose `/app` urls are routed through the SPA router
+    /// via the `navigate` event instead of loading the remote site
+    pub fn with_app_link_hosts(mut self, hosts: &'static [&'static str]) -> Self {
+        self.app_link_hosts = hosts;
+        self
+    }
+
+    /// Third-party pages the SPA loads in an iframe, matched by origin and
+    /// path (any query). On macOS the navigation handler cannot tell an
+    /// iframe load from a top-level one, and cancelling the iframe leaves an
+    /// empty frame over the app.
+    pub fn with_embedded_documents(
+        mut self,
+        documents: &'static [&'static str],
+    ) -> Result<Self, url::ParseError> {
+        self.embedded_documents = documents
+            .iter()
+            .map(|s| s.parse())
+            .collect::<Result<Arc<_>, _>>()?;
+        Ok(self)
+    }
+
+    fn is_embedded_document(&self, url: &Url) -> bool {
+        self.embedded_documents.iter().any(|document| {
+            document.scheme() == url.scheme()
+                && document.host_str() == url.host_str()
+                && document.port_or_known_default() == url.port_or_known_default()
+                && document.path() == url.path()
+        })
+    }
+
+    pub fn with_allowed_file_prefix(mut self, prefix: PathBuf) -> Self {
+        self.allowed_file_prefix = Some(prefix);
+        self
+    }
+
+    #[tracing::instrument(ret, level = tracing::Level::DEBUG, skip(self))]
+    fn get_destination<'a>(&self, url: &'a Url) -> NavigationOutput<'a> {
+        // checked before the allowlist: app link hosts (e.g. dev.macro.com)
+        // are not necessarily allowlisted webview domains
+        if let Some(scheme) = self.as_app_link(url) {
+            return NavigationOutput::AppLink(scheme);
+        }
+        if self.is_embedded_document(url) {
+            return NavigationOutput::Embedded;
+        }
+        match self.as_internal_url(url) {
+            Ok(()) => NavigationOutput::Internal,
+            Err(_)
+                if matches!(
+                    url.scheme(),
+                    "about" | "blob" | "data" | "javascript" | "file"
+                ) =>
+            {
+                NavigationOutput::Blocked
+            }
+            Err(external) => NavigationOutput::External(external),
+        }
+    }
+
+    #[tracing::instrument(ret, level = tracing::Level::DEBUG, skip(self))]
+    fn as_app_link(&self, url: &Url) -> Option<MacroScheme> {
+        if url.scheme() == "macro" {
+            return MacroScheme::new(url.clone()).ok();
+        }
+        if !is_app_link(self.app_link_hosts, url) {
+            return None;
+        }
+        MacroScheme::from_url(url).ok()
+    }
+
+    #[tracing::instrument(ret, level = tracing::Level::DEBUG, skip(self))]
+    fn as_internal_url<'a>(&self, url: &'a Url) -> Result<(), ExternalUrl<'a>> {
+        let is_allowed_domain = self.internal_domains.iter().any(|cur| {
+            cur.scheme().eq(url.scheme())
+                && cur.domain().eq(&url.domain())
+                && cur.port().eq(&url.port())
+        });
+
+        let is_allowed_file = url.scheme() == "file"
+            && self.allowed_file_prefix.as_ref().is_some_and(|prefix| {
+                url.to_file_path()
+                    .ok()
+                    .and_then(|path| path.canonicalize().ok())
+                    .and_then(|canonical| {
+                        prefix
+                            .canonicalize()
+                            .ok()
+                            .map(|cp| canonical.starts_with(cp))
+                    })
+                    .unwrap_or(false)
+            });
+
+        if is_allowed_domain || is_allowed_file {
+            Ok(())
+        } else {
+            Err(ExternalUrl(Cow::Borrowed(url)))
+        }
+    }
+
+    fn new_window_destination<'a>(&self, url: &'a Url) -> NavigationOutput<'a> {
+        match self.get_destination(url) {
+            // Standalone documents on an allowed webview origin are not SPA
+            // routes. Keep local-file policy and all other destinations intact.
+            NavigationOutput::Internal
+                if matches!(url.scheme(), "http" | "https" | "tauri")
+                    && url.path().ends_with(".html") =>
+            {
+                NavigationOutput::Internal
+            }
+            // A relative/same-origin app link should use the SPA router, not
+            // create a second webview or reload the existing app.
+            NavigationOutput::Internal => MacroScheme::from_url(url)
+                .map(NavigationOutput::AppLink)
+                .unwrap_or(NavigationOutput::Blocked),
+            NavigationOutput::Embedded => {
+                NavigationOutput::External(ExternalUrl(Cow::Borrowed(url)))
+            }
+            destination => destination,
+        }
+    }
+
+    /// Route desktop anchors and `window.open` requests at the webview boundary.
+    /// App links stay in the SPA and external URLs go to the system handler;
+    /// trusted standalone HTML documents may open a popup webview.
+    /// Mobile keeps the opener plugin's JS fallback.
+    pub fn on_new_window<R: Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        url: &Url,
+    ) -> tauri::webview::NewWindowResponse<R> {
+        if self.dispatch(app, self.new_window_destination(url)) {
+            tauri::webview::NewWindowResponse::Allow
+        } else {
+            tauri::webview::NewWindowResponse::Deny
+        }
+    }
+
+    /// Open a URL the page asked for outside its own navigation, with the same
+    /// policy as [`Self::on_new_window`]: app links go to the SPA router and
+    /// external URLs to the system handler. Unlike a popup request it needs no
+    /// user gesture, and unlike a same-page navigation it never runs the page's
+    /// `beforeunload`. Returns false for a standalone document that needs a
+    /// popup webview, which the caller must open itself.
+    pub fn open_external<R: Runtime>(&self, app: &tauri::AppHandle<R>, url: &Url) -> bool {
+        match self.new_window_destination(url) {
+            NavigationOutput::Internal => false,
+            destination => {
+                self.dispatch(app, destination);
+                true
+            }
+        }
+    }
+
+    /// Return true only when the current webview may load the URL itself.
+    fn dispatch<R: Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        destination: NavigationOutput<'_>,
+    ) -> bool {
+        match destination {
+            NavigationOutput::External(external_url) => {
+                // Opening a URL can block (and Android disallows it on the UI thread).
+                let app = app.clone();
+                let url = external_url.0.into_owned();
+                std::thread::spawn(move || {
+                    app.opener()
+                        .open_url(transform_external_url(url).as_str(), None::<&str>)
+                        .log_and_consume();
+                });
+                false
+            }
+            NavigationOutput::AppLink(scheme) => {
+                app.emit(
+                    "navigate",
+                    NavigatePayload {
+                        path: scheme.path(),
+                        query: scheme.query().unwrap_or_default(),
+                        fragment: scheme.fragment(),
+                    },
+                )
+                .log_and_consume();
+                false
+            }
+            NavigationOutput::Internal | NavigationOutput::Embedded => true,
+            NavigationOutput::Blocked => false,
+        }
+    }
+}
+
+/// Whether `url` is an `http(s)://<host>/app...` link for one of `hosts`,
+/// ignoring a `www.` prefix and host case.
+pub fn is_app_link(hosts: &[&str], url: &Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(domain) = url.domain() else {
+        return false;
+    };
+    let domain = domain.strip_prefix("www.").unwrap_or(domain);
+    let path = url.path();
+    hosts.iter().any(|host| domain.eq_ignore_ascii_case(host))
+        && (path == "/app" || path.starts_with("/app/"))
+}
+
+#[tracing::instrument(ret, level = tracing::Level::DEBUG)]
+fn transform_external_url(mut url: Url) -> Url {
+    let Some(query) = url.query() else {
+        return url;
+    };
+
+    if let Ok(AuthCallbackQuery {
+        original_url: Some(cb),
+        remaining,
+    }) = serde_qs::from_str(query).log_err()
+    {
+        let Ok(macro_scheme) = MacroScheme::from_url(&cb) else {
+            return url;
+        };
+
+        url.set_query(Some(
+            serde_qs::to_string(&MacroCallbackQuery {
+                original_url: macro_scheme,
+                remaining,
+            })
+            .expect("serialization should not fail")
+            .as_str(),
+        ));
+    }
+    if url
+        .query_pairs()
+        .find(|(k, _v)| k.as_ref() == "is_mobile")
+        .is_none()
+    {
+        url.query_pairs_mut().append_pair("is_mobile", "true");
+    }
+    url
+}
+
+impl<R: Runtime> Plugin<R> for MacroNavigationPlugin {
+    fn name(&self) -> &'static str {
+        std::any::type_name_of_val(self)
+    }
+
+    fn initialize(
+        &mut self,
+        app: &tauri::AppHandle<R>,
+        _config: serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.allowed_file_prefix.is_none()
+            && let Ok(cache_dir) = app.path().app_cache_dir()
+        {
+            tracing::debug!("Setting allowed file prefix to {cache_dir:?}");
+            self.allowed_file_prefix = Some(cache_dir);
+        }
+        Ok(())
+    }
+
+    fn on_navigation(&mut self, webview: &tauri::Webview<R>, url: &tauri::Url) -> bool {
+        self.dispatch(webview.app_handle(), self.get_destination(url))
+    }
+}

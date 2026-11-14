@@ -1,0 +1,513 @@
+import { toast } from '@core/component/Toast/Toast';
+import {
+  enableGraphqlSoup,
+  isFeatureEnabled,
+} from '@core/constant/featureFlags';
+import { fireAndForget } from '@core/util/fireAndForget';
+import {
+  readRecordsByKeys,
+  selectRecords,
+} from '@graphql-cache/exchange/record-selection';
+import { Telemetry } from '@macro-inc/observability';
+import {
+  EmailDraftThreadFieldsFragmentDoc,
+  EmailThreadMessageFieldsFragmentDoc,
+} from '@service-storage/graphql/generated/graphql';
+import {
+  assertEmailDraftQueueAvailable,
+  getGraphqlCacheHost,
+  getGraphqlSoupClient,
+  graphqlCacheEnabled,
+  graphqlCacheRecoveryState,
+  graphqlDraftQueueBlocked,
+  retryGraphqlCacheInitialization,
+} from '@service-storage/graphql-soup';
+import { ResultAsync } from 'neverthrow';
+import { queryClient } from '../client';
+import {
+  invalidateAllSoup,
+  invalidateSoupEntity,
+  refetchSoupEntity,
+} from '../soup/cache';
+import { markThreadDraftSaved } from './draft-cache';
+import {
+  draftFailureCode,
+  executeGraphqlDeleteEmailDraft,
+  executeGraphqlSaveEmailDraft,
+  type GraphqlSaveEmailDraftArgs,
+  type SaveEmailDraftFailureCode,
+} from './graphql/draft';
+import { mapGraphqlEmailMessage } from './graphql/mapper';
+import { emailKeys } from './keys';
+import {
+  abandonDraftDelete,
+  beginDraftAttempt,
+  draftSyncPaused,
+  emailSendOwnsDraft,
+  localDraftMessage,
+  localDraftStore,
+  markDraftAttemptQueued,
+  readLocalDraft,
+  readLocalEmailSends,
+  restoreLocalAttachments,
+  resumeLocalDraft,
+  watchLocalEmailSends,
+} from './local-drafts';
+import { emailSendDelivering, isEmailSendIntent } from './send-intent';
+import { fetchAndCacheThread, type ThreadQueryTransport } from './thread';
+
+export {
+  assertEmailDraftQueueAvailable,
+  graphqlCacheRecoveryState,
+  retryGraphqlCacheInitialization as recoverDraftSynchronization,
+};
+
+export async function retryEmailDraftSynchronization(
+  id: string
+): Promise<void> {
+  await retryGraphqlCacheInitialization();
+  await resumeLocalDraft(id);
+}
+
+/** Read content and persistence state together, including resolved local handles. */
+export async function readEmailDraft(
+  draftId: string,
+  options: { attachments?: boolean } = {}
+) {
+  const local = await readLocalDraft(draftId);
+  const host = getGraphqlCacheHost();
+  const cached = host
+    ? await ResultAsync.fromPromise(
+        readRecordsByKeys(
+          host,
+          selectRecords(EmailThreadMessageFieldsFragmentDoc),
+          [`GraphqlSoupEmailMessage:${local?.serverDraftId ?? draftId}`]
+        ),
+        (error: unknown) => error
+      )
+    : undefined;
+  // The independent working copy remains readable when cache startup fails.
+  // Without one, preserve the read error rather than inventing an empty draft.
+  if (cached?.isErr() && !local) throw cached.error;
+  const selected = cached?.isOk() ? cached.value.records[0] : undefined;
+  // Cancellation advances the server generation before restoring the local copy.
+  // An older accepted/sent cache record must not hide that restored draft.
+  // At the same or newer generation, server delivery state remains authoritative.
+  if (
+    selected &&
+    (!local ||
+      ((selected.record.draftGeneration ?? 0) >=
+        (local.content.draft_generation ?? 0) &&
+        (!selected.record.isDraft || local.status === 'synced')))
+  ) {
+    return {
+      draft: selected.record.isDraft
+        ? mapGraphqlEmailMessage(selected.record)
+        : undefined,
+      persistence: selected.identity?.pending
+        ? ('queued' as const)
+        : ('committed' as const),
+      mutationUuid: local?.key ?? selected.identity?.mutationUuid ?? undefined,
+      local: selected.record.isDraft ? local : undefined,
+    };
+  }
+  const discarding = local?.status === 'deleting';
+  if (local && (!discarding || options.attachments === false)) {
+    return {
+      draft: localDraftMessage(local),
+      // Upload receipts are separate from the body save. Pending files must
+      // not demote an acknowledged server identity to a client handle.
+      persistence:
+        local.serverDraftId && local.acknowledgedRevision >= local.revision
+          ? ('committed' as const)
+          : ('queued' as const),
+      mutationUuid: local.key,
+      local,
+      attachments:
+        options.attachments === false
+          ? undefined
+          : await restoreLocalAttachments(local),
+    };
+  }
+  if (!selected) return;
+  return {
+    draft: selected.record.isDraft
+      ? mapGraphqlEmailMessage(selected.record)
+      : undefined,
+    persistence: selected.identity?.pending
+      ? ('queued' as const)
+      : ('committed' as const),
+    mutationUuid: selected.identity?.mutationUuid ?? undefined,
+  };
+}
+
+/** Subscribers read durable state; missing a notification is harmless on remount. */
+export function watchEmailDrafts(
+  changed: (settlement?: {
+    mutationUuid?: string;
+    failed: boolean;
+    code?: DraftWriteRejection;
+  }) => void
+): () => void {
+  // A surface can enable the queue after mounting, before its first write
+  // initializes the client. Subscribe to that host before any save settles.
+  getGraphqlSoupClient();
+  const host = getGraphqlCacheHost();
+  const cache = host?.onCacheChanged(() => changed());
+  const local = localDraftStore.subscribe(() => changed());
+  const settlement = host?.onMutationSettled((result) => {
+    if (
+      result.status === 'permanently-failed' &&
+      result.errorCode === 'LOCAL_SUPERSEDED'
+    ) {
+      changed();
+      return;
+    }
+    const code =
+      result.status === 'permanently-failed'
+        ? draftFailureCode(result.errorCode)
+        : undefined;
+    changed({
+      mutationUuid: result.mutationUuid,
+      failed: result.status === 'permanently-failed',
+      code,
+    });
+  });
+  return () => {
+    local();
+    cache?.();
+    settlement?.();
+  };
+}
+
+/**
+ * Whether a surface's draft writes ride the durable GraphQL mutation queue,
+ * where offline writes persist locally and replay as idempotent upserts
+ * keyed by client handles.
+ *
+ * A write must use the transport the surface's thread read used: a queued
+ * save against a REST-read thread has no cached page for its optimistic
+ * patch, so the draft would be durable but invisible offline. Replies follow
+ * their thread query's transport; a surface without one follows the soup
+ * flag. The uncached fallback client has no queue, so REST remains the
+ * fallback there.
+ */
+export function draftQueueActive(
+  threadTransport?: ThreadQueryTransport
+): boolean {
+  if (!graphqlCacheEnabled() && !graphqlDraftQueueBlocked()) return false;
+  return threadTransport
+    ? threadTransport === 'graphql'
+    : isFeatureEnabled(enableGraphqlSoup);
+}
+
+/** A server rejection of a draft write; autosave never retries these. */
+export type DraftWriteRejection = Exclude<SaveEmailDraftFailureCode, 'NETWORK'>;
+
+export type QueuedDraftSave =
+  | { kind: 'committed'; draftId: string; threadId: string }
+  /** Durably accepted under the caller's handles; the server may not know them yet. */
+  | { kind: 'queued' }
+  | { kind: 'rejected'; code: DraftWriteRejection };
+
+export type QueuedDraftDelete =
+  | { kind: 'committed' | 'queued' }
+  | { kind: 'rejected'; code: DraftWriteRejection };
+
+const reportError = (error: unknown) =>
+  Telemetry.error(error instanceof Error ? error : new Error(String(error)));
+
+/**
+ * Notices and cache repair for a failed write, matching the REST mutations'
+ * onError. A transport failure throws — the write was never enqueued and the
+ * next save may retry it. A draft sent from another device gets its thread
+ * refreshed; the caller drops the local draft.
+ */
+function rejection(
+  code: SaveEmailDraftFailureCode,
+  message: string,
+  threadId: string
+): DraftWriteRejection {
+  if (code === 'NETWORK') {
+    toast.failure(message);
+    throw new Error(`${message}: network`);
+  }
+  if (code === 'DRAFT_ALREADY_SENT') {
+    markThreadDraftSaved(threadId);
+    invalidateSoupEntity(threadId);
+    void refetchSoupEntity(threadId, 'emailThread').catch(reportError);
+    fireAndForget(fetchAndCacheThread(threadId), 'email-draft-queue');
+  } else {
+    toast.failure(message);
+    reportError(new Error(`${message}: ${code}`));
+  }
+  return code;
+}
+
+const SNAPSHOT_READ_ATTEMPTS = 3;
+
+/** The draft and thread records a queued write rebases onto, when cached. */
+export async function readCachedDraftAndThread(
+  draftId: string,
+  threadId: string
+): Promise<
+  Pick<
+    GraphqlSaveEmailDraftArgs,
+    | 'draftId'
+    | 'threadDbId'
+    | 'existingDraft'
+    | 'existingThread'
+    | 'mutationUuid'
+  >
+> {
+  const host = getGraphqlCacheHost();
+  if (!host) return { draftId, threadDbId: threadId };
+  // Settlement can land between these reads. Compose from one revision so a
+  // local draft is never combined with a thread already using its server ID.
+  for (let attempt = 0; attempt < SNAPSHOT_READ_ATTEMPTS; attempt++) {
+    const [draft, thread] = await Promise.all([
+      readRecordsByKeys(
+        host,
+        selectRecords(EmailThreadMessageFieldsFragmentDoc),
+        [`GraphqlSoupEmailMessage:${draftId}`]
+      ),
+      readRecordsByKeys(
+        host,
+        selectRecords(EmailDraftThreadFieldsFragmentDoc),
+        [`GraphqlSoupEmailThread:${threadId}`]
+      ),
+    ]);
+    if (draft.revision !== thread.revision) continue;
+    const mutationUuid = draft.records[0]?.identity?.mutationUuid;
+    return {
+      draftId: draft.records[0]?.record.id ?? draftId,
+      threadDbId: thread.records[0]?.record.id ?? threadId,
+      existingDraft: draft.records[0]?.record,
+      existingThread: thread.records[0]?.record,
+      mutationUuid: mutationUuid ?? undefined,
+    };
+  }
+  throw new Error('Email draft cache kept changing; retry the draft write');
+}
+
+type QueuedSaveInput = {
+  args: GraphqlSaveEmailDraftArgs;
+  completingThread?: boolean;
+  previousThreadId?: string;
+};
+
+/**
+ * The latest save of each reply whose target this device is still delivering.
+ * The server holds that target as a draft until the provider confirms it and
+ * refuses a reply to a draft, so the save waits here, off the mutation queue,
+ * and goes out when the delivery settles.
+ */
+const heldSaves = new Map<string, QueuedSaveInput>();
+let stopWatchingSends: (() => void) | undefined;
+let releasing: Promise<void> = Promise.resolve();
+
+async function replyTargetDelivering(replyingToId: unknown): Promise<boolean> {
+  if (replyingToId == null) return false;
+  const sends = (await readLocalEmailSends()).filter(isEmailSendIntent);
+  return emailSendDelivering(sends, String(replyingToId));
+}
+
+function holdSave(input: QueuedSaveInput) {
+  heldSaves.set(String(input.args.draftId), input);
+  stopWatchingSends ??= watchLocalEmailSends(() => {
+    const previous = releasing;
+    releasing = (async () => {
+      await previous;
+      await releaseHeldSaves();
+    })();
+    fireAndForget(releasing, 'email-draft-queue');
+  });
+}
+
+async function releaseHeldSaves() {
+  for (const [draftId, input] of [...heldSaves]) {
+    try {
+      if (await replyTargetDelivering(input.args.replyingToId)) continue;
+      // A newer save of this draft took the slot while the read was pending.
+      if (heldSaves.get(draftId) !== input) continue;
+      heldSaves.delete(draftId);
+
+      // Sent or discarded since: nothing is left to save.
+      const local = await readLocalDraft(draftId);
+      if (!local || local.status === 'deleting') continue;
+      if (await emailSendOwnsDraft(local.draftId)) continue;
+
+      await saveEmailDraftQueued(input);
+    } catch (error) {
+      reportError(error);
+    }
+  }
+  if (heldSaves.size) return;
+  stopWatchingSends?.();
+  stopWatchingSends = undefined;
+}
+
+/** Saves over the queue; a commit mirrors useSaveDraftMutation's cache effects. */
+export async function saveEmailDraftQueued(
+  input: QueuedSaveInput
+): Promise<QueuedDraftSave> {
+  getGraphqlSoupClient();
+  assertEmailDraftQueueAvailable();
+  const local = await readLocalDraft(String(input.args.draftId));
+  if (local && draftSyncPaused(local))
+    return { kind: 'rejected', code: draftFailureCode(local.errorCode) };
+  if (await replyTargetDelivering(input.args.replyingToId)) {
+    holdSave(input);
+    return { kind: 'queued' };
+  }
+  heldSaves.delete(String(input.args.draftId));
+  const attempt = local
+    ? await beginDraftAttempt(
+        { ...local, revision: input.args.localRevision ?? local.revision },
+        'save'
+      )
+    : undefined;
+  // The draft is being discarded. A save that still arrives, such as a closed
+  // composer's last flush, must not take the discard's place in the queue.
+  if (local && !attempt) {
+    Telemetry.info('email_draft.save_yielded_to_discard', {
+      'email_draft.draft_id': local.key,
+    });
+    return { kind: 'queued' };
+  }
+  const cached = await readCachedDraftAndThread(
+    String(input.args.draftId),
+    input.args.threadDbId
+  );
+  const client = getGraphqlSoupClient();
+  assertEmailDraftQueueAvailable();
+  const outcome = await executeGraphqlSaveEmailDraft(client, {
+    ...input.args,
+    ...cached,
+    ...(local ? { draftId: local.draftId, clientMetadata: attempt } : {}),
+    mutationUuid:
+      input.args.mutationUuid ??
+      cached.mutationUuid ??
+      String(input.args.draftId),
+  });
+  if (outcome.kind === 'failed') {
+    // The draft's own send was admitted while this save was on the wire. The
+    // send carries the content, so the refusal is not a failure to report.
+    const draftId = local?.draftId ?? String(input.args.draftId);
+    if (await emailSendOwnsDraft(draftId, attempt)) return { kind: 'queued' };
+
+    return {
+      kind: 'rejected',
+      code: rejection(
+        outcome.code,
+        'Failed to save draft',
+        input.args.threadDbId
+      ),
+    };
+  }
+  if (outcome.kind === 'queued') {
+    if (attempt) {
+      try {
+        await markDraftAttemptQueued(attempt);
+      } catch (error) {
+        reportError(error);
+      }
+    }
+    return { kind: 'queued' };
+  }
+  refreshAfterCommittedSave(input, outcome.threadId);
+  return {
+    kind: 'committed',
+    draftId: outcome.draftId,
+    threadId: outcome.threadId,
+  };
+}
+
+/** A committed save's cache effects; a failure here never fails the save. */
+function refreshAfterCommittedSave(input: QueuedSaveInput, threadId: string) {
+  try {
+    markThreadDraftSaved(threadId);
+    if (input.previousThreadId && input.previousThreadId !== threadId) {
+      markThreadDraftSaved(input.previousThreadId);
+      invalidateSoupEntity(input.previousThreadId);
+      void refetchSoupEntity(input.previousThreadId, 'emailThread').catch(
+        reportError
+      );
+    }
+    queryClient.invalidateQueries({ queryKey: emailKeys.previews._def });
+    if (!input.completingThread) {
+      void refetchSoupEntity(threadId, 'emailThread').catch(reportError);
+    }
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+/** Deletes over the queue; a commit mirrors useDeleteDraftMutation's cache effects. */
+export async function deleteEmailDraftQueued(input: {
+  draftGeneration?: number;
+  draftId: string;
+  threadId: string;
+  completingThread?: boolean;
+}): Promise<QueuedDraftDelete> {
+  getGraphqlSoupClient();
+  assertEmailDraftQueueAvailable();
+  heldSaves.delete(input.draftId);
+  const local = await readLocalDraft(input.draftId);
+  const attempt = local ? await beginDraftAttempt(local, 'delete') : undefined;
+  const abandon = async () => {
+    if (attempt) await abandonDraftDelete(attempt).catch(reportError);
+  };
+  let outcome: Awaited<ReturnType<typeof executeGraphqlDeleteEmailDraft>>;
+  try {
+    const cached = await readCachedDraftAndThread(
+      input.draftId,
+      input.threadId
+    );
+    const client = getGraphqlSoupClient();
+    assertEmailDraftQueueAvailable();
+    outcome = await executeGraphqlDeleteEmailDraft(client, {
+      existingThread: cached.existingThread,
+      mutationUuid: cached.mutationUuid ?? input.draftId,
+      draftId: local?.draftId ?? String(cached.draftId),
+      clientMetadata: attempt,
+      draftGeneration:
+        input.draftGeneration ??
+        local?.content.draft_generation ??
+        cached.existingDraft?.draftGeneration ??
+        0,
+      threadDbId: cached.threadDbId,
+    });
+  } catch (error) {
+    await abandon();
+    throw error;
+  }
+  if (outcome.kind === 'failed') {
+    await abandon();
+    return {
+      kind: 'rejected',
+      code: rejection(outcome.code, 'Failed to delete draft', input.threadId),
+    };
+  }
+  if (outcome.kind === 'queued') {
+    if (attempt) {
+      try {
+        await markDraftAttemptQueued(attempt);
+      } catch (error) {
+        reportError(error);
+      }
+    }
+    return { kind: 'queued' };
+  }
+  try {
+    markThreadDraftSaved(input.threadId);
+    queryClient.invalidateQueries({ queryKey: emailKeys.previews._def });
+    if (!input.completingThread) {
+      void refetchSoupEntity(input.threadId, 'emailThread').catch(reportError);
+      invalidateAllSoup();
+    }
+  } catch (error) {
+    reportError(error);
+  }
+  return { kind: 'committed' };
+}

@@ -1,0 +1,710 @@
+import {
+  compileToAst,
+  queryStateFrom,
+} from '@app/features/next-soup/filters/filter-store';
+import { describe, expect, it } from 'vitest';
+import {
+  makeGraphqlGroupedSoupContinuationInput,
+  makeGraphqlGroupedSoupInput,
+  makeGraphqlSoupInput,
+} from './ast';
+
+const UPDATED_AT = '2026-01-01T00:00:00.000Z';
+
+function makeInput(query: Parameters<typeof queryStateFrom>[0]) {
+  return makeGraphqlSoupInput({
+    params: { limit: 100, sort_method: 'updated_at' },
+    body: compileToAst(queryStateFrom(query)),
+  });
+}
+
+describe('makeGraphqlSoupInput', () => {
+  it('preserves agent session opt-in and owner exclusions', () => {
+    const input = makeInput({
+      include: { includeAgentSessions: true },
+      exclude: { agentSessionOwnerId: ['macro|me@example.com'] },
+    });
+    expect(input).toMatchObject({
+      initial: {
+        filters: {
+          agentSessionFilter: {
+            and: {
+              left: { not: { literal: { owner: 'macro|me@example.com' } } },
+              right: { literal: { include: true } },
+            },
+          },
+        },
+      },
+    });
+    expect(
+      makeInput({ include: { agentSessionId: ['session'] } })
+    ).toMatchObject({
+      initial: {
+        filters: { agentSessionFilter: { literal: { id: 'session' } } },
+      },
+    });
+  });
+  it('maps exact states and keeps email read independent', () => {
+    for (const state of ['unseen', 'seen', 'done'] as const) {
+      const input = makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: { df: { l: { ns: state } }, ef: { l: { Read: true } } },
+      });
+      expect(input).toMatchObject({
+        initial: {
+          filters: {
+            documentFilter: {
+              literal: { notificationState: state.toUpperCase() },
+            },
+            emailFilter: { tree: { literal: { read: true } } },
+          },
+        },
+      });
+    }
+    expect(() =>
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: { df: { l: { ns: false } } },
+      })
+    ).toThrow();
+  });
+  it('maps compiled soup AST and request params into GraphQL Soup input', () => {
+    const input = makeInput({
+      include: {
+        documentDone: false,
+        documentUpdatedAt: { gte: UPDATED_AT },
+        emailShared: 'exclude',
+      },
+      emailView: 'inbox',
+    });
+
+    expect(input).toMatchObject({
+      initial: {
+        limit: 100,
+        expand: true,
+        sortMethod: 'UPDATED_AT',
+        emailView: 'INBOX',
+        filters: {
+          documentFilter: {
+            and: {
+              left: {
+                or: {
+                  left: { literal: { notificationState: 'UNSEEN' } },
+                  right: { literal: { notificationState: 'SEEN' } },
+                },
+              },
+              right: { literal: { updatedAt: { gte: UPDATED_AT } } },
+            },
+          },
+          emailFilter: {
+            tree: { literal: { shared: 'EXCLUDE' } },
+          },
+        },
+      },
+    });
+  });
+
+  it('maps channel participation filters into the channel literal', () => {
+    // The inbox signal view pins channelIsParticipant: [true] so it only ever
+    // shows channels the user is in.
+    const input = makeInput({
+      include: {
+        channelDone: false,
+        channelIsParticipant: [true],
+      },
+    });
+
+    expect(input).toMatchObject({
+      initial: {
+        filters: {
+          channelFilter: {
+            and: {
+              left: {
+                or: {
+                  left: { literal: { notificationState: 'UNSEEN' } },
+                  right: { literal: { notificationState: 'SEEN' } },
+                },
+              },
+              right: { literal: { isParticipant: true } },
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it('ORs multiple channel participation states so non-member team channels match', () => {
+    // The Channels → Teams tab queries [true, false]: member channels plus
+    // team channels of the user's teams they haven't joined.
+    const input = makeInput({
+      include: {
+        channelIsParticipant: [true, false],
+      },
+    });
+
+    expect(input).toMatchObject({
+      initial: {
+        filters: {
+          channelFilter: {
+            or: {
+              left: { literal: { isParticipant: true } },
+              right: { literal: { isParticipant: false } },
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it('maps cursor requests without resending filters or sort', () => {
+    const input = makeGraphqlSoupInput({
+      params: { limit: 100, sort_method: 'updated_at' },
+      body: compileToAst(
+        queryStateFrom({
+          include: { documentDone: false },
+          emailView: 'sent',
+        })
+      ),
+      cursor: 'opaque-cursor',
+    });
+
+    expect(input).toEqual({
+      continuation: {
+        cursor: 'opaque-cursor',
+        expand: true,
+        emailView: 'SENT',
+      },
+    });
+  });
+
+  it('maps grouped requests to GraphQL input', () => {
+    const input = makeGraphqlGroupedSoupInput({
+      params: { limit: 100, sort_method: 'updated_at' },
+      body: compileToAst(queryStateFrom({ include: { documentDone: false } })),
+      groupBy: {
+        type: 'property',
+        propertyDefinitionId: '00000000-0000-0000-0000-000000000001',
+        entityType: 'TASK',
+      },
+    });
+
+    expect(input).toMatchObject({
+      initial: {
+        groupBy: {
+          field: 'PROPERTY',
+          propertyDefinitionId: '00000000-0000-0000-0000-000000000001',
+          entityType: 'TASK',
+        },
+        limit: 100,
+        sortMethod: 'UPDATED_AT',
+        filters: {
+          documentFilter: {
+            or: {
+              left: { literal: { notificationState: 'UNSEEN' } },
+              right: { literal: { notificationState: 'SEEN' } },
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it('groups by entity type when a newer build saved a grouping this one does not know', () => {
+    const fromNewerBuild = JSON.parse('{"type":"assignee"}');
+    const input = makeGraphqlGroupedSoupInput({
+      params: { limit: 100, sort_method: 'updated_at' },
+      body: compileToAst(queryStateFrom({ include: { documentDone: false } })),
+      groupBy: fromNewerBuild,
+    });
+
+    expect(input).toMatchObject({
+      initial: { groupBy: { field: 'ENTITY_TYPE' } },
+    });
+  });
+
+  it('maps grouped cursor continuations to GraphQL input', () => {
+    expect(
+      makeGraphqlGroupedSoupContinuationInput({
+        groupBy: { type: 'entity_type' },
+        groupKey: 'document',
+        cursor: 'opaque-cursor',
+      })
+    ).toEqual({
+      continuation: {
+        groupBy: { field: 'ENTITY_TYPE' },
+        groupKey: 'document',
+        cursor: 'opaque-cursor',
+      },
+    });
+  });
+
+  it('maps property filter values', () => {
+    const input = makeInput({
+      include: {
+        properties: [
+          {
+            propertyId: '00000000-0000-0000-0000-000000000001',
+            type: 'select',
+            value: '00000000-0000-0000-0000-000000000002',
+          },
+        ],
+      },
+    });
+
+    expect(input).toMatchObject({
+      initial: {
+        filters: {
+          propertiesFilter: {
+            literal: {
+              propertyDefinitionId: '00000000-0000-0000-0000-000000000001',
+              value: { selectOption: '00000000-0000-0000-0000-000000000002' },
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it('maps channel thread participant filters', () => {
+    const input = makeGraphqlSoupInput({
+      params: { limit: 100, sort_method: 'updated_at' },
+      body: { cthf: { l: { Participant: 'user-1' } } } as never,
+    });
+
+    expect(input).toMatchObject({
+      initial: {
+        filters: {
+          channelThreadFilter: {
+            literal: { participant: 'user-1' },
+          },
+        },
+      },
+    });
+  });
+
+  it('maps calendar event id filters', () => {
+    const input = makeGraphqlSoupInput({
+      params: { limit: 100, sort_method: 'updated_at' },
+      body: { calf: { l: { id: 'event-1' } } } as never,
+    });
+
+    expect(input).toMatchObject({
+      initial: {
+        filters: {
+          calendarEventFilter: { literal: { id: 'event-1' } },
+        },
+      },
+    });
+  });
+
+  it('maps email subject and domain literals', () => {
+    expect(
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: {
+          ef: {
+            '&': [
+              { l: { Subject: 'FYI' } },
+              { l: { Cc: { Domain: 'acme.com' } } },
+            ],
+          },
+        },
+      })
+    ).toMatchObject({
+      initial: {
+        filters: {
+          emailFilter: {
+            tree: {
+              and: {
+                left: { literal: { subject: 'FYI' } },
+                right: { literal: { cc: { domain: 'acme.com' } } },
+              },
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it('maps email attachment kinds and rejects unknown ones', () => {
+    expect(
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: { ef: { l: { Attachment: 'image' } } },
+      })
+    ).toMatchObject({
+      initial: {
+        filters: {
+          emailFilter: { tree: { literal: { attachment: 'IMAGE' } } },
+        },
+      },
+    });
+    expect(() =>
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: { ef: { l: { Attachment: 'zip' } } },
+      })
+    ).toThrow();
+  });
+
+  it('translates CRM association and email attachment literals', () => {
+    const companyId = '0198a1b2-c3d4-7e5f-8061-728394a5b700';
+    expect(
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: {
+          df: {
+            '|': [
+              {
+                l: {
+                  prop: {
+                    pd: '00000001-0000-0000-0000-00000000000c',
+                    v: { er: companyId },
+                  },
+                },
+              },
+              { l: { eap: { Domain: 'acme.com' } } },
+            ],
+          },
+        } as never,
+      })
+    ).toMatchObject({
+      initial: {
+        filters: {
+          documentFilter: {
+            or: {
+              left: {
+                literal: {
+                  property: {
+                    propertyDefinitionId:
+                      '00000001-0000-0000-0000-00000000000c',
+                    value: { entityRef: companyId },
+                  },
+                },
+              },
+              right: {
+                literal: { emailAttachmentParticipant: { domain: 'acme.com' } },
+              },
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it('translates the CRM record scope, record literals, and name search', () => {
+    const company = '0198a1b2-c3d4-7e5f-8061-728394a5b700';
+    const contact = '0198a1b2-c3d4-7e5f-8061-728394a5b701';
+    const body = {
+      crma: { company },
+      df: {
+        '&': [{ l: { crm: { contact } } }, { l: { nc: 'Renewal' } }],
+      },
+    };
+    expect(
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: body as never,
+      })
+    ).toMatchObject({
+      initial: {
+        filters: {
+          crmAssociation: { company },
+          documentFilter: {
+            and: {
+              left: { literal: { crmAssociated: { contact } } },
+              right: { literal: { nameContains: 'Renewal' } },
+            },
+          },
+        },
+      },
+    });
+    // Grouped CRM Tasks keep the scope on the grouped transport too.
+    expect(
+      makeGraphqlGroupedSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: { crma: { contact }, df: { l: { dst: 'task' } } } as never,
+        groupBy: { type: 'property', propertyDefinitionId: 'status' },
+      })
+    ).toMatchObject({
+      initial: { filters: { crmAssociation: { contact } } },
+    });
+    expect(() =>
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: { crma: { team: company } } as never,
+      })
+    ).toThrow('Unsupported GraphQL Soup AST');
+  });
+
+  it('throws for unsupported calendar literals so callers can fall back', () => {
+    expect(() =>
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: { calf: { l: { s: 'confirmed' } } } as never,
+      })
+    ).toThrow('Unsupported GraphQL Soup AST');
+  });
+
+  it('translates skill inclusion and markdown skill exclusions without falling back', () => {
+    expect(makeInput({ include: { subType: ['skill'] } })).toMatchObject({
+      initial: {
+        filters: { documentFilter: { literal: { subType: 'SKILL' } } },
+      },
+    });
+    expect(makeInput({ exclude: { subType: ['skill'] } })).toMatchObject({
+      initial: {
+        filters: { documentFilter: { not: { literal: { subType: 'SKILL' } } } },
+      },
+    });
+  });
+
+  it('expands file associations into native-evaluatable GraphQL file types', () => {
+    expect(makeInput({ include: { fileAssoc: ['assoc:pdf'] } })).toMatchObject({
+      initial: {
+        filters: { documentFilter: { literal: { fileType: 'pdf' } } },
+      },
+    });
+    const code = makeInput({ include: { fileAssoc: ['assoc:code'] } });
+    const depth = (value: unknown): number =>
+      value && typeof value === 'object'
+        ? 1 + Math.max(0, ...Object.values(value).map(depth))
+        : 0;
+    expect(depth(code)).toBeLessThan(32);
+    expect(JSON.stringify(code)).toContain('"fileType":"ts"');
+    expect(JSON.stringify(code)).not.toContain('assoc:code');
+    expect(() =>
+      makeInput({ include: { fileAssoc: ['assoc:unknown'] } })
+    ).toThrow('unknown file association');
+  });
+
+  it('balances clause chains the server would reject as too deep', () => {
+    // Mirrors graphql_soup_filter_input::validate_json_bounds: the filters
+    // value is level 1 and every nested value, scalars included, adds one.
+    const serverDepth = (value: unknown): number =>
+      value && typeof value === 'object'
+        ? 1 + Math.max(0, ...Object.values(value).map(serverDepth))
+        : 1;
+    const channelIds = (input: ReturnType<typeof makeInput>) =>
+      [...JSON.stringify(input).matchAll(/"channelId":"([^"]+)"/g)].map(
+        (found) => found[1]
+      );
+
+    for (const count of [31, 32, 500]) {
+      const ids = Array.from(
+        { length: count },
+        (_, index) => `channel-${index}`
+      );
+      const input = makeInput({ include: { channelId: ids } });
+      expect(serverDepth(input.initial?.filters)).toBeLessThanOrEqual(64);
+      expect(channelIds(input)).toEqual(ids);
+    }
+  });
+
+  it('keeps the shape of clause chains that already fit the depth limit', () => {
+    expect(
+      makeInput({ include: { channelId: ['first', 'second', 'third'] } })
+    ).toMatchObject({
+      initial: {
+        filters: {
+          channelFilter: {
+            or: {
+              left: { literal: { channelId: 'first' } },
+              right: {
+                or: {
+                  left: { literal: { channelId: 'second' } },
+                  right: { literal: { channelId: 'third' } },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it('preserves the stable favorites constraint without expanding entity IDs', () => {
+    const body = { ...compileToAst(queryStateFrom({})), favorites_only: true };
+    expect(
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body,
+      })
+    ).toMatchObject({ initial: { filters: { favoritesOnly: true } } });
+    expect(
+      makeGraphqlGroupedSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body,
+        groupBy: { type: 'entity_type' },
+      })
+    ).toMatchObject({ initial: { filters: { favoritesOnly: true } } });
+  });
+
+  it('throws for REST-only top-level filters instead of silently widening the query', () => {
+    for (const body of [
+      { eca: ['person@example.com'] },
+      { ecd: ['example.com'] },
+    ]) {
+      expect(() =>
+        makeGraphqlSoupInput({
+          params: { limit: 100, sort_method: 'updated_at' },
+          body: body as never,
+        })
+      ).toThrow('Unsupported GraphQL Soup AST');
+    }
+  });
+
+  it('rejects REST-only top-level filters for grouped queries too', () => {
+    expect(() =>
+      makeGraphqlGroupedSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: { ecd: ['example.com'] } as never,
+        groupBy: { type: 'entity_type' },
+      })
+    ).toThrow('Unsupported GraphQL Soup AST');
+  });
+
+  it.each(['inbox', 'drafts', 'sent', 'all'] as const)(
+    'rejects grouped %s mail, including the date-grouped cached-mail slice',
+    (emailView) => {
+      expect(() =>
+        makeGraphqlGroupedSoupInput({
+          params: { limit: 100, sort_method: 'updated_at' },
+          body: { emailView },
+          groupBy: { type: 'date' },
+        })
+      ).toThrow('email views are not supported by grouped GraphQL Soup yet');
+    }
+  );
+
+  it('rejects unknown email views instead of using the GraphQL default', () => {
+    expect(() =>
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: { emailView: 'unknown' } as never,
+      })
+    ).toThrow('Unsupported GraphQL Soup AST');
+  });
+
+  it('throws for frecency sort so callers can fall back', () => {
+    expect(() =>
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'frecency' },
+        body: compileToAst(queryStateFrom({})),
+      })
+    ).toThrow('Unsupported GraphQL Soup AST');
+  });
+
+  it('throws for invalid call statuses so callers can fall back', () => {
+    expect(() =>
+      makeGraphqlSoupInput({
+        params: { limit: 100, sort_method: 'updated_at' },
+        body: { callf: { l: { Status: 'BOGUS' } } } as never,
+      })
+    ).toThrow('Unsupported GraphQL Soup AST');
+  });
+});
+
+it('maps open-ended property date ranges and explicit no-date negation', () => {
+  const propertyDefinitionId = '00000001-0000-0000-0000-000000000004';
+  const range = makeGraphqlSoupInput({
+    params: {
+      sort_method: 'property',
+      sort_direction: 'asc',
+      sort_property_definition_id: propertyDefinitionId,
+    },
+    body: {
+      propf: {
+        l: {
+          pd: propertyDefinitionId,
+          et: 'TASK',
+          v: { dr: { end: UPDATED_AT } },
+        },
+      },
+    },
+  });
+  expect(range).toMatchObject({
+    initial: {
+      sortMethod: 'PROPERTY',
+      sortDirection: 'ASC',
+      sortPropertyDefinitionId: propertyDefinitionId,
+      filters: {
+        propertiesFilter: {
+          literal: {
+            propertyDefinitionId,
+            entityType: 'TASK',
+            value: { dateRange: { end: UPDATED_AT } },
+          },
+        },
+      },
+    },
+  });
+  const missing = makeGraphqlSoupInput({
+    params: {},
+    body: {
+      propf: {
+        '!': { l: { pd: propertyDefinitionId, et: 'TASK', v: { dr: {} } } },
+      },
+    },
+  });
+  expect(missing).toMatchObject({
+    initial: {
+      filters: {
+        propertiesFilter: {
+          not: {
+            literal: {
+              propertyDefinitionId,
+              entityType: 'TASK',
+              value: { dateRange: {} },
+            },
+          },
+        },
+      },
+    },
+  });
+  expect(
+    makeGraphqlSoupInput({
+      params: {},
+      body: { propf: { l: { pd: propertyDefinitionId, v: { dr: {} } } } },
+    })
+  ).toMatchObject({
+    initial: {
+      filters: {
+        propertiesFilter: { literal: { value: { dateRange: {} } } },
+      },
+    },
+  });
+});
+
+it.each([
+  ['asc', 'ASC'],
+  ['desc', 'DESC'],
+] as const)(
+  'maps property sort %s consistently for flat and grouped requests',
+  (direction, expected) => {
+    const propertyDefinitionId = '00000001-0000-0000-0000-000000000004';
+    const params = {
+      sort_method: 'property' as const,
+      sort_direction: direction,
+      sort_property_definition_id: propertyDefinitionId,
+    };
+    const body = { df: { l: { dst: 'task' } } };
+    const flat = makeGraphqlSoupInput({ params, body });
+    const grouped = makeGraphqlGroupedSoupInput({
+      params,
+      body,
+      groupBy: {
+        type: 'property',
+        propertyDefinitionId: '00000001-0000-0000-0000-000000000002',
+      },
+    });
+    expect(flat.initial?.sortMethod).toBe('PROPERTY');
+    expect(grouped.initial?.sortMethod).toBe('PROPERTY');
+    expect(flat.initial?.sortDirection).toBe(expected);
+    expect(grouped.initial?.sortDirection).toBe(expected);
+    expect(flat.initial?.sortPropertyDefinitionId).toBe(propertyDefinitionId);
+    expect(grouped.initial?.sortPropertyDefinitionId).toBe(
+      propertyDefinitionId
+    );
+  }
+);

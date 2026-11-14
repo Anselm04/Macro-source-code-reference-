@@ -1,0 +1,976 @@
+import { gql, type OperationResult } from '@urql/core';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { CacheRequest, CacheResponse } from '../protocol';
+import { installCacheCoordinatorWorker } from '../worker/cache-coordinator-runtime';
+import { installCacheEngineWorker } from '../worker/cache-engine-runtime';
+import { createCacheCoordinatorPageAdapter } from '../worker/coordinator-page-adapter';
+import { CoordinatorRouter } from '../worker/coordinator-router';
+import { EFFECT_WORKER_CLOSE_FRAME } from '../worker/effect-worker-transport';
+import { createWorkerCacheHost } from './worker-host';
+import {
+  exchangeHarness,
+  LinkedMessageChannel,
+  LinkedMessagePort,
+  optimisticMutation,
+} from './worker-host.integration-helpers';
+
+const PAGEHIDE_MUTATION = gql`
+  mutation HoldPagehide {
+    holdPagehide
+  }
+`;
+const STANDBY_MUTATION = gql`
+  mutation HoldStandby {
+    holdStandby
+  }
+`;
+const COORDINATOR_RESTART_MUTATION = gql`
+  mutation HoldCoordinatorRestart {
+    holdCoordinatorRestart
+  }
+`;
+const RETIREMENT_FAILURE_MUTATION = gql`
+  mutation HoldRetirementFailure {
+    holdRetirementFailure
+  }
+`;
+
+type RuntimeLog = {
+  epoch: number;
+  kind: CacheRequest['kind'] | 'drain';
+  id?: number;
+  query?: string;
+};
+
+const requestObservers = new Set<(entry: RuntimeLog) => void>();
+// Fake durable storage shared by successive engine instances.
+const committedEnqueues: string[] = [];
+
+type Deferred = { promise: Promise<void>; resolve: () => void };
+const deferred = (): Deferred => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+};
+
+class IntegrationCore {
+  constructor(
+    private readonly epoch: number,
+    private readonly logs: RuntimeLog[],
+    private readonly activationGates: Map<number, Promise<void>>,
+    private readonly hostInitGates: Map<number, Promise<void>>,
+    private readonly enqueueGates: Map<string, Promise<void>>,
+    private readonly onOwnerLockAcquired?: () => Promise<void>
+  ) {}
+
+  addPort(): void {}
+
+  async handleRequest(
+    port: { postMessage(message: unknown): void },
+    request: CacheRequest
+  ): Promise<void> {
+    const entry = {
+      epoch: this.epoch,
+      kind: request.kind,
+      id: request.id,
+      query: 'query' in request ? request.query : undefined,
+    };
+    this.logs.push(entry);
+    for (const observer of requestObservers) observer(entry);
+    if (request.kind === 'init') {
+      // Like WASM: hold the owner lock and get the storage grant, then open.
+      if (request.id === 0) await this.onOwnerLockAcquired?.();
+      const gate =
+        request.id === 0
+          ? this.activationGates.get(this.epoch)
+          : this.hostInitGates.get(this.epoch);
+      if (gate) await gate;
+    }
+    if (request.kind === 'read' && request.query.includes('Slow')) {
+      await new Promise<void>(() => undefined);
+      return;
+    }
+    if (request.kind === 'enqueue-optimistic-mutation') {
+      committedEnqueues.push(request.uuid);
+      const gate = this.enqueueGates.get(request.operationName ?? '');
+      if (gate) await gate;
+    }
+    let result: unknown = null;
+    if (request.kind === 'read') result = { kind: 'miss' };
+    if (request.kind === 'enqueue-optimistic-mutation') {
+      result = {
+        transactionId: String(request.id),
+        changed: [],
+        affectedOps: [],
+        reset: false,
+        upsertKind: { kind: 'inserted' },
+        initialClaim: { kind: 'not-runnable' },
+      };
+    }
+    const response: CacheResponse = { id: request.id, ok: true, result };
+    port.postMessage(response);
+  }
+
+  async drain(): Promise<void> {
+    this.logs.push({ epoch: this.epoch, kind: 'drain' });
+  }
+}
+
+class IntegrationWorkerScope {
+  onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+  closed = false;
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
+class IntegrationDedicatedWorker {
+  onerror: ((this: AbstractWorker, event: ErrorEvent) => unknown) | null = null;
+  onmessageerror: ((this: Worker, event: MessageEvent) => unknown) | null =
+    null;
+  readonly scope = new IntegrationWorkerScope();
+  terminated = false;
+
+  constructor(
+    readonly epoch: number,
+    logs: RuntimeLog[],
+    activationGates: Map<number, Promise<void>>,
+    hostInitGates: Map<number, Promise<void>>,
+    enqueueGates: Map<string, Promise<void>>
+  ) {
+    installCacheEngineWorker({
+      scope: this.scope,
+      createCore: (options) =>
+        new IntegrationCore(
+          epoch,
+          logs,
+          activationGates,
+          hostInitGates,
+          enqueueGates,
+          options.onOwnerLockAcquired
+        ),
+      ownerLockIsHeld: async () => true,
+    });
+  }
+
+  postMessage(message: unknown, transfer: Transferable[]): void {
+    this.scope.onmessage?.({
+      data: message,
+      ports: transfer,
+    } as unknown as MessageEvent);
+  }
+
+  terminate(): void {
+    this.terminated = true;
+  }
+
+  fail(message: string): void {
+    this.onerror?.call(
+      {} as AbstractWorker,
+      { message, preventDefault: vi.fn() } as unknown as ErrorEvent
+    );
+  }
+}
+
+class IntegrationSharedWorker {
+  onerror: ((this: AbstractWorker, event: ErrorEvent) => unknown) | null = null;
+  readonly port: LinkedMessagePort;
+
+  constructor(router: CoordinatorRouter) {
+    const channel = new LinkedMessageChannel();
+    this.port = channel.port1;
+    installCacheCoordinatorWorker({
+      endpoint: channel.port2 as unknown as MessagePort,
+      router,
+    });
+  }
+
+  restart(router: CoordinatorRouter): void {
+    // Safari preserves the page endpoint but reconnects it to a fresh global.
+    const previous = this.port.peer;
+    previous?.close();
+    previous?.dispatchEvent(
+      new MessageEvent('message', { data: EFFECT_WORKER_CLOSE_FRAME })
+    );
+    const endpoint = new LinkedMessagePort();
+    endpoint.peer = this.port;
+    this.port.peer = endpoint;
+    installCacheCoordinatorWorker({
+      endpoint: endpoint as unknown as MessagePort,
+      router,
+    });
+  }
+
+  fail(message: string): void {
+    this.onerror?.call(
+      {} as AbstractWorker,
+      { message, preventDefault: vi.fn() } as unknown as ErrorEvent
+    );
+  }
+}
+
+describe('worker CacheHost coordinator integration', () => {
+  const logs: RuntimeLog[] = [];
+  const dedicatedWorkers: IntegrationDedicatedWorker[] = [];
+  const sharedWorkers: IntegrationSharedWorker[] = [];
+  const activationGates = new Map<number, Promise<void>>();
+  const hostInitGates = new Map<number, Promise<void>>();
+  const enqueueGates = new Map<string, Promise<void>>();
+  let router: CoordinatorRouter;
+
+  beforeEach(() => {
+    localStorage.clear();
+    logs.length = 0;
+    dedicatedWorkers.length = 0;
+    sharedWorkers.length = 0;
+    activationGates.clear();
+    hostInitGates.clear();
+    enqueueGates.clear();
+    requestObservers.clear();
+    committedEnqueues.length = 0;
+    router = new CoordinatorRouter({
+      verifyTabLockHeld: async () => true,
+      watchTabLock: () => () => undefined,
+    });
+    vi.stubGlobal('MessageChannel', LinkedMessageChannel);
+    vi.stubGlobal(
+      'SharedWorker',
+      class {
+        onerror: IntegrationSharedWorker['onerror'] = null;
+        readonly port: LinkedMessagePort;
+
+        constructor() {
+          const worker = new IntegrationSharedWorker(router);
+          sharedWorkers.push(worker);
+          this.port = worker.port;
+          Object.defineProperty(this, 'onerror', {
+            get: () => worker.onerror,
+            set: (value) => {
+              worker.onerror = value;
+            },
+          });
+        }
+      }
+    );
+    vi.stubGlobal(
+      'Worker',
+      class {
+        readonly delegate: IntegrationDedicatedWorker;
+
+        constructor(_url: URL, options?: WorkerOptions) {
+          const epoch = Number(options?.name?.split(':').at(-1));
+          this.delegate = new IntegrationDedicatedWorker(
+            epoch,
+            logs,
+            activationGates,
+            hostInitGates,
+            enqueueGates
+          );
+          dedicatedWorkers.push(this.delegate);
+        }
+
+        get onerror(): IntegrationDedicatedWorker['onerror'] {
+          return this.delegate.onerror;
+        }
+
+        set onerror(value: IntegrationDedicatedWorker['onerror']) {
+          this.delegate.onerror = value;
+        }
+
+        get onmessageerror(): IntegrationDedicatedWorker['onmessageerror'] {
+          return this.delegate.onmessageerror;
+        }
+
+        set onmessageerror(value: IntegrationDedicatedWorker['onmessageerror'],) {
+          this.delegate.onmessageerror = value;
+        }
+
+        postMessage(message: unknown, transfer: Transferable[]): void {
+          this.delegate.postMessage(message, transfer);
+        }
+
+        terminate(): void {
+          this.delegate.terminate();
+        }
+      }
+    );
+    vi.stubGlobal('navigator', {
+      locks: {
+        request: async (
+          name: string,
+          _options: LockOptions,
+          callback: (lock: Lock | null) => unknown
+        ) => await callback({ name, mode: 'exclusive' } as Lock),
+      },
+      storage: { getDirectory: vi.fn() },
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('re-registers after the coordinator restarts on the existing port without replaying old reads', async () => {
+    localStorage.setItem('graphql-cache:scope', 'integration-scope');
+    const onInitializationError = vi.fn();
+    const record = vi.fn();
+    const host = createWorkerCacheHost({
+      scope: 'integration-scope',
+      requestTimeoutMs: 1_000,
+      onInitializationError,
+      telemetry: { record, flush: vi.fn() },
+    });
+    const clientId = host.clientId;
+    await host.readQuery({ opKey: 7, query: 'query Seven { seven }' });
+    const observed = Promise.withResolvers<void>();
+    requestObservers.add((entry) => {
+      if (entry.query === 'query Slow { slow }') observed.resolve();
+    });
+    const pending = host.readQuery({ opKey: 9, query: 'query Slow { slow }' });
+    const rejected = expect(pending).rejects.toMatchObject({
+      errorCode: 'owner-epoch-lost',
+    });
+    await observed.promise;
+    const affected = Promise.withResolvers<number[]>();
+    const generations: unknown[] = [];
+    host.onOpsAffected((keys) => affected.resolve(keys));
+    host.onCacheGenerationChanged((change) => generations.push(change));
+    router = new CoordinatorRouter({
+      verifyTabLockHeld: async () => true,
+      watchTabLock: () => () => undefined,
+    });
+    sharedWorkers[0]?.restart(router);
+    await rejected;
+    expect(await affected.promise).toEqual([7, 9]);
+    await expect(
+      host.readQuery({ opKey: 7, query: 'query Seven { seven }' })
+    ).resolves.toEqual({ kind: 'miss' });
+    expect(host.clientId).toBe(clientId);
+    expect(generations).toEqual([{ storage: 'reset' }]);
+    expect(record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'graphql_cache.owner',
+        ownerEvent: 'coordinator-restarted',
+        errorCode: 'transport',
+      })
+    );
+    expect(dedicatedWorkers.map((worker) => worker.epoch)).toEqual([1, 1]);
+    expect(dedicatedWorkers[0]?.terminated).toBe(true);
+    expect(logs.filter((entry) => entry.query?.includes('Slow'))).toHaveLength(
+      1
+    );
+    expect(localStorage.getItem('graphql-cache:scope')).toBe(
+      'integration-scope'
+    );
+    expect(onInitializationError).not.toHaveBeenCalled();
+    host.dispose();
+  });
+
+  it('retries registration when the coordinator restarts before acknowledging it', async () => {
+    const registering = Promise.withResolvers<void>();
+    const gate = deferred();
+    router = new CoordinatorRouter({
+      verifyTabLockHeld: async () => {
+        registering.resolve();
+        await gate.promise;
+        return true;
+      },
+      watchTabLock: () => () => undefined,
+    });
+    const onInitializationError = vi.fn();
+    const host = createWorkerCacheHost({
+      scope: 'integration-scope',
+      onInitializationError,
+    });
+    const read = host.readQuery({ query: 'query First { first }' });
+    await registering.promise;
+    router = new CoordinatorRouter({
+      verifyTabLockHeld: async () => true,
+      watchTabLock: () => () => undefined,
+    });
+    sharedWorkers[0]?.restart(router);
+    await expect(read).resolves.toEqual({ kind: 'miss' });
+    gate.resolve();
+    await host.readQuery({ query: 'query After { after }' });
+    expect(dedicatedWorkers).toHaveLength(1);
+    expect(onInitializationError).not.toHaveBeenCalled();
+    host.dispose();
+  });
+
+  it('fences an interrupted initialization and restores its active reads', async () => {
+    const initializing = Promise.withResolvers<void>();
+    const gate = deferred();
+    hostInitGates.set(1, gate.promise);
+    requestObservers.add((entry) => {
+      if (entry.kind === 'init' && entry.id !== 0) initializing.resolve();
+    });
+    const onInitializationError = vi.fn();
+    const host = createWorkerCacheHost({
+      scope: 'integration-scope',
+      onInitializationError,
+    });
+    const affected = Promise.withResolvers<number[]>();
+    host.onOpsAffected((keys) => affected.resolve(keys));
+    const read = host.readQuery({ opKey: 7, query: 'query First { first }' });
+    const rejected = expect(read).rejects.toMatchObject({
+      errorCode: 'owner-epoch-lost',
+    });
+    await initializing.promise;
+    hostInitGates.clear();
+    router = new CoordinatorRouter({
+      verifyTabLockHeld: async () => true,
+      watchTabLock: () => () => undefined,
+    });
+    sharedWorkers[0]?.restart(router);
+    await rejected;
+    expect(await affected.promise).toEqual([7]);
+    gate.resolve();
+    await expect(
+      host.readQuery({ query: 'query After { after }' })
+    ).resolves.toEqual({
+      kind: 'miss',
+    });
+    expect(dedicatedWorkers[0]?.terminated).toBe(true);
+    expect(sharedWorkers).toHaveLength(2);
+    expect(onInitializationError).not.toHaveBeenCalled();
+    host.dispose();
+  });
+
+  it('bounds coordinator restarts that prevent initialization without quarantining storage', async () => {
+    const gate = deferred();
+    hostInitGates.set(1, gate.promise);
+    requestObservers.add((entry) => {
+      if (entry.kind !== 'init' || entry.id === 0) return;
+      queueMicrotask(() => {
+        router = new CoordinatorRouter({
+          verifyTabLockHeld: async () => true,
+          watchTabLock: () => () => undefined,
+        });
+        sharedWorkers.at(-1)?.restart(router);
+      });
+    });
+    localStorage.setItem('graphql-cache:scope', 'integration-scope');
+    const fallback = Promise.withResolvers<Error>();
+    const host = createWorkerCacheHost({
+      scope: 'integration-scope',
+      onInitializationError: fallback.resolve,
+    });
+    await expect(
+      host.readQuery({ query: 'query First { first }' })
+    ).rejects.toMatchObject({
+      errorCode: 'owner-epoch-lost',
+    });
+    expect(await fallback.promise).toMatchObject({
+      errorCode: 'owner-epoch-lost',
+    });
+    expect(sharedWorkers).toHaveLength(3);
+    expect(dedicatedWorkers.every((worker) => worker.terminated)).toBe(true);
+    expect(localStorage.getItem('graphql-cache:scope')).toBe(
+      'integration-scope'
+    );
+    gate.resolve();
+    await expect(host.currentRevision()).rejects.toMatchObject({
+      errorCode: 'owner-epoch-lost',
+    });
+    host.dispose();
+  });
+
+  it.each([false, true])(
+    'never forwards or replays an admitted enqueue across coordinator restart (disposing: %s)',
+    async (disposing) => {
+      const admitted = Promise.withResolvers<void>();
+      const gate = deferred();
+      enqueueGates.set('HoldCoordinatorRestart', gate.promise);
+      requestObservers.add((entry) => {
+        if (entry.kind === 'enqueue-optimistic-mutation') admitted.resolve();
+      });
+      localStorage.setItem('graphql-cache:scope', 'integration-scope');
+      const onInitializationError = vi.fn();
+      const host = createWorkerCacheHost({
+        scope: 'integration-scope',
+        onInitializationError,
+      });
+      const recovered = Promise.withResolvers<void>();
+      host.onCacheGenerationChanged(() => recovered.resolve());
+      const completed = Promise.withResolvers<OperationResult>();
+      const { forwarded } = exchangeHarness(
+        host,
+        optimisticMutation(104, COORDINATOR_RESTART_MUTATION),
+        completed.resolve
+      );
+      await admitted.promise;
+      if (disposing) host.dispose();
+      router = new CoordinatorRouter({
+        verifyTabLockHeld: async () => true,
+        watchTabLock: () => () => undefined,
+      });
+      sharedWorkers[0]?.restart(router);
+      const result = await completed.promise;
+      expect(result.error?.networkError).toMatchObject({
+        errorCode: 'admitted-enqueue-uncertain',
+      });
+      expect(forwarded).toHaveLength(0);
+      expect(dedicatedWorkers[0]?.terminated).toBe(true);
+      gate.resolve();
+      if (disposing) {
+        await expect(host.currentRevision()).rejects.toMatchObject({
+          errorCode: 'owner-epoch-lost',
+        });
+        expect(sharedWorkers).toHaveLength(1);
+      } else {
+        await recovered.promise;
+        await host.currentRevision();
+        expect(sharedWorkers).toHaveLength(2);
+      }
+      expect(
+        logs.filter((entry) => entry.kind === 'enqueue-optimistic-mutation')
+      ).toHaveLength(1);
+      expect(localStorage.getItem('graphql-cache:scope')).toBe(
+        'integration-scope'
+      );
+      expect(onInitializationError).not.toHaveBeenCalled();
+      host.dispose();
+    }
+  );
+
+  it('registers, replaces without replay or duplicate reread, and retires gracefully', async () => {
+    const host = createWorkerCacheHost({
+      scope: 'integration-scope',
+      requestTimeoutMs: 1_000,
+    });
+    const order: string[] = [];
+    let replacementRead: Promise<unknown> | undefined;
+    host.onOpsAffected((keys) => {
+      order.push(`affected:${keys.join(',')}`);
+      replacementRead = host.readQuery({
+        opKey: keys[0],
+        query: 'query Replacement { replacement }',
+      });
+    });
+
+    expect(sharedWorkers).toHaveLength(0);
+    expect(dedicatedWorkers).toHaveLength(0);
+
+    await expect(
+      host.readQuery({ query: 'query Warm { warm }' })
+    ).resolves.toEqual({ kind: 'miss' });
+    await Promise.all([
+      host.readQuery({ opKey: 7, query: 'query RegisteredSeven { seven }' }),
+      host.readQuery({ opKey: 9, query: 'query RegisteredNine { nine }' }),
+    ]);
+    expect(sharedWorkers).toHaveLength(1);
+    expect(dedicatedWorkers.map((worker) => worker.epoch)).toEqual([1]);
+
+    const slowRead = host.readQuery({
+      opKey: 7,
+      query: 'query Slow { slow }',
+    });
+    const slowRejected = expect(slowRead).rejects.toMatchObject({
+      errorCode: 'owner-epoch-lost',
+    });
+    void slowRead.catch(() => order.push('old-request-rejected'));
+    await vi.waitFor(() =>
+      expect(
+        logs.filter(
+          ({ epoch, query }) => epoch === 1 && query?.includes('Slow')
+        )
+      ).toHaveLength(1)
+    );
+
+    dedicatedWorkers[0]?.fail('integration engine loss');
+    await slowRejected;
+    await vi.waitFor(() => expect(order).toContain('affected:7,9'));
+    await vi.waitFor(() => expect(replacementRead).toBeDefined());
+    await expect(replacementRead).resolves.toEqual({ kind: 'miss' });
+
+    expect(order).toEqual(['old-request-rejected', 'affected:7,9']);
+    expect(dedicatedWorkers.map((worker) => worker.epoch)).toEqual([1, 2]);
+    expect(dedicatedWorkers[0]?.terminated).toBe(true);
+    expect(logs.filter(({ query }) => query?.includes('Slow'))).toHaveLength(1);
+    expect(
+      logs.filter(
+        ({ epoch, kind, id }) => epoch === 2 && kind === 'init' && id !== 0
+      )
+    ).toHaveLength(1);
+    expect(
+      logs.filter(
+        ({ epoch, query }) =>
+          epoch === 2 && query === 'query Replacement { replacement }'
+      )
+    ).toHaveLength(1);
+
+    host.dispose();
+    await vi.waitFor(() => expect(dedicatedWorkers[1]?.terminated).toBe(true));
+    expect(logs).toContainEqual({ epoch: 2, kind: 'drain' });
+    expect(sharedWorkers[0]?.port.closed).toBe(true);
+  });
+
+  it('does not duplicate reads queued before or joined during replacement init', async () => {
+    const activationGate = deferred();
+    const hostInitGate = deferred();
+    activationGates.set(2, activationGate.promise);
+    hostInitGates.set(2, hostInitGate.promise);
+    const host = createWorkerCacheHost({
+      scope: 'integration-scope',
+      requestTimeoutMs: 1_000,
+    });
+    const affected: number[][] = [];
+    let replacementRead: Promise<unknown> | undefined;
+    host.onOpsAffected((keys) => {
+      affected.push(keys);
+      replacementRead = host.readQuery({
+        opKey: keys[0],
+        query: 'query UntouchedReplacement { ten }',
+      });
+    });
+    await Promise.all(
+      [8, 9, 10].map((opKey) =>
+        host.readQuery({
+          opKey,
+          query: `query Registered${opKey} { value${opKey} }`,
+        })
+      )
+    );
+
+    // No request from this host is in flight when the owner is lost, so the
+    // host remains ready while the coordinator enters resetting/activating.
+    dedicatedWorkers[0]?.fail('integration engine loss');
+    await vi.waitFor(() =>
+      expect(dedicatedWorkers.map(({ epoch }) => epoch)).toEqual([1, 2])
+    );
+    const queuedBefore = host.readQuery({
+      opKey: 8,
+      query: 'query QueuedBefore { eight }',
+    });
+    expect(
+      logs.filter(
+        ({ epoch, query }) => epoch === 2 && query?.includes('QueuedBefore')
+      )
+    ).toHaveLength(0);
+    activationGate.resolve();
+    await vi.waitFor(() =>
+      expect(
+        logs.filter(
+          ({ epoch, kind, id }) => epoch === 2 && kind === 'init' && id !== 0
+        )
+      ).toHaveLength(1)
+    );
+
+    const joinedDuring = host.readQuery({
+      opKey: 9,
+      query: 'query JoinedDuring { nine }',
+    });
+    hostInitGate.resolve();
+    await expect(queuedBefore).resolves.toEqual({ kind: 'miss' });
+    await expect(joinedDuring).resolves.toEqual({ kind: 'miss' });
+    await vi.waitFor(() => expect(affected).toEqual([[10]]));
+    await vi.waitFor(() => expect(replacementRead).toBeDefined());
+    await expect(replacementRead).resolves.toEqual({ kind: 'miss' });
+
+    expect(
+      logs.filter(
+        ({ epoch, query }) => epoch === 2 && query?.includes('QueuedBefore')
+      )
+    ).toHaveLength(1);
+    expect(
+      logs.filter(
+        ({ epoch, query }) => epoch === 2 && query?.includes('JoinedDuring')
+      )
+    ).toHaveLength(1);
+    expect(
+      logs.filter(
+        ({ epoch, query }) =>
+          epoch === 2 && query?.includes('UntouchedReplacement')
+      )
+    ).toHaveLength(1);
+    host.dispose();
+  });
+
+  it('keeps API forwarding at zero and preserves scope when pagehide abandons an admitted enqueue', async () => {
+    const gate = deferred();
+    enqueueGates.set('HoldPagehide', gate.promise);
+    localStorage.setItem('graphql-cache:scope', 'integration-scope');
+    const host = createWorkerCacheHost({ scope: 'integration-scope' });
+    const { forwarded, results } = exchangeHarness(
+      host,
+      optimisticMutation(101, PAGEHIDE_MUTATION)
+    );
+    await vi.waitFor(() =>
+      expect(
+        logs.filter(
+          ({ kind, query }) =>
+            kind === 'enqueue-optimistic-mutation' &&
+            query?.includes('HoldPagehide')
+        )
+      ).toHaveLength(1)
+    );
+
+    dispatchEvent(new Event('pagehide'));
+    await vi.waitFor(() => expect(results).toHaveLength(1));
+
+    expect(forwarded).toHaveLength(0);
+    expect(results[0]?.error?.networkError).toMatchObject({
+      errorCode: 'admitted-enqueue-uncertain',
+    });
+    expect(localStorage.getItem('graphql-cache:scope')).toBe(
+      'integration-scope'
+    );
+  });
+
+  it.each([false, true])(
+    'never forwards a committed standby enqueue after owner navigation (link patches: %s)',
+    async (withLinkPatches) => {
+      // Only the owner navigates; the standby's page/host remains alive.
+      const owner = createCacheCoordinatorPageAdapter({
+        scope: 'integration-scope',
+      });
+      await owner.start();
+      const admitted = Promise.withResolvers<void>();
+      requestObservers.add((entry) => {
+        if (entry.kind === 'enqueue-optimistic-mutation') admitted.resolve();
+      });
+      const gate = deferred();
+      enqueueGates.set('HoldStandby', gate.promise);
+      const standby = createWorkerCacheHost({ scope: 'integration-scope' });
+      const recovered = Promise.withResolvers<unknown>();
+      standby.onCacheGenerationChanged(recovered.resolve);
+      const completed = Promise.withResolvers<OperationResult | 'forwarded'>();
+      const { forwarded, results } = exchangeHarness(
+        standby,
+        optimisticMutation(
+          105,
+          STANDBY_MUTATION,
+          withLinkPatches
+            ? [
+                {
+                  query: 'query Items { items { id } }',
+                  variablesJson: '{}',
+                  path: [{ field: 'items' }],
+                  operation: { kind: 'remove', entityKey: 'Item:1' },
+                },
+              ]
+            : []
+        ),
+        completed.resolve,
+        () => completed.resolve('forwarded')
+      );
+      try {
+        await admitted.promise;
+        expect(committedEnqueues).toEqual([
+          '00000000-0000-4000-8000-000000000001',
+        ]);
+        await owner.dispose({ graceful: false, preserveDatabase: true });
+        expect(await completed.promise).toMatchObject({
+          error: { networkError: { errorCode: 'admitted-enqueue-uncertain' } },
+        });
+        expect(await recovered.promise).toEqual({ storage: 'preserved' });
+        await expect(
+          standby.readQuery({ query: 'query After { after }' })
+        ).resolves.toEqual({ kind: 'miss' });
+        gate.resolve();
+        expect(dedicatedWorkers.map(({ epoch }) => epoch)).toEqual([1, 2]);
+        expect(dedicatedWorkers[0]?.terminated).toBe(true);
+        expect(forwarded).toHaveLength(0);
+        expect(results).toHaveLength(1);
+        expect(committedEnqueues).toEqual([
+          '00000000-0000-4000-8000-000000000001',
+        ]);
+        expect(
+          logs.filter(({ kind }) => kind === 'enqueue-optimistic-mutation')
+        ).toHaveLength(1);
+      } finally {
+        gate.resolve();
+        standby.dispose();
+        await owner.dispose({ graceful: false, preserveDatabase: true });
+      }
+    }
+  );
+
+  it('bounds reads for existing and joining clients without terminating a blocked owner or replaying writes', async () => {
+    class Visibility extends EventTarget {
+      visibilityState: DocumentVisibilityState = 'visible';
+    }
+    const visibility = new Visibility();
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    const blocked = Promise.withResolvers<void>();
+    router = new CoordinatorRouter({
+      verifyTabLockHeld: async () => true,
+      watchTabLock: () => () => undefined,
+      handoffReadTimeoutMs: 0,
+      telemetry: {
+        record: (event) => {
+          if (event.ownerEvent === 'visibility-handoff-blocked')
+            blocked.resolve();
+        },
+        flush() {},
+      },
+    });
+    const owner = createCacheCoordinatorPageAdapter({
+      scope: 'integration-scope',
+      visibility,
+    });
+    await owner.start();
+    const standby = createWorkerCacheHost({ scope: 'integration-scope' });
+    await standby.readQuery({ opKey: 7, query: 'query Warm { warm }' });
+    const recovered = Promise.withResolvers<unknown>();
+    const affected = Promise.withResolvers<number[]>();
+    standby.onCacheGenerationChanged(recovered.resolve);
+    standby.onOpsAffected(affected.resolve);
+    const admitted = Promise.withResolvers<void>();
+    requestObservers.add((entry) => {
+      if (entry.kind === 'enqueue-optimistic-mutation') admitted.resolve();
+    });
+    const gate = deferred();
+    enqueueGates.set('HoldStandby', gate.promise);
+    const completed = Promise.withResolvers<OperationResult>();
+    const { forwarded } = exchangeHarness(
+      standby,
+      optimisticMutation(106, STANDBY_MUTATION),
+      completed.resolve
+    );
+    await admitted.promise;
+    visibility.visibilityState = 'hidden';
+    visibility.dispatchEvent(new Event('visibilitychange'));
+    await blocked.promise;
+    await expect(
+      standby.readQuery({ opKey: 9, query: 'query Blocked { blocked }' })
+    ).rejects.toThrow('owner handoff timeout');
+    const write = standby.writeQuery({
+      query: 'query Write { write }',
+      data: { write: true },
+    });
+    const onInitializationError = vi.fn();
+    const late = createWorkerCacheHost({
+      scope: 'integration-scope',
+      onInitializationError,
+    });
+    const lateAffected = Promise.withResolvers<number[]>();
+    late.onOpsAffected(lateAffected.resolve);
+    try {
+      await expect(
+        late.readQuery({ opKey: 11, query: 'query Late { late }' })
+      ).rejects.toThrow('owner handoff timeout');
+      expect(onInitializationError).not.toHaveBeenCalled();
+      expect(dedicatedWorkers).toHaveLength(1);
+      expect(dedicatedWorkers[0]?.terminated).toBe(false);
+      expect(router.snapshot()?.state.kind).toBe('draining');
+      expect(logs.filter(({ kind }) => kind === 'write')).toEqual([]);
+      expect(forwarded).toHaveLength(0);
+      gate.resolve();
+      expect((await completed.promise).error).toBeUndefined();
+      expect(await recovered.promise).toEqual({ storage: 'preserved' });
+      expect(await affected.promise).toEqual([7, 9]);
+      await write;
+      expect(await lateAffected.promise).toEqual([11]);
+      await expect(
+        late.readQuery({ query: 'query Recovered { recovered }' })
+      ).resolves.toEqual({ kind: 'miss' });
+      const ownerRead = Promise.withResolvers<unknown>();
+      owner.onmessage = ({ data }) => {
+        if ('id' in data && data.id === 55) ownerRead.resolve(data);
+      };
+      owner.postMessage({ id: 55, kind: 'current-revision' });
+      expect(await ownerRead.promise).toMatchObject({ ok: true });
+      expect(sharedWorkers[0]?.port.closed).toBe(false);
+      expect(dedicatedWorkers.map(({ epoch }) => epoch)).toEqual([1, 2]);
+      expect(dedicatedWorkers[0]?.terminated).toBe(true);
+      expect(logs.filter(({ kind }) => kind === 'write')).toMatchObject([
+        { epoch: 2 },
+      ]);
+      expect(
+        logs.filter(({ kind }) => kind === 'enqueue-optimistic-mutation')
+      ).toHaveLength(1);
+      expect(onInitializationError).not.toHaveBeenCalled();
+      expect(forwarded).toHaveLength(0);
+    } finally {
+      gate.resolve();
+      standby.dispose();
+      late.dispose();
+      await owner.dispose({ graceful: false, preserveDatabase: true });
+    }
+  });
+
+  it('keeps a standby connected until its admitted enqueue response settles', async () => {
+    const owner = createWorkerCacheHost({ scope: 'integration-scope' });
+    await owner.readQuery({ query: 'query OwnerWarm { ownerWarm }' });
+    const gate = deferred();
+    enqueueGates.set('HoldStandby', gate.promise);
+    const standby = createWorkerCacheHost({ scope: 'integration-scope' });
+    const { forwarded, results } = exchangeHarness(
+      standby,
+      optimisticMutation(102, STANDBY_MUTATION)
+    );
+    await vi.waitFor(() =>
+      expect(
+        logs.filter(
+          ({ kind, query }) =>
+            kind === 'enqueue-optimistic-mutation' &&
+            query?.includes('HoldStandby')
+        )
+      ).toHaveLength(1)
+    );
+
+    standby.dispose();
+    expect(sharedWorkers[1]?.port.closed).toBe(false);
+    gate.resolve();
+    await vi.waitFor(() => expect(results).toHaveLength(1));
+    await vi.waitFor(() => expect(sharedWorkers[1]?.port.closed).toBe(true));
+
+    expect(forwarded).toHaveLength(0);
+    expect(results[0]?.error).toBeUndefined();
+    owner.dispose();
+    await vi.waitFor(() => expect(dedicatedWorkers[0]?.terminated).toBe(true));
+  });
+
+  it('keeps API forwarding at zero when standby retirement transport fails', async () => {
+    const owner = createWorkerCacheHost({ scope: 'integration-scope' });
+    await owner.readQuery({ query: 'query OwnerWarm { ownerWarm }' });
+    const gate = deferred();
+    enqueueGates.set('HoldRetirementFailure', gate.promise);
+    localStorage.setItem('graphql-cache:scope', 'integration-scope');
+    const initializationErrors: string[] = [];
+    const standby = createWorkerCacheHost({
+      scope: 'integration-scope',
+      onInitializationError: (error) =>
+        initializationErrors.push(error.message),
+    });
+    const { forwarded, results } = exchangeHarness(
+      standby,
+      optimisticMutation(103, RETIREMENT_FAILURE_MUTATION)
+    );
+    await vi.waitFor(() =>
+      expect(
+        logs.filter(
+          ({ kind, query }) =>
+            kind === 'enqueue-optimistic-mutation' &&
+            query?.includes('HoldRetirementFailure')
+        )
+      ).toHaveLength(1)
+    );
+
+    standby.dispose();
+    expect(sharedWorkers[1]?.port.closed).toBe(false);
+    sharedWorkers[1]?.fail('standby SharedWorker failed during retirement');
+    await vi.waitFor(() => expect(results).toHaveLength(1));
+
+    expect(forwarded).toHaveLength(0);
+    expect(results[0]?.error?.networkError).toMatchObject({
+      errorCode: 'admitted-enqueue-uncertain',
+    });
+    await vi.waitFor(() => {
+      expect(localStorage.getItem('graphql-cache:scope')).toBe(
+        'quarantine:integration-scope'
+      );
+      expect(initializationErrors).toEqual([
+        'standby SharedWorker failed during retirement',
+      ]);
+    });
+    gate.resolve();
+    owner.dispose();
+    await vi.waitFor(() => expect(dedicatedWorkers[0]?.terminated).toBe(true));
+  });
+});

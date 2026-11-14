@@ -1,0 +1,426 @@
+import { useFlow, usePending } from '@app/observability/flow';
+/**
+ * The Solid face of {@link AgentSession}: the shared session for whatever id
+ * the block currently shows, as a reconciled ordered store of folded messages
+ * plus the signals a transcript renders from.
+ *
+ * Everything stateful about the session lives in the class. This only owns
+ * the store, applies fold events to it, and releases the acquisition when
+ * the id changes or the owner disposes.
+ */
+
+import {
+  AgentSession,
+  AgentSessionAccessDenied,
+  type AgentSessionRecord,
+  type IssueResult,
+} from '@core/agent-session/AgentSession';
+import {
+  forgetRecentlyViewed,
+  isRecentlyViewed,
+  retainRecentlyViewed,
+} from '@core/agent-session/recently-viewed';
+import { fireAndForget } from '@core/util/fireAndForget';
+import type { AgentSessionRenamedEvent } from '@queries/agent-session/realtime-protocol';
+import {
+  subscribeAgentSessionRenamed,
+  subscribeAgentSessionUpdated,
+} from '@queries/agent-session/session-metadata-sync';
+import type {
+  FoldedMessage,
+  FoldedStreamEvent,
+  SessionMetadata,
+  TurnState,
+} from '@service-agent-fold/generated/types';
+import { agentHarnessServiceClient } from '@service-agent-harness/client';
+import type {
+  AgentAction,
+  AgentSessionResponse,
+  SessionBot,
+} from '@service-agent-harness/generated/schemas';
+import {
+  type Accessor,
+  batch,
+  createMemo,
+  createResource,
+  createSignal,
+  onCleanup,
+  untrack,
+} from 'solid-js';
+import { createStore, reconcile, unwrap } from 'solid-js/store';
+import { issueSessionAction } from '../queries/issue-session-action';
+import type { EffortSelection } from '../state/session-config';
+import { configureSessionModel } from './configure-session-model';
+
+export type AgentSessionHandle = {
+  /** Session row, absent until the load resolves. */
+  session: Accessor<AgentSessionResponse | undefined>;
+  /** The bot the session runs as, absent until the load resolves. */
+  bot: Accessor<SessionBot | undefined>;
+  /** The fold's session metadata (title, model, turn, …), followed live. */
+  metadata: Accessor<SessionMetadata | undefined>;
+  /** The folded transcript, ordered by turn (prompt before reply). */
+  messages: Accessor<FoldedMessage[]>;
+  loadFailed: Accessor<boolean>;
+  /** The load failed because the viewer is not a participant (401/403). */
+  accessDenied: Accessor<boolean>;
+  /** Re-runs a failed load. */
+  retry: () => void;
+  /**
+   * Do something to the agent. Folded speculatively at once; settled by the
+   * log. `undefined` while the block has no session to act on.
+   */
+  issue: (action: AgentAction) => Promise<IssueResult> | undefined;
+  /** Confirm a model change, then validate and confirm its optional effort. */
+  selectModel: (model: string, effort?: EffortSelection) => Promise<void>;
+  /**
+   * Show a queued action as dispatched under the id the server holds it
+   * by. See {@link AgentSession.expect}.
+   */
+  expect: (actionId: string, action: AgentAction) => void;
+  /** Take a speculation back. See {@link AgentSession.retract}. */
+  retract: (actionId: string) => void;
+  /**
+   * The session's own turn state, read at call time - not reactive. It is
+   * ahead of `metadata().turn` by the worker round trip: a prompt just
+   * issued or expected reads `starting` here before the fold has reported
+   * it. See {@link AgentSession.currentTurn}.
+   */
+  currentTurn: () => TurnState;
+  /**
+   * Adopt a newer snapshot of this session (the bounded external-url poll).
+   * No-op when the payload is for a different session.
+   */
+  applySnapshot: (session: AgentSessionResponse) => void;
+};
+
+/** Prompt sorts before reply within a turn. */
+function authorRank(message: FoldedMessage): number {
+  return message.author.kind === 'user' ? 0 : 1;
+}
+
+function compareMessages(a: FoldedMessage, b: FoldedMessage): number {
+  if (a.turn !== b.turn) return a.turn - b.turn;
+  return authorRank(a) - authorRank(b);
+}
+
+/**
+ * `sessionId` is absent while a just-created session's `POST` is still on the
+ * wire (`pending-session.ts`). `createResource` treats an absent source as
+ * "nothing to fetch", so the block simply renders its empty transcript until
+ * the id lands and the load runs itself.
+ */
+export function createAgentSession(
+  sessionId: Accessor<string | undefined>,
+  options: {
+    /** The viewer, so a speculated prompt is attributed as the log will. */
+    userId: Accessor<string | undefined>;
+    /** Keeps initial readiness open while a new session is provisioned. */
+    provisioning: Accessor<boolean>;
+    /** This view now owns a reference; a pending navigation may release its own. */
+    onAcquire?: () => void;
+  }
+): AgentSessionHandle {
+  // Whether this block went on screen before it had a session to load.
+  //
+  // `resource.latest` falls back to a *suspending* read until the resource has
+  // resolved once, and suspending hands the block's
+  // `<Suspense fallback={<LoadingBlock />}>` a promise: Solid swaps in the
+  // fallback, which detaches the whole block subtree and re-attaches it when
+  // the fetch lands. A cold open has nothing on screen to lose and wants that
+  // skeleton. This block does: it opened on a placeholder minutes before the
+  // create resolved, the user has been typing into its composer the whole
+  // time, and the detach blanks the transcript and drops the caret to
+  // `<body>`. Absent is a state it already renders — that is the whole point
+  // of the placeholder — so report that for the first fetch instead.
+  const loadSpan = useFlow().span;
+  const openedPending = sessionId() === undefined;
+
+  const [list, setList] = createStore<FoldedMessage[]>([]);
+  const [bot, setBot] = createSignal<SessionBot>();
+  const [metadata, setMetadata] = createSignal<SessionMetadata>();
+
+  // A whole new view of the conversation: what a load reports, and what every
+  // rebase reports while something is speculated.
+  //
+  // Keyed by each message's stable `key` (`<turn>:<author kind>`), so a row
+  // the new view still holds stays the same store object, reconciled in place,
+  // and only rows that came or went mount or unmount. A rebase happens on
+  // every confirmed frame while an action is pending; reconciling by position
+  // or swapping in fresh objects would remount the transcript and replay the
+  // whole turn. Not `merge`: a row can move.
+  const replace = (messages: FoldedMessage[]) =>
+    setList(reconcile(messages, { key: 'key' }));
+
+  // One streamed message. The fold appends in transcript order, so the tail is
+  // the only row this reads: settled history is never walked per event.
+  const upsert = (message: FoldedMessage) => {
+    const last = list.at(-1);
+    if (last?.key === message.key) {
+      setList(list.length - 1, reconcile(message));
+    } else if (!last || compareMessages(last, message) < 0) {
+      setList(list.length, message);
+    } else {
+      // Out of order or an earlier row's update: rare, so take the keyed
+      // path over the whole list.
+      const next = unwrap(list).filter((row) => row.key !== message.key);
+      const at = next.findIndex((row) => compareMessages(row, message) > 0);
+      next.splice(at === -1 ? next.length : at, 0, message);
+      replace(next);
+    }
+  };
+
+  const applyEvents = (events: FoldedStreamEvent[]) =>
+    batch(() => {
+      for (const event of events) {
+        if (event.kind === 'replace') replace(event.messages);
+        else if (event.kind === 'metadata') setMetadata(event.metadata);
+        else upsert(event.message);
+      }
+    });
+
+  // The shared session for the current id. A memo rather than an effect so
+  // acquisition and release track the id exactly, with nothing to schedule.
+  const live = createMemo(() => {
+    const id = sessionId();
+    if (!id) return undefined;
+    const session = loadSpan.run(() => AgentSession.acquire(id));
+    const unsubscribe = session.subscribe(applyEvents);
+    onCleanup(() => {
+      unsubscribe();
+      session.release();
+    });
+    options.onAcquire?.();
+    return session;
+  });
+
+  let latestRename: AgentSessionRenamedEvent | undefined;
+  let renameRefresh = 0;
+  /**
+   * The fetch failed after a cached transcript was already on screen. The
+   * resource resolved with the cached row, so its own error never fires;
+   * this carries the failure the same way.
+   */
+  const [settleFailure, setSettleFailure] = createSignal<unknown>();
+
+  const superseded = (session: AgentSession) =>
+    untrack(sessionId) !== session.id;
+
+  /**
+   * Show what the machine holds for `record`. Read after every input pushed
+   * so far, and applied before any event that arrives later: events between
+   * subscribe and here upserted into the list, and this replaces the list
+   * with a view that includes them.
+   */
+  const show = async (
+    session: AgentSession,
+    record: AgentSessionRecord,
+    kind: 'cached' | 'fetched'
+  ) => {
+    const snapshot = await session.snapshot();
+    if (superseded(session)) return;
+    batch(() => {
+      setBot(record.bot);
+      setMetadata(snapshot.metadata);
+      replace(snapshot.messages);
+    });
+    session.rendered(kind, snapshot.messages);
+  };
+
+  /** The fetched session, shown, with a rename that landed meanwhile kept. */
+  const settle = async (
+    session: AgentSession,
+    renameRefreshAtStart: number
+  ): Promise<AgentSessionResponse> => {
+    const record = await session.load();
+    if (superseded(session)) return record.session;
+    await show(session, record, 'fetched');
+    retainRecentlyViewed(session.id);
+    return renameRefresh > renameRefreshAtStart &&
+      latestRename?.agentSessionId === session.id
+      ? { ...record.session, name: latestRename.name }
+      : record.session;
+  };
+
+  const [resource, { mutate, refetch }] = createResource(
+    live,
+    async (session) => {
+      const renameRefreshAtStart = renameRefresh;
+      const reused = isRecentlyViewed(session.id);
+
+      batch(() => {
+        setList(reconcile([]));
+        setBot(undefined);
+        setMetadata(undefined);
+        setSettleFailure(undefined);
+      });
+
+      // Held open since an earlier view: the fold is current, so it goes
+      // straight up. The row is from that view, and is read again behind it.
+      if (reused) {
+        const row = await settle(session, renameRefreshAtStart);
+        // Started as the resource resolves, so its answer cannot land first.
+        if (!superseded(session)) {
+          fireAndForget(revalidateRow(session), 'agent-session');
+        }
+        return row;
+      }
+
+      const cached = await session.warm();
+      if (!cached || superseded(session)) {
+        return settle(session, renameRefreshAtStart);
+      }
+      // A transcript from the last open goes up now; the fetched one
+      // replaces it when it lands, through the same store, so the resource
+      // resolves here and the fetch settles it in the background.
+      await show(session, cached, 'cached');
+      fireAndForget(
+        settleInBackground(session, renameRefreshAtStart),
+        'agent-session'
+      );
+      return cached.session;
+    }
+  );
+
+  usePending(
+    'agent.transcript',
+    () => options.provisioning() || resource.loading
+  );
+
+  async function settleInBackground(
+    session: AgentSession,
+    renameRefreshAtStart: number
+  ): Promise<void> {
+    try {
+      const fetched = await settle(session, renameRefreshAtStart);
+      if (!superseded(session)) mutate(fetched);
+    } catch (error) {
+      if (!superseded(session)) setSettleFailure(error);
+    }
+  }
+
+  onCleanup(
+    subscribeAgentSessionRenamed((event) => {
+      if (event.agentSessionId !== sessionId()) return;
+      const run = ++renameRefresh;
+      fireAndForget(
+        agentHarnessServiceClient.get(event.agentSessionId).then((session) => {
+          if (
+            session.isErr() ||
+            run !== renameRefresh ||
+            event.agentSessionId !== sessionId()
+          )
+            return;
+          latestRename = {
+            agentSessionId: event.agentSessionId,
+            name: session.value.name,
+          };
+          mutate((current) =>
+            current ? { ...current, name: session.value.name } : current
+          );
+        }),
+        'agent-session'
+      );
+    })
+  );
+
+  let updateRefresh = 0;
+  onCleanup(
+    subscribeAgentSessionUpdated((event) => {
+      if (event.agentSessionId !== sessionId()) return;
+      const run = ++updateRefresh;
+      fireAndForget(
+        (async () => {
+          const session = await agentHarnessServiceClient.get(
+            event.agentSessionId
+          );
+          if (
+            session.isErr() ||
+            run !== updateRefresh ||
+            event.agentSessionId !== sessionId()
+          ) {
+            return;
+          }
+          mutate((current) => (current ? session.value : current));
+        })(),
+        'agent-session'
+      );
+    })
+  );
+
+  /**
+   * The row of a session held open since an earlier view, read again. A
+   * refusal ends the reopen as a denied load would have; a newer rename or
+   * update wins over this read.
+   */
+  async function revalidateRow(session: AgentSession): Promise<void> {
+    const run = ++updateRefresh;
+    const renameRefreshAtStart = renameRefresh;
+    const row = await session.readRow();
+    if (run !== updateRefresh || superseded(session)) return;
+    if (row.isErr()) {
+      if (row.error === 'denied') {
+        forgetRecentlyViewed(session.id);
+        setSettleFailure(new AgentSessionAccessDenied(session.id));
+      }
+      return;
+    }
+    if (renameRefresh !== renameRefreshAtStart) return;
+    mutate((current) => (current ? row.value : current));
+  }
+
+  // A first fetch would suspend; see `openedPending`.
+  //
+  // Once the load has failed, `resource.latest` rethrows the error on every
+  // read. Nothing above the block catches it, so the throw escapes Solid's
+  // update queue before the enclosing `<Suspense>` swaps its fallback back
+  // out, and the block shows a spinner forever instead of its error panel.
+  // The failure is reported through `loadFailed`; absent is what the row is.
+  const failure = () => resource.error ?? settleFailure();
+  const session = () => {
+    if (failure() !== undefined) return undefined;
+    if (openedPending && resource.state === 'pending') return undefined;
+    return resource.latest;
+  };
+
+  return {
+    session,
+    bot,
+    metadata,
+    messages: () => list,
+    loadFailed: () => failure() !== undefined,
+    accessDenied: () => failure() instanceof AgentSessionAccessDenied,
+    retry: () => fireAndForget(refetch(), 'agent-session'),
+    issue: (action) => {
+      const current = live();
+      return current
+        ? issueSessionAction(current, action, { userId: options.userId() })
+        : undefined;
+    },
+    selectModel: async (model, effort) => {
+      const current = live();
+      if (!current) throw new Error('The agent session is not ready.');
+      await configureSessionModel(
+        {
+          id: current.id,
+          issue: (action) =>
+            issueSessionAction(current, action, { userId: options.userId() }),
+          snapshot: () => current.snapshot(),
+          subscribe: (listener) => current.subscribe(listener),
+          refresh: () => current.refresh(),
+          retract: (actionId) => current.retract(actionId),
+        },
+        model,
+        effort
+      );
+    },
+    expect: (actionId, action) =>
+      live()?.expect(actionId, action, { userId: options.userId() }),
+    retract: (actionId) => live()?.retract(actionId),
+    currentTurn: () => untrack(live)?.currentTurn() ?? 'idle',
+    applySnapshot: (snapshot) => {
+      if (sessionId() !== snapshot.id) return;
+      mutate(snapshot);
+    },
+  };
+}

@@ -1,0 +1,291 @@
+//! Authenticated, bounded HTTP calls to the scheduled-action service.
+use crate::domain::{
+    RoutineConfiguration, RoutineDetails, RoutineInfo, RoutineRunStarted, RoutineService,
+};
+use anyhow::{Context, Result, bail, ensure};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use macro_authorization::{INTERNAL_API_KEY_HEADER, INTERNAL_MACRO_USER_ID_HEADER};
+use macro_user_id::user_id::MacroUserIdStr;
+use reqwest::{Client, Method, Url, header::HeaderValue};
+use serde::Deserialize;
+use serde_json::Value;
+use std::{sync::Arc, time::Duration};
+use uuid::Uuid;
+
+/// The scheduler's rejection text, which names a safe cause such as a deleted
+/// agent. Bounded so a proxy's error page cannot flood the tool result.
+async fn rejection_reason(mut response: reqwest::Response) -> String {
+    const MAX_REASON_BYTES: usize = 300;
+    let mut body = Vec::new();
+    while body.len() < MAX_REASON_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    let reason = String::from_utf8_lossy(&body[..body.len().min(MAX_REASON_BYTES)]);
+    let reason = reason.trim();
+    if reason.is_empty() {
+        "no reason given".to_owned()
+    } else {
+        reason.to_owned()
+    }
+}
+
+/// Reusable client; internal credentials never come from model arguments.
+pub struct RoutineClient {
+    client: Client,
+    base: Url,
+    key: HeaderValue,
+}
+impl RoutineClient {
+    /// Build with a trusted service URL and internal key from application configuration.
+    pub fn new(base: &str, key: &str) -> Result<Arc<Self>> {
+        let base = Url::parse(&format!("{}/", base.trim_end_matches('/')))?;
+        ensure!(
+            matches!(base.scheme(), "http" | "https")
+                && base.host_str().is_some()
+                && base.username().is_empty()
+                && base.password().is_none()
+                && base.query().is_none()
+                && base.fragment().is_none(),
+            "Invalid routine service URL"
+        );
+        ensure!(
+            !key.trim().is_empty(),
+            "Routine service credentials are required"
+        );
+        let mut key = HeaderValue::from_str(key)?;
+        key.set_sensitive(true);
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()?;
+        Ok(Arc::new(Self { client, base, key }))
+    }
+    async fn request<T: serde::de::DeserializeOwned>(
+        &self,
+        user: &MacroUserIdStr<'static>,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<T> {
+        let body = self.request_bytes(user, method, path, body).await?;
+        serde_json::from_slice(&body).context("Invalid routine service response")
+    }
+    async fn request_bytes(
+        &self,
+        user: &MacroUserIdStr<'static>,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Vec<u8>> {
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        macro_tower_layers::inject_trace_headers(&mut trace_headers);
+        let mut request = self
+            .client
+            .request(method, self.base.join(path)?)
+            .headers(trace_headers)
+            .header(INTERNAL_API_KEY_HEADER, self.key.clone())
+            .header(INTERNAL_MACRO_USER_ID_HEADER, user.as_ref());
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let mut response = request.send().await.context("Routine request failed. Check ListRoutines before retrying a creation; the write may have succeeded.")?;
+        let status = response.status().as_u16();
+        match status {
+            200..=299 => {
+                const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+                ensure!(
+                    response
+                        .content_length()
+                        .is_none_or(|length| length <= MAX_RESPONSE_BYTES as u64),
+                    "Routine response is too large."
+                );
+                let mut body = Vec::new();
+                while let Some(chunk) = response.chunk().await? {
+                    ensure!(
+                        body.len() + chunk.len() <= MAX_RESPONSE_BYTES,
+                        "Routine response is too large."
+                    );
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(body)
+            }
+            400 => bail!(
+                "Invalid routine ({}). Check the triggers and steps; select agents from ListAgents using their bot.botId.",
+                rejection_reason(response).await
+            ),
+            422 => bail!(
+                "Invalid routine configuration, or a required app is not connected or unusable by the selected agent ({}). Ask the user to connect each app in requiredApps (DiscoverConnectors gives a link) or remove it.",
+                rejection_reason(response).await
+            ),
+            401 | 403 | 404 => bail!(
+                "Routine or target is unavailable to this user ({}).",
+                rejection_reason(response).await
+            ),
+            402 => bail!("The user's AI allowance is exhausted, so the routine cannot run now."),
+            409 => bail!("Routine is running or changed. Read it again before editing."),
+            _ => bail!(
+                "Routine service is unavailable. Check ListRoutines before retrying a creation."
+            ),
+        }
+    }
+}
+#[derive(Deserialize)]
+struct WireRoutine {
+    id: Uuid,
+    name: String,
+    enabled: bool,
+    trigger: Value,
+    task: Value,
+    next_run_at: Option<DateTime<Utc>>,
+}
+impl From<WireRoutine> for RoutineInfo {
+    fn from(r: WireRoutine) -> Self {
+        let configuration = RoutineConfiguration::from_saved(&r.name, &r.trigger, &r.task);
+        Self {
+            id: r.id,
+            name: r.name,
+            enabled: r.enabled,
+            not_editable_here: configuration.as_ref().err().map(ToString::to_string),
+            configuration: configuration.ok(),
+            next_run_at: r.next_run_at,
+        }
+    }
+}
+#[async_trait]
+impl RoutineService for RoutineClient {
+    async fn create(
+        &self,
+        user: &MacroUserIdStr<'static>,
+        config: &RoutineConfiguration,
+    ) -> Result<RoutineInfo> {
+        let mut body = configuration_body(config, Utc::now(), None)?;
+        body["enabled"] = true.into();
+        Ok(self
+            .request::<WireRoutine>(user, Method::POST, "scheduled-actions", Some(body))
+            .await?
+            .into())
+    }
+    async fn list(&self, user: &MacroUserIdStr<'static>) -> Result<Vec<RoutineInfo>> {
+        Ok(self
+            .request::<Vec<WireRoutine>>(
+                user,
+                Method::GET,
+                "scheduled-actions?include_events=true",
+                None,
+            )
+            .await?
+            .into_iter()
+            .rev()
+            .map(Into::into)
+            .collect())
+    }
+    async fn read(&self, user: &MacroUserIdStr<'static>, id: Uuid) -> Result<RoutineDetails> {
+        let routine = self
+            .request::<WireRoutine>(user, Method::GET, &format!("scheduled-actions/{id}"), None)
+            .await?
+            .into();
+        let runs = self
+            .request::<Vec<Value>>(
+                user,
+                Method::GET,
+                &format!("scheduled-actions/{id}/history"),
+                None,
+            )
+            .await?
+            .into_iter()
+            .take(50)
+            .collect();
+        Ok(RoutineDetails { routine, runs })
+    }
+    async fn update(
+        &self,
+        user: &MacroUserIdStr<'static>,
+        id: Uuid,
+        config: &RoutineConfiguration,
+    ) -> Result<RoutineInfo> {
+        // A replacement is built against what is saved: it must not drop what
+        // these tools can't state, and it keeps the saved apps unless told.
+        let saved = self
+            .request::<WireRoutine>(user, Method::GET, &format!("scheduled-actions/{id}"), None)
+            .await?;
+        RoutineConfiguration::from_saved(&saved.name, &saved.trigger, &saved.task)?;
+        Ok(self
+            .request::<WireRoutine>(
+                user,
+                Method::PUT,
+                &format!("scheduled-actions/{id}"),
+                Some(configuration_body(config, Utc::now(), Some(&saved.task))?),
+            )
+            .await?
+            .into())
+    }
+    async fn set_enabled(
+        &self,
+        user: &MacroUserIdStr<'static>,
+        id: Uuid,
+        enabled: bool,
+    ) -> Result<RoutineInfo> {
+        Ok(self
+            .request::<WireRoutine>(
+                user,
+                Method::PUT,
+                &format!("scheduled-actions/{id}/enabled"),
+                Some(serde_json::json!({ "enabled": enabled })),
+            )
+            .await?
+            .into())
+    }
+    async fn delete(&self, user: &MacroUserIdStr<'static>, id: Uuid) -> Result<()> {
+        self.request_bytes(
+            user,
+            Method::DELETE,
+            &format!("scheduled-actions/{id}"),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+    async fn run_now(&self, user: &MacroUserIdStr<'static>, id: Uuid) -> Result<RoutineRunStarted> {
+        let execution = self
+            .request::<WireExecution>(
+                user,
+                Method::POST,
+                &format!("scheduled-actions/{id}/execute"),
+                None,
+            )
+            .await?;
+        Ok(RoutineRunStarted {
+            routine_id: execution.action_id,
+            resource: execution.resource,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct WireExecution {
+    action_id: Uuid,
+    #[serde(default)]
+    resource: Option<Value>,
+}
+fn configuration_body(
+    config: &RoutineConfiguration,
+    now: DateTime<Utc>,
+    saved_task: Option<&Value>,
+) -> Result<Value> {
+    config.validate(now)?;
+    Ok(serde_json::json!({
+        "name": config.name,
+        "kind": "Agent",
+        "trigger": config.trigger(now)?,
+        "task": config.task(saved_task),
+    }))
+}
+
+#[cfg(test)]
+mod test;

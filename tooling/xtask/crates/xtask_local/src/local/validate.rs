@@ -1,0 +1,463 @@
+//! `validate-local-compose` and `validate-local-env`.
+//!
+//! These are the durable guards behind the spec's hard invariants: no Rust
+//! service builds in Docker for the local path, and local mode never requires
+//! Pulumi / real AWS / real SES.
+
+#[cfg(test)]
+mod test;
+
+use anyhow::{Context, Result, bail};
+use serde_json::Value;
+
+use super::build::{BinariesDir, runtime_image_tag};
+use super::computers::{Computers, Fleet};
+use super::google_emulator;
+use super::instance::Port;
+use super::inventory::services_for_mode;
+use super::local_env::Tunnels;
+use super::microsoft_emulator;
+use super::{Mode, arch, env_layer, gen_compose, instance::Instance, proxy, workspace_root};
+
+/// Required non-Rust services that must be present in the rendered local
+/// compose.
+const REQUIRED_NON_RUST: &[&str] = &[
+    "postgres",
+    "redis",
+    "kafka",
+    "fusionauth",
+    "localstack",
+    "mailpit",
+];
+
+/// Render the merged compose config and assert every Rust service is a
+/// runtime-image container with no `build:` and an `/app/out` mount, and that
+/// the required non-Rust services exist. Runs once per frontend flavor
+/// (static bundle vs dev server): the validator cannot know which one the
+/// developer will launch, so it must hold for both.
+pub fn local_compose(instance: &Instance, mode: Mode, computers: &Computers) -> Result<()> {
+    for static_frontend in [true, false] {
+        local_compose_flavor(instance, mode, static_frontend, computers)?;
+    }
+    Ok(())
+}
+
+fn local_compose_flavor(
+    instance: &Instance,
+    mode: Mode,
+    static_frontend: bool,
+    computers: &Computers,
+) -> Result<()> {
+    // Generate the override against the expected (possibly not-yet-built)
+    // target dir — config rendering does not need the binaries to exist.
+    let target = arch::detect()?;
+    let binaries = BinariesDir::TargetDir(workspace_root().join(target.debug_dir()));
+    // Resolve first: the gmail_forwarder sidecar is gated on the resolved env
+    // exactly as `prepare` gates it, so the validated compose matches what a
+    // real bring-up with this env would generate.
+    let resolved = env_layer::resolve(
+        mode,
+        instance,
+        env_layer::ResolveOptions {
+            no_doppler: true,
+            env_file: None,
+            static_frontend,
+            tunnels: Tunnels::default(),
+            wire_otel: true,
+            computers,
+        },
+    )?;
+    let sidecars = gen_compose::Sidecars::from_env(mode, &resolved.merged);
+    gen_compose::generate(
+        mode,
+        instance,
+        &binaries,
+        static_frontend,
+        sidecars,
+        computers,
+    )?;
+
+    let files = gen_compose::compose_files(instance);
+    let mut cmd = gen_compose::docker_compose(instance, &files, &resolved.generated_path);
+    cmd.args(["config", "--format", "json"]);
+    let out = cmd.output().context("running `docker compose config`")?;
+    if !out.status.success() {
+        bail!(
+            "`docker compose config` failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let cfg: Value = serde_json::from_slice(&out.stdout).context("parsing compose config json")?;
+    let services = cfg.get("services").and_then(Value::as_object);
+    let Some(services) = services else {
+        bail!("rendered compose has no services");
+    };
+
+    let runtime_image = runtime_image_tag(super::arch::detect()?)?;
+    let mut failures: Vec<String> = Vec::new();
+    for svc in services_for_mode(mode) {
+        let Some(node) = services.get(svc.compose_name) else {
+            failures.push(format!(
+                "Rust service '{}' is missing from the rendered compose",
+                svc.compose_name
+            ));
+            continue;
+        };
+        if node.get("build").map(|b| !b.is_null()).unwrap_or(false) {
+            failures.push(format!(
+                "'{}' still has a build: stanza — the local path must mount prebuilt binaries, not build in Docker",
+                svc.compose_name
+            ));
+        }
+        match node.get("image").and_then(Value::as_str) {
+            Some(img) if img == runtime_image => {}
+            other => failures.push(format!(
+                "'{}' image is {:?}, expected {runtime_image}",
+                svc.compose_name, other
+            )),
+        }
+        if !has_app_out_mount(node) {
+            failures.push(format!(
+                "'{}' is missing the /app/out bind mount",
+                svc.compose_name
+            ));
+        }
+    }
+    for required in REQUIRED_NON_RUST {
+        if !services.contains_key(*required) {
+            failures.push(format!("required non-Rust service '{required}' is absent"));
+        }
+    }
+    // The sidecar is not in `services_for_mode` (modes-less inventory entry) —
+    // assert its presence and runtime-image shape when the env gates it in.
+    if sidecars.gmail_emulator {
+        match services.get(google_emulator::SERVICE) {
+            None => failures.push(
+                "gmail_emulator sidecar is absent although no real Google client is configured"
+                    .into(),
+            ),
+            Some(node) if !has_app_out_mount(node) => {
+                failures.push("gmail_emulator is missing the /app/out bind mount".into());
+            }
+            Some(_) => {}
+        }
+    }
+    if sidecars.outlook_emulator {
+        match services.get(microsoft_emulator::SERVICE) {
+            None => failures.push(
+                "outlook_emulator sidecar is absent although no real Microsoft client is configured"
+                    .into(),
+            ),
+            Some(node) if !has_app_out_mount(node) => {
+                failures.push("outlook_emulator is missing the /app/out bind mount".into());
+            }
+            Some(_) => {}
+        }
+    }
+    if sidecars.gmail_forwarder {
+        match services.get("gmail_forwarder") {
+            None => failures.push(
+                "gmail_forwarder sidecar is absent although GMAIL_FORWARDER_SA_KEY is set".into(),
+            ),
+            Some(node) if !has_app_out_mount(node) => {
+                failures.push("gmail_forwarder is missing the /app/out bind mount".into());
+            }
+            Some(_) => {}
+        }
+    }
+
+    failures.extend(computers_failures(services, computers));
+
+    if !failures.is_empty() {
+        bail!(
+            "validate-local-compose ({}) failed:\n  - {}",
+            flavor_label(static_frontend),
+            failures.join("\n  - ")
+        );
+    }
+    println!(
+        "validate-local-compose ({}): OK ({} Rust services{}, computers {:?})",
+        flavor_label(static_frontend),
+        services_for_mode(mode).count(),
+        [
+            (sidecars.gmail_emulator, " + gmail_emulator"),
+            (sidecars.outlook_emulator, " + outlook_emulator"),
+            (sidecars.gmail_forwarder, " + gmail_forwarder"),
+        ]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, label)| *label)
+        .collect::<String>(),
+        computers.fleet(),
+    );
+    Ok(())
+}
+
+/// The harness runs the computer control plane: it must see the fleet's env,
+/// and the Docker fleet's enrollment directory at its host path.
+fn computers_failures(
+    services: &serde_json::Map<String, Value>,
+    computers: &Computers,
+) -> Vec<String> {
+    let Some(harness) = services.get("agent_harness_service") else {
+        return Vec::new();
+    };
+    let env = |key: &str| {
+        harness
+            .get("environment")
+            .and_then(|environment| environment.get(key))
+            .and_then(Value::as_str)
+    };
+    let mut failures = Vec::new();
+    match computers.fleet() {
+        Fleet::Off => {
+            if harness
+                .get("environment")
+                .and_then(Value::as_object)
+                .is_some_and(|environment| {
+                    environment.keys().any(|key| key.starts_with("COMPUTERS_"))
+                })
+            {
+                failures.push(
+                    "no fleet is selected but computer infrastructure settings remain".into(),
+                );
+            }
+        }
+        Fleet::Docker => {
+            if env("COMPUTERS_FLEET") != Some("docker") {
+                failures.push("agent_harness_service lacks COMPUTERS_FLEET=docker".into());
+            }
+            let dir = computers.enrollment_dir().display().to_string();
+            if env("COMPUTERS_DOCKER_ENROLLMENT_DIR") != Some(dir.as_str()) {
+                failures.push(format!("COMPUTERS_DOCKER_ENROLLMENT_DIR is not {dir}"));
+            }
+            if !mounts(harness, &dir, &dir) {
+                failures.push(format!(
+                    "agent_harness_service does not mount {dir} at itself"
+                ));
+            }
+            if !mounts(harness, "/var/run/docker.sock", "/var/run/docker.sock") {
+                failures.push("agent_harness_service does not mount the Docker socket".into());
+            }
+        }
+        Fleet::Incus => {
+            if env("COMPUTERS_FLEET") != Some("incus") {
+                failures.push("agent_harness_service lacks COMPUTERS_FLEET=incus".into());
+            }
+            for sidecar in ["computers_incus_uplink", "computers_incus_relay"] {
+                if services.contains_key(sidecar) {
+                    failures.push(format!(
+                        "obsolete Incus relay sidecar '{sidecar}' is present"
+                    ));
+                }
+            }
+            let direct_endpoint = env("COMPUTERS_INCUS_URL")
+                .and_then(|url| url.strip_prefix("https://"))
+                .and_then(|endpoint| endpoint.strip_suffix(":8443"))
+                .is_some_and(|address| address.parse::<std::net::Ipv4Addr>().is_ok());
+            if !direct_endpoint {
+                failures.push("COMPUTERS_INCUS_URL must be https://<runtime IPv4>:8443".into());
+            }
+        }
+    }
+    if computers.fleet() != Fleet::Off {
+        for name in [
+            "OVERRIDE_AGENT_HARNESS_EGRESS_URL",
+            "OVERRIDE_AGENT_HARNESS_SERVICE_URL",
+            "OVERRIDE_AUTH_SERVICE_URL",
+            "OVERRIDE_DOCUMENT_STORAGE_SERVICE_URL",
+            "OVERRIDE_APP_SERVICE_URL",
+        ] {
+            if env(name).is_none_or(str::is_empty) {
+                failures.push(format!("agent_harness_service lacks {name}"));
+            }
+        }
+    }
+    failures
+}
+
+fn mounts(service: &Value, source: &str, target: &str) -> bool {
+    service
+        .get("volumes")
+        .and_then(Value::as_array)
+        .is_some_and(|volumes| {
+            volumes.iter().any(|volume| {
+                volume.get("source").and_then(Value::as_str) == Some(source)
+                    && volume.get("target").and_then(Value::as_str) == Some(target)
+            })
+        })
+}
+
+fn flavor_label(static_frontend: bool) -> &'static str {
+    if static_frontend {
+        "static frontend"
+    } else {
+        "dev-server frontend"
+    }
+}
+
+fn has_app_out_mount(service: &Value) -> bool {
+    let Some(volumes) = service.get("volumes").and_then(Value::as_array) else {
+        return false;
+    };
+    volumes.iter().any(|v| match v {
+        // Normalized form: { type, source, target, ... }.
+        Value::Object(map) => map.get("target").and_then(Value::as_str) == Some("/app/out"),
+        // Short form: "src:/app/out:ro".
+        Value::String(s) => s.split(':').nth(1) == Some("/app/out"),
+        _ => false,
+    })
+}
+
+/// Resolve the env layers and assert mode-appropriate invariants, once per
+/// frontend flavor — the validator cannot know which one the developer will
+/// launch, so both must resolve to a sane configuration.
+pub fn local_env(
+    instance: &Instance,
+    mode: Mode,
+    no_doppler: bool,
+    env_file: Option<&std::path::Path>,
+) -> Result<()> {
+    for static_frontend in [true, false] {
+        local_env_flavor(instance, mode, no_doppler, env_file, static_frontend)?;
+    }
+    Ok(())
+}
+
+fn local_env_flavor(
+    instance: &Instance,
+    mode: Mode,
+    no_doppler: bool,
+    env_file: Option<&std::path::Path>,
+    static_frontend: bool,
+) -> Result<()> {
+    let resolved = env_layer::resolve(
+        mode,
+        instance,
+        env_layer::ResolveOptions {
+            no_doppler,
+            env_file,
+            static_frontend,
+            tunnels: Tunnels::default(),
+            wire_otel: true,
+            // run_local's default fleet, which needs no host state to resolve.
+            computers: &Computers::new(mode, Fleet::Docker, instance),
+        },
+    )?;
+    let env = &resolved.merged;
+    let mut failures: Vec<String> = Vec::new();
+
+    let require = |failures: &mut Vec<String>, key: &str| {
+        if !env.contains_key(key) {
+            failures.push(format!("missing required env '{key}'"));
+        }
+    };
+
+    match mode {
+        Mode::Local => {
+            for key in [
+                "DATABASE_URL",
+                "REDIS_URI",
+                "LOCAL_AWS_URL",
+                "FUSIONAUTH_BASE_URL",
+                "FUSIONAUTH_PUBLIC_URL",
+                "FUSIONAUTH_CLIENT_ID",
+                "JWT_SECRET_KEY",
+                "DOCUMENT_STORAGE_BUCKET",
+            ] {
+                require(&mut failures, key);
+            }
+            // No real AWS creds locally.
+            if env.get("AWS_ACCESS_KEY_ID").map(String::as_str) != Some("test") {
+                failures.push(
+                    "AWS_ACCESS_KEY_ID is not the local dummy 'test' — refusing real AWS creds locally".into(),
+                );
+            }
+            // Endpoints must be local docker hosts.
+            for (key, host) in [
+                ("FUSIONAUTH_BASE_URL", "fusionauth"),
+                ("LOCAL_AWS_URL", "localstack"),
+                ("DATABASE_URL", "postgres"),
+                ("REDIS_URI", "redis"),
+            ] {
+                if let Some(v) = env.get(key)
+                    && !v.contains(host)
+                    && !v.contains("localhost")
+                {
+                    failures.push(format!(
+                        "{key}={v} is not a local endpoint (expected host '{host}')"
+                    ));
+                }
+            }
+            // The post-login redirect must point at where this flavor
+            // actually serves the app (localhost for static, machine hostname
+            // otherwise) — the exact drift this per-flavor pass exists to
+            // catch.
+            let expected_frontend_port = if static_frontend {
+                instance.port(Port::Proxy)
+            } else {
+                instance.port(Port::Frontend)
+            };
+            if env.get("FRONTEND_PORT") != Some(&expected_frontend_port.to_string()) {
+                failures.push(format!(
+                    "FRONTEND_PORT={:?} does not match the {} port {expected_frontend_port}",
+                    env.get("FRONTEND_PORT"),
+                    flavor_label(static_frontend),
+                ));
+            }
+            let expected_frontend_origin = if static_frontend {
+                proxy::url(instance)
+            } else {
+                super::frontend::https_origin(instance)?
+            };
+            if env.get("FRONTEND_ORIGIN") != Some(&expected_frontend_origin) {
+                failures.push(format!(
+                    "FRONTEND_ORIGIN={:?} does not match the {} origin {expected_frontend_origin}",
+                    env.get("FRONTEND_ORIGIN"),
+                    flavor_label(static_frontend),
+                ));
+            }
+        }
+        Mode::Dev => {
+            // run-dev runs as macro_env `local` *on purpose*: dev_personal ships
+            // real values, not Secrets-Manager names, so a `dev`/`develop`
+            // macro_env would make services try to fetch each value as a secret.
+            // Its "dev-ness" comes from the values (dev DB, real AWS), not this.
+            if env.get("ENVIRONMENT").map(String::as_str) != Some("local") {
+                failures.push(
+                    "run-dev resolves ENVIRONMENT=local (dev values, local macro_env)".into(),
+                );
+            }
+            if env.get("LOCAL_AWS_URL").is_some() {
+                failures.push(
+                    "run-dev must not set LOCAL_AWS_URL (would point SES/S3 at LocalStack)".into(),
+                );
+            }
+            match env.get("DATABASE_URL") {
+                None => failures.push("run-dev requires a dev DATABASE_URL (none found)".into()),
+                Some(v) if env_layer::is_local_database_url(v) => {
+                    failures.push(format!(
+                        "run-dev DATABASE_URL={v} points at local infra; expected a shared-dev host"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        bail!(
+            "validate-local-env ({}, {}) failed:\n  - {}",
+            mode.label(),
+            flavor_label(static_frontend),
+            failures.join("\n  - ")
+        );
+    }
+    println!(
+        "validate-local-env ({}, {}): OK — {}",
+        mode.label(),
+        flavor_label(static_frontend),
+        env_layer::summarize(env)
+    );
+    Ok(())
+}
