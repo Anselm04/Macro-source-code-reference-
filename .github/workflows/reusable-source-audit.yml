@@ -1,0 +1,79 @@
+name: Reusable pinned upstream Git tree audit
+on:
+  workflow_call:
+    inputs:
+      upstream_url:
+        required: true
+        type: string
+      upstream_sha:
+        required: true
+        type: string
+      audit_slug:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout current reference repository without downloading upstream application assets
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            .trillionai
+            docs
+            TRILLIONAI_REFERENCE.md
+      - name: Compare original Git tree with main and record exact omitted paths
+        shell: bash
+        env:
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
+          UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+          AUDIT_SLUG: ${{ inputs.audit_slug }}
+        run: |
+          set -euo pipefail
+          case "$UPSTREAM_URL" in https://github.com/*) ;; *) echo "Unsupported upstream origin"; exit 1 ;; esac
+          case "$UPSTREAM_SHA" in *[!a-f0-9]*|"") echo "Invalid SHA"; exit 1 ;; esac
+          test "${#UPSTREAM_SHA}" -eq 40
+          git init -q /tmp/trillionai-audit-upstream
+          git -C /tmp/trillionai-audit-upstream remote add origin "$UPSTREAM_URL"
+          git -C /tmp/trillionai-audit-upstream -c protocol.version=2 fetch -q --depth 1 --filter=blob:none origin "$UPSTREAM_SHA"
+          test "$(git -C /tmp/trillionai-audit-upstream rev-parse FETCH_HEAD)" = "$UPSTREAM_SHA"
+          python3 - <<'PY'
+          import json,os,subprocess
+          from pathlib import Path
+          def tracked(repo,rev):
+              raw=subprocess.check_output(["git","-C",repo,"ls-tree","-rz",rev])
+              result={}
+              for item in raw.split(b"\0"):
+                  if not item: continue
+                  meta,name=item.split(b"\t",1)
+                  mode,kind,oid=meta.decode().split()
+                  result[name.decode("utf-8","surrogateescape")]={"mode":mode,"type":kind,"sha":oid}
+              return result
+          u=tracked("/tmp/trillionai-audit-upstream","FETCH_HEAD")
+          d=tracked(".","HEAD")
+          missing=sorted(set(u)-set(d))
+          mismatched=sorted(p for p in u.keys() & d.keys() if u[p]!=d[p])
+          extra=sorted(set(d)-set(u))
+          ci=[p for p in missing if p.startswith(".github/workflows/")]
+          sha=os.environ["UPSTREAM_SHA"]
+          rep={"upstream":os.environ["UPSTREAM_URL"],"pinned_commit":sha,"destination_main_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"upstream_tracked_entries":len(u),"destination_tracked_entries":len(d),"missing_paths":missing,"missing_path_count":len(missing),"missing_upstream_ci_count":len(ci),"missing_other_count":len(missing)-len(ci),"mismatched_objects":[{"path":p,"upstream":u[p],"destination":d[p]} for p in mismatched],"mismatched_count":len(mismatched),"extra_paths":extra,"extra_count":len(extra)}
+          name=os.environ["AUDIT_SLUG"]
+          folder=Path("docs/verified-source-audit")
+          folder.mkdir(parents=True,exist_ok=True)
+          (folder/(name+"-main-delta.json")).write_text(json.dumps(rep,indent=2)+"\n")
+          (folder/(name+"-summary.md")).write_text("# "+name+" upstream Git-tree audit\n\n"+f"- Upstream pinned revision: `{sha}`\n- Original Git entries: **{len(u)}**\n- Current main entries before audit commit: **{len(d)}**\n- Missing files: **{len(missing)}** (CI workflows: **{len(ci)}**; other: **{len(missing)-len(ci)}**)\n- SHA/mode mismatches: **{len(mismatched)}**\n- Additional reference files: **{len(extra)}**\n\nSee JSON for exact omitted paths, object IDs, file modes and additional files. No source was executed. Excludes external dependencies, submodule payloads, LFS downloads and private services.\n")
+          print(json.dumps({k:v for k,v in rep.items() if not isinstance(v,list)},indent=2))
+          PY
+          rm -f .github/workflows/audit-source-once.yml
+          git add -A
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'audit: record every Git-tracked upstream source difference'
+          git push origin HEAD:main
