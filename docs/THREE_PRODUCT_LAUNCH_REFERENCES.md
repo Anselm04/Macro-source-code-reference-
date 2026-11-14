@@ -13,7 +13,7 @@ Last research verification: 2026-11-14 (NZ time).
 
 ## Current verified library size
 
-**9 verified source snapshots · 122,438 Git-tracked files total** (including three existing snapshots and five sources imported for the joint launch: Trigger.dev, Activepieces, Chatwoot, OpenHands and Appwrite). Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
+**10 verified source snapshots · 126,636 Git-tracked files total** (including three existing snapshots and five sources imported for the joint launch: Trigger.dev, Activepieces, Chatwoot, OpenHands and Appwrite). Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
 
 ## Launch-critical reference projects
 
