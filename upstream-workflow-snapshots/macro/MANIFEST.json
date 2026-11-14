@@ -1,0 +1,422 @@
+{
+  "source": "https://github.com/macro-inc/macro.git",
+  "commit": "532fba5e60c14b91ae641619c32a58120b6b4546",
+  "number_of_original_workflow_files": 69,
+  "original_ci_is_disabled": true,
+  "files": [
+    {
+      "upstream_path": ".github/workflows/alert-native-build-failures.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/alert-native-build-failures.yml",
+      "git_blob": "a0835c395a0ef44f43ae3bcf63d730b33cbf735c",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/android-apk-on-release.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/android-apk-on-release.yml",
+      "git_blob": "697febefe341e170e3ded1d2e2d354d6aa618b6e",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/android-play-publish.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/android-play-publish.yml",
+      "git_blob": "91afa8c42cefb349bb9031d1dd6d996b528930d3",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/android-play-release.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/android-play-release.yml",
+      "git_blob": "062e653e270061c02172cb2ac25d8d5b8bfbb1b4",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/android-release-drift.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/android-release-drift.yml",
+      "git_blob": "0f68d06899b21a2c42c66e7c88bfdb94441d2058",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/android-release-watch.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/android-release-watch.yml",
+      "git_blob": "25c6def0f98aac3bd9c25616cc10eddf3a307cc0",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/assign-author.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/assign-author.yml",
+      "git_blob": "c8ea3e558b6678230c933737f575d1be3851c784",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/assign-labels.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/assign-labels.yml",
+      "git_blob": "0b47a725bda34282ebf544f7b5b53fb6e2da1768",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/build-rust-ci-image.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/build-rust-ci-image.yml",
+      "git_blob": "689f3d217cdee530b21dec16969a0cc38f99ff92",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/build_agent_daemon_on_tag.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/build_agent_daemon_on_tag.yml",
+      "git_blob": "902b213df633465f052b5282d8c079519ff04948",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/build_appimage_on_tag.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/build_appimage_on_tag.yml",
+      "git_blob": "1afa1f9c304c27d6d066148796b60a09c748e72d",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/build_cef_codecs.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/build_cef_codecs.yml",
+      "git_blob": "520fb376a89f2a4933c1a11e8cfa850fde401b32",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/build_desktop_on_tag.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/build_desktop_on_tag.yml",
+      "git_blob": "1d5aa11fa6d05cb4abd5ae82a40f10c6d428dd35",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/build_dmg_on_tag.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/build_dmg_on_tag.yml",
+      "git_blob": "32b62455f982fc17673b9780a411f91eeb8e12c2",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/build_web_app.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/build_web_app.yml",
+      "git_blob": "68d028ab297ffa722002606cc39f0d05eb5cd33a",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/cancel_stuck_cloud_storage_deploys.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/cancel_stuck_cloud_storage_deploys.yml",
+      "git_blob": "3941e567cffc8c9e1552d6f6f30493d95d77eafd",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/cargo_deny.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/cargo_deny.yml",
+      "git_blob": "9a62322315206ff23132f522ced67a9fb7e0fce8",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/cargo_workspace_dependency_check.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/cargo_workspace_dependency_check.yml",
+      "git_blob": "63c76eb213b3c78cfda795c10cc8eedb282587dd",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/check_generated.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/check_generated.yml",
+      "git_blob": "4a3007d63a3e8be4ca90e5878120d9e950cd887d",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/check_node_modules_nix.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/check_node_modules_nix.yml",
+      "git_blob": "0b0219264ac706bf57fb21f28c2d2c1ad4309c66",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/check_tauri_lockfiles.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/check_tauri_lockfiles.yml",
+      "git_blob": "65ffa608ed136bb2c72f18d99bbff8076d88860b",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/ci-gate-fork.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/ci-gate-fork.yml",
+      "git_blob": "3d77768e42b733c3e86e450cec9fd38083972a04",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/ci-gate-label.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/ci-gate-label.yml",
+      "git_blob": "36d351beb7d9c3b996b0ef63bdbb93a468824e45",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/ci-gate-reminder.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/ci-gate-reminder.yml",
+      "git_blob": "b5e6bcdfb5dc41cf63f0624f6b086d1ea8415d03",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/cla.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/cla.yml",
+      "git_blob": "d2b463c1c48a5cc55ece7ebd10d008e7f7ae0dd9",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/cleanup_preview.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/cleanup_preview.yml",
+      "git_blob": "9f3cdfe08d31c5f38b3cbfbf81cbcef3c133e362",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/code_check_cloud_storage.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/code_check_cloud_storage.yml",
+      "git_blob": "1527db680e3b5fbcc0af684f062898ffe3a5764d",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/code_check_conventions.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/code_check_conventions.yml",
+      "git_blob": "9bb75cc49a6c091e35078d188bcd99e7a9aadc0d",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/code_check_infra.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/code_check_infra.yml",
+      "git_blob": "3159766f5b256dcab219bc8d419052547cbbbf68",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy-analytics-proxy-dev.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy-analytics-proxy-dev.yml",
+      "git_blob": "99ccb33cdc35b03d245e00d9900b421c819cbaaa",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy-observability.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy-observability.yml",
+      "git_blob": "54073dbae1ef3ecde90b7422671873e6077243f0",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy-pulumi-stack.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy-pulumi-stack.yml",
+      "git_blob": "266709b899180426a9cd3ec9120d4195ce14d46d",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy-service-generic.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy-service-generic.yml",
+      "git_blob": "431d20ec0140e92c41ba29607db8fbe9a488ff8b",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_ai_editing_worker.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy_ai_editing_worker.yml",
+      "git_blob": "f190e95dfb1cf85674bb10f4f958e2de51ac5400",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_all_services.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy_all_services.yml",
+      "git_blob": "c7c7accef3d94a461a908171aba1500cdb1816b6",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_cla_worker.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy_cla_worker.yml",
+      "git_blob": "ccd58b84052d6d6be4d32f1fc46034640e776334",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_fusionauth_instance.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy_fusionauth_instance.yml",
+      "git_blob": "7dc69dcfe246eda320111a4738a84efe10cd5ec1",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_mcp_chatgpt_worker.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy_mcp_chatgpt_worker.yml",
+      "git_blob": "b51d95bf05ef5b590628989273c94cd8327e7366",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_on_push.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy_on_push.yml",
+      "git_blob": "7a7b0fee4ad193e781f71c06dcb2a49232f8b0eb",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_sdk_docs.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy_sdk_docs.yml",
+      "git_blob": "ca747a198726a4a5d9ebace6ecab91af24b5dbbc",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_sync_service.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy_sync_service.yml",
+      "git_blob": "442a64c14fffa6e2015f1f717141c35b690aa183",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_web_app.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy_web_app.yml",
+      "git_blob": "1de16e5a84b6eb75a91f99e6bd9cdbfaa62ea189",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_website.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/deploy_website.yml",
+      "git_blob": "705e976310143a534f8c08120ef2c1b38f715a44",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/desktop_qa_macos.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/desktop_qa_macos.yml",
+      "git_blob": "54240b5e3dda50b8836c4229ff224262e7acb1e8",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/ensure_daytona_snapshot.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/ensure_daytona_snapshot.yml",
+      "git_blob": "ced66a2829919d8c32531b80efcb046f2d169130",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/export-ci-telemetry.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/export-ci-telemetry.yml",
+      "git_blob": "3fc8f91f66dd41396571236a15d291eaeba8367b",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/export-datadog-observability.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/export-datadog-observability.yml",
+      "git_blob": "7e28452512f5aa19ae3bd514088e32f0c6ca7ed2",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/ios-app-store-publish.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/ios-app-store-publish.yml",
+      "git_blob": "2b16ecc4bdf13febe6280e11f37d79c1bd3e9fcf",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/ios-app-store-release.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/ios-app-store-release.yml",
+      "git_blob": "21897ae265e2e5e61a0074041f91ae4a26f7adfd",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/ios-release-drift.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/ios-release-drift.yml",
+      "git_blob": "89abfb2942510feeeb3afdd86ff858b9b7d684dd",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/ios-release-watch.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/ios-release-watch.yml",
+      "git_blob": "400ebd730b23e715f4050f1228ee15e503d141ae",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/ios_preview.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/ios_preview.yml",
+      "git_blob": "4d90621f48ce167f369e28ccf5a5e482fe88e08e",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/migrate-macro-db.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/migrate-macro-db.yml",
+      "git_blob": "46e305aafe584fbda188ca688cdac1a06091aa23",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/native-check-label.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/native-check-label.yml",
+      "git_blob": "f0343ea356a7d7f777f4c4a83c3ac9c6c5b5545b",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/observability_image.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/observability_image.yml",
+      "git_blob": "0f3f5881c6a5e76dbf485139c7e890eba1731dfa",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/pr-ci.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/pr-ci.yml",
+      "git_blob": "f553050ef0e501d61f00837b0a991d76f974da35",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/pr-privacy-check.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/pr-privacy-check.yml",
+      "git_blob": "da477134779817ce372fc7ad6d16c441b23b7b61",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/publish-android-play.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/publish-android-play.yml",
+      "git_blob": "0c96ba4eafb954b93d61d9d78d54c0e03d11d1ac",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/publish-sdk.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/publish-sdk.yml",
+      "git_blob": "9e8049a8ca2a67413857c308616760e1b351c753",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/pulumi_preview_pr.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/pulumi_preview_pr.yml",
+      "git_blob": "2e214c2f93ef64f62f1df54726513b04c761c9cf",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/push_local_stack_binaries.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/push_local_stack_binaries.yml",
+      "git_blob": "5e3ba5c854d35e1b83b867c91092e0b76b4c7267",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/release-label-check.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/release-label-check.yml",
+      "git_blob": "eb7fbcaef1a5c7f70f00c393fc231030b6d0d6cc",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/release-production.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/release-production.yml",
+      "git_blob": "2d9d63bc9438f3dac605c7dedc15108fe0f5012a",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/release-sdk.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/release-sdk.yml",
+      "git_blob": "f0f9f9b9f13e0ed704beac95578ded17dcd59ade",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/reusable_deploy_service.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/reusable_deploy_service.yml",
+      "git_blob": "deaf726d72c2df4e655f93ab71415adf02fa8abf",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/reusable_preview_service.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/reusable_preview_service.yml",
+      "git_blob": "35c5e5301f5eee92192a109dab3214620181bfaa",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/sdk-check.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/sdk-check.yml",
+      "git_blob": "1c3b67d37813bee024b0e28d52365c3c99049424",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/test_macrod_update.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/test_macrod_update.yml",
+      "git_blob": "7d995c77c2d7610d2acf2162335e72c97d05755a",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/web-app-check-main.yml",
+      "reference_path": "upstream-workflow-snapshots/macro/.github/workflows/web-app-check-main.yml",
+      "git_blob": "a841c8a3372584e637b120b2235b822214982779",
+      "original_mode": "100644"
+    }
+  ]
+}
