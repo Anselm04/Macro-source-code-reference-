@@ -13,7 +13,7 @@ Last research verification: 2026-11-14 (NZ time).
 
 ## Current verified library size
 
-**12 verified source snapshots · 241,478 retained Git-tracked files** across twelve dedicated repositories, including the licence-filtered Twenty and PostHog snapshots. Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
+**13 verified source snapshots · 266,510 retained Git-tracked files** across thirteen dedicated repositories, including the licence-filtered Twenty and PostHog snapshots. Git tree checks passed individually. Source-file counts are not measurements of line count, security quality, or commercial completeness.
 
 ## Launch-critical reference projects
 
@@ -32,7 +32,7 @@ Last research verification: 2026-11-14 (NZ time).
 | L1 | Appwrite | https://github.com/appwrite/appwrite | https://appwrite.io/pricing (cloud tiers) | BSD-3-Clause upstream; dependencies separately licensed | **AppForge/shared customer backend** | Registration, sessions, storage, queues, functions, persistent data | **VERIFIED** [16,673 files](https://github.com/Anselm04/Appwrite-Source-Code-Reference/tree/appwrite-upstream-snapshot/upstream) in dedicated repository; upstream `8d5559c74e9d8ef336713cabfb9b512fdb86c5b1`; tree `9b3935082e0eda53bc811eb0d786ca9a96fe38c7` |
 | L1 | Temporal | https://github.com/temporalio/temporal | https://temporal.io/pricing (commercial Temporal Cloud; source is separate) | MIT | **Manager + AppForge** | Durable workflows, retry/idempotency, fault recovery and history | **VERIFIED** [4,198 files](https://github.com/Anselm04/Temporal-Source-Code-Reference/tree/temporal-upstream-snapshot/upstream); upstream `98925be15707693868c3a900a5d41df126da7fdf`; tree `6d462212d9c308ef9e56f9d7e5cf72d3731861b7` |
 | L1 | LangGraph.js | https://github.com/langchain-ai/langgraphjs | https://www.langchain.com/pricing (LangSmith commercial service, **distinct from OSS library**) | MIT | **Manager + AppForge** | Stateful agent graphs and checkpoints | **VERIFIED** [2,073 files](https://github.com/Anselm04/LangGraph-Source-Code-Reference/tree/langgraph-upstream-snapshot/upstream); upstream `62e40b998f769ccf9d872d394d2fd3d6796a0ddf`; tree `c534cd4169babeba9499f1c38363a88782f12961` |
-| L2 | Medusa | https://github.com/medusajs/medusa | https://medusajs.com/pricing (paid Medusa Cloud) | MIT core; enterprise features separate | **Shared commercial services** | Events, orders, webhooks, transactions, subscriptions integration patterns | RESEARCH CANDIDATE |
+| L2 | Medusa | https://github.com/medusajs/medusa | https://medusajs.com/pricing (paid Medusa Cloud) | MIT community code; 265 enterprise-licensed paths excluded according to ENTERPRISE-LICENSE.md | **Shared commercial services** | Events, orders, webhooks, transactions, subscriptions integration patterns | **VERIFIED FILTERED** [25,032 files](https://github.com/Anselm04/Medusa-Source-Code-Reference/tree/medusa-upstream-snapshot/upstream), 265 restricted files excluded; upstream `01de0be27a7c228795d5cfc31662ca144781fbfc`; filtered tree `9dfde825357225687b752656368e03a89919c711` |
 | L2 | Cal.com | https://github.com/calcom/cal.com | https://cal.com/pricing (paid scheduling tiers) | Mixed licensing; verify root and enterprise paths | **Manager + Marketing** | Bookings, appointment events, customer follow-up | RESEARCH CANDIDATE |
 | L2 | Plane | https://github.com/makeplane/plane | https://plane.so/pricing (paid team plans) | Mixed licensing, check before reuse | **Manager** | Work queues, operations dashboards, task dependencies | RESEARCH CANDIDATE |
 | RESEARCH ONLY | n8n | https://github.com/n8n-io/n8n | https://n8n.io/pricing (paid hosted automation) | Sustainable Use License + enterprise licence; **not standard open-source**, customer-facing workflow SaaS may require commercial licensing | **Manager + Marketing** | Compare patterns ONLY; do not embed or copy its implementation | NO IMPORT PLANNED without separate review |
@@ -52,7 +52,7 @@ Only copy an upstream snapshot when it answers a concrete product milestone. Don
 ## GitHub setup and storage layout
 
 **Current separation:**
-- Every one of the twelve verified reference projects now has its **own dedicated public repository**, linked in the table above; each uses a source snapshot branch under `upstream/`.
+- Every one of the thirteen verified reference projects now has its **own dedicated public repository**, linked in the table above; each uses a source snapshot branch under `upstream/`.
 - `Anselm04/Macro-source-code-reference-` currently also hosts the central catalogue and the older legacy snapshot branches created before separation; those older duplicates should not be used for future research.
 - Do **not** merge source snapshot branches into main or commercial TrillionAI repos.
 
