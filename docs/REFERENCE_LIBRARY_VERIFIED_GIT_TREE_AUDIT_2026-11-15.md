@@ -75,7 +75,7 @@ Original entries are Git blobs / Gitlinks / symlinks (not full checked-out submo
 |---|---|---|
 | Cosign | Restored **6 Go implementation/test files** | [Repair](https://github.com/Anselm04/Cosign-Source-Code-Reference/commit/6c1e047ea6bae011170c168ad4f9f0a50d3320b7); re-audit shows **0** remaining non-CI missing files and **0** mismatched objects |
 | OSCAL | Restored **2 XML fixtures** and **2 original submodule Gitlinks** | [Repair](https://github.com/Anselm04/OSCAL-Source-Code-Reference/commit/21c3629f97bbd57967ac877121cf1ee83203aa59); re-audit shows **0** remaining non-CI missing Git entries and **0** mismatched objects |
-| Compliance Trestle | Restored **1 original nist-content Gitlink** | [Repair](https://github.com/Anselm04/Compliance-Trestle-Source-Code-Reference/commit/717d54760b7a7cabdd6bef9af737a537f1d7e51); re-audit shows **0** remaining non-CI missing Git entries and **0** mismatched objects |
+| Compliance Trestle | Restored **1 original nist-content Gitlink** | [Repair](https://github.com/Anselm04/Compliance-Trestle-Source-Code-Reference/commit/641f7cb1391fc251abba0c08dcdbc7128e27a56d); re-audit shows **0** remaining non-CI missing Git entries and **0** mismatched objects |
 | Activepieces | Restored previous erroneous deletion of **229 files** | Pinned source re-audit: **0** missing non-CI paths, **0** mismatches |
 | Chatwoot | Restored previous erroneous deletion of **739 files** | Pinned source re-audit: **0** missing non-CI paths, **0** mismatches |
 | Dyad | Restored previous erroneous deletion of **198 files** | Pinned source re-audit: **0** missing non-CI paths, **0** mismatches |
