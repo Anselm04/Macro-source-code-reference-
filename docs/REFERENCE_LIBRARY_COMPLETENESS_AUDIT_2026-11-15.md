@@ -1,6 +1,6 @@
 # TrillionAI Reference Library — Source Completeness Audit
 
-**Audit date:** 2026-11-15 (Pacific/Auckland)  
+> **SUPERSEDED BY FULL GIT-TREE VERIFICATION.** [Read the 31-repository verified source audit](REFERENCE_LIBRARY_VERIFIED_GIT_TREE_AUDIT_2026-11-15.md). This earlier inventory was preliminary. A later exact upstream Git-object comparison identified **2,045**, not 2,044, remaining non-CI omissions (Trivy has 67, not 66), repaired 11 other missing original Git entries, and safely archived 821 original upstream CI files without executing them. Use the newer report for current totals.\n\n**Audit date:** 2026-11-15 (Pacific/Auckland)  
 **Scope:** 31 public `Anselm04/*Source-Code-Reference*` repositories; current `main` and their original pinned-source documentation.  
 **Method:** GitHub repository discovery; retrieved provenance/licence documents; inspected import and restoration commit records; inspected representative source files. Existing historical importer tree-verification results were reviewed as recorded claims, not independently re-executed.
 
