@@ -1,0 +1,15 @@
+# TrillionAI Reference Source Preservation and Independent Engineering Policy
+
+**Applies to every source-code-reference repository in Anselm04.**
+
+1. **Never silently delete or alter original tracked source.** Any change to a pinned upstream snapshot must be accompanied by exact upstream repository URL, commit SHA, complete path/hash/mode delta, and explicit documentation of why it differs. Ask for approval before deliberate source removal.
+2. **Preserve architecture and research completeness.** Retain original permitted source, directory structures, file-level licences, notices, documentation, tests and samples. Preserve upstream CI code as byte-identical *inert reference snapshots* outside the execution-trigger directory `.github/workflows/`.
+3. **When external licence terms or security prevent a public mirror**, do not invent replacement code, silently omit, bypass secret scanning, or retype copyrighted code character-for-character. Record exact missing paths, original upstream pinned links, original Git identity and a lawful non-copying study route. Do not claim the mirror is complete.
+4. **Keep source research separate from proprietary product code.** Derive functional requirements, security boundaries, architecture decisions and measurable acceptance tests; independently engineer TrillionAI Flutter frontends and Node.js/TypeScript backends. Never copy restricted enterprise implementations into proprietary products merely because they are readable.
+5. **Audit every pinned revision before reporting completion.** Recursively compare each tracked Git path, blob or Gitlink object SHA, and file mode to the original pinned upstream source; verify no unreported omissions. Enumerate Git LFS pointers and submodule Gitlinks separately; these are not downloaded binary payloads or full submodule contents.
+6. **Avoid accidental execution and costs.** Never enable imported CI pipelines, run arbitrary dependencies, reconnect paid cloud infrastructure, or deploy third-party code as part of source archival research.
+7. **Represent rights accurately.** Publicly readable source is not unrestricted public-domain code. Reference or implementation rights depend on the original licence, file-level provisions, agreements, and applicable copyright/patent law.
+8. **Keep the source library useful even when public replication is restricted.** Maintain pinned upstream read-only links and verified path inventories, preserve local access where rights permit, and write original implementation design notes rather than source-code substitutions.
+9. **Report exact status, including incompleteness.** A linked original is not a mirrored local file, an archive is not a passing build, and restoration of a Gitlink is not a checkout of its submodule content.
+
+**Current evidence:** [31-repository full Git-tree audit](REFERENCE_LIBRARY_VERIFIED_GIT_TREE_AUDIT_2026-11-15.md). All 821 upstream CI workflow files have been preserved inertly with SHA verification; 2,045 filtered source paths remain linked to their pinned original upstream locations and are explicitly not claimed to exist in their public mirror.
